@@ -20,4 +20,10 @@ export const env = {
   plaidEnv: (process.env.PLAID_ENV ?? 'sandbox') as 'sandbox' | 'development' | 'production',
   plaidProducts: (process.env.PLAID_PRODUCTS ?? 'transactions,auth').split(','),
   plaidCountryCodes: (process.env.PLAID_COUNTRY_CODES ?? 'US').split(','),
+
+  // Optional: this backend's own public HTTPS URL (e.g. the Railway domain). When set, Plaid
+  // Link is asked to register a webhook on every item so transactions/errors push to us instead
+  // of relying only on manual refresh/sync. Left unset in local dev, where Plaid can't reach
+  // localhost anyway.
+  backendPublicUrl: process.env.BACKEND_PUBLIC_URL || null,
 };

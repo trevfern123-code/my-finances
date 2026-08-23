@@ -56,6 +56,7 @@ Only the variables below are actually read by the code — everything else is de
 | `FRONTEND_URL` | The **only** var driving CORS (`backend/src/index.ts`) — must exactly match the Vercel URL |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Server-side Supabase client |
 | `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV`, `PLAID_PRODUCTS`, `PLAID_COUNTRY_CODES` | Plaid client config |
+| `BACKEND_PUBLIC_URL` (optional) | This backend's own public URL, used to register `/api/webhooks/plaid` with Plaid on link. See **Webhooks** below. |
 
 `CORS_ORIGIN` and `CLIENT_URL` (added during troubleshooting, presumably guessing at alternate names CORS config might read) aren't referenced anywhere in the code — `FRONTEND_URL` is the single source of truth for the allowed origin. Safe to delete both.
 
@@ -80,3 +81,15 @@ Only the variables below are actually read by the code — everything else is de
 3. Frontend opens Plaid Link with that token; on success Plaid returns a `public_token`.
 4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token`. The backend exchanges it for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
 5. Frontend calls `GET /api/plaid/items` to display the user's linked institutions/accounts.
+
+## Webhooks
+
+Plaid pushes updates to `POST /api/webhooks/plaid` instead of the app relying solely on the user manually clicking "Sync transactions"/"Refresh balances". This endpoint is intentionally **not** behind `requireAuth` — Plaid calls it directly as a server, not as a signed-in user — so authenticity is verified a different way: every delivery carries a `Plaid-Verification` header (a JWT signed with a key Plaid rotates periodically), which `backend/src/services/webhookVerification.ts` checks against Plaid's `/webhook_verification_key/get` endpoint (caching keys for 24h) and against a hash of the exact raw request body, rejecting anything that doesn't match or is older than 5 minutes. `backend/src/index.ts` captures the raw body via `express.json()`'s `verify` callback specifically so this check has the exact original bytes to hash, since the parsed `req.body` isn't guaranteed to re-serialize identically.
+
+Two webhook types are handled (`backend/src/controllers/webhookController.ts`):
+- `TRANSACTIONS` / `SYNC_UPDATES_AVAILABLE` — runs the same sync logic as the manual "Sync transactions" button (`backend/src/services/syncService.ts`, shared by both paths so they can't drift out of sync with each other).
+- `ITEM` / `ERROR` with `ITEM_LOGIN_REQUIRED` — flips the item to `login_required` immediately, so the reconnect banner appears without the user having to trigger a manual refresh first.
+
+**Enabling this**: set `BACKEND_PUBLIC_URL` on Railway to the backend's own public URL once you have it (same chicken-and-egg as `FRONTEND_URL` — deploy once first, then set it). `plaidService.createLinkToken`/`createReauthLinkToken` only pass a `webhook` URL to Plaid when this is set, so items linked before it's configured won't have a webhook registered — clicking **Refresh balances** afterward backfills it onto existing items (`plaidService.updateItemWebhook`, called best-effort inside `refreshAccounts`). Left unset in local dev, since Plaid can't deliver webhooks to `localhost`.
+
+**Testing in Sandbox**: `POST /api/plaid/items/:itemId/sandbox-fire-webhook` (same auth/ownership/404-outside-sandbox pattern as the existing `sandbox-reset-login` route) asks Plaid to actually deliver the `SYNC_UPDATES_AVAILABLE` webhook for that item, so you can exercise the real receiver — signature verification included — rather than only trusting it in theory.

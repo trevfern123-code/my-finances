@@ -17,3 +17,4 @@ plaidRouter.patch('/transactions/:transactionId/category', plaidController.setTr
 plaidRouter.post('/items/:itemId/reauth-link-token', plaidController.createReauthLinkToken);
 plaidRouter.post('/items/:itemId/reauth-complete', plaidController.completeReauth);
 plaidRouter.post('/items/:itemId/sandbox-reset-login', plaidController.sandboxResetLogin);
+plaidRouter.post('/items/:itemId/sandbox-fire-webhook', plaidController.sandboxFireWebhook);

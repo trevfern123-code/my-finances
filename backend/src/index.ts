@@ -5,6 +5,7 @@ import morgan from 'morgan';
 import { env } from './config/env';
 import { plaidRouter } from './routes/plaid';
 import { budgetCategoriesRouter } from './routes/budgetCategories';
+import { webhooksRouter } from './routes/webhooks';
 import { errorHandler } from './middleware/errorHandler';
 
 // Last-resort logging so a future unhandled rejection is visible in deploy logs before
@@ -27,7 +28,15 @@ app.use(
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
-app.use(express.json());
+app.use(
+  express.json({
+    // Plaid webhook signatures are computed over the exact raw request bytes — capture them
+    // alongside normal JSON parsing rather than re-reading the (already-consumed) stream later.
+    verify: (req, _res, buf) => {
+      (req as express.Request).rawBody = buf;
+    },
+  })
+);
 app.use(morgan('dev'));
 
 app.get('/', (_req, res) => {
@@ -40,6 +49,7 @@ app.get('/health', (_req, res) => {
 
 app.use('/api/plaid', plaidRouter);
 app.use('/api/budget-categories', budgetCategoriesRouter);
+app.use('/api/webhooks', webhooksRouter);
 
 app.use(errorHandler);
 

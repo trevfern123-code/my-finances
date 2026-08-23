@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import * as plaidService from '../services/plaidService';
 import * as dataService from '../services/dataService';
+import * as syncService from '../services/syncService';
 import { env } from '../config/env';
 
 const LIABILITY_ACCOUNT_TYPES = new Set(['credit', 'loan']);
@@ -93,15 +94,13 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
     const plaidAccounts = await plaidService.getAccounts(accessToken);
     const accountRows = await dataService.upsertAccountsForItem(itemRow.id, plaidAccounts);
 
-    // Pull initial transaction history right away so the dashboard isn't empty
-    // until the user manually triggers a sync.
-    const accountIdByPlaidId = new Map(accountRows.map((a) => [a.plaid_account_id, a.id]));
-    const { added, modified, removed, cursor } = await plaidService.syncTransactions(
-      accessToken,
-      null
-    );
-    await dataService.applyTransactionChanges({ added, modified, removed, accountIdByPlaidId });
-    await dataService.updateItemCursor(itemRow.id, cursor);
+    // Pull initial transaction history right away so the dashboard isn't empty until the
+    // webhook (or a manual sync) delivers the next update.
+    const { added } = await syncService.syncItemTransactions({
+      id: itemRow.id,
+      access_token: accessToken,
+      transactions_cursor: null,
+    });
 
     // Access token is intentionally never included in the response — it stays server-side.
     res.status(201).json({
@@ -111,7 +110,7 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
         institution_name: itemRow.institution_name,
       },
       accounts: accountRows,
-      transactions_synced: added.length,
+      transactions_synced: added,
     });
   } catch (err) {
     next(err);
@@ -138,6 +137,12 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
         const plaidAccounts = await plaidService.getAccounts(item.access_token);
         await dataService.upsertAccountsForItem(item.id, plaidAccounts);
         await dataService.setItemStatus(item.id, 'active');
+
+        // Best-effort: backfills the webhook URL onto items linked before webhooks were
+        // configured. Not critical, so a failure here shouldn't fail the whole refresh.
+        await plaidService.updateItemWebhook(item.access_token).catch((err) => {
+          console.error(`Failed to backfill webhook for item ${item.id}:`, err);
+        });
       } catch (err) {
         // An item needing re-auth shouldn't break refreshing everyone else's accounts —
         // flag it and let the frontend prompt the user to reconnect that one institution.
@@ -167,18 +172,10 @@ export async function syncTransactions(req: Request, res: Response, next: NextFu
 
     for (const item of items) {
       try {
-        const { added, modified, removed, cursor } = await plaidService.syncTransactions(
-          item.access_token,
-          item.transactions_cursor
-        );
-        const accountIdByPlaidId = await dataService.getAccountIdMapForItem(item.id);
-        await dataService.applyTransactionChanges({ added, modified, removed, accountIdByPlaidId });
-        await dataService.updateItemCursor(item.id, cursor);
-        await dataService.setItemStatus(item.id, 'active');
-
-        addedCount += added.length;
-        modifiedCount += modified.length;
-        removedCount += removed.length;
+        const result = await syncService.syncItemTransactions(item);
+        addedCount += result.added;
+        modifiedCount += result.modified;
+        removedCount += result.removed;
       } catch (err) {
         if (plaidService.isReauthRequiredError(err)) {
           await dataService.setItemStatus(item.id, 'login_required');
@@ -233,6 +230,29 @@ export async function sandboxResetLogin(req: Request, res: Response, next: NextF
 
     const items = await dataService.getLinkedItemsForUser(userId);
     res.json({ items });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function sandboxFireWebhook(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (env.plaidEnv !== 'sandbox') {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    const userId = req.user!.id;
+    const { itemId } = req.params;
+
+    const item = await dataService.getPlaidItemForUser(itemId, userId);
+    if (!item) {
+      res.status(404).json({ error: 'Item not found' });
+      return;
+    }
+
+    await plaidService.sandboxFireWebhook(item.access_token);
+    res.json({ fired: true });
   } catch (err) {
     next(err);
   }

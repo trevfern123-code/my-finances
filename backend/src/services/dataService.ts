@@ -53,6 +53,20 @@ export async function setItemStatus(itemRowId: string, status: 'active' | 'login
   if (error) throw new Error(`Failed to update item status: ${error.message}`);
 }
 
+/** Looks up an item by Plaid's own item_id, which is what webhook payloads identify items by. */
+export async function getPlaidItemByPlaidItemId(
+  plaidItemId: string
+): Promise<Pick<PlaidItemRow, 'id' | 'access_token' | 'transactions_cursor'> | null> {
+  const { data, error } = await supabaseAdmin
+    .from('plaid_items')
+    .select('id, access_token, transactions_cursor')
+    .eq('plaid_item_id', plaidItemId)
+    .maybeSingle();
+
+  if (error) throw new Error(`Failed to load Plaid item: ${error.message}`);
+  return data;
+}
+
 export async function getPlaidItemForUser(
   itemId: string,
   userId: string

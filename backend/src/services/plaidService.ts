@@ -1,9 +1,17 @@
-import { CountryCode, Products, type RemovedTransaction, type Transaction } from 'plaid';
+import {
+  CountryCode,
+  Products,
+  SandboxItemFireWebhookRequestWebhookCodeEnum,
+  type RemovedTransaction,
+  type Transaction,
+} from 'plaid';
 import { plaidClient } from '../config/plaid';
 import { env } from '../config/env';
 
 const products = env.plaidProducts.map((p) => p as Products);
 const countryCodes = env.plaidCountryCodes.map((c) => c as CountryCode);
+
+const webhookUrl = env.backendPublicUrl ? `${env.backendPublicUrl}/api/webhooks/plaid` : undefined;
 
 export async function createLinkToken(userId: string): Promise<string> {
   const response = await plaidClient.linkTokenCreate({
@@ -12,6 +20,7 @@ export async function createLinkToken(userId: string): Promise<string> {
     products,
     country_codes: countryCodes,
     language: 'en',
+    webhook: webhookUrl,
   });
 
   return response.data.link_token;
@@ -52,9 +61,16 @@ export async function createReauthLinkToken(userId: string, accessToken: string)
     country_codes: countryCodes,
     language: 'en',
     access_token: accessToken,
+    webhook: webhookUrl,
   });
 
   return response.data.link_token;
+}
+
+/** Backfills the webhook URL onto an item that was linked before webhooks were configured. */
+export async function updateItemWebhook(accessToken: string) {
+  if (!webhookUrl) return;
+  await plaidClient.itemWebhookUpdate({ access_token: accessToken, webhook: webhookUrl });
 }
 
 interface PlaidApiErrorShape {
@@ -70,6 +86,14 @@ export function isReauthRequiredError(err: unknown): boolean {
 /** Sandbox-only: forces an item into ITEM_LOGIN_REQUIRED so the reconnect flow can be tested. */
 export async function sandboxResetLogin(accessToken: string) {
   await plaidClient.sandboxItemResetLogin({ access_token: accessToken });
+}
+
+/** Sandbox-only: asks Plaid to deliver a real test webhook for this item, to exercise the receiver end-to-end. */
+export async function sandboxFireWebhook(accessToken: string) {
+  await plaidClient.sandboxItemFireWebhook({
+    access_token: accessToken,
+    webhook_code: SandboxItemFireWebhookRequestWebhookCodeEnum.SyncUpdatesAvailable,
+  });
 }
 
 export async function getAccounts(accessToken: string) {
