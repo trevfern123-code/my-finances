@@ -104,7 +104,10 @@ Only the variables below are actually read by the code — everything else is de
 
 `GET /api/budget-categories` now returns a `spent` figure per category, computed server-side (`budgetCategoryController.ts` + `services/budgetPeriod.ts`) as the sum of that category's positive-amount transactions dated within the current calendar month (UTC) — previously this was computed client-side in `BudgetCategories.tsx` from whatever transactions happened to already be loaded in the feed, which wasn't scoped to a calendar month at all and silently included spend from every month in the loaded window as one running total.
 
-**The frontend has not been updated to use this yet** — `BudgetCategories.tsx` still does its own (still-incorrect) client-side calculation from the `transactions` prop, and the `BudgetCategory` TypeScript type on the frontend doesn't declare the new `spent` field. This was deliberate: the backend logic and its test coverage were the priority for this pass. Swapping the frontend to trust `category.spent` directly (and dropping the `transactions` prop dependency from `BudgetCategories.tsx` entirely) is the next step whenever UI work resumes.
+The frontend now trusts `category.spent` directly — `BudgetCategories.tsx` no longer recomputes anything client-side and no longer takes a `transactions` prop at all. Two wrinkles worth knowing about:
+
+- **`spent` only exists on the list response.** `POST`/`PATCH /api/budget-categories` return the bare Supabase row with no `spent` field (typed in `frontend/src/lib/api.ts` as `Omit<BudgetCategory, 'spent'>` so this isn't just implicit/undocumented). Creating a category sets `spent: 0` locally (always correct — a new category has no transactions yet); updating one merges the response into existing state instead of replacing it, so the previously-known `spent` isn't clobbered with `undefined`.
+- **Keeping `spent` fresh.** Categorizing a transaction or syncing new transactions can both change a category's current-month total, so `App.tsx` refetches the categories list (`refreshBudgetCategories`) after either action — the same best-effort, non-blocking pattern already used for `refreshSummary`.
 
 ## Webhooks
 

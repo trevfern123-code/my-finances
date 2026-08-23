@@ -1,25 +1,21 @@
 import { useState } from 'react';
-import type { BudgetCategory, TransactionItem } from '../lib/api';
+import type { BudgetCategory } from '../lib/api';
 
 function formatCurrency(amount: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 }
 
-function spentForCategory(categoryId: string, transactions: TransactionItem[]) {
-  return transactions
-    .filter((t) => t.budget_category_id === categoryId && t.amount > 0)
-    .reduce((sum, t) => sum + t.amount, 0);
+function currentMonthLabel() {
+  return new Date().toLocaleDateString('en-US', { month: 'long' });
 }
 
 export function BudgetCategories({
   categories,
-  transactions,
   onCreate,
   onUpdate,
   onDelete,
 }: {
   categories: BudgetCategory[];
-  transactions: TransactionItem[];
   onCreate: (name: string, budgetAmount: number) => void;
   onUpdate: (id: string, budgetAmount: number) => void;
   onDelete: (id: string) => void;
@@ -39,15 +35,17 @@ export function BudgetCategories({
 
   return (
     <div>
-      <h2>Budget categories</h2>
+      <div className="section-header">
+        <h2>Budget categories</h2>
+        <span className="hint">{currentMonthLabel()}</span>
+      </div>
       {categories.length === 0 ? (
         <p>No budget categories yet.</p>
       ) : (
         <div className="budget-categories">
           {categories.map((c) => {
-            const spent = spentForCategory(c.id, transactions);
-            const pct = c.budget_amount > 0 ? Math.min((spent / c.budget_amount) * 100, 100) : 0;
-            const over = spent > c.budget_amount;
+            const pct = c.budget_amount > 0 ? Math.min((c.spent / c.budget_amount) * 100, 100) : 0;
+            const over = c.spent > c.budget_amount;
             return (
               <div key={c.id} className="budget-category-row">
                 <div className="budget-category-header">
@@ -77,7 +75,7 @@ export function BudgetCategories({
                   />
                 </div>
                 <span className="budget-category-summary">
-                  {formatCurrency(spent)} of {formatCurrency(c.budget_amount)} spent
+                  {formatCurrency(c.spent)} of {formatCurrency(c.budget_amount)} spent
                 </span>
               </div>
             );

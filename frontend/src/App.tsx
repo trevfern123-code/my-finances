@@ -74,6 +74,18 @@ export default function App() {
     }
   }
 
+  // `spent` is only computed on the list endpoint, not returned by the create/update/categorize
+  // endpoints — anything that can change a category's current-month spend needs to refetch the
+  // list to stay accurate, rather than trying to patch `spent` in locally.
+  async function refreshBudgetCategories() {
+    try {
+      const res = await getBudgetCategories();
+      setBudgetCategories(res.categories);
+    } catch {
+      // ignore
+    }
+  }
+
   async function handleAccountsRefreshed(newItems: LinkedItem[]) {
     setItems(newItems);
     refreshSummary();
@@ -87,6 +99,7 @@ export default function App() {
       const res = await getTransactions();
       setTransactions(res.transactions);
       refreshSummary();
+      refreshBudgetCategories();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to sync transactions');
     } finally {
@@ -103,6 +116,7 @@ export default function App() {
       setTransactions((prev) =>
         prev.map((t) => (t.id === transactionId ? { ...t, budget_category_id: budgetCategoryId } : t))
       );
+      refreshBudgetCategories();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to update category');
     }
@@ -112,7 +126,9 @@ export default function App() {
     setActionError(null);
     try {
       const res = await createBudgetCategory({ name, budget_amount: budgetAmount });
-      setBudgetCategories((prev) => [...prev, res.category]);
+      // A brand-new category has no transactions assigned to it yet, so spent is always 0 —
+      // no need to refetch just to fill in a field we already know the value of.
+      setBudgetCategories((prev) => [...prev, { ...res.category, spent: 0 }]);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to create category');
     }
@@ -122,7 +138,11 @@ export default function App() {
     setActionError(null);
     try {
       const res = await updateBudgetCategory(id, { budget_amount: budgetAmount });
-      setBudgetCategories((prev) => prev.map((c) => (c.id === id ? res.category : c)));
+      // Merge rather than replace — the response has no `spent`, and changing budget_amount
+      // doesn't change how much has actually been spent, so keep whatever value is already there.
+      setBudgetCategories((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, ...res.category } : c))
+      );
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to update category');
     }
@@ -182,7 +202,6 @@ export default function App() {
           <section>
             <BudgetCategories
               categories={budgetCategories}
-              transactions={transactions}
               onCreate={handleCreateCategory}
               onUpdate={handleUpdateCategory}
               onDelete={handleDeleteCategory}

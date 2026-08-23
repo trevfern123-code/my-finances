@@ -69,6 +69,8 @@ export interface BudgetCategory {
   budget_amount: number;
   color: string | null;
   sort_order: number;
+  /** Sum of positive-amount categorized transactions in the current calendar month — only present on GET /api/budget-categories. */
+  spent: number;
 }
 
 export function createLinkToken(): Promise<{ link_token: string }> {
@@ -141,18 +143,20 @@ export function getBudgetCategories(): Promise<{ categories: BudgetCategory[] }>
   return authedFetch('/api/budget-categories');
 }
 
+// The create/update endpoints return the bare row from Supabase, not the enriched shape —
+// only GET /api/budget-categories computes and includes `spent`.
 export function createBudgetCategory(params: {
   name: string;
   budget_amount: number;
   color?: string | null;
-}): Promise<{ category: BudgetCategory }> {
+}): Promise<{ category: Omit<BudgetCategory, 'spent'> }> {
   return authedFetch('/api/budget-categories', { method: 'POST', body: JSON.stringify(params) });
 }
 
 export function updateBudgetCategory(
   id: string,
   fields: Partial<{ name: string; budget_amount: number; color: string | null; sort_order: number }>
-): Promise<{ category: BudgetCategory }> {
+): Promise<{ category: Omit<BudgetCategory, 'spent'> }> {
   return authedFetch(`/api/budget-categories/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(fields),
