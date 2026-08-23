@@ -1,0 +1,315 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+.auth-card {
+  max-width: 480px;
+  margin: 3rem auto;
+  padding: 1.5rem;
+}
+
+.dashboard {
+  max-width: 900px;
+  margin: 2rem auto;
+  padding: 1.5rem;
+}
+
+.dashboard section {
+  margin-bottom: 2.5rem;
+}
+
+.auth-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.auth-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.9rem;
+}
+
+input,
+button {
+  font-size: 1rem;
+  padding: 0.5rem;
+  border-radius: 6px;
+  border: 1px solid #334155;
+}
+
+button {
+  background: #22c55e;
+  color: #0f172a;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.link-button {
+  background: none;
+  color: #38bdf8;
+  font-weight: 400;
+  text-decoration: underline;
+  padding: 0.25rem 0;
+}
+
+.error {
+  color: #f87171;
+}
+
+.dashboard header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.institution-card {
+  background: #1e293b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.account-type {
+  color: #94a3b8;
+  font-size: 0.85rem;
+}
+
+.overview-stats {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.stat-card {
+  flex: 1;
+  background: #1e293b;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.stat-label {
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.stat-value {
+  font-size: 1.4rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.spending-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+  height: 160px;
+  padding-top: 1.5rem;
+}
+
+.spending-bar-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+}
+
+.spending-bar-value {
+  font-size: 0.7rem;
+  color: #94a3b8;
+  margin-bottom: 0.25rem;
+  white-space: nowrap;
+}
+
+.spending-bar-track {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+
+.spending-bar {
+  width: 100%;
+  background: #22c55e;
+  border-radius: 4px 4px 0 0;
+  min-height: 0;
+}
+
+.spending-bar-label {
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.reconnect-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: #422006;
+  border: 1px solid #f59e0b;
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.reconnect-banner button {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.6rem;
+  background: #f59e0b;
+}
+
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.section-header button {
+  font-size: 0.85rem;
+  padding: 0.4rem 0.75rem;
+}
+
+.account-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.25rem 0;
+}
+
+.balance {
+  font-variant-numeric: tabular-nums;
+}
+
+.transactions-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.transactions-table th {
+  text-align: left;
+  color: #94a3b8;
+  font-weight: 500;
+  padding: 0.5rem;
+  border-bottom: 1px solid #334155;
+}
+
+.transactions-table td {
+  padding: 0.5rem;
+  border-bottom: 1px solid #1e293b;
+}
+
+.transactions-table select {
+  background: #1e293b;
+  color: #e2e8f0;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 0.25rem;
+  font-size: 0.85rem;
+}
+
+.transactions-table tr.pending {
+  opacity: 0.7;
+}
+
+.pending-badge {
+  margin-left: 0.5rem;
+  font-size: 0.7rem;
+  color: #facc15;
+  border: 1px solid #facc15;
+  border-radius: 4px;
+  padding: 0 0.3rem;
+}
+
+.amount-debit {
+  color: #f87171;
+  font-variant-numeric: tabular-nums;
+}
+
+.amount-credit {
+  color: #4ade80;
+  font-variant-numeric: tabular-nums;
+}
+
+.budget-categories {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.budget-category-row {
+  background: #1e293b;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+}
+
+.budget-category-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.budget-category-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.budget-amount-input {
+  width: 5rem;
+  padding: 0.25rem;
+  font-size: 0.85rem;
+}
+
+.progress-track {
+  background: #0f172a;
+  border-radius: 4px;
+  height: 8px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  background: #22c55e;
+  height: 100%;
+}
+
+.progress-fill.over {
+  background: #f87171;
+}
+
+.budget-category-summary {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.new-category-form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.new-category-form input {
+  flex: 1;
+}

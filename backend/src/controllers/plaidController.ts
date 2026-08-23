@@ -1,0 +1,312 @@
+import type { Request, Response, NextFunction } from 'express';
+import * as plaidService from '../services/plaidService';
+import * as dataService from '../services/dataService';
+import { env } from '../config/env';
+
+const LIABILITY_ACCOUNT_TYPES = new Set(['credit', 'loan']);
+
+export async function getSpendingSummary(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const months = Math.min(Math.max(Number(req.query.months ?? 6), 1), 24);
+
+    const accounts = await dataService.getAccountBalancesForUser(userId);
+    const { assets, liabilities } = accounts.reduce(
+      (totals, account) => {
+        const balance = account.current_balance ?? 0;
+        if (LIABILITY_ACCOUNT_TYPES.has(account.type)) {
+          totals.liabilities += balance;
+        } else {
+          totals.assets += balance;
+        }
+        return totals;
+      },
+      { assets: 0, liabilities: 0 }
+    );
+
+    const since = new Date();
+    since.setUTCDate(1);
+    since.setUTCMonth(since.getUTCMonth() - (months - 1));
+    const sinceDate = since.toISOString().slice(0, 10);
+
+    const transactions = await dataService.getTransactionsSince(userId, sinceDate);
+
+    const byMonth = new Map<string, { spent: number; income: number }>();
+    for (const t of transactions) {
+      const month = t.date.slice(0, 7);
+      const bucket = byMonth.get(month) ?? { spent: 0, income: 0 };
+      // Plaid convention: positive amount = money out (spend), negative = money in (income/credit).
+      if (t.amount >= 0) {
+        bucket.spent += t.amount;
+      } else {
+        bucket.income += -t.amount;
+      }
+      byMonth.set(month, bucket);
+    }
+
+    const monthlySpending = Array.from(byMonth.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([month, totals]) => ({ month, ...totals }));
+
+    res.json({
+      net_worth: assets - liabilities,
+      total_assets: assets,
+      total_liabilities: liabilities,
+      monthly_spending: monthlySpending,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function createLinkToken(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const linkToken = await plaidService.createLinkToken(userId);
+    res.json({ link_token: linkToken });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function exchangePublicToken(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { public_token: publicToken } = req.body as { public_token?: string };
+
+    if (!publicToken) {
+      res.status(400).json({ error: 'public_token is required' });
+      return;
+    }
+
+    const { accessToken, itemId } = await plaidService.exchangePublicToken(publicToken);
+    const { institutionId, institutionName } = await plaidService.getItemInstitution(accessToken);
+
+    const itemRow = await dataService.insertPlaidItem({
+      userId,
+      itemId,
+      accessToken,
+      institutionId,
+      institutionName,
+    });
+
+    const plaidAccounts = await plaidService.getAccounts(accessToken);
+    const accountRows = await dataService.upsertAccountsForItem(itemRow.id, plaidAccounts);
+
+    // Pull initial transaction history right away so the dashboard isn't empty
+    // until the user manually triggers a sync.
+    const accountIdByPlaidId = new Map(accountRows.map((a) => [a.plaid_account_id, a.id]));
+    const { added, modified, removed, cursor } = await plaidService.syncTransactions(
+      accessToken,
+      null
+    );
+    await dataService.applyTransactionChanges({ added, modified, removed, accountIdByPlaidId });
+    await dataService.updateItemCursor(itemRow.id, cursor);
+
+    // Access token is intentionally never included in the response — it stays server-side.
+    res.status(201).json({
+      item: {
+        id: itemRow.id,
+        institution_id: itemRow.institution_id,
+        institution_name: itemRow.institution_name,
+      },
+      accounts: accountRows,
+      transactions_synced: added.length,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function listLinkedItems(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const items = await dataService.getLinkedItemsForUser(userId);
+    res.json({ items });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function refreshAccounts(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const items = await dataService.getPlaidItemsForUser(userId);
+
+    for (const item of items) {
+      try {
+        const plaidAccounts = await plaidService.getAccounts(item.access_token);
+        await dataService.upsertAccountsForItem(item.id, plaidAccounts);
+        await dataService.setItemStatus(item.id, 'active');
+      } catch (err) {
+        // An item needing re-auth shouldn't break refreshing everyone else's accounts —
+        // flag it and let the frontend prompt the user to reconnect that one institution.
+        if (plaidService.isReauthRequiredError(err)) {
+          await dataService.setItemStatus(item.id, 'login_required');
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    const refreshed = await dataService.getLinkedItemsForUser(userId);
+    res.json({ items: refreshed });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function syncTransactions(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const items = await dataService.getPlaidItemsForUser(userId);
+
+    let addedCount = 0;
+    let modifiedCount = 0;
+    let removedCount = 0;
+
+    for (const item of items) {
+      try {
+        const { added, modified, removed, cursor } = await plaidService.syncTransactions(
+          item.access_token,
+          item.transactions_cursor
+        );
+        const accountIdByPlaidId = await dataService.getAccountIdMapForItem(item.id);
+        await dataService.applyTransactionChanges({ added, modified, removed, accountIdByPlaidId });
+        await dataService.updateItemCursor(item.id, cursor);
+        await dataService.setItemStatus(item.id, 'active');
+
+        addedCount += added.length;
+        modifiedCount += modified.length;
+        removedCount += removed.length;
+      } catch (err) {
+        if (plaidService.isReauthRequiredError(err)) {
+          await dataService.setItemStatus(item.id, 'login_required');
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    res.json({ added: addedCount, modified: modifiedCount, removed: removedCount });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function createReauthLinkToken(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { itemId } = req.params;
+
+    const item = await dataService.getPlaidItemForUser(itemId, userId);
+    if (!item) {
+      res.status(404).json({ error: 'Item not found' });
+      return;
+    }
+
+    const linkToken = await plaidService.createReauthLinkToken(userId, item.access_token);
+    res.json({ link_token: linkToken });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function sandboxResetLogin(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (env.plaidEnv !== 'sandbox') {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    const userId = req.user!.id;
+    const { itemId } = req.params;
+
+    const item = await dataService.getPlaidItemForUser(itemId, userId);
+    if (!item) {
+      res.status(404).json({ error: 'Item not found' });
+      return;
+    }
+
+    await plaidService.sandboxResetLogin(item.access_token);
+    await dataService.setItemStatus(item.id, 'login_required');
+
+    const items = await dataService.getLinkedItemsForUser(userId);
+    res.json({ items });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function completeReauth(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { itemId } = req.params;
+
+    const item = await dataService.getPlaidItemForUser(itemId, userId);
+    if (!item) {
+      res.status(404).json({ error: 'Item not found' });
+      return;
+    }
+
+    // Update Mode doesn't issue a new access token — confirm the existing one actually
+    // works again before clearing the login_required flag.
+    try {
+      await plaidService.getAccounts(item.access_token);
+    } catch (err) {
+      if (plaidService.isReauthRequiredError(err)) {
+        res.status(409).json({ error: 'Item still requires re-authentication' });
+        return;
+      }
+      throw err;
+    }
+
+    await dataService.setItemStatus(item.id, 'active');
+    const items = await dataService.getLinkedItemsForUser(userId);
+    res.json({ items });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function listTransactions(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const requestedLimit = Number(req.query.limit ?? 50);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1), 200)
+      : 50;
+
+    const transactions = await dataService.getRecentTransactionsForUser(userId, limit);
+    res.json({ transactions });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function setTransactionCategory(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { transactionId } = req.params;
+    const { budget_category_id: budgetCategoryId } = req.body as { budget_category_id: string | null };
+
+    const ownerId = await dataService.getTransactionOwnerId(transactionId);
+    if (!ownerId || ownerId !== userId) {
+      res.status(404).json({ error: 'Transaction not found' });
+      return;
+    }
+
+    if (budgetCategoryId !== null) {
+      const belongsToUser = await dataService.budgetCategoryBelongsToUser(budgetCategoryId, userId);
+      if (!belongsToUser) {
+        res.status(400).json({ error: 'Invalid budget category' });
+        return;
+      }
+    }
+
+    const transaction = await dataService.setTransactionCategory(transactionId, budgetCategoryId);
+    res.json({ transaction });
+  } catch (err) {
+    next(err);
+  }
+}
