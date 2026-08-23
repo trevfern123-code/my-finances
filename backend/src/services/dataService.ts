@@ -2,6 +2,7 @@ import { supabaseAdmin } from '../config/supabase';
 import type {
   AccountRow,
   BudgetCategoryRow,
+  LoanRow,
   PlaidItemRow,
   RecurringStreamRow,
   TransactionRow,
@@ -12,6 +13,7 @@ import type {
   Transaction as PlaidTransaction,
   TransactionStream,
 } from 'plaid';
+import type { NormalizedLoan } from './loans';
 
 // ---- Plaid items -----------------------------------------------------------
 
@@ -424,6 +426,67 @@ export async function getRecurringStreamsForUser(userId: string): Promise<Recurr
 
   if (error) throw new Error(`Failed to load recurring streams: ${error.message}`);
   return data as unknown as RecurringStreamRow[];
+}
+
+// ---- Loans ----------------------------------------------------------------------
+
+/** Replaces (upserts by item_id + plaid_account_id) an item's loan/liability details from a fresh Plaid response. */
+export async function upsertLoans(
+  itemRowId: string,
+  loans: NormalizedLoan[],
+  accountIdByPlaidId: Map<string, string>
+): Promise<void> {
+  if (loans.length === 0) return;
+
+  const rows = loans.map((loan) => ({
+    item_id: itemRowId,
+    account_id: accountIdByPlaidId.get(loan.plaid_account_id) ?? null,
+    plaid_account_id: loan.plaid_account_id,
+    loan_type: loan.loan_type,
+    name: loan.name,
+    interest_rate_percentage: loan.interest_rate_percentage,
+    origination_principal_amount: loan.origination_principal_amount,
+    origination_date: loan.origination_date,
+    minimum_payment_amount: loan.minimum_payment_amount,
+    next_payment_due_date: loan.next_payment_due_date,
+    last_payment_amount: loan.last_payment_amount,
+    last_payment_date: loan.last_payment_date,
+    is_overdue: loan.is_overdue,
+  }));
+
+  const { error } = await supabaseAdmin
+    .from('loans')
+    .upsert(rows, { onConflict: 'item_id,plaid_account_id' });
+
+  if (error) throw new Error(`Failed to save loans: ${error.message}`);
+}
+
+export interface LoanWithAccount extends LoanRow {
+  account_name: string | null;
+  current_balance: number | null;
+  iso_currency_code: string | null;
+}
+
+export async function getLoansForUser(userId: string): Promise<LoanWithAccount[]> {
+  const { data, error } = await supabaseAdmin
+    .from('loans')
+    .select(
+      'id, item_id, account_id, plaid_account_id, loan_type, name, interest_rate_percentage, origination_principal_amount, origination_date, minimum_payment_amount, next_payment_due_date, last_payment_amount, last_payment_date, is_overdue, plaid_items!inner(user_id), accounts(name, current_balance, iso_currency_code)'
+    )
+    .eq('plaid_items.user_id', userId);
+
+  if (error) throw new Error(`Failed to load loans: ${error.message}`);
+
+  return (
+    data as unknown as (LoanRow & {
+      accounts: { name: string; current_balance: number | null; iso_currency_code: string | null } | null;
+    })[]
+  ).map(({ accounts, ...loan }) => ({
+    ...loan,
+    account_name: accounts?.name ?? null,
+    current_balance: accounts?.current_balance ?? null,
+    iso_currency_code: accounts?.iso_currency_code ?? null,
+  }));
 }
 
 // ---- Budget categories ---------------------------------------------------------

@@ -117,6 +117,12 @@ export async function syncTransactions(accessToken: string, cursor: string | nul
   return { added, modified, removed, cursor: nextCursor! };
 }
 
+/** Requires the `liabilities` Plaid product to be enabled for the item — otherwise Plaid rejects the call. */
+export async function getLiabilities(accessToken: string) {
+  const response = await plaidClient.liabilitiesGet({ access_token: accessToken });
+  return response.data.liabilities;
+}
+
 export async function getRecurringStreams(accessToken: string) {
   const response = await plaidClient.transactionsRecurringGet({ access_token: accessToken });
   return {

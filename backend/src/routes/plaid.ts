@@ -13,6 +13,8 @@ plaidRouter.get('/summary', plaidController.getSpendingSummary);
 plaidRouter.get('/net-worth-history', plaidController.getNetWorthHistory);
 plaidRouter.get('/monthly-breakdown', plaidController.getMonthlyBreakdown);
 plaidRouter.get('/recurring-streams', plaidController.getRecurringStreams);
+plaidRouter.get('/loans', plaidController.getLoans);
+plaidRouter.get('/assets-summary', plaidController.getAssetsSummary);
 plaidRouter.post('/accounts/refresh', plaidController.refreshAccounts);
 plaidRouter.post('/transactions/sync', plaidController.syncTransactions);
 plaidRouter.get('/transactions', plaidController.listTransactions);

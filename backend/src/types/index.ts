@@ -78,3 +78,20 @@ export interface RecurringStreamRow {
   status: string;
   category: string | null;
 }
+
+export interface LoanRow {
+  id: string;
+  item_id: string;
+  account_id: string | null;
+  plaid_account_id: string;
+  loan_type: 'student' | 'mortgage' | 'credit';
+  name: string | null;
+  interest_rate_percentage: number | null;
+  origination_principal_amount: number | null;
+  origination_date: string | null;
+  minimum_payment_amount: number | null;
+  next_payment_due_date: string | null;
+  last_payment_amount: number | null;
+  last_payment_date: string | null;
+  is_overdue: boolean | null;
+}

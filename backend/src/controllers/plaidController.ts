@@ -5,6 +5,8 @@ import * as syncService from '../services/syncService';
 import * as netWorthService from '../services/netWorth';
 import { aggregateByMonth } from '../services/monthlyBreakdown';
 import { normalizeToMonthlyAmount } from '../services/recurringStreams';
+import { computePayoffProgressPct, refreshLoansForItem } from '../services/loans';
+import { groupAccountsForAssetsSummary, type AssetAccount } from '../services/assetsSummary';
 import { env } from '../config/env';
 
 export async function getSpendingSummary(req: Request, res: Response, next: NextFunction) {
@@ -82,6 +84,52 @@ export async function getRecurringStreams(req: Request, res: Response, next: Nex
   }
 }
 
+export async function getLoans(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const loans = await dataService.getLoansForUser(userId);
+
+    const withProgress = loans.map((loan) => ({
+      ...loan,
+      payoff_progress_pct: computePayoffProgressPct(loan.origination_principal_amount, loan.current_balance),
+    }));
+
+    const totalDebt = withProgress.reduce((sum, l) => sum + (l.current_balance ?? 0), 0);
+    const totalMinimumPayment = withProgress.reduce((sum, l) => sum + (l.minimum_payment_amount ?? 0), 0);
+
+    res.json({ loans: withProgress, total_debt: totalDebt, total_minimum_payment: totalMinimumPayment });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getAssetsSummary(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const items = await dataService.getLinkedItemsForUser(userId);
+
+    const accounts: AssetAccount[] = items.flatMap((item) =>
+      item.accounts.map((account) => ({
+        id: account.id,
+        name: account.name,
+        official_name: account.official_name,
+        type: account.type,
+        subtype: account.subtype,
+        current_balance: account.current_balance,
+        iso_currency_code: account.iso_currency_code,
+        institution_name: item.institution_name,
+      }))
+    );
+
+    const groups = groupAccountsForAssetsSummary(accounts);
+    const totalAssets = groups.reduce((sum, g) => sum + g.total, 0);
+
+    res.json({ groups, total_assets: totalAssets });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function getNetWorthHistory(req: Request, res: Response, next: NextFunction) {
   try {
     const userId = req.user!.id;
@@ -142,6 +190,11 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
     // first linked item and an additional one (net worth is a total across all their items).
     await netWorthService.recordSnapshotForUser(userId);
 
+    // Best-effort: only produces data if the `liabilities` product is enabled and this item
+    // actually has credit/mortgage/student-loan accounts.
+    const accountIdByPlaidId = new Map(accountRows.map((a) => [a.plaid_account_id, a.id]));
+    await refreshLoansForItem(itemRow.id, accessToken, accountIdByPlaidId);
+
     // Access token is intentionally never included in the response — it stays server-side.
     res.status(201).json({
       item: {
@@ -175,7 +228,7 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
     for (const item of items) {
       try {
         const plaidAccounts = await plaidService.getAccounts(item.access_token);
-        await dataService.upsertAccountsForItem(item.id, plaidAccounts);
+        const updatedAccounts = await dataService.upsertAccountsForItem(item.id, plaidAccounts);
         await dataService.setItemStatus(item.id, 'active');
 
         // Best-effort: backfills the webhook URL onto items linked before webhooks were
@@ -183,6 +236,11 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
         await plaidService.updateItemWebhook(item.access_token).catch((err) => {
           console.error(`Failed to backfill webhook for item ${item.id}:`, err);
         });
+
+        // Also best-effort (see refreshLoansForItem) — only produces data once the
+        // `liabilities` product is enabled and this item has qualifying loan accounts.
+        const accountIdByPlaidId = new Map(updatedAccounts.map((a) => [a.plaid_account_id, a.id]));
+        await refreshLoansForItem(item.id, item.access_token, accountIdByPlaidId);
       } catch (err) {
         // An item needing re-auth shouldn't break refreshing everyone else's accounts —
         // flag it and let the frontend prompt the user to reconnect that one institution.

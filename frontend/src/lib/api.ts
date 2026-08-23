@@ -156,6 +156,54 @@ export function getRecurringStreams(): Promise<{
   return authedFetch('/api/plaid/recurring-streams');
 }
 
+export interface Loan {
+  id: string;
+  loan_type: 'student' | 'mortgage' | 'credit';
+  name: string | null;
+  account_name: string | null;
+  current_balance: number | null;
+  iso_currency_code: string | null;
+  interest_rate_percentage: number | null;
+  origination_principal_amount: number | null;
+  origination_date: string | null;
+  minimum_payment_amount: number | null;
+  next_payment_due_date: string | null;
+  last_payment_amount: number | null;
+  last_payment_date: string | null;
+  is_overdue: boolean | null;
+  payoff_progress_pct: number | null;
+}
+
+export function getLoans(): Promise<{
+  loans: Loan[];
+  total_debt: number;
+  total_minimum_payment: number;
+}> {
+  return authedFetch('/api/plaid/loans');
+}
+
+export interface AssetAccountSummary {
+  id: string;
+  name: string;
+  official_name: string | null;
+  type: string;
+  subtype: string | null;
+  current_balance: number | null;
+  iso_currency_code: string | null;
+  institution_name: string | null;
+}
+
+export interface AssetGroup {
+  category: 'checking' | 'savings' | 'investment' | 'other';
+  label: string;
+  total: number;
+  accounts: AssetAccountSummary[];
+}
+
+export function getAssetsSummary(): Promise<{ groups: AssetGroup[]; total_assets: number }> {
+  return authedFetch('/api/plaid/assets-summary');
+}
+
 export function createReauthLinkToken(itemId: string): Promise<{ link_token: string }> {
   return authedFetch(`/api/plaid/items/${itemId}/reauth-link-token`, { method: 'POST' });
 }

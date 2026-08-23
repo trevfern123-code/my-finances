@@ -4,8 +4,10 @@ import { supabase } from './lib/supabaseClient';
 import {
   createBudgetCategory,
   deleteBudgetCategory,
+  getAssetsSummary,
   getBudgetCategories,
   getLinkedItems,
+  getLoans,
   getMonthlyBreakdown,
   getNetWorthHistory,
   getRecurringStreams,
@@ -14,8 +16,10 @@ import {
   setTransactionCategory,
   syncTransactions as syncTransactionsRequest,
   updateBudgetCategory,
+  type AssetGroup,
   type BudgetCategory,
   type LinkedItem,
+  type Loan,
   type MonthBreakdown,
   type NetWorthPoint,
   type RecurringStream,
@@ -31,6 +35,8 @@ import { SpendingOverview } from './components/SpendingOverview';
 import { NetWorthChart } from './components/NetWorthChart';
 import { MonthlyBreakdown } from './components/MonthlyBreakdown';
 import { SubscriptionsRecurring } from './components/SubscriptionsRecurring';
+import { LoanProgress } from './components/LoanProgress';
+import { IncomeSavings } from './components/IncomeSavings';
 import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
 
@@ -39,6 +45,8 @@ const TABS: Tab[] = [
   { id: 'monthly', label: 'Monthly Breakdown' },
   { id: 'budget', label: 'Budget' },
   { id: 'recurring', label: 'Subscriptions & Recurring' },
+  { id: 'loans', label: 'Loans' },
+  { id: 'income', label: 'Income & Savings' },
   { id: 'accounts', label: 'Accounts' },
 ];
 
@@ -53,6 +61,11 @@ export default function App() {
   const [monthlyBreakdown, setMonthlyBreakdown] = useState<MonthBreakdown[]>([]);
   const [recurringStreams, setRecurringStreams] = useState<RecurringStream[]>([]);
   const [totalMonthlyOutflow, setTotalMonthlyOutflow] = useState(0);
+  const [loans, setLoans] = useState<Loan[]>([]);
+  const [totalDebt, setTotalDebt] = useState(0);
+  const [totalMinimumPayment, setTotalMinimumPayment] = useState(0);
+  const [assetGroups, setAssetGroups] = useState<AssetGroup[]>([]);
+  const [totalAssets, setTotalAssets] = useState(0);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -69,16 +82,27 @@ export default function App() {
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
     // blank the entire dashboard when the other calls succeeded fine.
-    const [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes, breakdownRes, recurringRes] =
-      await Promise.allSettled([
-        getLinkedItems(),
-        getTransactions(),
-        getBudgetCategories(),
-        getSpendingSummary(),
-        getNetWorthHistory(),
-        getMonthlyBreakdown(),
-        getRecurringStreams(),
-      ]);
+    const [
+      itemsRes,
+      transactionsRes,
+      categoriesRes,
+      summaryRes,
+      netWorthRes,
+      breakdownRes,
+      recurringRes,
+      loansRes,
+      assetsRes,
+    ] = await Promise.allSettled([
+      getLinkedItems(),
+      getTransactions(),
+      getBudgetCategories(),
+      getSpendingSummary(),
+      getNetWorthHistory(),
+      getMonthlyBreakdown(),
+      getRecurringStreams(),
+      getLoans(),
+      getAssetsSummary(),
+    ]);
 
     if (itemsRes.status === 'fulfilled') setItems(itemsRes.value.items);
     if (transactionsRes.status === 'fulfilled') setTransactions(transactionsRes.value.transactions);
@@ -90,6 +114,15 @@ export default function App() {
       setRecurringStreams(recurringRes.value.streams);
       setTotalMonthlyOutflow(recurringRes.value.total_monthly_outflow);
     }
+    if (loansRes.status === 'fulfilled') {
+      setLoans(loansRes.value.loans);
+      setTotalDebt(loansRes.value.total_debt);
+      setTotalMinimumPayment(loansRes.value.total_minimum_payment);
+    }
+    if (assetsRes.status === 'fulfilled') {
+      setAssetGroups(assetsRes.value.groups);
+      setTotalAssets(assetsRes.value.total_assets);
+    }
 
     const failures = [
       itemsRes,
@@ -99,6 +132,8 @@ export default function App() {
       netWorthRes,
       breakdownRes,
       recurringRes,
+      loansRes,
+      assetsRes,
     ].filter((r): r is PromiseRejectedResult => r.status === 'rejected');
     if (failures.length > 0) {
       console.error('Some dashboard data failed to load:', failures.map((f) => f.reason));
@@ -150,6 +185,27 @@ export default function App() {
     }
   }
 
+  async function refreshLoans() {
+    try {
+      const res = await getLoans();
+      setLoans(res.loans);
+      setTotalDebt(res.total_debt);
+      setTotalMinimumPayment(res.total_minimum_payment);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function refreshAssetsSummary() {
+    try {
+      const res = await getAssetsSummary();
+      setAssetGroups(res.groups);
+      setTotalAssets(res.total_assets);
+    } catch {
+      // ignore
+    }
+  }
+
   // `spent`/`recent_avg_spent` are only computed on the list endpoint, not returned by the
   // create/update/categorize endpoints — anything that can change a category's spend needs to
   // refetch the list to stay accurate, rather than trying to patch the values in locally.
@@ -165,8 +221,11 @@ export default function App() {
   async function handleAccountsRefreshed(newItems: LinkedItem[]) {
     setItems(newItems);
     refreshSummary();
-    // The backend records a net worth snapshot as part of every balance refresh.
+    // The backend records a net worth snapshot, refreshes loan/liability details, and this
+    // view's grouping all depend on the same freshly-fetched balances — refetch all three.
     refreshNetWorthHistory();
+    refreshLoans();
+    refreshAssetsSummary();
   }
 
   async function handleSyncTransactions() {
@@ -287,6 +346,12 @@ export default function App() {
           {activeTab === 'recurring' && (
             <SubscriptionsRecurring streams={recurringStreams} totalMonthlyOutflow={totalMonthlyOutflow} />
           )}
+
+          {activeTab === 'loans' && (
+            <LoanProgress loans={loans} totalDebt={totalDebt} totalMinimumPayment={totalMinimumPayment} />
+          )}
+
+          {activeTab === 'income' && <IncomeSavings groups={assetGroups} totalAssets={totalAssets} />}
 
           {activeTab === 'accounts' && (
             <div className="tab-panel">
