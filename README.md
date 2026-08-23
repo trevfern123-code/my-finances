@@ -109,6 +109,41 @@ The frontend now trusts `category.spent` directly — `BudgetCategories.tsx` no 
 - **`spent` only exists on the list response.** `POST`/`PATCH /api/budget-categories` return the bare Supabase row with no `spent` field (typed in `frontend/src/lib/api.ts` as `Omit<BudgetCategory, 'spent'>` so this isn't just implicit/undocumented). Creating a category sets `spent: 0` locally (always correct — a new category has no transactions yet); updating one merges the response into existing state instead of replacing it, so the previously-known `spent` isn't clobbered with `undefined`.
 - **Keeping `spent` fresh.** Categorizing a transaction or syncing new transactions can both change a category's current-month total, so `App.tsx` refetches the categories list (`refreshBudgetCategories`) after either action — the same best-effort, non-blocking pattern already used for `refreshSummary`.
 
+## Net worth over time
+
+`GET /api/plaid/net-worth-history?months=6` returns a time series of `{ date, net_worth, total_assets, total_liabilities }`, rendered in the frontend by `NetWorthChart.tsx` (same plain-CSS bar-chart approach as the monthly spending chart in `SpendingOverview.tsx`).
+
+**Requires a migration that has not been run yet as of this writing** — `net_worth_snapshots` doesn't exist in the database. Run this in the Supabase SQL editor before the feature will work; until then, `GET /api/plaid/net-worth-history` 500s with `Could not find the table 'public.net_worth_snapshots' in the schema cache`, and the frontend shows "No history yet" instead (see the `Promise.allSettled` note below for why that one failure doesn't blank the rest of the dashboard):
+
+```sql
+create table public.net_worth_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id),
+  date date not null,
+  total_assets numeric not null default 0,
+  total_liabilities numeric not null default 0,
+  net_worth numeric not null default 0,
+  created_at timestamptz not null default now(),
+  unique (user_id, date)
+);
+
+create index if not exists net_worth_snapshots_user_id_date_idx on public.net_worth_snapshots(user_id, date);
+
+alter table public.net_worth_snapshots enable row level security;
+
+create policy "Users can only see their own net_worth_snapshots"
+  on public.net_worth_snapshots for select
+  using (auth.uid() = user_id);
+```
+
+One row per `(user_id, date)`, upserted (`services/dataService.ts`'s `upsertNetWorthSnapshot`, `onConflict: 'user_id,date'`) whenever balances are actually refreshed from Plaid — initial link (`exchangePublicToken`) and manual "Refresh balances" (`refreshAccounts`) — since that's the only time `accounts.current_balance` changes. There's no scheduled/cron snapshot yet, so a user who never clicks refresh won't accumulate history; that's a reasonable follow-up if daily granularity independent of user activity turns out to matter.
+
+The asset/liability split (`services/netWorth.ts`'s `aggregateAssetsAndLiabilities`) is the same logic `getSpendingSummary` already used — extracted into its own pure, tested module and reused by both, rather than duplicated.
+
+## Frontend resilience note
+
+`App.tsx`'s `refreshAll` uses `Promise.allSettled`, not `Promise.all` — with five parallel dashboard fetches, one endpoint failing (as `net-worth-history` currently does, pending the migration above) used to reject the whole batch and leave every section on its empty initial state, silently, with only an uncaught promise rejection in the console. Now each successful fetch still updates its own section, and a single error banner (`actionError`) surfaces if anything failed — check the browser console for which endpoint, since the banner doesn't say.
+
 ## Webhooks
 
 Plaid pushes updates to `POST /api/webhooks/plaid` instead of the app relying solely on the user manually clicking "Sync transactions"/"Refresh balances". This endpoint is intentionally **not** behind `requireAuth` — Plaid calls it directly as a server, not as a signed-in user — so authenticity is verified a different way: every delivery carries a `Plaid-Verification` header (a JWT signed with a key Plaid rotates periodically), which `backend/src/services/webhookVerification.ts` checks against Plaid's `/webhook_verification_key/get` endpoint (caching keys for 24h) and against a hash of the exact raw request body, rejecting anything that doesn't match or is older than 5 minutes. `backend/src/index.ts` captures the raw body via `express.json()`'s `verify` callback specifically so this check has the exact original bytes to hash, since the parsed `req.body` isn't guaranteed to re-serialize identically.

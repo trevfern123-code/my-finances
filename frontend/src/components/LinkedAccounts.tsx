@@ -66,7 +66,7 @@ export function LinkedAccounts({
   }
 
   return (
-    <div>
+    <div className="card">
       <div className="section-header">
         <h2>Linked accounts</h2>
         <button onClick={handleRefresh} disabled={refreshing || items.length === 0}>

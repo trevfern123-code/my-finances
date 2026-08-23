@@ -9,6 +9,15 @@ function currentMonthLabel() {
   return new Date().toLocaleDateString('en-US', { month: 'long' });
 }
 
+/** Traffic-light tiers so a glance at the bar's color says as much as the numbers do. */
+function progressTier(spent: number, budgetAmount: number): 'good' | 'warn' | 'over' {
+  if (budgetAmount <= 0) return spent > 0 ? 'over' : 'good';
+  const pct = spent / budgetAmount;
+  if (pct >= 1) return 'over';
+  if (pct >= 0.7) return 'warn';
+  return 'good';
+}
+
 export function BudgetCategories({
   categories,
   onCreate,
@@ -34,18 +43,18 @@ export function BudgetCategories({
   }
 
   return (
-    <div>
+    <div className="card">
       <div className="section-header">
         <h2>Budget categories</h2>
         <span className="hint">{currentMonthLabel()}</span>
       </div>
       {categories.length === 0 ? (
-        <p>No budget categories yet.</p>
+        <p className="hint">No budget categories yet.</p>
       ) : (
         <div className="budget-categories">
           {categories.map((c) => {
             const pct = c.budget_amount > 0 ? Math.min((c.spent / c.budget_amount) * 100, 100) : 0;
-            const over = c.spent > c.budget_amount;
+            const tier = progressTier(c.spent, c.budget_amount);
             return (
               <div key={c.id} className="budget-category-row">
                 <div className="budget-category-header">
@@ -69,12 +78,9 @@ export function BudgetCategories({
                   </div>
                 </div>
                 <div className="progress-track">
-                  <div
-                    className={over ? 'progress-fill over' : 'progress-fill'}
-                    style={{ width: `${pct}%` }}
-                  />
+                  <div className={`progress-fill progress-${tier}`} style={{ width: `${pct}%` }} />
                 </div>
-                <span className="budget-category-summary">
+                <span className={`budget-category-summary budget-category-summary-${tier}`}>
                   {formatCurrency(c.spent)} of {formatCurrency(c.budget_amount)} spent
                 </span>
               </div>

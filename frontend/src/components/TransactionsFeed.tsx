@@ -23,7 +23,7 @@ export function TransactionsFeed({
   onCategorize: (transactionId: string, budgetCategoryId: string | null) => void;
 }) {
   return (
-    <div>
+    <div className="card">
       <div className="section-header">
         <h2>Recent transactions</h2>
         <button onClick={onSync} disabled={syncing}>
@@ -31,47 +31,49 @@ export function TransactionsFeed({
         </button>
       </div>
       {transactions.length === 0 ? (
-        <p>No transactions yet — link an account or sync to fetch history.</p>
+        <p className="hint">No transactions yet — link an account or sync to fetch history.</p>
       ) : (
-        <table className="transactions-table">
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Description</th>
-              <th>Account</th>
-              <th>Amount</th>
-              <th>Category</th>
-            </tr>
-          </thead>
-          <tbody>
-            {transactions.map((t) => (
-              <tr key={t.id} className={t.pending ? 'pending' : ''}>
-                <td>{t.date}</td>
-                <td>
-                  {t.merchant_name ?? t.name}
-                  {t.pending && <span className="pending-badge">pending</span>}
-                </td>
-                <td>{t.accounts?.name ?? '—'}</td>
-                <td className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
-                  {formatAmount(t.amount, t.iso_currency_code)}
-                </td>
-                <td>
-                  <select
-                    value={t.budget_category_id ?? ''}
-                    onChange={(e) => onCategorize(t.id, e.target.value || null)}
-                  >
-                    <option value="">Uncategorized</option>
-                    {budgetCategories.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </select>
-                </td>
+        <div className="table-scroll">
+          <table className="transactions-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Description</th>
+                <th>Account</th>
+                <th>Amount</th>
+                <th>Category</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {transactions.map((t) => (
+                <tr key={t.id} className={t.pending ? 'pending' : ''}>
+                  <td>{t.date}</td>
+                  <td>
+                    {t.merchant_name ?? t.name}
+                    {t.pending && <span className="pending-badge">pending</span>}
+                  </td>
+                  <td>{t.accounts?.name ?? '—'}</td>
+                  <td className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
+                    {formatAmount(t.amount, t.iso_currency_code)}
+                  </td>
+                  <td>
+                    <select
+                      value={t.budget_category_id ?? ''}
+                      onChange={(e) => onCategorize(t.id, e.target.value || null)}
+                    >
+                      <option value="">Uncategorized</option>
+                      {budgetCategories.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );

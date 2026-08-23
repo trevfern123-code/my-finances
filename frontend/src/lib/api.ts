@@ -103,6 +103,17 @@ export function getSpendingSummary(months = 6): Promise<SpendingSummary> {
   return authedFetch(`/api/plaid/summary?months=${months}`);
 }
 
+export interface NetWorthPoint {
+  date: string;
+  net_worth: number;
+  total_assets: number;
+  total_liabilities: number;
+}
+
+export function getNetWorthHistory(months = 6): Promise<{ history: NetWorthPoint[] }> {
+  return authedFetch(`/api/plaid/net-worth-history?months=${months}`);
+}
+
 export function createReauthLinkToken(itemId: string): Promise<{ link_token: string }> {
   return authedFetch(`/api/plaid/items/${itemId}/reauth-link-token`, { method: 'POST' });
 }

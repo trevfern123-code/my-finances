@@ -20,7 +20,7 @@ export function SpendingOverview({ summary }: { summary: SpendingSummary }) {
   const maxSpent = Math.max(...summary.monthly_spending.map((m) => m.spent), 1);
 
   return (
-    <div>
+    <div className="card">
       <h2>Overview</h2>
       <div className="overview-stats">
         <div className="stat-card">
@@ -38,7 +38,7 @@ export function SpendingOverview({ summary }: { summary: SpendingSummary }) {
       </div>
 
       {summary.monthly_spending.length === 0 ? (
-        <p>No transaction history yet.</p>
+        <p className="hint">No transaction history yet.</p>
       ) : (
         <div className="spending-chart">
           {summary.monthly_spending.map((m) => (

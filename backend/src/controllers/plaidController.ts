@@ -2,9 +2,8 @@ import type { Request, Response, NextFunction } from 'express';
 import * as plaidService from '../services/plaidService';
 import * as dataService from '../services/dataService';
 import * as syncService from '../services/syncService';
+import * as netWorthService from '../services/netWorth';
 import { env } from '../config/env';
-
-const LIABILITY_ACCOUNT_TYPES = new Set(['credit', 'loan']);
 
 export async function getSpendingSummary(req: Request, res: Response, next: NextFunction) {
   try {
@@ -12,24 +11,9 @@ export async function getSpendingSummary(req: Request, res: Response, next: Next
     const months = Math.min(Math.max(Number(req.query.months ?? 6), 1), 24);
 
     const accounts = await dataService.getAccountBalancesForUser(userId);
-    const { assets, liabilities } = accounts.reduce(
-      (totals, account) => {
-        const balance = account.current_balance ?? 0;
-        if (LIABILITY_ACCOUNT_TYPES.has(account.type)) {
-          totals.liabilities += balance;
-        } else {
-          totals.assets += balance;
-        }
-        return totals;
-      },
-      { assets: 0, liabilities: 0 }
-    );
+    const { assets, liabilities } = netWorthService.aggregateAssetsAndLiabilities(accounts);
 
-    const since = new Date();
-    since.setUTCDate(1);
-    since.setUTCMonth(since.getUTCMonth() - (months - 1));
-    const sinceDate = since.toISOString().slice(0, 10);
-
+    const sinceDate = netWorthService.getMonthsAgoStart(months);
     const transactions = await dataService.getTransactionsSince(userId, sinceDate);
 
     const byMonth = new Map<string, { spent: number; income: number }>();
@@ -55,6 +39,20 @@ export async function getSpendingSummary(req: Request, res: Response, next: Next
       total_liabilities: liabilities,
       monthly_spending: monthlySpending,
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getNetWorthHistory(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const months = Math.min(Math.max(Number(req.query.months ?? 6), 1), 24);
+
+    const sinceDate = netWorthService.getMonthsAgoStart(months);
+    const history = await dataService.getNetWorthHistory(userId, sinceDate);
+
+    res.json({ history });
   } catch (err) {
     next(err);
   }
@@ -101,6 +99,10 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
       access_token: accessToken,
       transactions_cursor: null,
     });
+
+    // Record today's net worth now that we have fresh balances — covers both a user's very
+    // first linked item and an additional one (net worth is a total across all their items).
+    await netWorthService.recordSnapshotForUser(userId);
 
     // Access token is intentionally never included in the response — it stays server-side.
     res.status(201).json({
@@ -153,6 +155,9 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
         }
       }
     }
+
+    // Once per refresh, not once per item — net worth is a total across all the user's items.
+    await netWorthService.recordSnapshotForUser(userId);
 
     const refreshed = await dataService.getLinkedItemsForUser(userId);
     res.json({ items: refreshed });

@@ -108,6 +108,44 @@ export async function getAccountBalancesForUser(
   return data;
 }
 
+// ---- Net worth snapshots -----------------------------------------------------
+
+export async function upsertNetWorthSnapshot(params: {
+  userId: string;
+  date: string;
+  totalAssets: number;
+  totalLiabilities: number;
+  netWorth: number;
+}): Promise<void> {
+  const { error } = await supabaseAdmin.from('net_worth_snapshots').upsert(
+    {
+      user_id: params.userId,
+      date: params.date,
+      total_assets: params.totalAssets,
+      total_liabilities: params.totalLiabilities,
+      net_worth: params.netWorth,
+    },
+    { onConflict: 'user_id,date' }
+  );
+
+  if (error) throw new Error(`Failed to save net worth snapshot: ${error.message}`);
+}
+
+export async function getNetWorthHistory(
+  userId: string,
+  sinceDate: string
+): Promise<{ date: string; net_worth: number; total_assets: number; total_liabilities: number }[]> {
+  const { data, error } = await supabaseAdmin
+    .from('net_worth_snapshots')
+    .select('date, net_worth, total_assets, total_liabilities')
+    .eq('user_id', userId)
+    .gte('date', sinceDate)
+    .order('date', { ascending: true });
+
+  if (error) throw new Error(`Failed to load net worth history: ${error.message}`);
+  return data;
+}
+
 /** Inserts new accounts and updates existing ones (by plaid_account_id) for a Plaid item — used both at initial link and on balance refresh. */
 export async function upsertAccountsForItem(
   itemRowId: string,

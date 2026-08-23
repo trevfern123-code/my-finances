@@ -6,6 +6,7 @@ import {
   deleteBudgetCategory,
   getBudgetCategories,
   getLinkedItems,
+  getNetWorthHistory,
   getSpendingSummary,
   getTransactions,
   setTransactionCategory,
@@ -13,6 +14,7 @@ import {
   updateBudgetCategory,
   type BudgetCategory,
   type LinkedItem,
+  type NetWorthPoint,
   type SpendingSummary,
   type TransactionItem,
 } from './lib/api';
@@ -22,6 +24,7 @@ import { LinkedAccounts } from './components/LinkedAccounts';
 import { TransactionsFeed } from './components/TransactionsFeed';
 import { BudgetCategories } from './components/BudgetCategories';
 import { SpendingOverview } from './components/SpendingOverview';
+import { NetWorthChart } from './components/NetWorthChart';
 import './App.css';
 
 export default function App() {
@@ -30,6 +33,7 @@ export default function App() {
   const [transactions, setTransactions] = useState<TransactionItem[]>([]);
   const [budgetCategories, setBudgetCategories] = useState<BudgetCategory[]>([]);
   const [summary, setSummary] = useState<SpendingSummary | null>(null);
+  const [netWorthHistory, setNetWorthHistory] = useState<NetWorthPoint[]>([]);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -44,20 +48,31 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     setLoading(true);
-    try {
-      const [itemsRes, transactionsRes, categoriesRes, summaryRes] = await Promise.all([
-        getLinkedItems(),
-        getTransactions(),
-        getBudgetCategories(),
-        getSpendingSummary(),
-      ]);
-      setItems(itemsRes.items);
-      setTransactions(transactionsRes.transactions);
-      setBudgetCategories(categoriesRes.categories);
-      setSummary(summaryRes);
-    } finally {
-      setLoading(false);
+    // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
+    // blank the entire dashboard when the other four calls succeeded fine.
+    const [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes] = await Promise.allSettled([
+      getLinkedItems(),
+      getTransactions(),
+      getBudgetCategories(),
+      getSpendingSummary(),
+      getNetWorthHistory(),
+    ]);
+
+    if (itemsRes.status === 'fulfilled') setItems(itemsRes.value.items);
+    if (transactionsRes.status === 'fulfilled') setTransactions(transactionsRes.value.transactions);
+    if (categoriesRes.status === 'fulfilled') setBudgetCategories(categoriesRes.value.categories);
+    if (summaryRes.status === 'fulfilled') setSummary(summaryRes.value);
+    if (netWorthRes.status === 'fulfilled') setNetWorthHistory(netWorthRes.value.history);
+
+    const failures = [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes].filter(
+      (r): r is PromiseRejectedResult => r.status === 'rejected'
+    );
+    if (failures.length > 0) {
+      console.error('Some dashboard data failed to load:', failures.map((f) => f.reason));
+      setActionError('Some dashboard data failed to load — see console for details.');
     }
+
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -69,6 +84,15 @@ export default function App() {
   async function refreshSummary() {
     try {
       setSummary(await getSpendingSummary());
+    } catch {
+      // ignore
+    }
+  }
+
+  async function refreshNetWorthHistory() {
+    try {
+      const res = await getNetWorthHistory();
+      setNetWorthHistory(res.history);
     } catch {
       // ignore
     }
@@ -89,6 +113,8 @@ export default function App() {
   async function handleAccountsRefreshed(newItems: LinkedItem[]) {
     setItems(newItems);
     refreshSummary();
+    // The backend records a net worth snapshot as part of every balance refresh.
+    refreshNetWorthHistory();
   }
 
   async function handleSyncTransactions() {
@@ -164,32 +190,46 @@ export default function App() {
 
   return (
     <div className="dashboard">
-      <header>
+      <header className="app-header">
         <h1>My Finances</h1>
-        <button className="link-button" onClick={() => supabase.auth.signOut()}>
-          Sign out
-        </button>
+        <div className="app-header-actions">
+          <PlaidLink onLinked={refreshAll} />
+          <button className="link-button" onClick={() => supabase.auth.signOut()}>
+            Sign out
+          </button>
+        </div>
       </header>
-
-      <PlaidLink onLinked={refreshAll} />
 
       {actionError && <p className="error">{actionError}</p>}
 
       {loading ? (
-        <p>Loading...</p>
+        <p className="hint">Loading...</p>
       ) : (
-        <>
+        <div className="dashboard-grid">
           {summary && (
-            <section>
+            <div className="grid-span-2">
               <SpendingOverview summary={summary} />
-            </section>
+            </div>
           )}
 
-          <section>
-            <LinkedAccounts items={items} onRefreshed={handleAccountsRefreshed} />
-          </section>
+          <div className="grid-span-2">
+            <NetWorthChart history={netWorthHistory} />
+          </div>
 
-          <section>
+          <div>
+            <LinkedAccounts items={items} onRefreshed={handleAccountsRefreshed} />
+          </div>
+
+          <div>
+            <BudgetCategories
+              categories={budgetCategories}
+              onCreate={handleCreateCategory}
+              onUpdate={handleUpdateCategory}
+              onDelete={handleDeleteCategory}
+            />
+          </div>
+
+          <div className="grid-span-2">
             <TransactionsFeed
               transactions={transactions}
               budgetCategories={budgetCategories}
@@ -197,17 +237,8 @@ export default function App() {
               onSync={handleSyncTransactions}
               onCategorize={handleCategorize}
             />
-          </section>
-
-          <section>
-            <BudgetCategories
-              categories={budgetCategories}
-              onCreate={handleCreateCategory}
-              onUpdate={handleUpdateCategory}
-              onDelete={handleDeleteCategory}
-            />
-          </section>
-        </>
+          </div>
+        </div>
       )}
     </div>
   );
