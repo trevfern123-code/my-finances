@@ -24,6 +24,24 @@ npm install
 npm run dev
 ```
 
+## Testing
+
+```bash
+cd backend
+npm test
+```
+
+Backend unit tests (Vitest), with Supabase and Plaid mocked — no real network calls or test database, so they run fast and don't touch production data. Coverage focuses on the logic that's actually broken this project in practice, rather than everything indiscriminately:
+
+- **`middleware/auth.test.ts`** — regression test for the exact bug that crashed production: `requireAuth` used to have no `try/catch`, so a rejected promise (e.g. a Supabase network blip) became an unhandled rejection and killed the whole process on every authenticated request. This locks in that it now calls `next(err)` instead.
+- **`services/webhookVerification.test.ts`** — signs real JWTs with a locally generated ES256 key pair (via `jose`) to exercise the actual signature verification, not just mocked assertions: valid signatures, tampered bodies, wrong signing keys, stale tokens (replay protection), and that verification keys are cached rather than re-fetched per webhook.
+- **`services/syncService.test.ts`** — the sync logic shared by the manual "Sync transactions" endpoint and the webhook handler: correct cursor/access-token usage, correct aggregation, and that a Plaid error propagates without partially applying changes.
+- **`services/dataService.test.ts`** — the insert-vs-update branching in `upsertAccountsForItem`/`applyTransactionChanges` (matching existing rows by `plaid_account_id`/`plaid_transaction_id`), using a hand-rolled chainable mock of the Supabase query builder (`src/testUtils/supabaseMock.ts`) rather than a real database.
+- **`services/budgetPeriod.test.ts`** — the current-month date-range math (including month/year rollover and leap years) and the spend-aggregation rules (excludes uncategorized transactions and non-positive amounts, i.e. income/refunds aren't counted as "spent").
+- **`services/plaidErrors.test.ts`** — which Plaid error codes mean "this item needs re-authentication" vs. everything else.
+
+Test files are excluded from the production build (`tsconfig.build.json`, used by `npm run build`) but still typechecked by `npm run typecheck` (which uses the base `tsconfig.json`) — so a type error in a test fails CI-equivalent checks without ending up in `dist/`.
+
 ## Deployment
 
 Backend on [Railway](https://railway.app), frontend on [Vercel](https://vercel.com), both deploying from this repo.
@@ -81,6 +99,12 @@ Only the variables below are actually read by the code — everything else is de
 3. Frontend opens Plaid Link with that token; on success Plaid returns a `public_token`.
 4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token`. The backend exchanges it for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
 5. Frontend calls `GET /api/plaid/items` to display the user's linked institutions/accounts.
+
+## Budget periods
+
+`GET /api/budget-categories` now returns a `spent` figure per category, computed server-side (`budgetCategoryController.ts` + `services/budgetPeriod.ts`) as the sum of that category's positive-amount transactions dated within the current calendar month (UTC) — previously this was computed client-side in `BudgetCategories.tsx` from whatever transactions happened to already be loaded in the feed, which wasn't scoped to a calendar month at all and silently included spend from every month in the loaded window as one running total.
+
+**The frontend has not been updated to use this yet** — `BudgetCategories.tsx` still does its own (still-incorrect) client-side calculation from the `transactions` prop, and the `BudgetCategory` TypeScript type on the frontend doesn't declare the new `spent` field. This was deliberate: the backend logic and its test coverage were the priority for this pass. Swapping the frontend to trust `category.spent` directly (and dropping the `transactions` prop dependency from `BudgetCategories.tsx` entirely) is the next step whenever UI work resumes.
 
 ## Webhooks
 

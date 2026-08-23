@@ -324,6 +324,23 @@ export async function listBudgetCategories(userId: string): Promise<BudgetCatego
   return data as BudgetCategoryRow[];
 }
 
+/** Categorized transaction amounts for a user within [start, end) — the raw material for per-category spend totals. */
+export async function getCategorySpendRows(
+  userId: string,
+  range: { start: string; end: string }
+): Promise<{ budget_category_id: string | null; amount: number }[]> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select('budget_category_id, amount, accounts!inner(plaid_items!inner(user_id))')
+    .eq('accounts.plaid_items.user_id', userId)
+    .not('budget_category_id', 'is', null)
+    .gte('date', range.start)
+    .lt('date', range.end);
+
+  if (error) throw new Error(`Failed to load category spend: ${error.message}`);
+  return data;
+}
+
 export async function createBudgetCategory(
   userId: string,
   params: { name: string; budgetAmount: number; color: string | null; sortOrder: number }

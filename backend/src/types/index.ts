@@ -52,3 +52,8 @@ export interface BudgetCategoryRow {
   color: string | null;
   sort_order: number;
 }
+
+export interface BudgetCategoryWithSpend extends BudgetCategoryRow {
+  /** Sum of positive-amount (spend, not income/credit) categorized transactions in the current calendar month. */
+  spent: number;
+}

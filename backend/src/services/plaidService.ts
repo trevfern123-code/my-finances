@@ -8,6 +8,8 @@ import {
 import { plaidClient } from '../config/plaid';
 import { env } from '../config/env';
 
+export { isReauthRequiredError } from './plaidErrors';
+
 const products = env.plaidProducts.map((p) => p as Products);
 const countryCodes = env.plaidCountryCodes.map((c) => c as CountryCode);
 
@@ -71,16 +73,6 @@ export async function createReauthLinkToken(userId: string, accessToken: string)
 export async function updateItemWebhook(accessToken: string) {
   if (!webhookUrl) return;
   await plaidClient.itemWebhookUpdate({ access_token: accessToken, webhook: webhookUrl });
-}
-
-interface PlaidApiErrorShape {
-  response?: { data?: { error_code?: string } };
-}
-
-/** True for Plaid errors that mean the item's access token is no longer usable and the user must re-link. */
-export function isReauthRequiredError(err: unknown): boolean {
-  const code = (err as PlaidApiErrorShape)?.response?.data?.error_code;
-  return code === 'ITEM_LOGIN_REQUIRED' || code === 'ITEM_NOT_FOUND' || code === 'INVALID_ACCESS_TOKEN';
 }
 
 /** Sandbox-only: forces an item into ITEM_LOGIN_REQUIRED so the reconnect flow can be tested. */

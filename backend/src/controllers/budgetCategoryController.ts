@@ -1,10 +1,25 @@
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
+import { aggregateSpendByCategory, getCurrentMonthRange } from '../services/budgetPeriod';
+import type { BudgetCategoryWithSpend } from '../types';
 
 export async function listBudgetCategories(req: Request, res: Response, next: NextFunction) {
   try {
-    const categories = await dataService.listBudgetCategories(req.user!.id);
-    res.json({ categories });
+    const userId = req.user!.id;
+    const range = getCurrentMonthRange();
+
+    const [categories, spendRows] = await Promise.all([
+      dataService.listBudgetCategories(userId),
+      dataService.getCategorySpendRows(userId, range),
+    ]);
+
+    const spendByCategory = aggregateSpendByCategory(spendRows);
+    const categoriesWithSpend: BudgetCategoryWithSpend[] = categories.map((category) => ({
+      ...category,
+      spent: spendByCategory.get(category.id) ?? 0,
+    }));
+
+    res.json({ categories: categoriesWithSpend });
   } catch (err) {
     next(err);
   }
