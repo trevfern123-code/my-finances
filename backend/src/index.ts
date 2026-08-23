@@ -20,6 +20,10 @@ app.use(
 app.use(express.json());
 app.use(morgan('dev'));
 
+app.get('/', (_req, res) => {
+  res.json({ status: 'ok' });
+});
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
@@ -29,6 +33,8 @@ app.use('/api/budget-categories', budgetCategoriesRouter);
 
 app.use(errorHandler);
 
-app.listen(env.port, () => {
-  console.log(`Backend listening on http://localhost:${env.port}`);
+// Binding explicitly to 0.0.0.0 (rather than the implicit default) is required in some
+// container networking setups — Railway's healthcheck couldn't reach the app without it.
+app.listen(env.port, '0.0.0.0', () => {
+  console.log(`Backend listening on 0.0.0.0:${env.port}`);
 });
