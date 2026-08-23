@@ -1,6 +1,9 @@
 {
   "name": "my-finances",
   "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "workspaces": [
     "backend",
     "frontend"
