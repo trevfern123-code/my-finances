@@ -16,13 +16,19 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     return;
   }
 
-  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  try {
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
 
-  if (error || !data.user) {
-    res.status(401).json({ error: 'Invalid or expired session' });
-    return;
+    if (error || !data.user) {
+      res.status(401).json({ error: 'Invalid or expired session' });
+      return;
+    }
+
+    req.user = { id: data.user.id, email: data.user.email ?? null };
+    next();
+  } catch (err) {
+    // Express 4 doesn't catch rejected promises from middleware on its own — an uncaught
+    // rejection here (e.g. a network blip reaching Supabase) crashes the whole process.
+    next(err);
   }
-
-  req.user = { id: data.user.id, email: data.user.email ?? null };
-  next();
 }

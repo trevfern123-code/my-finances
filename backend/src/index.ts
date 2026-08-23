@@ -7,6 +7,16 @@ import { plaidRouter } from './routes/plaid';
 import { budgetCategoriesRouter } from './routes/budgetCategories';
 import { errorHandler } from './middleware/errorHandler';
 
+// Last-resort logging so a future unhandled rejection is visible in deploy logs before
+// the process exits, rather than the container just going silently unresponsive.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  process.exit(1);
+});
+
 const app = express();
 
 app.use(helmet());
