@@ -114,6 +114,11 @@ export function sandboxResetLogin(itemId: string): Promise<{ items: LinkedItem[]
   return authedFetch(`/api/plaid/items/${itemId}/sandbox-reset-login`, { method: 'POST' });
 }
 
+/** Sandbox-only testing helper — 404s outside Plaid Sandbox. Asks Plaid to actually deliver a test webhook. */
+export function sandboxFireWebhook(itemId: string): Promise<{ fired: boolean }> {
+  return authedFetch(`/api/plaid/items/${itemId}/sandbox-fire-webhook`, { method: 'POST' });
+}
+
 export function syncTransactions(): Promise<{ added: number; modified: number; removed: number }> {
   return authedFetch('/api/plaid/transactions/sync', { method: 'POST' });
 }

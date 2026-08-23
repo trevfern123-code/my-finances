@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { LinkedItem } from '../lib/api';
-import { refreshAccountBalances, sandboxResetLogin } from '../lib/api';
+import { refreshAccountBalances, sandboxFireWebhook, sandboxResetLogin } from '../lib/api';
 import { ReconnectButton } from './ReconnectButton';
 
 function formatBalance(amount: number | null, currency: string | null) {
@@ -20,6 +20,7 @@ export function LinkedAccounts({
 }) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [hint, setHint] = useState<string | null>(null);
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -36,6 +37,7 @@ export function LinkedAccounts({
 
   async function handleSandboxReset(itemId: string) {
     setError(null);
+    setHint(null);
     try {
       const res = await sandboxResetLogin(itemId);
       onRefreshed(res.items);
@@ -44,6 +46,21 @@ export function LinkedAccounts({
         err instanceof Error
           ? `${err.message} (this only works against Plaid Sandbox)`
           : 'Failed to simulate reauth'
+      );
+    }
+  }
+
+  async function handleSandboxWebhook(itemId: string) {
+    setError(null);
+    setHint(null);
+    try {
+      await sandboxFireWebhook(itemId);
+      setHint('Webhook fired — check Recent transactions in a few seconds.');
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? `${err.message} (this only works against Plaid Sandbox)`
+          : 'Failed to fire webhook'
       );
     }
   }
@@ -57,6 +74,7 @@ export function LinkedAccounts({
         </button>
       </div>
       {error && <p className="error">{error}</p>}
+      {hint && <p className="hint">{hint}</p>}
       {items.length === 0 ? (
         <p>No accounts linked yet.</p>
       ) : (
@@ -84,9 +102,14 @@ export function LinkedAccounts({
                 ))}
               </ul>
               {item.status === 'active' && (
-                <button className="link-button" onClick={() => handleSandboxReset(item.id)}>
-                  Simulate reauth (sandbox test)
-                </button>
+                <div className="sandbox-test-actions">
+                  <button className="link-button" onClick={() => handleSandboxReset(item.id)}>
+                    Simulate reauth (sandbox test)
+                  </button>
+                  <button className="link-button" onClick={() => handleSandboxWebhook(item.id)}>
+                    Simulate webhook (sandbox test)
+                  </button>
+                </div>
               )}
             </div>
           ))}
