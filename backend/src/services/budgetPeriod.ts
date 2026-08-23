@@ -24,6 +24,20 @@ export function getCurrentMonthRange(now: Date = new Date()): DateRange {
   };
 }
 
+/**
+ * The range covering `monthsBack` full calendar months immediately before the month containing
+ * `now` — e.g. monthsBack=2 in August covers June and July, excluding the in-progress current
+ * month so a "recent average" isn't skewed by comparing a partial month against full ones.
+ */
+export function getRecentMonthsRange(monthsBack: number, now: Date = new Date()): DateRange {
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  return {
+    start: toDateOnly(year, month - monthsBack, 1),
+    end: toDateOnly(year, month, 1),
+  };
+}
+
 export interface SpendRow {
   budget_category_id: string | null;
   amount: number;

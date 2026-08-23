@@ -11,6 +11,7 @@ plaidRouter.post('/exchange-public-token', plaidController.exchangePublicToken);
 plaidRouter.get('/items', plaidController.listLinkedItems);
 plaidRouter.get('/summary', plaidController.getSpendingSummary);
 plaidRouter.get('/net-worth-history', plaidController.getNetWorthHistory);
+plaidRouter.get('/monthly-breakdown', plaidController.getMonthlyBreakdown);
 plaidRouter.post('/accounts/refresh', plaidController.refreshAccounts);
 plaidRouter.post('/transactions/sync', plaidController.syncTransactions);
 plaidRouter.get('/transactions', plaidController.listTransactions);

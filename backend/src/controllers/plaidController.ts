@@ -3,6 +3,7 @@ import * as plaidService from '../services/plaidService';
 import * as dataService from '../services/dataService';
 import * as syncService from '../services/syncService';
 import * as netWorthService from '../services/netWorth';
+import { aggregateByMonth } from '../services/monthlyBreakdown';
 import { env } from '../config/env';
 
 export async function getSpendingSummary(req: Request, res: Response, next: NextFunction) {
@@ -39,6 +40,20 @@ export async function getSpendingSummary(req: Request, res: Response, next: Next
       total_liabilities: liabilities,
       monthly_spending: monthlySpending,
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getMonthlyBreakdown(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const months = Math.min(Math.max(Number(req.query.months ?? 6), 1), 24);
+
+    const sinceDate = netWorthService.getMonthsAgoStart(months);
+    const transactions = await dataService.getCategorizedTransactionsSince(userId, sinceDate);
+
+    res.json({ months: aggregateByMonth(transactions) });
   } catch (err) {
     next(err);
   }

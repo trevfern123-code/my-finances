@@ -183,11 +183,51 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.tab-nav {
+  display: flex;
+  gap: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 4px;
+  margin-bottom: 1.25rem;
+  overflow-x: auto;
+}
+
+.tab-btn {
+  font-size: 0.85rem;
+  font-weight: 500;
+  padding: 0.5rem 1rem;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.tab-btn:hover:not(.active) {
+  color: var(--text);
+  filter: none;
+}
+
+.tab-btn.active {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
 .dashboard-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 1.25rem;
   align-items: start;
+}
+
+.tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  min-width: 0;
 }
 
 .grid-span-2 {
@@ -476,6 +516,7 @@ button:disabled {
 }
 
 .progress-track {
+  position: relative;
   background: var(--bg);
   border-radius: 999px;
   height: 8px;
@@ -500,9 +541,34 @@ button:disabled {
   background: var(--danger);
 }
 
+/* Marks where the recent (trailing-month) average spend falls against the budget, so a
+   single-month dip below budget doesn't hide a category that's usually running hot. */
+.recent-avg-marker {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--text);
+  opacity: 0.6;
+  transform: translateX(-1px);
+}
+
+.recent-avg-marker.over {
+  background: var(--danger);
+  opacity: 0.9;
+}
+
+.budget-category-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-top: 0.4rem;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
 .budget-category-summary {
   display: block;
-  margin-top: 0.4rem;
   font-size: 0.8rem;
   color: var(--text-muted);
 }
@@ -523,6 +589,105 @@ button:disabled {
 .new-category-form input {
   flex: 1;
   min-width: 0;
+}
+
+/* ---- Monthly breakdown ---- */
+
+.months-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.month-totals {
+  display: flex;
+  gap: 0.9rem;
+  font-size: 0.82rem;
+  flex-wrap: wrap;
+}
+
+.month-total-spent {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.month-total-income {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.month-total-net-pos {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.month-total-net-neg {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.category-breakdown {
+  display: flex;
+  flex-direction: column;
+}
+
+.cat-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.cat-row:last-child {
+  border-bottom: none;
+}
+
+.cat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.cat-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cat-bar-track {
+  width: 100px;
+  height: 6px;
+  background: var(--bg);
+  border-radius: 999px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.cat-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+}
+
+.cat-pct {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  width: 2.4rem;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.cat-amount {
+  font-size: 0.85rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  width: 5.5rem;
+  text-align: right;
+  flex-shrink: 0;
 }
 
 /* ---- Responsive ---- */
@@ -566,5 +731,14 @@ button:disabled {
 
   .spending-bar-value {
     display: none;
+  }
+
+  .cat-bar-track {
+    display: none;
+  }
+
+  .month-totals {
+    width: 100%;
+    justify-content: space-between;
   }
 }

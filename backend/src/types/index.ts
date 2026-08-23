@@ -56,4 +56,6 @@ export interface BudgetCategoryRow {
 export interface BudgetCategoryWithSpend extends BudgetCategoryRow {
   /** Sum of positive-amount (spend, not income/credit) categorized transactions in the current calendar month. */
   spent: number;
+  /** Average monthly spend over the most recent full months (excludes the in-progress current month). */
+  recent_avg_spent: number;
 }

@@ -6,6 +6,7 @@ import {
   deleteBudgetCategory,
   getBudgetCategories,
   getLinkedItems,
+  getMonthlyBreakdown,
   getNetWorthHistory,
   getSpendingSummary,
   getTransactions,
@@ -14,6 +15,7 @@ import {
   updateBudgetCategory,
   type BudgetCategory,
   type LinkedItem,
+  type MonthBreakdown,
   type NetWorthPoint,
   type SpendingSummary,
   type TransactionItem,
@@ -25,15 +27,26 @@ import { TransactionsFeed } from './components/TransactionsFeed';
 import { BudgetCategories } from './components/BudgetCategories';
 import { SpendingOverview } from './components/SpendingOverview';
 import { NetWorthChart } from './components/NetWorthChart';
+import { MonthlyBreakdown } from './components/MonthlyBreakdown';
+import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
+
+const TABS: Tab[] = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'monthly', label: 'Monthly Breakdown' },
+  { id: 'budget', label: 'Budget' },
+  { id: 'accounts', label: 'Accounts' },
+];
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
+  const [activeTab, setActiveTab] = useState('overview');
   const [items, setItems] = useState<LinkedItem[]>([]);
   const [transactions, setTransactions] = useState<TransactionItem[]>([]);
   const [budgetCategories, setBudgetCategories] = useState<BudgetCategory[]>([]);
   const [summary, setSummary] = useState<SpendingSummary | null>(null);
   const [netWorthHistory, setNetWorthHistory] = useState<NetWorthPoint[]>([]);
+  const [monthlyBreakdown, setMonthlyBreakdown] = useState<MonthBreakdown[]>([]);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -49,22 +62,25 @@ export default function App() {
   const refreshAll = useCallback(async () => {
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
-    // blank the entire dashboard when the other four calls succeeded fine.
-    const [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes] = await Promise.allSettled([
-      getLinkedItems(),
-      getTransactions(),
-      getBudgetCategories(),
-      getSpendingSummary(),
-      getNetWorthHistory(),
-    ]);
+    // blank the entire dashboard when the other calls succeeded fine.
+    const [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes, breakdownRes] =
+      await Promise.allSettled([
+        getLinkedItems(),
+        getTransactions(),
+        getBudgetCategories(),
+        getSpendingSummary(),
+        getNetWorthHistory(),
+        getMonthlyBreakdown(),
+      ]);
 
     if (itemsRes.status === 'fulfilled') setItems(itemsRes.value.items);
     if (transactionsRes.status === 'fulfilled') setTransactions(transactionsRes.value.transactions);
     if (categoriesRes.status === 'fulfilled') setBudgetCategories(categoriesRes.value.categories);
     if (summaryRes.status === 'fulfilled') setSummary(summaryRes.value);
     if (netWorthRes.status === 'fulfilled') setNetWorthHistory(netWorthRes.value.history);
+    if (breakdownRes.status === 'fulfilled') setMonthlyBreakdown(breakdownRes.value.months);
 
-    const failures = [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes].filter(
+    const failures = [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes, breakdownRes].filter(
       (r): r is PromiseRejectedResult => r.status === 'rejected'
     );
     if (failures.length > 0) {
@@ -98,9 +114,18 @@ export default function App() {
     }
   }
 
-  // `spent` is only computed on the list endpoint, not returned by the create/update/categorize
-  // endpoints — anything that can change a category's current-month spend needs to refetch the
-  // list to stay accurate, rather than trying to patch `spent` in locally.
+  async function refreshMonthlyBreakdown() {
+    try {
+      const res = await getMonthlyBreakdown();
+      setMonthlyBreakdown(res.months);
+    } catch {
+      // ignore
+    }
+  }
+
+  // `spent`/`recent_avg_spent` are only computed on the list endpoint, not returned by the
+  // create/update/categorize endpoints — anything that can change a category's spend needs to
+  // refetch the list to stay accurate, rather than trying to patch the values in locally.
   async function refreshBudgetCategories() {
     try {
       const res = await getBudgetCategories();
@@ -126,6 +151,7 @@ export default function App() {
       setTransactions(res.transactions);
       refreshSummary();
       refreshBudgetCategories();
+      refreshMonthlyBreakdown();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to sync transactions');
     } finally {
@@ -152,9 +178,9 @@ export default function App() {
     setActionError(null);
     try {
       const res = await createBudgetCategory({ name, budget_amount: budgetAmount });
-      // A brand-new category has no transactions assigned to it yet, so spent is always 0 —
-      // no need to refetch just to fill in a field we already know the value of.
-      setBudgetCategories((prev) => [...prev, { ...res.category, spent: 0 }]);
+      // A brand-new category has no transactions assigned to it yet, so both derived fields
+      // are always 0 — no need to refetch just to fill in values we already know.
+      setBudgetCategories((prev) => [...prev, { ...res.category, spent: 0, recent_avg_spent: 0 }]);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to create category');
     }
@@ -164,8 +190,8 @@ export default function App() {
     setActionError(null);
     try {
       const res = await updateBudgetCategory(id, { budget_amount: budgetAmount });
-      // Merge rather than replace — the response has no `spent`, and changing budget_amount
-      // doesn't change how much has actually been spent, so keep whatever value is already there.
+      // Merge rather than replace — the response has no spent/recent_avg_spent, and changing
+      // budget_amount doesn't change how much has actually been spent, so keep what's there.
       setBudgetCategories((prev) =>
         prev.map((c) => (c.id === id ? { ...c, ...res.category } : c))
       );
@@ -205,40 +231,42 @@ export default function App() {
       {loading ? (
         <p className="hint">Loading...</p>
       ) : (
-        <div className="dashboard-grid">
-          {summary && (
-            <div className="grid-span-2">
-              <SpendingOverview summary={summary} />
+        <>
+          <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
+
+          {activeTab === 'overview' && (
+            <div className="dashboard-grid">
+              <div>{summary && <SpendingOverview summary={summary} />}</div>
+              <div>
+                <NetWorthChart history={netWorthHistory} />
+              </div>
             </div>
           )}
 
-          <div className="grid-span-2">
-            <NetWorthChart history={netWorthHistory} />
-          </div>
+          {activeTab === 'monthly' && <MonthlyBreakdown months={monthlyBreakdown} />}
 
-          <div>
-            <LinkedAccounts items={items} onRefreshed={handleAccountsRefreshed} />
-          </div>
-
-          <div>
+          {activeTab === 'budget' && (
             <BudgetCategories
               categories={budgetCategories}
               onCreate={handleCreateCategory}
               onUpdate={handleUpdateCategory}
               onDelete={handleDeleteCategory}
             />
-          </div>
+          )}
 
-          <div className="grid-span-2">
-            <TransactionsFeed
-              transactions={transactions}
-              budgetCategories={budgetCategories}
-              syncing={syncing}
-              onSync={handleSyncTransactions}
-              onCategorize={handleCategorize}
-            />
-          </div>
-        </div>
+          {activeTab === 'accounts' && (
+            <div className="tab-panel">
+              <LinkedAccounts items={items} onRefreshed={handleAccountsRefreshed} />
+              <TransactionsFeed
+                transactions={transactions}
+                budgetCategories={budgetCategories}
+                syncing={syncing}
+                onSync={handleSyncTransactions}
+                onCategorize={handleCategorize}
+              />
+            </div>
+          )}
+        </>
       )}
     </div>
   );

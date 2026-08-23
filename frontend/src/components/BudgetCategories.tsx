@@ -55,6 +55,9 @@ export function BudgetCategories({
           {categories.map((c) => {
             const pct = c.budget_amount > 0 ? Math.min((c.spent / c.budget_amount) * 100, 100) : 0;
             const tier = progressTier(c.spent, c.budget_amount);
+            const recentAvgPct =
+              c.budget_amount > 0 ? Math.min((c.recent_avg_spent / c.budget_amount) * 100, 100) : 0;
+            const overRecentAvg = c.recent_avg_spent > c.budget_amount;
             return (
               <div key={c.id} className="budget-category-row">
                 <div className="budget-category-header">
@@ -79,10 +82,22 @@ export function BudgetCategories({
                 </div>
                 <div className="progress-track">
                   <div className={`progress-fill progress-${tier}`} style={{ width: `${pct}%` }} />
+                  {c.recent_avg_spent > 0 && (
+                    <div
+                      className={overRecentAvg ? 'recent-avg-marker over' : 'recent-avg-marker'}
+                      style={{ left: `${recentAvgPct}%` }}
+                      title={`Recent average: ${formatCurrency(c.recent_avg_spent)}/mo`}
+                    />
+                  )}
                 </div>
-                <span className={`budget-category-summary budget-category-summary-${tier}`}>
-                  {formatCurrency(c.spent)} of {formatCurrency(c.budget_amount)} spent
-                </span>
+                <div className="budget-category-footer">
+                  <span className={`budget-category-summary budget-category-summary-${tier}`}>
+                    {formatCurrency(c.spent)} of {formatCurrency(c.budget_amount)} spent
+                  </span>
+                  {c.recent_avg_spent > 0 && (
+                    <span className="hint">recent avg {formatCurrency(c.recent_avg_spent)}/mo</span>
+                  )}
+                </div>
               </div>
             );
           })}

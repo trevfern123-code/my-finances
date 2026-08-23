@@ -71,6 +71,8 @@ export interface BudgetCategory {
   sort_order: number;
   /** Sum of positive-amount categorized transactions in the current calendar month — only present on GET /api/budget-categories. */
   spent: number;
+  /** Average monthly spend over the most recent full months, excluding the in-progress current month — only present on GET /api/budget-categories. */
+  recent_avg_spent: number;
 }
 
 export function createLinkToken(): Promise<{ link_token: string }> {
@@ -114,6 +116,22 @@ export function getNetWorthHistory(months = 6): Promise<{ history: NetWorthPoint
   return authedFetch(`/api/plaid/net-worth-history?months=${months}`);
 }
 
+export interface CategoryAmount {
+  category: string;
+  amount: number;
+}
+
+export interface MonthBreakdown {
+  month: string;
+  total_spent: number;
+  total_income: number;
+  by_category: CategoryAmount[];
+}
+
+export function getMonthlyBreakdown(months = 6): Promise<{ months: MonthBreakdown[] }> {
+  return authedFetch(`/api/plaid/monthly-breakdown?months=${months}`);
+}
+
 export function createReauthLinkToken(itemId: string): Promise<{ link_token: string }> {
   return authedFetch(`/api/plaid/items/${itemId}/reauth-link-token`, { method: 'POST' });
 }
@@ -155,19 +173,21 @@ export function getBudgetCategories(): Promise<{ categories: BudgetCategory[] }>
 }
 
 // The create/update endpoints return the bare row from Supabase, not the enriched shape —
-// only GET /api/budget-categories computes and includes `spent`.
+// only GET /api/budget-categories computes and includes `spent`/`recent_avg_spent`.
+type BareBudgetCategory = Omit<BudgetCategory, 'spent' | 'recent_avg_spent'>;
+
 export function createBudgetCategory(params: {
   name: string;
   budget_amount: number;
   color?: string | null;
-}): Promise<{ category: Omit<BudgetCategory, 'spent'> }> {
+}): Promise<{ category: BareBudgetCategory }> {
   return authedFetch('/api/budget-categories', { method: 'POST', body: JSON.stringify(params) });
 }
 
 export function updateBudgetCategory(
   id: string,
   fields: Partial<{ name: string; budget_amount: number; color: string | null; sort_order: number }>
-): Promise<{ category: Omit<BudgetCategory, 'spent'> }> {
+): Promise<{ category: BareBudgetCategory }> {
   return authedFetch(`/api/budget-categories/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(fields),

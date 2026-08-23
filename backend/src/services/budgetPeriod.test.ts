@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { aggregateSpendByCategory, getCurrentMonthRange } from './budgetPeriod';
+import { aggregateSpendByCategory, getCurrentMonthRange, getRecentMonthsRange } from './budgetPeriod';
 
 describe('getCurrentMonthRange', () => {
   it('returns the first day of the current month through the first day of the next month', () => {
@@ -30,6 +30,23 @@ describe('getCurrentMonthRange', () => {
   it('uses the current date when none is provided', () => {
     const range = getCurrentMonthRange();
     expect(range.start).toMatch(/^\d{4}-\d{2}-01$/);
+  });
+});
+
+describe('getRecentMonthsRange', () => {
+  it('covers the N full months before the current one, excluding it', () => {
+    const range = getRecentMonthsRange(2, new Date('2026-08-15T12:00:00Z'));
+    expect(range).toEqual({ start: '2026-06-01', end: '2026-08-01' });
+  });
+
+  it('rolls over the year boundary', () => {
+    const range = getRecentMonthsRange(2, new Date('2026-01-15T12:00:00Z'));
+    expect(range).toEqual({ start: '2025-11-01', end: '2026-01-01' });
+  });
+
+  it('supports a 1-month window', () => {
+    const range = getRecentMonthsRange(1, new Date('2026-08-15T12:00:00Z'));
+    expect(range).toEqual({ start: '2026-07-01', end: '2026-08-01' });
   });
 });
 

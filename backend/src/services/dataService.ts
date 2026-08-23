@@ -319,6 +319,24 @@ export async function getTransactionsSince(
   return data;
 }
 
+/** Like getTransactionsSince, but also includes Plaid's own category — for the monthly
+ *  breakdown view, which groups by Plaid's taxonomy rather than the user's budget categories
+ *  (Plaid categorizes essentially every transaction; budget categories are optional/sparse). */
+export async function getCategorizedTransactionsSince(
+  userId: string,
+  sinceDate: string
+): Promise<{ amount: number; date: string; category: string | null }[]> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select('amount, date, category, accounts!inner(plaid_items!inner(user_id))')
+    .eq('accounts.plaid_items.user_id', userId)
+    .gte('date', sinceDate)
+    .order('date', { ascending: true });
+
+  if (error) throw new Error(`Failed to load categorized transaction history: ${error.message}`);
+  return data;
+}
+
 /** Returns the owning user_id for a transaction (via accounts -> plaid_items), or null if it doesn't exist. */
 export async function getTransactionOwnerId(transactionId: string): Promise<string | null> {
   const { data, error } = await supabaseAdmin

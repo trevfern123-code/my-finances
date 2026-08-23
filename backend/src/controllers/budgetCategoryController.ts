@@ -1,22 +1,33 @@
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
-import { aggregateSpendByCategory, getCurrentMonthRange } from '../services/budgetPeriod';
+import {
+  aggregateSpendByCategory,
+  getCurrentMonthRange,
+  getRecentMonthsRange,
+} from '../services/budgetPeriod';
 import type { BudgetCategoryWithSpend } from '../types';
+
+const RECENT_AVG_MONTHS = 2;
 
 export async function listBudgetCategories(req: Request, res: Response, next: NextFunction) {
   try {
     const userId = req.user!.id;
-    const range = getCurrentMonthRange();
+    const currentRange = getCurrentMonthRange();
+    const recentRange = getRecentMonthsRange(RECENT_AVG_MONTHS);
 
-    const [categories, spendRows] = await Promise.all([
+    const [categories, currentSpendRows, recentSpendRows] = await Promise.all([
       dataService.listBudgetCategories(userId),
-      dataService.getCategorySpendRows(userId, range),
+      dataService.getCategorySpendRows(userId, currentRange),
+      dataService.getCategorySpendRows(userId, recentRange),
     ]);
 
-    const spendByCategory = aggregateSpendByCategory(spendRows);
+    const currentSpendByCategory = aggregateSpendByCategory(currentSpendRows);
+    const recentSpendByCategory = aggregateSpendByCategory(recentSpendRows);
+
     const categoriesWithSpend: BudgetCategoryWithSpend[] = categories.map((category) => ({
       ...category,
-      spent: spendByCategory.get(category.id) ?? 0,
+      spent: currentSpendByCategory.get(category.id) ?? 0,
+      recent_avg_spent: (recentSpendByCategory.get(category.id) ?? 0) / RECENT_AVG_MONTHS,
     }));
 
     res.json({ categories: categoriesWithSpend });
