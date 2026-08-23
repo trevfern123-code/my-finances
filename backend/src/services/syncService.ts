@@ -20,5 +20,18 @@ export async function syncItemTransactions(item: {
   await dataService.updateItemCursor(item.id, cursor);
   await dataService.setItemStatus(item.id, 'active');
 
+  // Best-effort: recurring-stream detection is a separate Plaid call and a nice-to-have, not
+  // core to syncing transactions — a failure here shouldn't fail the sync that triggered it.
+  try {
+    const { inflowStreams, outflowStreams } = await plaidService.getRecurringStreams(item.access_token);
+    const streams = [
+      ...inflowStreams.map((stream) => ({ direction: 'inflow' as const, stream })),
+      ...outflowStreams.map((stream) => ({ direction: 'outflow' as const, stream })),
+    ];
+    await dataService.upsertRecurringStreams(item.id, streams, accountIdByPlaidId);
+  } catch (err) {
+    console.error(`Failed to refresh recurring streams for item ${item.id}:`, err);
+  }
+
   return { added: added.length, modified: modified.length, removed: removed.length };
 }

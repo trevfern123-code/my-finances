@@ -116,3 +116,11 @@ export async function syncTransactions(accessToken: string, cursor: string | nul
 
   return { added, modified, removed, cursor: nextCursor! };
 }
+
+export async function getRecurringStreams(accessToken: string) {
+  const response = await plaidClient.transactionsRecurringGet({ access_token: accessToken });
+  return {
+    inflowStreams: response.data.inflow_streams,
+    outflowStreams: response.data.outflow_streams,
+  };
+}

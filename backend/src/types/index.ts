@@ -59,3 +59,22 @@ export interface BudgetCategoryWithSpend extends BudgetCategoryRow {
   /** Average monthly spend over the most recent full months (excludes the in-progress current month). */
   recent_avg_spent: number;
 }
+
+export interface RecurringStreamRow {
+  id: string;
+  item_id: string;
+  account_id: string | null;
+  plaid_stream_id: string;
+  description: string;
+  merchant_name: string | null;
+  direction: 'inflow' | 'outflow';
+  frequency: string;
+  average_amount: number;
+  last_amount: number;
+  iso_currency_code: string | null;
+  first_date: string;
+  last_date: string;
+  is_active: boolean;
+  status: string;
+  category: string | null;
+}

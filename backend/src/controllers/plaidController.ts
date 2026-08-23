@@ -4,6 +4,7 @@ import * as dataService from '../services/dataService';
 import * as syncService from '../services/syncService';
 import * as netWorthService from '../services/netWorth';
 import { aggregateByMonth } from '../services/monthlyBreakdown';
+import { normalizeToMonthlyAmount } from '../services/recurringStreams';
 import { env } from '../config/env';
 
 export async function getSpendingSummary(req: Request, res: Response, next: NextFunction) {
@@ -54,6 +55,28 @@ export async function getMonthlyBreakdown(req: Request, res: Response, next: Nex
     const transactions = await dataService.getCategorizedTransactionsSince(userId, sinceDate);
 
     res.json({ months: aggregateByMonth(transactions) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getRecurringStreams(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const streams = await dataService.getRecurringStreamsForUser(userId);
+
+    const withMonthlyAmount = streams
+      .map((stream) => ({
+        ...stream,
+        monthly_amount: normalizeToMonthlyAmount(stream.average_amount, stream.frequency),
+      }))
+      .sort((a, b) => b.monthly_amount - a.monthly_amount);
+
+    const totalMonthlyOutflow = withMonthlyAmount
+      .filter((s) => s.direction === 'outflow')
+      .reduce((sum, s) => sum + s.monthly_amount, 0);
+
+    res.json({ streams: withMonthlyAmount, total_monthly_outflow: totalMonthlyOutflow });
   } catch (err) {
     next(err);
   }

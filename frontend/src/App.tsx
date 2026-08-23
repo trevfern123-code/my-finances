@@ -8,6 +8,7 @@ import {
   getLinkedItems,
   getMonthlyBreakdown,
   getNetWorthHistory,
+  getRecurringStreams,
   getSpendingSummary,
   getTransactions,
   setTransactionCategory,
@@ -17,6 +18,7 @@ import {
   type LinkedItem,
   type MonthBreakdown,
   type NetWorthPoint,
+  type RecurringStream,
   type SpendingSummary,
   type TransactionItem,
 } from './lib/api';
@@ -28,6 +30,7 @@ import { BudgetCategories } from './components/BudgetCategories';
 import { SpendingOverview } from './components/SpendingOverview';
 import { NetWorthChart } from './components/NetWorthChart';
 import { MonthlyBreakdown } from './components/MonthlyBreakdown';
+import { SubscriptionsRecurring } from './components/SubscriptionsRecurring';
 import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
 
@@ -35,6 +38,7 @@ const TABS: Tab[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'monthly', label: 'Monthly Breakdown' },
   { id: 'budget', label: 'Budget' },
+  { id: 'recurring', label: 'Subscriptions & Recurring' },
   { id: 'accounts', label: 'Accounts' },
 ];
 
@@ -47,6 +51,8 @@ export default function App() {
   const [summary, setSummary] = useState<SpendingSummary | null>(null);
   const [netWorthHistory, setNetWorthHistory] = useState<NetWorthPoint[]>([]);
   const [monthlyBreakdown, setMonthlyBreakdown] = useState<MonthBreakdown[]>([]);
+  const [recurringStreams, setRecurringStreams] = useState<RecurringStream[]>([]);
+  const [totalMonthlyOutflow, setTotalMonthlyOutflow] = useState(0);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -63,7 +69,7 @@ export default function App() {
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
     // blank the entire dashboard when the other calls succeeded fine.
-    const [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes, breakdownRes] =
+    const [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes, breakdownRes, recurringRes] =
       await Promise.allSettled([
         getLinkedItems(),
         getTransactions(),
@@ -71,6 +77,7 @@ export default function App() {
         getSpendingSummary(),
         getNetWorthHistory(),
         getMonthlyBreakdown(),
+        getRecurringStreams(),
       ]);
 
     if (itemsRes.status === 'fulfilled') setItems(itemsRes.value.items);
@@ -79,10 +86,20 @@ export default function App() {
     if (summaryRes.status === 'fulfilled') setSummary(summaryRes.value);
     if (netWorthRes.status === 'fulfilled') setNetWorthHistory(netWorthRes.value.history);
     if (breakdownRes.status === 'fulfilled') setMonthlyBreakdown(breakdownRes.value.months);
+    if (recurringRes.status === 'fulfilled') {
+      setRecurringStreams(recurringRes.value.streams);
+      setTotalMonthlyOutflow(recurringRes.value.total_monthly_outflow);
+    }
 
-    const failures = [itemsRes, transactionsRes, categoriesRes, summaryRes, netWorthRes, breakdownRes].filter(
-      (r): r is PromiseRejectedResult => r.status === 'rejected'
-    );
+    const failures = [
+      itemsRes,
+      transactionsRes,
+      categoriesRes,
+      summaryRes,
+      netWorthRes,
+      breakdownRes,
+      recurringRes,
+    ].filter((r): r is PromiseRejectedResult => r.status === 'rejected');
     if (failures.length > 0) {
       console.error('Some dashboard data failed to load:', failures.map((f) => f.reason));
       setActionError('Some dashboard data failed to load — see console for details.');
@@ -123,6 +140,16 @@ export default function App() {
     }
   }
 
+  async function refreshRecurringStreams() {
+    try {
+      const res = await getRecurringStreams();
+      setRecurringStreams(res.streams);
+      setTotalMonthlyOutflow(res.total_monthly_outflow);
+    } catch {
+      // ignore
+    }
+  }
+
   // `spent`/`recent_avg_spent` are only computed on the list endpoint, not returned by the
   // create/update/categorize endpoints — anything that can change a category's spend needs to
   // refetch the list to stay accurate, rather than trying to patch the values in locally.
@@ -152,6 +179,9 @@ export default function App() {
       refreshSummary();
       refreshBudgetCategories();
       refreshMonthlyBreakdown();
+      // Recurring-stream detection is also refreshed server-side as part of every sync
+      // (manual or webhook-driven) — refetch here so this tab reflects that without a reload.
+      refreshRecurringStreams();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to sync transactions');
     } finally {
@@ -252,6 +282,10 @@ export default function App() {
               onUpdate={handleUpdateCategory}
               onDelete={handleDeleteCategory}
             />
+          )}
+
+          {activeTab === 'recurring' && (
+            <SubscriptionsRecurring streams={recurringStreams} totalMonthlyOutflow={totalMonthlyOutflow} />
           )}
 
           {activeTab === 'accounts' && (

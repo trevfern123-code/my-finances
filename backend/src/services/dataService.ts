@@ -1,6 +1,17 @@
 import { supabaseAdmin } from '../config/supabase';
-import type { AccountRow, BudgetCategoryRow, PlaidItemRow, TransactionRow } from '../types';
-import type { AccountBase, RemovedTransaction, Transaction as PlaidTransaction } from 'plaid';
+import type {
+  AccountRow,
+  BudgetCategoryRow,
+  PlaidItemRow,
+  RecurringStreamRow,
+  TransactionRow,
+} from '../types';
+import type {
+  AccountBase,
+  RemovedTransaction,
+  Transaction as PlaidTransaction,
+  TransactionStream,
+} from 'plaid';
 
 // ---- Plaid items -----------------------------------------------------------
 
@@ -365,6 +376,54 @@ export async function setTransactionCategory(
 
   if (error) throw new Error(`Failed to set transaction category: ${error.message}`);
   return data as TransactionRow;
+}
+
+// ---- Recurring streams ---------------------------------------------------------
+
+/** Replaces (upserts by item_id + plaid_stream_id) an item's recurring streams from a fresh Plaid response. */
+export async function upsertRecurringStreams(
+  itemRowId: string,
+  streams: { direction: 'inflow' | 'outflow'; stream: TransactionStream }[],
+  accountIdByPlaidId: Map<string, string>
+): Promise<void> {
+  if (streams.length === 0) return;
+
+  const rows = streams.map(({ direction, stream }) => ({
+    item_id: itemRowId,
+    account_id: accountIdByPlaidId.get(stream.account_id) ?? null,
+    plaid_stream_id: stream.stream_id,
+    description: stream.description,
+    merchant_name: stream.merchant_name,
+    direction,
+    frequency: stream.frequency,
+    average_amount: stream.average_amount.amount ?? 0,
+    last_amount: stream.last_amount.amount ?? 0,
+    iso_currency_code: stream.average_amount.iso_currency_code ?? 'USD',
+    first_date: stream.first_date,
+    last_date: stream.last_date,
+    is_active: stream.is_active,
+    status: stream.status,
+    category: stream.personal_finance_category?.primary ?? null,
+  }));
+
+  const { error } = await supabaseAdmin
+    .from('recurring_streams')
+    .upsert(rows, { onConflict: 'item_id,plaid_stream_id' });
+
+  if (error) throw new Error(`Failed to save recurring streams: ${error.message}`);
+}
+
+export async function getRecurringStreamsForUser(userId: string): Promise<RecurringStreamRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('recurring_streams')
+    .select(
+      'id, item_id, account_id, plaid_stream_id, description, merchant_name, direction, frequency, average_amount, last_amount, iso_currency_code, first_date, last_date, is_active, status, category, plaid_items!inner(user_id)'
+    )
+    .eq('plaid_items.user_id', userId)
+    .eq('is_active', true);
+
+  if (error) throw new Error(`Failed to load recurring streams: ${error.message}`);
+  return data as unknown as RecurringStreamRow[];
 }
 
 // ---- Budget categories ---------------------------------------------------------

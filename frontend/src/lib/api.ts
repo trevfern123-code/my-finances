@@ -132,6 +132,30 @@ export function getMonthlyBreakdown(months = 6): Promise<{ months: MonthBreakdow
   return authedFetch(`/api/plaid/monthly-breakdown?months=${months}`);
 }
 
+export interface RecurringStream {
+  id: string;
+  description: string;
+  merchant_name: string | null;
+  direction: 'inflow' | 'outflow';
+  frequency: string;
+  average_amount: number;
+  last_amount: number;
+  iso_currency_code: string | null;
+  first_date: string;
+  last_date: string;
+  is_active: boolean;
+  status: string;
+  category: string | null;
+  monthly_amount: number;
+}
+
+export function getRecurringStreams(): Promise<{
+  streams: RecurringStream[];
+  total_monthly_outflow: number;
+}> {
+  return authedFetch('/api/plaid/recurring-streams');
+}
+
 export function createReauthLinkToken(itemId: string): Promise<{ link_token: string }> {
   return authedFetch(`/api/plaid/items/${itemId}/reauth-link-token`, { method: 'POST' });
 }
