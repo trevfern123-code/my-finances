@@ -300,6 +300,20 @@ button:disabled {
   letter-spacing: -0.01em;
 }
 
+.stat-delta {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-delta.positive {
+  color: var(--accent);
+}
+
+.stat-delta.negative {
+  color: var(--danger);
+}
+
 /* ---- Bar charts (spending + net worth) ---- */
 
 .spending-chart {
@@ -340,15 +354,63 @@ button:disabled {
   min-height: 0;
 }
 
-.spending-bar.net-worth-bar {
-  background: linear-gradient(180deg, #93c5fd, var(--info));
-}
-
 .spending-bar-label {
   margin-top: 0.4rem;
   font-size: 0.72rem;
   color: var(--text-muted);
   white-space: nowrap;
+}
+
+/* ---- Net worth line chart ---- */
+
+.stat-value-inline {
+  font-size: 1.1rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--info);
+}
+
+.stat-value-inline.negative {
+  color: var(--danger);
+}
+
+.networth-svg {
+  width: 100%;
+  height: 220px;
+  margin-top: 0.5rem;
+  overflow: visible;
+}
+
+.networth-area {
+  fill: url(#networth-area-fill);
+  stroke: none;
+}
+
+.networth-line {
+  fill: none;
+  stroke: var(--info);
+  stroke-width: 2.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.networth-zero-line {
+  stroke: var(--border-strong);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+
+.networth-point {
+  fill: var(--info);
+}
+
+.networth-point.negative {
+  fill: var(--danger);
+}
+
+.networth-axis-label {
+  fill: var(--text-muted);
+  font-size: 11px;
 }
 
 /* ---- Linked accounts ---- */

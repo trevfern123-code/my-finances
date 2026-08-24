@@ -454,7 +454,9 @@ export default function App() {
 
           {activeTab === 'overview' && (
             <div className="dashboard-grid">
-              <div>{summary && <SpendingOverview summary={summary} />}</div>
+              <div>
+                {summary && <SpendingOverview summary={summary} netWorthHistory={netWorthHistory} />}
+              </div>
               <div>
                 <NetWorthChart history={netWorthHistory} />
               </div>
