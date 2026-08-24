@@ -300,6 +300,10 @@ button:disabled {
   letter-spacing: -0.01em;
 }
 
+.stat-value.negative {
+  color: var(--danger);
+}
+
 .stat-delta {
   font-size: 0.78rem;
   color: var(--text-muted);

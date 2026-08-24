@@ -46,7 +46,8 @@ import { PlaidLink } from './components/PlaidLink';
 import { LinkedAccounts } from './components/LinkedAccounts';
 import { TransactionsFeed } from './components/TransactionsFeed';
 import { BudgetCategories } from './components/BudgetCategories';
-import { SpendingOverview } from './components/SpendingOverview';
+import { OverviewStats } from './components/OverviewStats';
+import { MonthlySpendingChart } from './components/MonthlySpendingChart';
 import { NetWorthChart } from './components/NetWorthChart';
 import { MonthlyBreakdown } from './components/MonthlyBreakdown';
 import { SubscriptionsRecurring } from './components/SubscriptionsRecurring';
@@ -453,12 +454,20 @@ export default function App() {
           <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
 
           {activeTab === 'overview' && (
-            <div className="dashboard-grid">
-              <div>
-                {summary && <SpendingOverview summary={summary} netWorthHistory={netWorthHistory} />}
-              </div>
-              <div>
-                <NetWorthChart history={netWorthHistory} />
+            <div className="tab-panel">
+              {summary && (
+                <OverviewStats
+                  netWorth={summary.net_worth}
+                  netWorthHistory={netWorthHistory}
+                  assetGroups={assetGroups}
+                  monthlySpending={summary.monthly_spending}
+                />
+              )}
+              <div className="dashboard-grid">
+                <div>{summary && <MonthlySpendingChart summary={summary} />}</div>
+                <div>
+                  <NetWorthChart history={netWorthHistory} />
+                </div>
               </div>
             </div>
           )}
