@@ -198,6 +198,9 @@ export interface ManualLoan {
    *  auto-link and decrement this loan's balance. Null disables auto-linking. */
   match_text: string | null;
   payoff_progress_pct: number | null;
+  /** Lifetime sum across both auto-linked and manually-logged payments. */
+  lifetime_principal_paid: number;
+  lifetime_interest_paid: number;
 }
 
 export interface ManualLoanInput {
@@ -233,16 +236,20 @@ export function deleteManualLoan(id: string): Promise<void> {
   return authedFetch(`/api/manual-loans/${id}`, { method: 'DELETE' });
 }
 
-export interface LinkedLoanPayment {
+export interface LoanPayment {
   id: string;
+  /** "linked" = auto-detected from a synced bank transaction (interest is amount-minus-principal,
+   *  editable via principal only). "manual" = logged by hand with both portions entered directly. */
+  source: 'linked' | 'manual';
   date: string;
   name: string;
   merchant_name: string | null;
-  amount: number;
-  principal_portion: number | null;
+  principal_portion: number;
+  interest_portion: number;
+  notes: string | null;
 }
 
-export function getLinkedLoanPayments(loanId: string): Promise<{ payments: LinkedLoanPayment[] }> {
+export function getLoanPayments(loanId: string): Promise<{ payments: LoanPayment[] }> {
   return authedFetch(`/api/manual-loans/${loanId}/payments`);
 }
 
@@ -259,6 +266,38 @@ export function updateLinkedLoanPayment(
 
 export function unlinkLoanPayment(loanId: string, transactionId: string): Promise<{ loan: ManualLoan }> {
   return authedFetch(`/api/manual-loans/${loanId}/payments/${transactionId}`, { method: 'DELETE' });
+}
+
+export interface ManualPaymentInput {
+  date: string;
+  principal_portion: number;
+  interest_portion: number;
+  notes: string | null;
+}
+
+export function createManualPayment(
+  loanId: string,
+  input: ManualPaymentInput
+): Promise<{ loan: ManualLoan }> {
+  return authedFetch(`/api/manual-loans/${loanId}/manual-payments`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateManualPayment(
+  loanId: string,
+  paymentId: string,
+  input: Partial<ManualPaymentInput>
+): Promise<{ loan: ManualLoan }> {
+  return authedFetch(`/api/manual-loans/${loanId}/manual-payments/${paymentId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteManualPayment(loanId: string, paymentId: string): Promise<{ loan: ManualLoan }> {
+  return authedFetch(`/api/manual-loans/${loanId}/manual-payments/${paymentId}`, { method: 'DELETE' });
 }
 
 export interface AssetAccountSummary {

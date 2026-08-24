@@ -125,3 +125,18 @@ export interface ManualLoanRow {
    *  outflow transactions auto-link to this loan and decrement its balance. Null disables matching. */
   match_text: string | null;
 }
+
+/** A payment logged by hand rather than detected from a synced bank transaction — e.g. a cash
+ *  payment, or a historical payment made before the loan was added. Unlike a linked transaction's
+ *  principal_portion (where interest is implicitly amount-minus-principal), both portions are
+ *  entered explicitly here since there's no underlying transaction amount to split. */
+export interface ManualLoanPaymentRow {
+  id: string;
+  loan_id: string;
+  user_id: string;
+  date: string;
+  principal_portion: number;
+  interest_portion: number;
+  notes: string | null;
+  created_at: string;
+}

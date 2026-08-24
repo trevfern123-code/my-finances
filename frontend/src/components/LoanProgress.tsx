@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { LinkedLoanPayment, Loan, ManualLoan, ManualLoanInput } from '../lib/api';
+import type { LoanPayment, ManualPaymentInput, Loan, ManualLoan, ManualLoanInput } from '../lib/api';
 
 const LOAN_TYPE_LABELS: Record<string, string> = {
   student: 'Student Loan',
@@ -50,7 +50,81 @@ interface DisplayLoan {
   termMonths: number | null;
   notes: string | null;
   matchText: string | null;
+  lifetimePrincipalPaid: number | null;
+  lifetimeInterestPaid: number | null;
   editable: boolean;
+}
+
+const EMPTY_PAYMENT_FORM: ManualPaymentInput = {
+  date: new Date().toISOString().slice(0, 10),
+  principal_portion: 0,
+  interest_portion: 0,
+  notes: null,
+};
+
+function ManualPaymentForm({
+  initial,
+  onCancel,
+  onSubmit,
+}: {
+  initial: ManualPaymentInput;
+  onCancel: () => void;
+  onSubmit: (input: ManualPaymentInput) => void;
+}) {
+  const [form, setForm] = useState(initial);
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    onSubmit(form);
+  }
+
+  return (
+    <form className="manual-payment-form" onSubmit={handleSubmit}>
+      <label>
+        Date
+        <input
+          type="date"
+          value={form.date}
+          onChange={(e) => setForm({ ...form, date: e.target.value })}
+          required
+        />
+      </label>
+      <label>
+        Principal
+        <input
+          type="number"
+          step="0.01"
+          value={form.principal_portion}
+          onChange={(e) => setForm({ ...form, principal_portion: Number(e.target.value) })}
+          required
+        />
+      </label>
+      <label>
+        Interest
+        <input
+          type="number"
+          step="0.01"
+          value={form.interest_portion}
+          onChange={(e) => setForm({ ...form, interest_portion: Number(e.target.value) })}
+          required
+        />
+      </label>
+      <label className="manual-payment-form-notes">
+        Notes
+        <input
+          value={form.notes ?? ''}
+          onChange={(e) => setForm({ ...form, notes: e.target.value || null })}
+          placeholder="Optional — e.g. paid by check"
+        />
+      </label>
+      <div className="manual-payment-form-actions">
+        <button type="submit">Save payment</button>
+        <button type="button" className="link-button" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
 }
 
 function LinkedPaymentRow({
@@ -58,22 +132,23 @@ function LinkedPaymentRow({
   onUpdate,
   onUnlink,
 }: {
-  payment: LinkedLoanPayment;
+  payment: LoanPayment;
   onUpdate: (principalPortion: number) => void;
   onUnlink: () => void;
 }) {
-  const [principal, setPrincipal] = useState(String(payment.principal_portion ?? payment.amount));
-  const dirty = Number(principal) !== (payment.principal_portion ?? payment.amount);
+  const [principal, setPrincipal] = useState(String(payment.principal_portion));
+  const dirty = Number(principal) !== payment.principal_portion;
+  const amount = payment.principal_portion + payment.interest_portion;
 
   return (
-    <div className="linked-payment-row">
-      <div className="linked-payment-info">
+    <div className="payment-row">
+      <div className="payment-row-info">
         <span>{payment.name}</span>
         <span className="hint">
-          {formatDate(payment.date)} · {formatCurrency(payment.amount, null)} paid
+          {formatDate(payment.date)} · {formatCurrency(amount, null)} paid
         </span>
       </div>
-      <label className="linked-payment-principal">
+      <label className="payment-row-principal">
         Principal
         <input
           type="number"
@@ -82,7 +157,7 @@ function LinkedPaymentRow({
           onChange={(e) => setPrincipal(e.target.value)}
         />
       </label>
-      <div className="linked-payment-actions">
+      <div className="payment-row-actions">
         <button
           type="button"
           className="link-button"
@@ -99,34 +174,124 @@ function LinkedPaymentRow({
   );
 }
 
-function LinkedPayments({
-  loanId,
+function ManualPaymentRow({
+  payment,
+  onEdit,
+  onDelete,
+}: {
+  payment: LoanPayment;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const amount = payment.principal_portion + payment.interest_portion;
+  return (
+    <div className="payment-row">
+      <div className="payment-row-info">
+        <span>{payment.notes || 'Manual payment'}</span>
+        <span className="hint">
+          {formatDate(payment.date)} · {formatCurrency(amount, null)} paid ·{' '}
+          {formatCurrency(payment.principal_portion, null)} principal /{' '}
+          {formatCurrency(payment.interest_portion, null)} interest
+        </span>
+      </div>
+      <div className="payment-row-actions">
+        <button type="button" className="link-button" onClick={onEdit}>
+          Edit
+        </button>
+        <button type="button" className="link-button" onClick={onDelete}>
+          Delete
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PaymentHistory({
   payments,
   loading,
-  onUpdate,
+  onUpdateLinked,
   onUnlink,
+  onCreateManual,
+  onUpdateManual,
+  onDeleteManual,
 }: {
-  loanId: string;
-  payments: LinkedLoanPayment[] | undefined;
+  payments: LoanPayment[] | undefined;
   loading: boolean;
-  onUpdate: (transactionId: string, principalPortion: number) => void;
+  onUpdateLinked: (transactionId: string, principalPortion: number) => void;
   onUnlink: (transactionId: string) => void;
+  onCreateManual: (input: ManualPaymentInput) => void;
+  onUpdateManual: (paymentId: string, input: ManualPaymentInput) => void;
+  onDeleteManual: (paymentId: string) => void;
 }) {
-  if (loading) return <p className="hint">Loading linked payments...</p>;
-  if (!payments || payments.length === 0) {
-    return <p className="hint">No bank transactions linked to this loan yet.</p>;
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [editingPaymentId, setEditingPaymentId] = useState<string | null>(null);
+
+  const editingPayment = payments?.find((p) => p.id === editingPaymentId && p.source === 'manual') ?? null;
+
+  function handleCreate(input: ManualPaymentInput) {
+    onCreateManual(input);
+    setShowAddForm(false);
+  }
+
+  function handleUpdate(input: ManualPaymentInput) {
+    if (editingPaymentId) onUpdateManual(editingPaymentId, input);
+    setEditingPaymentId(null);
   }
 
   return (
-    <div className="linked-payments">
-      {payments.map((payment) => (
-        <LinkedPaymentRow
-          key={payment.id}
-          payment={payment}
-          onUpdate={(principalPortion) => onUpdate(payment.id, principalPortion)}
-          onUnlink={() => onUnlink(payment.id)}
+    <div className="payment-history">
+      <div className="payment-history-header">
+        <button type="button" className="link-button" onClick={() => setShowAddForm(true)}>
+          Log a payment
+        </button>
+      </div>
+
+      {showAddForm && (
+        <ManualPaymentForm
+          initial={EMPTY_PAYMENT_FORM}
+          onCancel={() => setShowAddForm(false)}
+          onSubmit={handleCreate}
         />
-      ))}
+      )}
+
+      {editingPayment && (
+        <ManualPaymentForm
+          initial={{
+            date: editingPayment.date,
+            principal_portion: editingPayment.principal_portion,
+            interest_portion: editingPayment.interest_portion,
+            notes: editingPayment.notes,
+          }}
+          onCancel={() => setEditingPaymentId(null)}
+          onSubmit={handleUpdate}
+        />
+      )}
+
+      {loading && <p className="hint">Loading payment history...</p>}
+      {!loading && (!payments || payments.length === 0) && (
+        <p className="hint">No payments logged for this loan yet.</p>
+      )}
+      {!loading && payments && payments.length > 0 && (
+        <div className="payment-rows">
+          {payments.map((payment) =>
+            payment.source === 'linked' ? (
+              <LinkedPaymentRow
+                key={payment.id}
+                payment={payment}
+                onUpdate={(principalPortion) => onUpdateLinked(payment.id, principalPortion)}
+                onUnlink={() => onUnlink(payment.id)}
+              />
+            ) : (
+              <ManualPaymentRow
+                key={payment.id}
+                payment={payment}
+                onEdit={() => setEditingPaymentId(payment.id)}
+                onDelete={() => onDeleteManual(payment.id)}
+              />
+            )
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -139,18 +304,24 @@ function LoanCard({
   onToggleExpanded,
   payments,
   paymentsLoading,
-  onUpdatePayment,
+  onUpdateLinkedPayment,
   onUnlinkPayment,
+  onCreateManualPayment,
+  onUpdateManualPayment,
+  onDeleteManualPayment,
 }: {
   loan: DisplayLoan;
   onEdit?: () => void;
   onDelete?: () => void;
   expanded: boolean;
   onToggleExpanded: () => void;
-  payments: LinkedLoanPayment[] | undefined;
+  payments: LoanPayment[] | undefined;
   paymentsLoading: boolean;
-  onUpdatePayment: (transactionId: string, principalPortion: number) => void;
+  onUpdateLinkedPayment: (transactionId: string, principalPortion: number) => void;
   onUnlinkPayment: (transactionId: string) => void;
+  onCreateManualPayment: (input: ManualPaymentInput) => void;
+  onUpdateManualPayment: (paymentId: string, input: ManualPaymentInput) => void;
+  onDeleteManualPayment: (paymentId: string) => void;
 }) {
   return (
     <div className="card loan-card">
@@ -193,6 +364,21 @@ function LoanCard({
             <span className="loan-stat-value">{loan.termMonths} months</span>
           </div>
         )}
+        {loan.lifetimePrincipalPaid !== null &&
+          (loan.lifetimePrincipalPaid > 0 || (loan.lifetimeInterestPaid ?? 0) > 0) && (
+            <>
+              <div>
+                <span className="stat-label">Total principal paid</span>
+                <span className="loan-stat-value">{formatCurrency(loan.lifetimePrincipalPaid, loan.currencyCode)}</span>
+              </div>
+              <div>
+                <span className="stat-label">Total interest paid</span>
+                <span className="loan-stat-value">
+                  {formatCurrency(loan.lifetimeInterestPaid, loan.currencyCode)}
+                </span>
+              </div>
+            </>
+          )}
       </div>
 
       {loan.payoffProgressPct !== null && (
@@ -220,16 +406,18 @@ function LoanCard({
               Delete
             </button>
             <button className="link-button" onClick={onToggleExpanded}>
-              {expanded ? 'Hide linked payments' : 'Linked payments'}
+              {expanded ? 'Hide payment history' : 'Payment history'}
             </button>
           </div>
           {expanded && (
-            <LinkedPayments
-              loanId={loan.id}
+            <PaymentHistory
               payments={payments}
               loading={paymentsLoading}
-              onUpdate={onUpdatePayment}
+              onUpdateLinked={onUpdateLinkedPayment}
               onUnlink={onUnlinkPayment}
+              onCreateManual={onCreateManualPayment}
+              onUpdateManual={onUpdateManualPayment}
+              onDeleteManual={onDeleteManualPayment}
             />
           )}
         </>
@@ -254,6 +442,8 @@ function plaidToDisplay(loan: Loan): DisplayLoan {
     termMonths: null,
     notes: null,
     matchText: null,
+    lifetimePrincipalPaid: null,
+    lifetimeInterestPaid: null,
     editable: false,
   };
 }
@@ -274,6 +464,8 @@ function manualToDisplay(loan: ManualLoan): DisplayLoan {
     termMonths: loan.term_months,
     notes: loan.notes,
     matchText: loan.match_text,
+    lifetimePrincipalPaid: loan.lifetime_principal_paid,
+    lifetimeInterestPaid: loan.lifetime_interest_paid,
     editable: true,
   };
 }
@@ -448,9 +640,12 @@ export function LoanProgress({
   onCreateManualLoan,
   onUpdateManualLoan,
   onDeleteManualLoan,
-  onFetchLinkedPayments,
+  onFetchPayments,
   onUpdateLinkedPayment,
   onUnlinkPayment,
+  onCreateManualPayment,
+  onUpdateManualPayment,
+  onDeleteManualPayment,
 }: {
   loans: Loan[];
   manualLoans: ManualLoan[];
@@ -459,14 +654,17 @@ export function LoanProgress({
   onCreateManualLoan: (input: ManualLoanInput) => void;
   onUpdateManualLoan: (id: string, input: ManualLoanInput) => Promise<void>;
   onDeleteManualLoan: (id: string) => void;
-  onFetchLinkedPayments: (loanId: string) => Promise<LinkedLoanPayment[]>;
+  onFetchPayments: (loanId: string) => Promise<LoanPayment[]>;
   onUpdateLinkedPayment: (loanId: string, transactionId: string, principalPortion: number) => Promise<void>;
   onUnlinkPayment: (loanId: string, transactionId: string) => Promise<void>;
+  onCreateManualPayment: (loanId: string, input: ManualPaymentInput) => Promise<void>;
+  onUpdateManualPayment: (loanId: string, paymentId: string, input: ManualPaymentInput) => Promise<void>;
+  onDeleteManualPayment: (loanId: string, paymentId: string) => Promise<void>;
 }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [editingLoanId, setEditingLoanId] = useState<string | null>(null);
   const [expandedLoanId, setExpandedLoanId] = useState<string | null>(null);
-  const [paymentsByLoanId, setPaymentsByLoanId] = useState<Record<string, LinkedLoanPayment[]>>({});
+  const [paymentsByLoanId, setPaymentsByLoanId] = useState<Record<string, LoanPayment[]>>({});
   const [paymentsLoadingId, setPaymentsLoadingId] = useState<string | null>(null);
 
   const combinedTotalDebt = totalDebt + manualLoans.reduce((sum, l) => sum + l.current_balance, 0);
@@ -504,7 +702,7 @@ export function LoanProgress({
   async function loadPayments(loanId: string) {
     setPaymentsLoadingId(loanId);
     try {
-      const payments = await onFetchLinkedPayments(loanId);
+      const payments = await onFetchPayments(loanId);
       setPaymentsByLoanId((prev) => ({ ...prev, [loanId]: payments }));
     } catch {
       // ignore — the section just stays empty/stale, no dedicated error UI for this yet
@@ -522,7 +720,7 @@ export function LoanProgress({
     if (!paymentsByLoanId[loanId]) loadPayments(loanId);
   }
 
-  async function handleUpdatePayment(loanId: string, transactionId: string, principalPortion: number) {
+  async function handleUpdateLinkedPayment(loanId: string, transactionId: string, principalPortion: number) {
     try {
       await onUpdateLinkedPayment(loanId, transactionId, principalPortion);
       await loadPayments(loanId);
@@ -534,6 +732,33 @@ export function LoanProgress({
   async function handleUnlinkPayment(loanId: string, transactionId: string) {
     try {
       await onUnlinkPayment(loanId, transactionId);
+      await loadPayments(loanId);
+    } catch {
+      // error already surfaced via the app-level action error banner
+    }
+  }
+
+  async function handleCreateManualPayment(loanId: string, input: ManualPaymentInput) {
+    try {
+      await onCreateManualPayment(loanId, input);
+      await loadPayments(loanId);
+    } catch {
+      // error already surfaced via the app-level action error banner
+    }
+  }
+
+  async function handleUpdateManualPayment(loanId: string, paymentId: string, input: ManualPaymentInput) {
+    try {
+      await onUpdateManualPayment(loanId, paymentId, input);
+      await loadPayments(loanId);
+    } catch {
+      // error already surfaced via the app-level action error banner
+    }
+  }
+
+  async function handleDeleteManualPayment(loanId: string, paymentId: string) {
+    try {
+      await onDeleteManualPayment(loanId, paymentId);
       await loadPayments(loanId);
     } catch {
       // error already surfaced via the app-level action error banner
@@ -600,10 +825,15 @@ export function LoanProgress({
               onToggleExpanded={() => handleToggleExpanded(loan.id)}
               payments={paymentsByLoanId[loan.id]}
               paymentsLoading={paymentsLoadingId === loan.id}
-              onUpdatePayment={(transactionId, principalPortion) =>
-                handleUpdatePayment(loan.id, transactionId, principalPortion)
+              onUpdateLinkedPayment={(transactionId, principalPortion) =>
+                handleUpdateLinkedPayment(loan.id, transactionId, principalPortion)
               }
               onUnlinkPayment={(transactionId) => handleUnlinkPayment(loan.id, transactionId)}
+              onCreateManualPayment={(input) => handleCreateManualPayment(loan.id, input)}
+              onUpdateManualPayment={(paymentId, input) =>
+                handleUpdateManualPayment(loan.id, paymentId, input)
+              }
+              onDeleteManualPayment={(paymentId) => handleDeleteManualPayment(loan.id, paymentId)}
             />
           ))}
         </div>

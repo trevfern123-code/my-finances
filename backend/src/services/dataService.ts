@@ -4,6 +4,7 @@ import type {
   BudgetCategoryRow,
   InsertedTransaction,
   LoanRow,
+  ManualLoanPaymentRow,
   ManualLoanRow,
   PlaidItemRow,
   RecurringStreamRow,
@@ -714,6 +715,136 @@ export async function unlinkPaymentFromLoan(transactionId: string, loanId: strin
 
   if (updateError) throw new Error(`Failed to unlink payment: ${updateError.message}`);
   await adjustManualLoanBalance(loanId, oldPortion);
+}
+
+/** Sums how much principal and interest have been paid on each of the given loans, combining
+ *  both payment sources: auto-linked/backfilled bank transactions (whose interest is implicitly
+ *  amount-minus-principal) and manually-logged payments (which store both portions explicitly).
+ *  Loans with no payments from either source are simply absent from the returned map. */
+export async function getLifetimeTotalsByLoanId(
+  loanIds: string[]
+): Promise<Map<string, { principalPaid: number; interestPaid: number }>> {
+  const totals = new Map<string, { principalPaid: number; interestPaid: number }>();
+  if (loanIds.length === 0) return totals;
+
+  function add(loanId: string, principal: number, interest: number) {
+    const entry = totals.get(loanId) ?? { principalPaid: 0, interestPaid: 0 };
+    entry.principalPaid += principal;
+    entry.interestPaid += interest;
+    totals.set(loanId, entry);
+  }
+
+  const { data: txnRows, error: txnError } = await supabaseAdmin
+    .from('transactions')
+    .select('manual_loan_id, amount, principal_portion')
+    .in('manual_loan_id', loanIds);
+  if (txnError) throw new Error(`Failed to load linked payment totals: ${txnError.message}`);
+
+  for (const row of txnRows) {
+    const principal = (row.principal_portion as number | null) ?? 0;
+    add(row.manual_loan_id as string, principal, (row.amount as number) - principal);
+  }
+
+  const { data: manualRows, error: manualError } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .select('loan_id, principal_portion, interest_portion')
+    .in('loan_id', loanIds);
+  if (manualError) throw new Error(`Failed to load manual payment totals: ${manualError.message}`);
+
+  for (const row of manualRows) {
+    add(row.loan_id as string, row.principal_portion as number, row.interest_portion as number);
+  }
+
+  return totals;
+}
+
+export async function listManualLoanPayments(loanId: string): Promise<ManualLoanPaymentRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .select('*')
+    .eq('loan_id', loanId)
+    .order('date', { ascending: false });
+
+  if (error) throw new Error(`Failed to load manual payments: ${error.message}`);
+  return data as ManualLoanPaymentRow[];
+}
+
+export async function createManualLoanPayment(
+  userId: string,
+  loanId: string,
+  params: { date: string; principalPortion: number; interestPortion: number; notes: string | null }
+): Promise<ManualLoanPaymentRow> {
+  const { data, error } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .insert({
+      user_id: userId,
+      loan_id: loanId,
+      date: params.date,
+      principal_portion: params.principalPortion,
+      interest_portion: params.interestPortion,
+      notes: params.notes,
+    })
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to create manual payment: ${error.message}`);
+  await adjustManualLoanBalance(loanId, -params.principalPortion);
+  return data as ManualLoanPaymentRow;
+}
+
+export async function updateManualLoanPayment(
+  id: string,
+  loanId: string,
+  fields: Partial<{ date: string; principal_portion: number; interest_portion: number; notes: string | null }>
+): Promise<ManualLoanPaymentRow | null> {
+  const { data: existing, error: fetchError } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .select('principal_portion')
+    .eq('id', id)
+    .eq('loan_id', loanId)
+    .maybeSingle();
+
+  if (fetchError) throw new Error(`Failed to load manual payment: ${fetchError.message}`);
+  if (!existing) return null;
+
+  const { data, error } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .update(fields)
+    .eq('id', id)
+    .eq('loan_id', loanId)
+    .select()
+    .maybeSingle();
+
+  if (error) throw new Error(`Failed to update manual payment: ${error.message}`);
+  if (!data) return null;
+
+  if (fields.principal_portion !== undefined) {
+    const oldPortion = existing.principal_portion as number;
+    await adjustManualLoanBalance(loanId, oldPortion - fields.principal_portion);
+  }
+
+  return data as ManualLoanPaymentRow;
+}
+
+export async function deleteManualLoanPayment(id: string, loanId: string): Promise<void> {
+  const { data: existing, error: fetchError } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .select('principal_portion')
+    .eq('id', id)
+    .eq('loan_id', loanId)
+    .maybeSingle();
+
+  if (fetchError) throw new Error(`Failed to load manual payment: ${fetchError.message}`);
+  if (!existing) return;
+
+  const { error } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .delete()
+    .eq('id', id)
+    .eq('loan_id', loanId);
+
+  if (error) throw new Error(`Failed to delete manual payment: ${error.message}`);
+  await adjustManualLoanBalance(loanId, existing.principal_portion as number);
 }
 
 // ---- Budget categories ---------------------------------------------------------

@@ -821,14 +821,23 @@ button:disabled {
   gap: 0.4rem;
 }
 
-.linked-payments {
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
+.payment-history {
   margin-top: 0.75rem;
 }
 
-.linked-payment-row {
+.payment-history-header {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.5rem;
+}
+
+.payment-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.payment-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -838,14 +847,14 @@ button:disabled {
   flex-wrap: wrap;
 }
 
-.linked-payment-info {
+.payment-row-info {
   display: flex;
   flex-direction: column;
   gap: 0.15rem;
   min-width: 0;
 }
 
-.linked-payment-principal {
+.payment-row-principal {
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
@@ -853,13 +862,43 @@ button:disabled {
   color: var(--text-muted);
 }
 
-.linked-payment-principal input {
+.payment-row-principal input {
   width: 7rem;
 }
 
-.linked-payment-actions {
+.payment-row-actions {
   display: flex;
   gap: 0.6rem;
+}
+
+.manual-payment-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.75rem;
+  align-items: end;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.6rem;
+}
+
+.manual-payment-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.manual-payment-form-notes {
+  grid-column: 1 / -1;
+}
+
+.manual-payment-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  grid-column: 1 / -1;
 }
 
 /* ---- Income & savings ---- */

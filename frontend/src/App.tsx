@@ -4,12 +4,14 @@ import { supabase } from './lib/supabaseClient';
 import {
   createBudgetCategory,
   createManualLoan,
+  createManualPayment,
   deleteBudgetCategory,
   deleteManualLoan,
+  deleteManualPayment,
   getAssetsSummary,
   getBudgetCategories,
   getLinkedItems,
-  getLinkedLoanPayments,
+  getLoanPayments,
   getLoans,
   getManualLoans,
   getMonthlyBreakdown,
@@ -23,13 +25,15 @@ import {
   updateBudgetCategory,
   updateLinkedLoanPayment,
   updateManualLoan,
+  updateManualPayment,
   type AssetGroup,
   type BudgetCategory,
   type LinkedItem,
-  type LinkedLoanPayment,
   type Loan,
+  type LoanPayment,
   type ManualLoan,
   type ManualLoanInput,
+  type ManualPaymentInput,
   type MonthBreakdown,
   type NetWorthPoint,
   type RecurringStream,
@@ -344,8 +348,8 @@ export default function App() {
     }
   }
 
-  async function handleFetchLinkedPayments(loanId: string): Promise<LinkedLoanPayment[]> {
-    const res = await getLinkedLoanPayments(loanId);
+  async function handleFetchPayments(loanId: string): Promise<LoanPayment[]> {
+    const res = await getLoanPayments(loanId);
     return res.payments;
   }
 
@@ -367,6 +371,39 @@ export default function App() {
       setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to unlink payment');
+      throw err;
+    }
+  }
+
+  async function handleCreateManualPayment(loanId: string, input: ManualPaymentInput) {
+    setActionError(null);
+    try {
+      const res = await createManualPayment(loanId, input);
+      setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to log payment');
+      throw err;
+    }
+  }
+
+  async function handleUpdateManualPayment(loanId: string, paymentId: string, input: ManualPaymentInput) {
+    setActionError(null);
+    try {
+      const res = await updateManualPayment(loanId, paymentId, input);
+      setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update payment');
+      throw err;
+    }
+  }
+
+  async function handleDeleteManualPayment(loanId: string, paymentId: string) {
+    setActionError(null);
+    try {
+      const res = await deleteManualPayment(loanId, paymentId);
+      setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to delete payment');
       throw err;
     }
   }
@@ -428,9 +465,12 @@ export default function App() {
               onCreateManualLoan={handleCreateManualLoan}
               onUpdateManualLoan={handleUpdateManualLoan}
               onDeleteManualLoan={handleDeleteManualLoan}
-              onFetchLinkedPayments={handleFetchLinkedPayments}
+              onFetchPayments={handleFetchPayments}
               onUpdateLinkedPayment={handleUpdateLinkedPayment}
               onUnlinkPayment={handleUnlinkPayment}
+              onCreateManualPayment={handleCreateManualPayment}
+              onUpdateManualPayment={handleUpdateManualPayment}
+              onDeleteManualPayment={handleDeleteManualPayment}
             />
           )}
 

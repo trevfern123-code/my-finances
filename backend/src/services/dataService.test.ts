@@ -7,6 +7,10 @@ import {
   linkTransactionToLoan,
   updateLinkedPaymentPrincipal,
   unlinkPaymentFromLoan,
+  getLifetimeTotalsByLoanId,
+  createManualLoanPayment,
+  updateManualLoanPayment,
+  deleteManualLoanPayment,
 } from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
@@ -268,5 +272,133 @@ describe('unlinkPaymentFromLoan', () => {
 
     expect(updateTxnQuery.update).toHaveBeenCalledWith({ manual_loan_id: null, principal_portion: null });
     expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 1000 });
+  });
+});
+
+describe('getLifetimeTotalsByLoanId', () => {
+  it('combines linked-transaction and manual-payment totals per loan', async () => {
+    const txnQuery = createQueryBuilder({
+      data: [
+        { manual_loan_id: 'loan-1', amount: 500, principal_portion: 450 },
+        { manual_loan_id: 'loan-1', amount: 300, principal_portion: 300 },
+        { manual_loan_id: 'loan-2', amount: 100, principal_portion: 100 },
+      ],
+      error: null,
+    });
+    const manualQuery = createQueryBuilder({
+      data: [{ loan_id: 'loan-1', principal_portion: 200, interest_portion: 20 }],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(txnQuery).mockReturnValueOnce(manualQuery);
+
+    const totals = await getLifetimeTotalsByLoanId(['loan-1', 'loan-2']);
+
+    // loan-1: principal 450+300+200=950, interest (500-450)+(300-300)+20=70
+    expect(totals.get('loan-1')).toEqual({ principalPaid: 950, interestPaid: 70 });
+    // loan-2: principal 100, interest 0
+    expect(totals.get('loan-2')).toEqual({ principalPaid: 100, interestPaid: 0 });
+  });
+
+  it('returns an empty map without querying when given no loan ids', async () => {
+    const totals = await getLifetimeTotalsByLoanId([]);
+    expect(totals.size).toBe(0);
+    expect(mockFrom).not.toHaveBeenCalled();
+  });
+});
+
+describe('createManualLoanPayment', () => {
+  it('inserts the payment and decrements the loan balance by its principal portion', async () => {
+    const insertQuery = createQueryBuilder({
+      data: { id: 'payment-1', principal_portion: 300, interest_portion: 50 },
+      error: null,
+    });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(insertQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+
+    await createManualLoanPayment('user-1', 'loan-1', {
+      date: '2026-08-01',
+      principalPortion: 300,
+      interestPortion: 50,
+      notes: 'Cash payment',
+    });
+
+    expect(insertQuery.insert).toHaveBeenCalledWith({
+      user_id: 'user-1',
+      loan_id: 'loan-1',
+      date: '2026-08-01',
+      principal_portion: 300,
+      interest_portion: 50,
+      notes: 'Cash payment',
+    });
+    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 700 });
+  });
+});
+
+describe('updateManualLoanPayment', () => {
+  it('updates the payment and adjusts the balance by the principal difference', async () => {
+    const fetchQuery = createQueryBuilder({ data: { principal_portion: 300 }, error: null });
+    const updateQuery = createQueryBuilder({ data: { id: 'payment-1', principal_portion: 250 }, error: null });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 700 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom
+      .mockReturnValueOnce(fetchQuery)
+      .mockReturnValueOnce(updateQuery)
+      .mockReturnValueOnce(balanceQuery)
+      .mockReturnValueOnce(updateBalanceQuery);
+
+    await updateManualLoanPayment('payment-1', 'loan-1', { principal_portion: 250, interest_portion: 100 });
+
+    expect(updateQuery.update).toHaveBeenCalledWith({ principal_portion: 250, interest_portion: 100 });
+    // Old portion (300) applied 300 to balance; new portion (250) should give 50 back.
+    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 750 });
+  });
+
+  it('returns null without adjusting balance when the payment does not exist', async () => {
+    const fetchQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    const result = await updateManualLoanPayment('payment-1', 'loan-1', { principal_portion: 250 });
+
+    expect(result).toBeNull();
+    expect(mockFrom).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not touch the balance when principal_portion is not part of the update', async () => {
+    const fetchQuery = createQueryBuilder({ data: { principal_portion: 300 }, error: null });
+    const updateQuery = createQueryBuilder({ data: { id: 'payment-1', notes: 'Updated note' }, error: null });
+    mockFrom.mockReturnValueOnce(fetchQuery).mockReturnValueOnce(updateQuery);
+
+    await updateManualLoanPayment('payment-1', 'loan-1', { notes: 'Updated note' });
+
+    expect(mockFrom).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('deleteManualLoanPayment', () => {
+  it('deletes the payment and restores the loan balance by its principal portion', async () => {
+    const fetchQuery = createQueryBuilder({ data: { principal_portion: 300 }, error: null });
+    const deleteQuery = createQueryBuilder({ data: null, error: null });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 700 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom
+      .mockReturnValueOnce(fetchQuery)
+      .mockReturnValueOnce(deleteQuery)
+      .mockReturnValueOnce(balanceQuery)
+      .mockReturnValueOnce(updateBalanceQuery);
+
+    await deleteManualLoanPayment('payment-1', 'loan-1');
+
+    expect(deleteQuery.delete).toHaveBeenCalled();
+    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 1000 });
+  });
+
+  it('does nothing when the payment does not exist', async () => {
+    const fetchQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    await deleteManualLoanPayment('payment-1', 'loan-1');
+
+    expect(mockFrom).toHaveBeenCalledTimes(1);
   });
 });
