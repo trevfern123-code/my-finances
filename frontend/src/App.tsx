@@ -22,6 +22,7 @@ import {
   setTransactionCategory,
   syncTransactions as syncTransactionsRequest,
   unlinkLoanPayment,
+  updateAccountCreditLimit,
   updateBudgetCategory,
   updateLinkedLoanPayment,
   updateManualLoan,
@@ -68,6 +69,7 @@ export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [activeTab, setActiveTab] = useState('overview');
   const [items, setItems] = useState<LinkedItem[]>([]);
+  const [isSandbox, setIsSandbox] = useState(false);
   const [transactions, setTransactions] = useState<TransactionItem[]>([]);
   const [budgetCategories, setBudgetCategories] = useState<BudgetCategory[]>([]);
   const [summary, setSummary] = useState<SpendingSummary | null>(null);
@@ -121,7 +123,10 @@ export default function App() {
       getManualLoans(),
     ]);
 
-    if (itemsRes.status === 'fulfilled') setItems(itemsRes.value.items);
+    if (itemsRes.status === 'fulfilled') {
+      setItems(itemsRes.value.items);
+      setIsSandbox(itemsRes.value.is_sandbox);
+    }
     if (transactionsRes.status === 'fulfilled') setTransactions(transactionsRes.value.transactions);
     if (categoriesRes.status === 'fulfilled') setBudgetCategories(categoriesRes.value.categories);
     if (summaryRes.status === 'fulfilled') setSummary(summaryRes.value);
@@ -245,6 +250,21 @@ export default function App() {
     refreshNetWorthHistory();
     refreshLoans();
     refreshAssetsSummary();
+  }
+
+  async function handleUpdateCreditLimit(accountId: string, creditLimit: number | null) {
+    setActionError(null);
+    try {
+      const res = await updateAccountCreditLimit(accountId, creditLimit);
+      setItems((prev) =>
+        prev.map((item) => ({
+          ...item,
+          accounts: item.accounts.map((a) => (a.id === accountId ? res.account : a)),
+        }))
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update credit limit');
+    }
   }
 
   async function handleSyncTransactions() {
@@ -478,7 +498,12 @@ export default function App() {
 
           {activeTab === 'accounts' && (
             <div className="tab-panel">
-              <LinkedAccounts items={items} onRefreshed={handleAccountsRefreshed} />
+              <LinkedAccounts
+                items={items}
+                isSandbox={isSandbox}
+                onRefreshed={handleAccountsRefreshed}
+                onUpdateCreditLimit={handleUpdateCreditLimit}
+              />
               <TransactionsFeed
                 transactions={transactions}
                 budgetCategories={budgetCategories}

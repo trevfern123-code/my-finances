@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { LinkedItem } from '../lib/api';
+import type { LinkedAccount, LinkedItem } from '../lib/api';
 import { refreshAccountBalances, sandboxFireWebhook, sandboxResetLogin } from '../lib/api';
 import { ReconnectButton } from './ReconnectButton';
 
@@ -11,12 +11,68 @@ function formatBalance(amount: number | null, currency: string | null) {
   }).format(amount);
 }
 
+function creditUtilizationTier(balance: number, limit: number): 'good' | 'warn' | 'over' {
+  const pct = balance / limit;
+  if (pct > 0.5) return 'over';
+  if (pct >= 0.3) return 'warn';
+  return 'good';
+}
+
+function CreditUtilization({
+  account,
+  onUpdateCreditLimit,
+}: {
+  account: LinkedAccount;
+  onUpdateCreditLimit: (accountId: string, creditLimit: number | null) => void;
+}) {
+  const [editing, setEditing] = useState<string | undefined>(undefined);
+  const balance = account.current_balance ?? 0;
+  const limit = account.credit_limit;
+  const hasLimit = limit !== null && limit > 0;
+  const pct = hasLimit ? Math.min((balance / limit) * 100, 100) : 0;
+  const tier = hasLimit ? creditUtilizationTier(balance, limit) : 'good';
+
+  return (
+    <div className="credit-utilization">
+      <div className="credit-utilization-header">
+        <span className="hint">Credit limit</span>
+        <input
+          type="number"
+          step="0.01"
+          className="budget-amount-input"
+          value={editing ?? limit ?? ''}
+          placeholder="Not set"
+          onChange={(e) => setEditing(e.target.value)}
+          onBlur={() => {
+            if (editing === undefined) return;
+            const value = editing.trim() === '' ? null : Number(editing);
+            if (value === null || !Number.isNaN(value)) onUpdateCreditLimit(account.id, value);
+            setEditing(undefined);
+          }}
+        />
+      </div>
+      {hasLimit && (
+        <>
+          <div className="progress-track">
+            <div className={`progress-fill progress-${tier}`} style={{ width: `${pct}%` }} />
+          </div>
+          <span className="hint">{pct.toFixed(0)}% utilization</span>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function LinkedAccounts({
   items,
+  isSandbox,
   onRefreshed,
+  onUpdateCreditLimit,
 }: {
   items: LinkedItem[];
+  isSandbox: boolean;
   onRefreshed: (items: LinkedItem[]) => void;
+  onUpdateCreditLimit: (accountId: string, creditLimit: number | null) => void;
 }) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -91,17 +147,22 @@ export function LinkedAccounts({
               )}
               <ul>
                 {item.accounts.map((account) => (
-                  <li key={account.id} className="account-row">
-                    <span>
-                      {account.name} <span className="account-type">({account.subtype ?? account.type})</span>
-                    </span>
-                    <span className="balance">
-                      {formatBalance(account.current_balance, account.iso_currency_code)}
-                    </span>
+                  <li key={account.id} className="account-list-item">
+                    <div className="account-row">
+                      <span>
+                        {account.name} <span className="account-type">({account.subtype ?? account.type})</span>
+                      </span>
+                      <span className="balance">
+                        {formatBalance(account.current_balance, account.iso_currency_code)}
+                      </span>
+                    </div>
+                    {account.type === 'credit' && (
+                      <CreditUtilization account={account} onUpdateCreditLimit={onUpdateCreditLimit} />
+                    )}
                   </li>
                 ))}
               </ul>
-              {item.status === 'active' && (
+              {isSandbox && item.status === 'active' && (
                 <div className="sandbox-test-actions">
                   <button className="link-button" onClick={() => handleSandboxReset(item.id)}>
                     Simulate reauth (sandbox test)

@@ -35,6 +35,9 @@ export interface AccountRow {
   current_balance: number | null;
   available_balance: number | null;
   iso_currency_code: string | null;
+  /** User-entered, not from Plaid — Plaid's own credit-limit data is unreliable across
+   *  institutions, so utilization is computed from whatever the user fills in here. */
+  credit_limit: number | null;
 }
 
 export interface TransactionRow {

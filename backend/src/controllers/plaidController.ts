@@ -215,7 +215,7 @@ export async function listLinkedItems(req: Request, res: Response, next: NextFun
   try {
     const userId = req.user!.id;
     const items = await dataService.getLinkedItemsForUser(userId);
-    res.json({ items });
+    res.json({ items, is_sandbox: env.plaidEnv === 'sandbox' });
   } catch (err) {
     next(err);
   }
@@ -257,7 +257,30 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
     await netWorthService.recordSnapshotForUser(userId);
 
     const refreshed = await dataService.getLinkedItemsForUser(userId);
-    res.json({ items: refreshed });
+    res.json({ items: refreshed, is_sandbox: env.plaidEnv === 'sandbox' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateAccountCreditLimit(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { accountId } = req.params;
+    const { credit_limit: creditLimit } = req.body as { credit_limit?: number | null };
+
+    if (creditLimit !== null && creditLimit !== undefined && typeof creditLimit !== 'number') {
+      res.status(400).json({ error: 'credit_limit must be a number or null' });
+      return;
+    }
+
+    const account = await dataService.updateAccountCreditLimit(accountId, userId, creditLimit ?? null);
+    if (!account) {
+      res.status(404).json({ error: 'Account not found' });
+      return;
+    }
+
+    res.json({ account });
   } catch (err) {
     next(err);
   }

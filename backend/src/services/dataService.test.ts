@@ -11,6 +11,7 @@ import {
   createManualLoanPayment,
   updateManualLoanPayment,
   deleteManualLoanPayment,
+  updateAccountCreditLimit,
 } from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
@@ -399,6 +400,30 @@ describe('deleteManualLoanPayment', () => {
 
     await deleteManualLoanPayment('payment-1', 'loan-1');
 
+    expect(mockFrom).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('updateAccountCreditLimit', () => {
+  it('updates the credit limit after verifying the account belongs to the user', async () => {
+    const ownershipQuery = createQueryBuilder({ data: { id: 'account-1' }, error: null });
+    const updateQuery = createQueryBuilder({ data: { id: 'account-1', credit_limit: 5000 }, error: null });
+    mockFrom.mockReturnValueOnce(ownershipQuery).mockReturnValueOnce(updateQuery);
+
+    const result = await updateAccountCreditLimit('account-1', 'user-1', 5000);
+
+    expect(ownershipQuery.eq).toHaveBeenCalledWith('plaid_items.user_id', 'user-1');
+    expect(updateQuery.update).toHaveBeenCalledWith({ credit_limit: 5000 });
+    expect(result).toEqual({ id: 'account-1', credit_limit: 5000 });
+  });
+
+  it('returns null without updating when the account does not belong to the user', async () => {
+    const ownershipQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(ownershipQuery);
+
+    const result = await updateAccountCreditLimit('account-1', 'user-1', 5000);
+
+    expect(result).toBeNull();
     expect(mockFrom).toHaveBeenCalledTimes(1);
   });
 });

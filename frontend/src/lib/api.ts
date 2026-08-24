@@ -39,6 +39,8 @@ export interface LinkedAccount {
   current_balance: number | null;
   available_balance: number | null;
   iso_currency_code: string | null;
+  /** User-entered — only meaningful for type: "credit" accounts, used to compute utilization. */
+  credit_limit: number | null;
 }
 
 export interface LinkedItem {
@@ -86,12 +88,22 @@ export function exchangePublicToken(publicToken: string) {
   });
 }
 
-export function getLinkedItems(): Promise<{ items: LinkedItem[] }> {
+export function getLinkedItems(): Promise<{ items: LinkedItem[]; is_sandbox: boolean }> {
   return authedFetch('/api/plaid/items');
 }
 
-export function refreshAccountBalances(): Promise<{ items: LinkedItem[] }> {
+export function refreshAccountBalances(): Promise<{ items: LinkedItem[]; is_sandbox: boolean }> {
   return authedFetch('/api/plaid/accounts/refresh', { method: 'POST' });
+}
+
+export function updateAccountCreditLimit(
+  accountId: string,
+  creditLimit: number | null
+): Promise<{ account: LinkedAccount }> {
+  return authedFetch(`/api/plaid/accounts/${accountId}/credit-limit`, {
+    method: 'PATCH',
+    body: JSON.stringify({ credit_limit: creditLimit }),
+  });
 }
 
 export interface SpendingSummary {
