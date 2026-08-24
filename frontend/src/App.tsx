@@ -3,11 +3,14 @@ import type { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabaseClient';
 import {
   createBudgetCategory,
+  createManualLoan,
   deleteBudgetCategory,
+  deleteManualLoan,
   getAssetsSummary,
   getBudgetCategories,
   getLinkedItems,
   getLoans,
+  getManualLoans,
   getMonthlyBreakdown,
   getNetWorthHistory,
   getRecurringStreams,
@@ -16,10 +19,13 @@ import {
   setTransactionCategory,
   syncTransactions as syncTransactionsRequest,
   updateBudgetCategory,
+  updateManualLoan,
   type AssetGroup,
   type BudgetCategory,
   type LinkedItem,
   type Loan,
+  type ManualLoan,
+  type ManualLoanInput,
   type MonthBreakdown,
   type NetWorthPoint,
   type RecurringStream,
@@ -64,6 +70,7 @@ export default function App() {
   const [loans, setLoans] = useState<Loan[]>([]);
   const [totalDebt, setTotalDebt] = useState(0);
   const [totalMinimumPayment, setTotalMinimumPayment] = useState(0);
+  const [manualLoans, setManualLoans] = useState<ManualLoan[]>([]);
   const [assetGroups, setAssetGroups] = useState<AssetGroup[]>([]);
   const [totalAssets, setTotalAssets] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -92,6 +99,7 @@ export default function App() {
       recurringRes,
       loansRes,
       assetsRes,
+      manualLoansRes,
     ] = await Promise.allSettled([
       getLinkedItems(),
       getTransactions(),
@@ -102,6 +110,7 @@ export default function App() {
       getRecurringStreams(),
       getLoans(),
       getAssetsSummary(),
+      getManualLoans(),
     ]);
 
     if (itemsRes.status === 'fulfilled') setItems(itemsRes.value.items);
@@ -123,6 +132,7 @@ export default function App() {
       setAssetGroups(assetsRes.value.groups);
       setTotalAssets(assetsRes.value.total_assets);
     }
+    if (manualLoansRes.status === 'fulfilled') setManualLoans(manualLoansRes.value.loans);
 
     const failures = [
       itemsRes,
@@ -134,6 +144,7 @@ export default function App() {
       recurringRes,
       loansRes,
       assetsRes,
+      manualLoansRes,
     ].filter((r): r is PromiseRejectedResult => r.status === 'rejected');
     if (failures.length > 0) {
       console.error('Some dashboard data failed to load:', failures.map((f) => f.reason));
@@ -299,6 +310,36 @@ export default function App() {
     }
   }
 
+  async function handleCreateManualLoan(input: ManualLoanInput) {
+    setActionError(null);
+    try {
+      const res = await createManualLoan(input);
+      setManualLoans((prev) => [...prev, res.loan]);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to add loan');
+    }
+  }
+
+  async function handleUpdateManualLoan(id: string, input: ManualLoanInput) {
+    setActionError(null);
+    try {
+      const res = await updateManualLoan(id, input);
+      setManualLoans((prev) => prev.map((l) => (l.id === id ? res.loan : l)));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update loan');
+    }
+  }
+
+  async function handleDeleteManualLoan(id: string) {
+    setActionError(null);
+    try {
+      await deleteManualLoan(id);
+      setManualLoans((prev) => prev.filter((l) => l.id !== id));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to delete loan');
+    }
+  }
+
   if (!session) {
     return <Auth />;
   }
@@ -348,7 +389,15 @@ export default function App() {
           )}
 
           {activeTab === 'loans' && (
-            <LoanProgress loans={loans} totalDebt={totalDebt} totalMinimumPayment={totalMinimumPayment} />
+            <LoanProgress
+              loans={loans}
+              manualLoans={manualLoans}
+              totalDebt={totalDebt}
+              totalMinimumPayment={totalMinimumPayment}
+              onCreateManualLoan={handleCreateManualLoan}
+              onUpdateManualLoan={handleUpdateManualLoan}
+              onDeleteManualLoan={handleDeleteManualLoan}
+            />
           )}
 
           {activeTab === 'income' && <IncomeSavings groups={assetGroups} totalAssets={totalAssets} />}

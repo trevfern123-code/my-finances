@@ -720,8 +720,61 @@ button:disabled {
 
 .loan-summary-badges {
   display: flex;
+  align-items: center;
   gap: 0.6rem;
   flex-wrap: wrap;
+}
+
+.loan-summary-badges button {
+  font-size: 0.8rem;
+  padding: 0.4rem 0.75rem;
+}
+
+.loan-notes {
+  margin-top: 0.6rem;
+  font-style: italic;
+}
+
+.loan-card-actions {
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.9rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.manual-loan-form {
+  margin-top: 1rem;
+  margin-bottom: 1rem;
+}
+
+.manual-loan-form h3 {
+  margin-bottom: 0.9rem;
+}
+
+.manual-loan-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.9rem;
+}
+
+.manual-loan-form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.manual-loan-form-notes {
+  grid-column: 1 / -1;
+}
+
+.manual-loan-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1.1rem;
 }
 
 .loan-cards {

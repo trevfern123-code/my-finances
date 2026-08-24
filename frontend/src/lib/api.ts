@@ -182,6 +182,53 @@ export function getLoans(): Promise<{
   return authedFetch('/api/plaid/loans');
 }
 
+export interface ManualLoan {
+  id: string;
+  name: string;
+  loan_type: 'personal' | 'student' | 'mortgage' | 'auto' | 'other';
+  current_balance: number;
+  origination_principal_amount: number | null;
+  interest_rate_percentage: number | null;
+  origination_date: string | null;
+  term_months: number | null;
+  minimum_payment_amount: number | null;
+  next_payment_due_date: string | null;
+  notes: string | null;
+  payoff_progress_pct: number | null;
+}
+
+export interface ManualLoanInput {
+  name: string;
+  loan_type: string;
+  current_balance: number;
+  origination_principal_amount: number | null;
+  interest_rate_percentage: number | null;
+  origination_date: string | null;
+  term_months: number | null;
+  minimum_payment_amount: number | null;
+  next_payment_due_date: string | null;
+  notes: string | null;
+}
+
+export function getManualLoans(): Promise<{ loans: ManualLoan[] }> {
+  return authedFetch('/api/manual-loans');
+}
+
+export function createManualLoan(input: ManualLoanInput): Promise<{ loan: ManualLoan }> {
+  return authedFetch('/api/manual-loans', { method: 'POST', body: JSON.stringify(input) });
+}
+
+export function updateManualLoan(
+  id: string,
+  input: Partial<ManualLoanInput>
+): Promise<{ loan: ManualLoan }> {
+  return authedFetch(`/api/manual-loans/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+}
+
+export function deleteManualLoan(id: string): Promise<void> {
+  return authedFetch(`/api/manual-loans/${id}`, { method: 'DELETE' });
+}
+
 export interface AssetAccountSummary {
   id: string;
   name: string;

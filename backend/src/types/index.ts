@@ -95,3 +95,18 @@ export interface LoanRow {
   last_payment_date: string | null;
   is_overdue: boolean | null;
 }
+
+export interface ManualLoanRow {
+  id: string;
+  user_id: string;
+  name: string;
+  loan_type: 'personal' | 'student' | 'mortgage' | 'auto' | 'other';
+  current_balance: number;
+  origination_principal_amount: number | null;
+  interest_rate_percentage: number | null;
+  origination_date: string | null;
+  term_months: number | null;
+  minimum_payment_amount: number | null;
+  next_payment_due_date: string | null;
+  notes: string | null;
+}

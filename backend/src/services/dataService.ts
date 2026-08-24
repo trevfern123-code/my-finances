@@ -3,6 +3,7 @@ import type {
   AccountRow,
   BudgetCategoryRow,
   LoanRow,
+  ManualLoanRow,
   PlaidItemRow,
   RecurringStreamRow,
   TransactionRow,
@@ -487,6 +488,92 @@ export async function getLoansForUser(userId: string): Promise<LoanWithAccount[]
     current_balance: accounts?.current_balance ?? null,
     iso_currency_code: accounts?.iso_currency_code ?? null,
   }));
+}
+
+// ---- Manual loans -----------------------------------------------------------------
+
+/** Loans the user enters by hand — for accounts Plaid's Liabilities product doesn't cover
+ *  (e.g. a personal loan from an online lender), directly user-owned rather than tied to a
+ *  Plaid item, same ownership pattern as budget_categories. */
+export async function listManualLoans(userId: string): Promise<ManualLoanRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('manual_loans')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true });
+
+  if (error) throw new Error(`Failed to load manual loans: ${error.message}`);
+  return data as ManualLoanRow[];
+}
+
+export async function createManualLoan(
+  userId: string,
+  params: {
+    name: string;
+    loanType: string;
+    currentBalance: number;
+    originationPrincipalAmount: number | null;
+    interestRatePercentage: number | null;
+    originationDate: string | null;
+    termMonths: number | null;
+    minimumPaymentAmount: number | null;
+    nextPaymentDueDate: string | null;
+    notes: string | null;
+  }
+): Promise<ManualLoanRow> {
+  const { data, error } = await supabaseAdmin
+    .from('manual_loans')
+    .insert({
+      user_id: userId,
+      name: params.name,
+      loan_type: params.loanType,
+      current_balance: params.currentBalance,
+      origination_principal_amount: params.originationPrincipalAmount,
+      interest_rate_percentage: params.interestRatePercentage,
+      origination_date: params.originationDate,
+      term_months: params.termMonths,
+      minimum_payment_amount: params.minimumPaymentAmount,
+      next_payment_due_date: params.nextPaymentDueDate,
+      notes: params.notes,
+    })
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to create manual loan: ${error.message}`);
+  return data as ManualLoanRow;
+}
+
+export async function updateManualLoan(
+  id: string,
+  userId: string,
+  fields: Partial<{
+    name: string;
+    loan_type: string;
+    current_balance: number;
+    origination_principal_amount: number | null;
+    interest_rate_percentage: number | null;
+    origination_date: string | null;
+    term_months: number | null;
+    minimum_payment_amount: number | null;
+    next_payment_due_date: string | null;
+    notes: string | null;
+  }>
+): Promise<ManualLoanRow | null> {
+  const { data, error } = await supabaseAdmin
+    .from('manual_loans')
+    .update({ ...fields, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('user_id', userId)
+    .select()
+    .maybeSingle();
+
+  if (error) throw new Error(`Failed to update manual loan: ${error.message}`);
+  return data as ManualLoanRow | null;
+}
+
+export async function deleteManualLoan(id: string, userId: string): Promise<void> {
+  const { error } = await supabaseAdmin.from('manual_loans').delete().eq('id', id).eq('user_id', userId);
+  if (error) throw new Error(`Failed to delete manual loan: ${error.message}`);
 }
 
 // ---- Budget categories ---------------------------------------------------------

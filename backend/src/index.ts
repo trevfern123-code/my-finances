@@ -5,6 +5,7 @@ import morgan from 'morgan';
 import { env } from './config/env';
 import { plaidRouter } from './routes/plaid';
 import { budgetCategoriesRouter } from './routes/budgetCategories';
+import { manualLoansRouter } from './routes/manualLoans';
 import { webhooksRouter } from './routes/webhooks';
 import { errorHandler } from './middleware/errorHandler';
 
@@ -49,6 +50,7 @@ app.get('/health', (_req, res) => {
 
 app.use('/api/plaid', plaidRouter);
 app.use('/api/budget-categories', budgetCategoriesRouter);
+app.use('/api/manual-loans', manualLoansRouter);
 app.use('/api/webhooks', webhooksRouter);
 
 app.use(errorHandler);
