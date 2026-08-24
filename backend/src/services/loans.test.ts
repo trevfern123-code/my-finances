@@ -9,9 +9,24 @@ const mockGetLiabilities = vi.hoisted(() => vi.fn());
 vi.mock('./plaidService', () => ({ getLiabilities: mockGetLiabilities }));
 
 const mockUpsertLoans = vi.hoisted(() => vi.fn());
-vi.mock('./dataService', () => ({ upsertLoans: mockUpsertLoans }));
+const mockListManualLoans = vi.hoisted(() => vi.fn());
+const mockLinkTransactionToLoan = vi.hoisted(() => vi.fn());
+const mockGetUnlinkedOutflowTransactionsForUser = vi.hoisted(() => vi.fn());
+vi.mock('./dataService', () => ({
+  upsertLoans: mockUpsertLoans,
+  listManualLoans: mockListManualLoans,
+  linkTransactionToLoan: mockLinkTransactionToLoan,
+  getUnlinkedOutflowTransactionsForUser: mockGetUnlinkedOutflowTransactionsForUser,
+}));
 
-import { computePayoffProgressPct, normalizeLiabilities, refreshLoansForItem } from './loans';
+import {
+  backfillMatchesForLoan,
+  computePayoffProgressPct,
+  linkNewTransactionsToManualLoans,
+  matchTransactionToLoan,
+  normalizeLiabilities,
+  refreshLoansForItem,
+} from './loans';
 
 // These fixtures intentionally only fill in the fields normalizeLiabilities actually reads —
 // Plaid's real interfaces have many more optional/required fields we don't touch, so casting
@@ -185,5 +200,120 @@ describe('refreshLoansForItem', () => {
 
     await expect(refreshLoansForItem('item-row-1', 'access-token-1', new Map())).resolves.toBeUndefined();
     expect(mockUpsertLoans).not.toHaveBeenCalled();
+  });
+});
+
+describe('matchTransactionToLoan', () => {
+  const sofiLoan = { id: 'loan-1', match_text: 'SoFi' };
+
+  it('matches a transaction whose name contains the match text, case-insensitively', () => {
+    const txn = { name: 'SOFI PAYMENT', merchant_name: null, amount: 250 };
+    expect(matchTransactionToLoan(txn, [sofiLoan])).toBe('loan-1');
+  });
+
+  it('matches against merchant_name too', () => {
+    const txn = { name: 'Online Payment', merchant_name: 'SoFi', amount: 250 };
+    expect(matchTransactionToLoan(txn, [sofiLoan])).toBe('loan-1');
+  });
+
+  it('returns null when nothing matches', () => {
+    const txn = { name: 'Coffee Shop', merchant_name: null, amount: 5 };
+    expect(matchTransactionToLoan(txn, [sofiLoan])).toBeNull();
+  });
+
+  it('ignores inflow (non-positive amount) transactions even if the name matches', () => {
+    const txn = { name: 'SoFi Refund', merchant_name: null, amount: -250 };
+    expect(matchTransactionToLoan(txn, [sofiLoan])).toBeNull();
+  });
+
+  it('ignores loans with an empty match_text', () => {
+    const txn = { name: 'SoFi Payment', merchant_name: null, amount: 250 };
+    expect(matchTransactionToLoan(txn, [{ id: 'loan-1', match_text: '  ' }])).toBeNull();
+  });
+
+  it('returns the first matching loan when more than one matches', () => {
+    const txn = { name: 'SoFi Payment', merchant_name: null, amount: 250 };
+    const loans = [sofiLoan, { id: 'loan-2', match_text: 'Payment' }];
+    expect(matchTransactionToLoan(txn, loans)).toBe('loan-1');
+  });
+});
+
+describe('linkNewTransactionsToManualLoans', () => {
+  beforeEach(() => {
+    mockListManualLoans.mockReset();
+    mockLinkTransactionToLoan.mockReset();
+  });
+
+  it('links matching inserted transactions to the matching loan', async () => {
+    mockListManualLoans.mockResolvedValue([
+      { id: 'loan-1', match_text: 'SoFi' },
+      { id: 'loan-2', match_text: null },
+    ]);
+    const inserted = [
+      { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+      { id: 'txn-2', name: 'Coffee Shop', merchant_name: null, amount: 5 },
+    ];
+
+    await linkNewTransactionsToManualLoans('user-1', inserted);
+
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('txn-1', 'loan-1', 250);
+  });
+
+  it('does nothing when there are no inserted transactions', async () => {
+    await linkNewTransactionsToManualLoans('user-1', []);
+    expect(mockListManualLoans).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when no loans have a match_text set', async () => {
+    mockListManualLoans.mockResolvedValue([{ id: 'loan-1', match_text: null }]);
+
+    await linkNewTransactionsToManualLoans('user-1', [
+      { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+    ]);
+
+    expect(mockLinkTransactionToLoan).not.toHaveBeenCalled();
+  });
+
+  it('swallows a failure rather than throwing (best-effort, piggybacking on a sync)', async () => {
+    mockListManualLoans.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      linkNewTransactionsToManualLoans('user-1', [
+        { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+      ])
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe('backfillMatchesForLoan', () => {
+  beforeEach(() => {
+    mockGetUnlinkedOutflowTransactionsForUser.mockReset();
+    mockLinkTransactionToLoan.mockReset();
+  });
+
+  it('links unlinked transactions matching the loan match_text', async () => {
+    mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([
+      { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+      { id: 'txn-2', name: 'Coffee Shop', merchant_name: null, amount: 5 },
+    ]);
+
+    await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' });
+
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('txn-1', 'loan-1', 250);
+  });
+
+  it('does nothing when the loan has no match_text', async () => {
+    await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: null });
+    expect(mockGetUnlinkedOutflowTransactionsForUser).not.toHaveBeenCalled();
+  });
+
+  it('swallows a failure rather than throwing', async () => {
+    mockGetUnlinkedOutflowTransactionsForUser.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' })
+    ).resolves.toBeUndefined();
   });
 });

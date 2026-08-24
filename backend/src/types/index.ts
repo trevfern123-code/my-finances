@@ -15,6 +15,14 @@ export interface PlaidItemRow {
   status: string;
 }
 
+/** A transaction row as returned right after insert — just enough to run loan-payment matching against. */
+export interface InsertedTransaction {
+  id: string;
+  name: string;
+  merchant_name: string | null;
+  amount: number;
+}
+
 export interface AccountRow {
   id: string;
   item_id: string;
@@ -42,6 +50,10 @@ export interface TransactionRow {
   plaid_category: string | null;
   pending: boolean;
   budget_category_id: string | null;
+  manual_loan_id: string | null;
+  /** How much of this transaction's amount reduces the linked loan's principal — editable, since
+   *  a payment on an interest-bearing loan doesn't reduce balance by the full payment amount. */
+  principal_portion: number | null;
 }
 
 export interface BudgetCategoryRow {
@@ -109,4 +121,7 @@ export interface ManualLoanRow {
   minimum_payment_amount: number | null;
   next_payment_due_date: string | null;
   notes: string | null;
+  /** Case-insensitive substring matched against a transaction's name/merchant — matching
+   *  outflow transactions auto-link to this loan and decrement its balance. Null disables matching. */
+  match_text: string | null;
 }

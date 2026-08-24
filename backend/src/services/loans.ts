@@ -1,6 +1,7 @@
 import type { CreditCardLiability, MortgageLiability, StudentLoan } from 'plaid';
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
+import type { InsertedTransaction } from '../types';
 
 export type LoanType = 'student' | 'mortgage' | 'credit';
 
@@ -97,6 +98,81 @@ export function computePayoffProgressPct(
   if (originalAmount === null || originalAmount <= 0 || currentBalance === null) return null;
   const paidOff = originalAmount - currentBalance;
   return Math.max(0, Math.min(100, (paidOff / originalAmount) * 100));
+}
+
+export interface LoanMatcher {
+  id: string;
+  match_text: string;
+}
+
+/**
+ * Picks which manual loan (if any) a transaction's payment should auto-link to, by a
+ * case-insensitive substring match of the loan's match_text against the transaction's name or
+ * merchant name. Only outflow transactions can be loan payments — Plaid's convention is a
+ * positive amount for money leaving the account. First matching loan wins if more than one
+ * loan's match_text happens to match the same transaction.
+ */
+export function matchTransactionToLoan(
+  transaction: { name: string; merchant_name: string | null; amount: number },
+  loans: LoanMatcher[]
+): string | null {
+  if (transaction.amount <= 0) return null;
+  const haystack = `${transaction.name} ${transaction.merchant_name ?? ''}`.toLowerCase();
+  const match = loans.find((l) => l.match_text.trim() !== '' && haystack.includes(l.match_text.toLowerCase()));
+  return match?.id ?? null;
+}
+
+/**
+ * Best-effort by design (wrapped internally, not just by callers) — runs after every
+ * transaction sync so newly-synced payments auto-link to the user's manual loans, but a failure
+ * here shouldn't fail the sync it's piggybacking on.
+ */
+export async function linkNewTransactionsToManualLoans(
+  userId: string,
+  insertedTransactions: InsertedTransaction[]
+): Promise<void> {
+  if (insertedTransactions.length === 0) return;
+
+  try {
+    const loans = await dataService.listManualLoans(userId);
+    const matchers = loans
+      .filter((l): l is typeof l & { match_text: string } => !!l.match_text)
+      .map((l) => ({ id: l.id, match_text: l.match_text }));
+    if (matchers.length === 0) return;
+
+    for (const txn of insertedTransactions) {
+      const loanId = matchTransactionToLoan(txn, matchers);
+      if (loanId) {
+        await dataService.linkTransactionToLoan(txn.id, loanId, txn.amount);
+      }
+    }
+  } catch (err) {
+    console.error(`Failed to auto-link transactions to manual loans for user ${userId}:`, err);
+  }
+}
+
+/**
+ * Scans a user's not-yet-linked outflow transactions for matches against one loan's match_text
+ * — run after creating/updating a manual loan so setting or changing match_text picks up
+ * payments that were already synced before the match rule existed, not just future ones.
+ */
+export async function backfillMatchesForLoan(
+  userId: string,
+  loan: { id: string; match_text: string | null }
+): Promise<void> {
+  if (!loan.match_text) return;
+
+  try {
+    const candidates = await dataService.getUnlinkedOutflowTransactionsForUser(userId);
+    const matcher = { id: loan.id, match_text: loan.match_text };
+    for (const txn of candidates) {
+      if (matchTransactionToLoan(txn, [matcher])) {
+        await dataService.linkTransactionToLoan(txn.id, loan.id, txn.amount);
+      }
+    }
+  } catch (err) {
+    console.error(`Failed to backfill matches for manual loan ${loan.id}:`, err);
+  }
 }
 
 /**

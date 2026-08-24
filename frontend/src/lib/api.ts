@@ -194,6 +194,9 @@ export interface ManualLoan {
   minimum_payment_amount: number | null;
   next_payment_due_date: string | null;
   notes: string | null;
+  /** Case-insensitive substring matched against synced transactions' name/merchant — matches
+   *  auto-link and decrement this loan's balance. Null disables auto-linking. */
+  match_text: string | null;
   payoff_progress_pct: number | null;
 }
 
@@ -208,6 +211,7 @@ export interface ManualLoanInput {
   minimum_payment_amount: number | null;
   next_payment_due_date: string | null;
   notes: string | null;
+  match_text: string | null;
 }
 
 export function getManualLoans(): Promise<{ loans: ManualLoan[] }> {
@@ -227,6 +231,34 @@ export function updateManualLoan(
 
 export function deleteManualLoan(id: string): Promise<void> {
   return authedFetch(`/api/manual-loans/${id}`, { method: 'DELETE' });
+}
+
+export interface LinkedLoanPayment {
+  id: string;
+  date: string;
+  name: string;
+  merchant_name: string | null;
+  amount: number;
+  principal_portion: number | null;
+}
+
+export function getLinkedLoanPayments(loanId: string): Promise<{ payments: LinkedLoanPayment[] }> {
+  return authedFetch(`/api/manual-loans/${loanId}/payments`);
+}
+
+export function updateLinkedLoanPayment(
+  loanId: string,
+  transactionId: string,
+  principalPortion: number
+): Promise<{ loan: ManualLoan }> {
+  return authedFetch(`/api/manual-loans/${loanId}/payments/${transactionId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ principal_portion: principalPortion }),
+  });
+}
+
+export function unlinkLoanPayment(loanId: string, transactionId: string): Promise<{ loan: ManualLoan }> {
+  return authedFetch(`/api/manual-loans/${loanId}/payments/${transactionId}`, { method: 'DELETE' });
 }
 
 export interface AssetAccountSummary {

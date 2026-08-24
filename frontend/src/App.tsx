@@ -9,6 +9,7 @@ import {
   getAssetsSummary,
   getBudgetCategories,
   getLinkedItems,
+  getLinkedLoanPayments,
   getLoans,
   getManualLoans,
   getMonthlyBreakdown,
@@ -18,11 +19,14 @@ import {
   getTransactions,
   setTransactionCategory,
   syncTransactions as syncTransactionsRequest,
+  unlinkLoanPayment,
   updateBudgetCategory,
+  updateLinkedLoanPayment,
   updateManualLoan,
   type AssetGroup,
   type BudgetCategory,
   type LinkedItem,
+  type LinkedLoanPayment,
   type Loan,
   type ManualLoan,
   type ManualLoanInput,
@@ -340,6 +344,33 @@ export default function App() {
     }
   }
 
+  async function handleFetchLinkedPayments(loanId: string): Promise<LinkedLoanPayment[]> {
+    const res = await getLinkedLoanPayments(loanId);
+    return res.payments;
+  }
+
+  async function handleUpdateLinkedPayment(loanId: string, transactionId: string, principalPortion: number) {
+    setActionError(null);
+    try {
+      const res = await updateLinkedLoanPayment(loanId, transactionId, principalPortion);
+      setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update payment');
+      throw err;
+    }
+  }
+
+  async function handleUnlinkPayment(loanId: string, transactionId: string) {
+    setActionError(null);
+    try {
+      const res = await unlinkLoanPayment(loanId, transactionId);
+      setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to unlink payment');
+      throw err;
+    }
+  }
+
   if (!session) {
     return <Auth />;
   }
@@ -397,6 +428,9 @@ export default function App() {
               onCreateManualLoan={handleCreateManualLoan}
               onUpdateManualLoan={handleUpdateManualLoan}
               onDeleteManualLoan={handleDeleteManualLoan}
+              onFetchLinkedPayments={handleFetchLinkedPayments}
+              onUpdateLinkedPayment={handleUpdateLinkedPayment}
+              onUnlinkPayment={handleUnlinkPayment}
             />
           )}
 

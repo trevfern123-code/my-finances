@@ -1,6 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
-import { computePayoffProgressPct } from '../services/loans';
+import { backfillMatchesForLoan, computePayoffProgressPct } from '../services/loans';
 import type { ManualLoanRow } from '../types';
 
 // Computed fresh on every response (list, create, update) rather than stored — cheap, and
@@ -33,10 +33,12 @@ interface ManualLoanBody {
   minimum_payment_amount?: number | null;
   next_payment_due_date?: string | null;
   notes?: string | null;
+  match_text?: string | null;
 }
 
 export async function createManualLoan(req: Request, res: Response, next: NextFunction) {
   try {
+    const userId = req.user!.id;
     const body = req.body as ManualLoanBody;
 
     if (!body.name || typeof body.current_balance !== 'number') {
@@ -44,7 +46,7 @@ export async function createManualLoan(req: Request, res: Response, next: NextFu
       return;
     }
 
-    const loan = await dataService.createManualLoan(req.user!.id, {
+    const loan = await dataService.createManualLoan(userId, {
       name: body.name,
       loanType: body.loan_type ?? 'personal',
       currentBalance: body.current_balance,
@@ -55,9 +57,15 @@ export async function createManualLoan(req: Request, res: Response, next: NextFu
       minimumPaymentAmount: body.minimum_payment_amount ?? null,
       nextPaymentDueDate: body.next_payment_due_date ?? null,
       notes: body.notes ?? null,
+      matchText: body.match_text ?? null,
     });
 
-    res.status(201).json({ loan: withPayoffProgress(loan) });
+    // Best-effort (wrapped internally) — picks up already-synced payments that predate this
+    // loan's match_text, so response can just await it rather than racing a background call.
+    await backfillMatchesForLoan(userId, loan);
+    const refreshed = (await dataService.getManualLoan(loan.id, userId)) ?? loan;
+
+    res.status(201).json({ loan: withPayoffProgress(refreshed) });
   } catch (err) {
     next(err);
   }
@@ -65,6 +73,7 @@ export async function createManualLoan(req: Request, res: Response, next: NextFu
 
 export async function updateManualLoan(req: Request, res: Response, next: NextFunction) {
   try {
+    const userId = req.user!.id;
     const { id } = req.params;
     const body = req.body as ManualLoanBody;
 
@@ -83,11 +92,19 @@ export async function updateManualLoan(req: Request, res: Response, next: NextFu
     if (body.minimum_payment_amount !== undefined) fields.minimum_payment_amount = body.minimum_payment_amount;
     if (body.next_payment_due_date !== undefined) fields.next_payment_due_date = body.next_payment_due_date;
     if (body.notes !== undefined) fields.notes = body.notes;
+    if (body.match_text !== undefined) fields.match_text = body.match_text;
 
-    const loan = await dataService.updateManualLoan(id, req.user!.id, fields);
+    let loan = await dataService.updateManualLoan(id, userId, fields);
     if (!loan) {
       res.status(404).json({ error: 'Manual loan not found' });
       return;
+    }
+
+    if (body.match_text !== undefined) {
+      // Best-effort (wrapped internally) — picks up already-synced payments that predate this
+      // match_text value, so response can just await it rather than racing a background call.
+      await backfillMatchesForLoan(userId, loan);
+      loan = (await dataService.getManualLoan(id, userId)) ?? loan;
     }
 
     res.json({ loan: withPayoffProgress(loan) });
@@ -101,6 +118,61 @@ export async function deleteManualLoan(req: Request, res: Response, next: NextFu
     const { id } = req.params;
     await dataService.deleteManualLoan(id, req.user!.id);
     res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function listLinkedPayments(req: Request, res: Response, next: NextFunction) {
+  try {
+    const loan = await dataService.getManualLoan(req.params.id, req.user!.id);
+    if (!loan) {
+      res.status(404).json({ error: 'Manual loan not found' });
+      return;
+    }
+
+    const payments = await dataService.getLinkedPaymentsForLoan(loan.id);
+    res.json({ payments });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateLinkedPayment(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const loan = await dataService.getManualLoan(req.params.id, userId);
+    if (!loan) {
+      res.status(404).json({ error: 'Manual loan not found' });
+      return;
+    }
+
+    const { principal_portion: principalPortion } = req.body as { principal_portion?: number };
+    if (typeof principalPortion !== 'number') {
+      res.status(400).json({ error: 'principal_portion is required' });
+      return;
+    }
+
+    await dataService.updateLinkedPaymentPrincipal(req.params.transactionId, loan.id, principalPortion);
+    const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
+    res.json({ loan: withPayoffProgress(updatedLoan) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function unlinkPayment(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const loan = await dataService.getManualLoan(req.params.id, userId);
+    if (!loan) {
+      res.status(404).json({ error: 'Manual loan not found' });
+      return;
+    }
+
+    await dataService.unlinkPaymentFromLoan(req.params.transactionId, loan.id);
+    const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
+    res.json({ loan: withPayoffProgress(updatedLoan) });
   } catch (err) {
     next(err);
   }

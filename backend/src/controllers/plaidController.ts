@@ -182,6 +182,7 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
     // webhook (or a manual sync) delivers the next update.
     const { added } = await syncService.syncItemTransactions({
       id: itemRow.id,
+      user_id: userId,
       access_token: accessToken,
       transactions_cursor: null,
     });

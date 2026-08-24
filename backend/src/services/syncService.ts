@@ -1,5 +1,6 @@
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
+import * as loansService from './loans';
 
 /**
  * Syncs one Plaid item's transactions and advances its cursor. Shared by the authenticated
@@ -7,6 +8,7 @@ import * as dataService from './dataService';
  */
 export async function syncItemTransactions(item: {
   id: string;
+  user_id: string;
   access_token: string;
   transactions_cursor: string | null;
 }) {
@@ -16,9 +18,18 @@ export async function syncItemTransactions(item: {
   );
 
   const accountIdByPlaidId = await dataService.getAccountIdMapForItem(item.id);
-  await dataService.applyTransactionChanges({ added, modified, removed, accountIdByPlaidId });
+  const insertedTransactions = await dataService.applyTransactionChanges({
+    added,
+    modified,
+    removed,
+    accountIdByPlaidId,
+  });
   await dataService.updateItemCursor(item.id, cursor);
   await dataService.setItemStatus(item.id, 'active');
+
+  // Best-effort (wrapped internally by linkNewTransactionsToManualLoans) — auto-linking loan
+  // payments shouldn't fail the sync that triggered it.
+  await loansService.linkNewTransactionsToManualLoans(item.user_id, insertedTransactions);
 
   // Best-effort: recurring-stream detection is a separate Plaid call and a nice-to-have, not
   // core to syncing transactions — a failure here shouldn't fail the sync that triggered it.

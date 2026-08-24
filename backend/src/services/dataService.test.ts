@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AccountBase, RemovedTransaction, Transaction as PlaidTransaction } from 'plaid';
 import { createQueryBuilder } from '../testUtils/supabaseMock';
-import { upsertAccountsForItem, applyTransactionChanges } from './dataService';
+import {
+  upsertAccountsForItem,
+  applyTransactionChanges,
+  linkTransactionToLoan,
+  updateLinkedPaymentPrincipal,
+  unlinkPaymentFromLoan,
+} from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
 vi.mock('../config/supabase', () => ({ supabaseAdmin: { from: mockFrom } }));
@@ -101,12 +107,13 @@ describe('applyTransactionChanges', () => {
 
   const fakeRemoved: RemovedTransaction = { transaction_id: 'txn-removed' } as RemovedTransaction;
 
-  it('inserts added transactions that map to a known account', async () => {
+  it('inserts added transactions that map to a known account, and returns the inserted rows', async () => {
     const existingQuery = createQueryBuilder({ data: [], error: null });
-    const insertQuery = createQueryBuilder({ data: null, error: null });
+    const insertedRow = { id: 'txn-row-new', name: 'Coffee Shop', merchant_name: 'Coffee Shop', amount: 12.5 };
+    const insertQuery = createQueryBuilder({ data: [insertedRow], error: null });
     mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(insertQuery);
 
-    await applyTransactionChanges({
+    const result = await applyTransactionChanges({
       added: [fakeTransaction()],
       modified: [],
       removed: [],
@@ -121,12 +128,13 @@ describe('applyTransactionChanges', () => {
       category: 'FOOD_AND_DRINK',
       plaid_category: 'Food and Drink > Coffee',
     });
+    expect(result).toEqual([insertedRow]);
   });
 
   it('silently skips a transaction whose account is not in our accountIdByPlaidId map', async () => {
     // No known local account for this transaction (e.g. account not yet synced) — should be
     // dropped rather than inserted with a broken account_id.
-    await applyTransactionChanges({
+    const result = await applyTransactionChanges({
       added: [fakeTransaction({ account_id: 'unknown-plaid-account' })],
       modified: [],
       removed: [],
@@ -134,6 +142,7 @@ describe('applyTransactionChanges', () => {
     });
 
     expect(mockFrom).not.toHaveBeenCalled();
+    expect(result).toEqual([]);
   });
 
   it('updates (not inserts) a transaction whose plaid_transaction_id already exists', async () => {
@@ -175,5 +184,89 @@ describe('applyTransactionChanges', () => {
   it('does nothing when there are no changes at all', async () => {
     await applyTransactionChanges({ added: [], modified: [], removed: [], accountIdByPlaidId });
     expect(mockFrom).not.toHaveBeenCalled();
+  });
+});
+
+describe('linkTransactionToLoan', () => {
+  it('links the transaction and decrements the loan balance by the principal portion', async () => {
+    const linkQuery = createQueryBuilder({ data: null, error: null });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(linkQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+
+    await linkTransactionToLoan('txn-1', 'loan-1', 200);
+
+    expect(linkQuery.update).toHaveBeenCalledWith({ manual_loan_id: 'loan-1', principal_portion: 200 });
+    expect(linkQuery.eq).toHaveBeenCalledWith('id', 'txn-1');
+    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 800 });
+    expect(updateBalanceQuery.eq).toHaveBeenCalledWith('id', 'loan-1');
+  });
+
+  it('clamps the new balance at 0 rather than going negative', async () => {
+    const linkQuery = createQueryBuilder({ data: null, error: null });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 150 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(linkQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+
+    await linkTransactionToLoan('txn-1', 'loan-1', 200);
+
+    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 0 });
+  });
+});
+
+describe('updateLinkedPaymentPrincipal', () => {
+  it('updates the principal portion and adjusts the loan balance by the difference', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { principal_portion: 100, manual_loan_id: 'loan-1' },
+      error: null,
+    });
+    const updateTxnQuery = createQueryBuilder({ data: null, error: null });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 900 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom
+      .mockReturnValueOnce(fetchQuery)
+      .mockReturnValueOnce(updateTxnQuery)
+      .mockReturnValueOnce(balanceQuery)
+      .mockReturnValueOnce(updateBalanceQuery);
+
+    await updateLinkedPaymentPrincipal('txn-1', 'loan-1', 150);
+
+    expect(updateTxnQuery.update).toHaveBeenCalledWith({ principal_portion: 150 });
+    // Old portion (100) applied 100 to balance; new portion (150) should apply 50 more.
+    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 850 });
+  });
+
+  it('throws when the transaction is not linked to the given loan', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { principal_portion: 100, manual_loan_id: 'some-other-loan' },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    await expect(updateLinkedPaymentPrincipal('txn-1', 'loan-1', 150)).rejects.toThrow(
+      'Payment is not linked to this loan'
+    );
+  });
+});
+
+describe('unlinkPaymentFromLoan', () => {
+  it('clears the link and restores the loan balance by the payment principal portion', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { principal_portion: 200, manual_loan_id: 'loan-1' },
+      error: null,
+    });
+    const updateTxnQuery = createQueryBuilder({ data: null, error: null });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 800 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom
+      .mockReturnValueOnce(fetchQuery)
+      .mockReturnValueOnce(updateTxnQuery)
+      .mockReturnValueOnce(balanceQuery)
+      .mockReturnValueOnce(updateBalanceQuery);
+
+    await unlinkPaymentFromLoan('txn-1', 'loan-1');
+
+    expect(updateTxnQuery.update).toHaveBeenCalledWith({ manual_loan_id: null, principal_portion: null });
+    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 1000 });
   });
 });

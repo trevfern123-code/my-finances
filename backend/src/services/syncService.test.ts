@@ -21,12 +21,23 @@ vi.mock('./dataService', () => ({
   upsertRecurringStreams: mockUpsertRecurringStreams,
 }));
 
-const item = { id: 'item-row-1', access_token: 'access-token-1', transactions_cursor: 'old-cursor' };
+const mockLinkNewTransactionsToManualLoans = vi.hoisted(() => vi.fn());
+vi.mock('./loans', () => ({
+  linkNewTransactionsToManualLoans: mockLinkNewTransactionsToManualLoans,
+}));
+
+const item = {
+  id: 'item-row-1',
+  user_id: 'user-1',
+  access_token: 'access-token-1',
+  transactions_cursor: 'old-cursor',
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
   mockGetAccountIdMapForItem.mockResolvedValue(new Map([['plaid-acc-1', 'account-row-1']]));
   mockSyncTransactions.mockResolvedValue({ added: [], modified: [], removed: [], cursor: 'new-cursor' });
+  mockApplyTransactionChanges.mockResolvedValue([]);
   mockGetRecurringStreams.mockResolvedValue({ inflowStreams: [], outflowStreams: [] });
 });
 
@@ -106,5 +117,14 @@ describe('syncItemTransactions', () => {
 
     expect(result).toEqual({ added: 0, modified: 0, removed: 0 });
     expect(mockSetItemStatus).toHaveBeenCalledWith('item-row-1', 'active');
+  });
+
+  it('links newly-inserted transactions to the user\'s manual loans', async () => {
+    const insertedTransactions = [{ id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 }];
+    mockApplyTransactionChanges.mockResolvedValue(insertedTransactions);
+
+    await syncItemTransactions(item);
+
+    expect(mockLinkNewTransactionsToManualLoans).toHaveBeenCalledWith('user-1', insertedTransactions);
   });
 });

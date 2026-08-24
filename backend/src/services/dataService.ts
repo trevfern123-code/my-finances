@@ -2,6 +2,7 @@ import { supabaseAdmin } from '../config/supabase';
 import type {
   AccountRow,
   BudgetCategoryRow,
+  InsertedTransaction,
   LoanRow,
   ManualLoanRow,
   PlaidItemRow,
@@ -43,10 +44,10 @@ export async function insertPlaidItem(params: {
 
 export async function getPlaidItemsForUser(
   userId: string
-): Promise<Pick<PlaidItemRow, 'id' | 'access_token' | 'transactions_cursor'>[]> {
+): Promise<Pick<PlaidItemRow, 'id' | 'user_id' | 'access_token' | 'transactions_cursor'>[]> {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
-    .select('id, access_token, transactions_cursor')
+    .select('id, user_id, access_token, transactions_cursor')
     .eq('user_id', userId);
 
   if (error) throw new Error(`Failed to load Plaid items: ${error.message}`);
@@ -70,10 +71,10 @@ export async function setItemStatus(itemRowId: string, status: 'active' | 'login
 /** Looks up an item by Plaid's own item_id, which is what webhook payloads identify items by. */
 export async function getPlaidItemByPlaidItemId(
   plaidItemId: string
-): Promise<Pick<PlaidItemRow, 'id' | 'access_token' | 'transactions_cursor'> | null> {
+): Promise<Pick<PlaidItemRow, 'id' | 'user_id' | 'access_token' | 'transactions_cursor'> | null> {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
-    .select('id, access_token, transactions_cursor')
+    .select('id, user_id, access_token, transactions_cursor')
     .eq('plaid_item_id', plaidItemId)
     .maybeSingle();
 
@@ -250,19 +251,23 @@ function mapPlaidTransaction(transaction: PlaidTransaction, accountId: string) {
  * Applies a batch of Plaid transaction changes (added/modified/removed) against
  * our `transactions` table. `accountIdByPlaidId` maps a Plaid account_id to our
  * accounts.id — transactions we can't match to a known account are skipped.
+ * Returns the newly-inserted rows (id/name/merchant_name/amount only) so the caller
+ * can run loan-payment matching against them without a second round-trip.
  */
 export async function applyTransactionChanges(params: {
   added: PlaidTransaction[];
   modified: PlaidTransaction[];
   removed: RemovedTransaction[];
   accountIdByPlaidId: Map<string, string>;
-}) {
+}): Promise<InsertedTransaction[]> {
   const upsertCandidates = [...params.added, ...params.modified]
     .map((t) => {
       const accountId = params.accountIdByPlaidId.get(t.account_id);
       return accountId ? mapPlaidTransaction(t, accountId) : null;
     })
     .filter((t): t is NonNullable<typeof t> => t !== null);
+
+  let insertedRows: InsertedTransaction[] = [];
 
   if (upsertCandidates.length > 0) {
     const plaidIds = upsertCandidates.map((t) => t.plaid_transaction_id);
@@ -281,8 +286,12 @@ export async function applyTransactionChanges(params: {
     const toUpdate = upsertCandidates.filter((t) => existingByPlaidId.has(t.plaid_transaction_id));
 
     if (toInsert.length > 0) {
-      const { error } = await supabaseAdmin.from('transactions').insert(toInsert);
+      const { data, error } = await supabaseAdmin
+        .from('transactions')
+        .insert(toInsert)
+        .select('id, name, merchant_name, amount');
       if (error) throw new Error(`Failed to insert transactions: ${error.message}`);
+      insertedRows = (data ?? []) as InsertedTransaction[];
     }
 
     for (const row of toUpdate) {
@@ -302,6 +311,8 @@ export async function applyTransactionChanges(params: {
 
     if (error) throw new Error(`Failed to delete removed transactions: ${error.message}`);
   }
+
+  return insertedRows;
 }
 
 export async function getRecentTransactionsForUser(userId: string, limit: number) {
@@ -379,6 +390,23 @@ export async function setTransactionCategory(
 
   if (error) throw new Error(`Failed to set transaction category: ${error.message}`);
   return data as TransactionRow;
+}
+
+/** Outflow (positive-amount) transactions not yet linked to a manual loan — the candidate pool
+ *  for backfilling matches when a loan's match_text is set or changed after transactions already
+ *  exist (auto-linking during sync only sees newly-added transactions, not history). */
+export async function getUnlinkedOutflowTransactionsForUser(
+  userId: string
+): Promise<InsertedTransaction[]> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select('id, name, merchant_name, amount, accounts!inner(plaid_items!inner(user_id))')
+    .eq('accounts.plaid_items.user_id', userId)
+    .is('manual_loan_id', null)
+    .gt('amount', 0);
+
+  if (error) throw new Error(`Failed to load unlinked transactions: ${error.message}`);
+  return data as unknown as InsertedTransaction[];
 }
 
 // ---- Recurring streams ---------------------------------------------------------
@@ -519,6 +547,7 @@ export async function createManualLoan(
     minimumPaymentAmount: number | null;
     nextPaymentDueDate: string | null;
     notes: string | null;
+    matchText: string | null;
   }
 ): Promise<ManualLoanRow> {
   const { data, error } = await supabaseAdmin
@@ -535,6 +564,7 @@ export async function createManualLoan(
       minimum_payment_amount: params.minimumPaymentAmount,
       next_payment_due_date: params.nextPaymentDueDate,
       notes: params.notes,
+      match_text: params.matchText,
     })
     .select()
     .single();
@@ -557,6 +587,7 @@ export async function updateManualLoan(
     minimum_payment_amount: number | null;
     next_payment_due_date: string | null;
     notes: string | null;
+    match_text: string | null;
   }>
 ): Promise<ManualLoanRow | null> {
   const { data, error } = await supabaseAdmin
@@ -574,6 +605,115 @@ export async function updateManualLoan(
 export async function deleteManualLoan(id: string, userId: string): Promise<void> {
   const { error } = await supabaseAdmin.from('manual_loans').delete().eq('id', id).eq('user_id', userId);
   if (error) throw new Error(`Failed to delete manual loan: ${error.message}`);
+}
+
+export async function getManualLoan(id: string, userId: string): Promise<ManualLoanRow | null> {
+  const { data, error } = await supabaseAdmin
+    .from('manual_loans')
+    .select('*')
+    .eq('id', id)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error) throw new Error(`Failed to load manual loan: ${error.message}`);
+  return data as ManualLoanRow | null;
+}
+
+async function adjustManualLoanBalance(loanId: string, delta: number): Promise<void> {
+  const { data: loan, error: fetchError } = await supabaseAdmin
+    .from('manual_loans')
+    .select('current_balance')
+    .eq('id', loanId)
+    .single();
+
+  if (fetchError) throw new Error(`Failed to load manual loan balance: ${fetchError.message}`);
+
+  const newBalance = Math.max(0, (loan.current_balance as number) + delta);
+  const { error: updateError } = await supabaseAdmin
+    .from('manual_loans')
+    .update({ current_balance: newBalance, updated_at: new Date().toISOString() })
+    .eq('id', loanId);
+
+  if (updateError) throw new Error(`Failed to update manual loan balance: ${updateError.message}`);
+}
+
+/** Links a transaction to a manual loan and decrements the loan's balance by principalPortion
+ *  (the part of the payment that reduces principal, as opposed to interest). */
+export async function linkTransactionToLoan(
+  transactionId: string,
+  loanId: string,
+  principalPortion: number
+): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from('transactions')
+    .update({ manual_loan_id: loanId, principal_portion: principalPortion })
+    .eq('id', transactionId);
+
+  if (error) throw new Error(`Failed to link transaction to loan: ${error.message}`);
+  await adjustManualLoanBalance(loanId, -principalPortion);
+}
+
+export async function getLinkedPaymentsForLoan(
+  loanId: string
+): Promise<{ id: string; date: string; name: string; merchant_name: string | null; amount: number; principal_portion: number | null }[]> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select('id, date, name, merchant_name, amount, principal_portion')
+    .eq('manual_loan_id', loanId)
+    .order('date', { ascending: false });
+
+  if (error) throw new Error(`Failed to load linked payments: ${error.message}`);
+  return data;
+}
+
+/** Edits how much of an already-linked payment counts toward principal, adjusting the loan's
+ *  balance by the difference so it stays consistent with the new value. */
+export async function updateLinkedPaymentPrincipal(
+  transactionId: string,
+  loanId: string,
+  newPrincipalPortion: number
+): Promise<void> {
+  const { data: txn, error: fetchError } = await supabaseAdmin
+    .from('transactions')
+    .select('principal_portion, manual_loan_id')
+    .eq('id', transactionId)
+    .maybeSingle();
+
+  if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
+  if (!txn || txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
+
+  const oldPortion = (txn.principal_portion as number | null) ?? 0;
+
+  const { error: updateError } = await supabaseAdmin
+    .from('transactions')
+    .update({ principal_portion: newPrincipalPortion })
+    .eq('id', transactionId);
+
+  if (updateError) throw new Error(`Failed to update payment: ${updateError.message}`);
+  await adjustManualLoanBalance(loanId, oldPortion - newPrincipalPortion);
+}
+
+/** Reverses a payment link — restores the loan's balance by the portion that had been applied
+ *  and clears the link, e.g. to correct a false-positive text match. */
+export async function unlinkPaymentFromLoan(transactionId: string, loanId: string): Promise<void> {
+  const { data: txn, error: fetchError } = await supabaseAdmin
+    .from('transactions')
+    .select('principal_portion, manual_loan_id')
+    .eq('id', transactionId)
+    .maybeSingle();
+
+  if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
+  if (!txn || txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
+
+  const oldPortion = (txn.principal_portion as number | null) ?? 0;
+
+  const { error: updateError } = await supabaseAdmin
+    .from('transactions')
+    .update({ manual_loan_id: null, principal_portion: null })
+    .eq('id', transactionId);
+
+  if (updateError) throw new Error(`Failed to unlink payment: ${updateError.message}`);
+  await adjustManualLoanBalance(loanId, oldPortion);
 }
 
 // ---- Budget categories ---------------------------------------------------------

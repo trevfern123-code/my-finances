@@ -821,6 +821,47 @@ button:disabled {
   gap: 0.4rem;
 }
 
+.linked-payments {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.linked-payment-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.6rem 0;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.linked-payment-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.linked-payment-principal {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.linked-payment-principal input {
+  width: 7rem;
+}
+
+.linked-payment-actions {
+  display: flex;
+  gap: 0.6rem;
+}
+
 /* ---- Income & savings ---- */
 
 .asset-groups {
