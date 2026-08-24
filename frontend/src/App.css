@@ -706,6 +706,58 @@ button:disabled {
   min-width: 0;
 }
 
+/* ---- Cash flow & budget pace ---- */
+
+.cash-flow-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 1.1rem;
+}
+
+.cash-flow-row {
+  display: grid;
+  grid-template-columns: 130px 1fr auto;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.cash-flow-bar-track {
+  height: 10px;
+  background: var(--bg);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.cash-flow-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+}
+
+.cash-flow-bar-fill.income {
+  background: var(--accent);
+}
+
+.cash-flow-bar-fill.spending {
+  background: var(--danger);
+}
+
+.cash-flow-amount {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  font-size: 0.88rem;
+  text-align: right;
+}
+
+.budget-pace {
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--border);
+}
+
+.budget-pace-hint {
+  margin-top: 0.5rem;
+}
+
 /* ---- Monthly breakdown ---- */
 
 .months-breakdown {

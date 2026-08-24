@@ -47,6 +47,7 @@ import { LinkedAccounts } from './components/LinkedAccounts';
 import { TransactionsFeed } from './components/TransactionsFeed';
 import { BudgetCategories } from './components/BudgetCategories';
 import { OverviewStats } from './components/OverviewStats';
+import { CashFlowPace } from './components/CashFlowPace';
 import { MonthlySpendingChart } from './components/MonthlySpendingChart';
 import { NetWorthChart } from './components/NetWorthChart';
 import { MonthlyBreakdown } from './components/MonthlyBreakdown';
@@ -461,6 +462,13 @@ export default function App() {
                   netWorthHistory={netWorthHistory}
                   assetGroups={assetGroups}
                   monthlySpending={summary.monthly_spending}
+                />
+              )}
+              {summary && (
+                <CashFlowPace
+                  budgetCategories={budgetCategories}
+                  currentMonthIncome={summary.monthly_spending[summary.monthly_spending.length - 1]?.income ?? 0}
+                  currentMonthSpent={summary.monthly_spending[summary.monthly_spending.length - 1]?.spent ?? 0}
                 />
               )}
               <div className="dashboard-grid">
