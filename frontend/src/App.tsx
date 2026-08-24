@@ -48,6 +48,9 @@ import { TransactionsFeed } from './components/TransactionsFeed';
 import { BudgetCategories } from './components/BudgetCategories';
 import { OverviewStats } from './components/OverviewStats';
 import { CashFlowPace } from './components/CashFlowPace';
+import { AccountQuickView } from './components/AccountQuickView';
+import { UpcomingBills } from './components/UpcomingBills';
+import { RecentActivity } from './components/RecentActivity';
 import { MonthlySpendingChart } from './components/MonthlySpendingChart';
 import { NetWorthChart } from './components/NetWorthChart';
 import { MonthlyBreakdown } from './components/MonthlyBreakdown';
@@ -91,8 +94,12 @@ export default function App() {
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    // Supabase re-emits SIGNED_IN (with a fresh session object each time) on things like tab
+    // focus/visibility changes, not just actual sign-in — bail out via the functional updater
+    // when the token hasn't actually changed, so this doesn't retrigger the refreshAll effect
+    // below on every tab switch.
     const { data: subscription } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      setSession(newSession);
+      setSession((prev) => (prev?.access_token === newSession?.access_token ? prev : newSession));
     });
     return () => subscription.subscription.unsubscribe();
   }, []);
@@ -472,11 +479,20 @@ export default function App() {
                 />
               )}
               <div className="dashboard-grid">
-                <div>{summary && <MonthlySpendingChart summary={summary} />}</div>
                 <div>
-                  <NetWorthChart history={netWorthHistory} />
+                  <AccountQuickView assetGroups={assetGroups} />
+                </div>
+                <div>
+                  <UpcomingBills recurringStreams={recurringStreams} loans={loans} manualLoans={manualLoans} />
                 </div>
               </div>
+              <div className="dashboard-grid">
+                <div>
+                  <RecentActivity transactions={transactions} onViewAll={() => setActiveTab('accounts')} />
+                </div>
+                <div>{summary && <MonthlySpendingChart summary={summary} />}</div>
+              </div>
+              <NetWorthChart history={netWorthHistory} />
             </div>
           )}
 
