@@ -392,7 +392,7 @@ export async function getRecentTransactionsForUser(userId: string, limit: number
   const { data, error } = await supabaseAdmin
     .from('transactions')
     .select(
-      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, plaid_items!inner(user_id, institution_name)), transaction_splits(id, budget_category_id, amount, note)'
+      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, plaid_items!inner(user_id, institution_name)), splits:transaction_splits(id, budget_category_id, amount, note)'
     )
     .eq('accounts.plaid_items.user_id', userId)
     .order('date', { ascending: false })
