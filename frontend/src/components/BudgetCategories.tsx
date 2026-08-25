@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import type { BudgetCategory } from '../lib/api';
+import type { BudgetCategory, TransactionItem } from '../lib/api';
+import { getCurrentMonthCategoryItems } from '../lib/budgetDrilldown';
 
 const EMOJI_OPTIONS = [
   '🍔', '🚗', '🏠', '💊', '🎬', '✈️', '🛒', '⚡',
@@ -13,6 +14,15 @@ function formatCurrency(amount: number) {
 
 function currentMonthLabel() {
   return new Date().toLocaleDateString('en-US', { month: 'long' });
+}
+
+function formatDrilldownDate(date: string) {
+  const [year, month, day] = date.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  });
 }
 
 /** Traffic-light tiers so a glance at the bar's color says as much as the numbers do. */
@@ -145,8 +155,48 @@ function AddCategoryForm({
   );
 }
 
+function CategoryDrilldown({
+  categoryId,
+  transactions,
+  totalSpent,
+}: {
+  categoryId: string;
+  transactions: TransactionItem[];
+  totalSpent: number;
+}) {
+  const items = getCurrentMonthCategoryItems(transactions, categoryId);
+  const shownTotal = items.reduce((sum, item) => sum + item.amount, 0);
+  const missing = totalSpent - shownTotal;
+
+  return (
+    <div className="category-drilldown">
+      {items.length === 0 ? (
+        <p className="hint">No transactions this month.</p>
+      ) : (
+        items.map((item, i) => (
+          <div key={i} className="drilldown-row">
+            <span className="drilldown-date">{formatDrilldownDate(item.date)}</span>
+            <span className="drilldown-name">
+              {item.name}
+              {item.isSplit && <span className="split-badge">split</span>}
+            </span>
+            <span className="drilldown-amount">{formatCurrency(item.amount)}</span>
+          </div>
+        ))
+      )}
+      {missing > 0.01 && (
+        <p className="hint drilldown-mismatch">
+          Showing {formatCurrency(shownTotal)} of {formatCurrency(totalSpent)} — older transactions may not be
+          loaded.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function BudgetCategories({
   categories,
+  transactions,
   onCreate,
   onUpdate,
   onUpdateEmoji,
@@ -154,6 +204,7 @@ export function BudgetCategories({
   onDelete,
 }: {
   categories: BudgetCategory[];
+  transactions: TransactionItem[];
   onCreate: (name: string, budgetAmount: number, emoji: string | null) => void;
   onUpdate: (id: string, budgetAmount: number) => void;
   onUpdateEmoji: (id: string, emoji: string | null) => void;
@@ -162,6 +213,7 @@ export function BudgetCategories({
 }) {
   const [editing, setEditing] = useState<Record<string, string>>({});
   const [showAddForm, setShowAddForm] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // Always render in sort_order regardless of the order the array arrived in, so a reorder
   // takes effect immediately once the underlying values update, with no separate refetch.
@@ -273,7 +325,15 @@ export function BudgetCategories({
                         Recent avg: {formatCurrency(c.recent_avg_spent)}/mo
                       </span>
                     )}
+                    <button
+                      type="button"
+                      className="link-button drilldown-toggle"
+                      onClick={() => setExpandedId(expandedId === c.id ? null : c.id)}
+                    >
+                      {expandedId === c.id ? 'Hide transactions ▴' : 'Show transactions ▾'}
+                    </button>
                   </div>
+                  {expandedId === c.id && <CategoryDrilldown categoryId={c.id} transactions={transactions} totalSpent={c.spent} />}
                 </div>
               );
             })}

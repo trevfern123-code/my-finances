@@ -47,6 +47,7 @@ export function TransactionsFeed({
   const [dateTo, setDateTo] = useState('');
   const [needsReviewOnly, setNeedsReviewOnly] = useState(false);
   const [splitEditingId, setSplitEditingId] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
 
   const categoryById = useMemo(() => {
     const map = new Map<string, BudgetCategory>();
@@ -102,10 +103,19 @@ export function TransactionsFeed({
           <button onClick={onSync} disabled={syncing}>
             {syncing ? 'Syncing...' : 'Sync transactions'}
           </button>
+          <button
+            type="button"
+            className={collapsed ? 'collapse-toggle collapsed' : 'collapse-toggle'}
+            onClick={() => setCollapsed((prev) => !prev)}
+            aria-label={collapsed ? 'Show transactions' : 'Hide transactions'}
+            aria-expanded={!collapsed}
+          >
+            ▾
+          </button>
         </div>
       </div>
 
-      {transactions.length === 0 ? (
+      {collapsed ? null : transactions.length === 0 ? (
         <p className="hint">No transactions yet — link an account or sync to fetch history.</p>
       ) : (
         <>

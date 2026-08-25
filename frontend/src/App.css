@@ -1218,6 +1218,22 @@ button:disabled {
   gap: 0.6rem;
   padding: 0.5rem 0;
   border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  width: 100%;
+  background: transparent;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+  text-align: left;
+  font: inherit;
+  font-weight: normal;
+  color: inherit;
+  cursor: pointer;
+}
+
+.cat-row:hover {
+  filter: none;
+  background: var(--bg);
 }
 
 .cat-row:last-child {
@@ -1268,6 +1284,79 @@ button:disabled {
   width: 2.4rem;
   text-align: right;
   flex-shrink: 0;
+}
+
+.category-drilldown {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.5rem 0 0.75rem 1.4rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.drilldown-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.8rem;
+}
+
+.drilldown-date {
+  color: var(--text-muted);
+  width: 3.4rem;
+  flex-shrink: 0;
+}
+
+.drilldown-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drilldown-amount {
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.drilldown-mismatch {
+  margin: 0.2rem 0 0;
+  font-size: 0.75rem;
+}
+
+.split-badge {
+  margin-left: 0.4rem;
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 0 0.35rem;
+}
+
+.drilldown-toggle {
+  font-size: 0.78rem;
+  margin-left: auto;
+}
+
+.collapse-toggle {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  padding: 0.35rem 0.6rem;
+  font-size: 0.8rem;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+
+.collapse-toggle:hover {
+  filter: none;
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.collapse-toggle.collapsed {
+  transform: rotate(-90deg);
 }
 
 .cat-amount {

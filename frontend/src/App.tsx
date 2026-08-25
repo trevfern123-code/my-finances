@@ -82,6 +82,11 @@ const TABS: Tab[] = [
   { id: 'settings', label: 'Settings' },
 ];
 
+// The backend caps /api/plaid/transactions at 200 regardless of what's requested — fetching the
+// max lets the Monthly Breakdown and Budget tab drill-downs (both filtered client-side from this
+// same in-memory list) cover as much history as the API allows, rather than the default 50.
+const TRANSACTIONS_FETCH_LIMIT = 200;
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [activeTab, setActiveTab] = useState('overview');
@@ -138,7 +143,7 @@ export default function App() {
       plaidCategoriesRes,
     ] = await Promise.allSettled([
       getLinkedItems(),
-      getTransactions(),
+      getTransactions(TRANSACTIONS_FETCH_LIMIT),
       getBudgetCategories(),
       getSpendingSummary(),
       getNetWorthHistory(),
@@ -323,7 +328,7 @@ export default function App() {
     setActionError(null);
     try {
       await syncTransactionsRequest();
-      const res = await getTransactions();
+      const res = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
       setTransactions(res.transactions);
       refreshSummary();
       refreshBudgetCategories();
@@ -454,7 +459,7 @@ export default function App() {
       if (backfill && res.backfilled_count > 0) {
         // Backfilling updates transaction rows directly in the database — refetch so the
         // Accounts and Budget tabs reflect the newly-assigned categories.
-        const transactionsRes = await getTransactions();
+        const transactionsRes = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
         setTransactions(transactionsRes.transactions);
         refreshBudgetCategories();
       }
@@ -635,11 +640,12 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === 'monthly' && <MonthlyBreakdown months={monthlyBreakdown} />}
+          {activeTab === 'monthly' && <MonthlyBreakdown months={monthlyBreakdown} transactions={transactions} />}
 
           {activeTab === 'budget' && (
             <BudgetCategories
               categories={budgetCategories}
+              transactions={transactions}
               onCreate={handleCreateCategory}
               onUpdate={handleUpdateCategory}
               onUpdateEmoji={handleUpdateCategoryEmoji}

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { CategoryAmount, MonthBreakdown } from '../lib/api';
+import type { CategoryAmount, MonthBreakdown, TransactionItem } from '../lib/api';
 import { formatPlaidCategoryLabel } from '../lib/categoryLabels';
 
 const CATEGORY_COLORS = [
@@ -36,6 +36,15 @@ function formatShortMonth(month: string) {
   });
 }
 
+function formatDrilldownDate(date: string) {
+  const [year, month, day] = date.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  });
+}
+
 /** Assigns each category a color by its name, from a stable alphabetical ordering across every
  *  month in view — not by position within a single month's own sorted list, which is what let
  *  the same category (e.g. FOOD_AND_DRINK) show up as a different color from one month to the
@@ -60,6 +69,56 @@ function sortWithUncategorizedLast(categories: CategoryAmount[]): CategoryAmount
     if (b.category === 'Uncategorized') return -1;
     return b.amount - a.amount;
   });
+}
+
+/** Mirrors the backend's aggregateByMonth grouping (calendar month + Plaid's own category,
+ *  positive amounts only) so the drill-down list lines up with the category total it's under. */
+function transactionsForMonthCategory(
+  transactions: TransactionItem[],
+  month: string,
+  category: string
+): TransactionItem[] {
+  return transactions
+    .filter((t) => t.date.slice(0, 7) === month && t.amount > 0 && (t.category ?? 'Uncategorized') === category)
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+}
+
+function CategoryDrilldown({
+  month,
+  category,
+  totalAmount,
+  transactions,
+}: {
+  month: string;
+  category: string;
+  totalAmount: number;
+  transactions: TransactionItem[];
+}) {
+  const items = transactionsForMonthCategory(transactions, month, category);
+  const shownTotal = items.reduce((sum, t) => sum + t.amount, 0);
+  const missing = totalAmount - shownTotal;
+
+  return (
+    <div className="category-drilldown">
+      {items.length === 0 ? (
+        <p className="hint">No matching transactions loaded for this month.</p>
+      ) : (
+        items.map((t) => (
+          <div key={t.id} className="drilldown-row">
+            <span className="drilldown-date">{formatDrilldownDate(t.date)}</span>
+            <span className="drilldown-name">{t.merchant_name ?? t.name}</span>
+            <span className="drilldown-amount">{formatCurrency(t.amount)}</span>
+          </div>
+        ))
+      )}
+      {missing > 0.01 && (
+        <p className="hint drilldown-mismatch">
+          Showing {formatCurrency(shownTotal)} of {formatCurrency(totalAmount)} — older transactions may not be
+          loaded.
+        </p>
+      )}
+    </div>
+  );
 }
 
 function SpendingTrendChart({ months }: { months: MonthBreakdown[] }) {
@@ -91,14 +150,17 @@ function MonthCard({
   categoryColors,
   expanded,
   onToggle,
+  transactions,
 }: {
   month: MonthBreakdown;
   categoryColors: Map<string, string>;
   expanded: boolean;
   onToggle: () => void;
+  transactions: TransactionItem[];
 }) {
   const net = month.total_income - month.total_spent;
   const sortedCategories = sortWithUncategorizedLast(month.by_category);
+  const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
 
   return (
     <div className="card month-card">
@@ -127,15 +189,30 @@ function MonthCard({
                 const pct = month.total_spent > 0 ? (c.amount / month.total_spent) * 100 : 0;
                 const isUncategorized = c.category === 'Uncategorized';
                 const color = isUncategorized ? UNCATEGORIZED_COLOR : categoryColors.get(c.category);
+                const isCategoryExpanded = expandedCategory === c.category;
                 return (
-                  <div key={c.category} className={isUncategorized ? 'cat-row uncategorized' : 'cat-row'}>
-                    <span className="cat-dot" style={{ background: color }} />
-                    <span className="cat-name">{formatPlaidCategoryLabel(c.category)}</span>
-                    <div className="cat-bar-track">
-                      <div className="cat-bar-fill" style={{ width: `${pct}%`, background: color }} />
-                    </div>
-                    <span className="cat-pct">{pct.toFixed(0)}%</span>
-                    <span className="cat-amount">{formatCurrency(c.amount)}</span>
+                  <div key={c.category}>
+                    <button
+                      type="button"
+                      className={isUncategorized ? 'cat-row uncategorized' : 'cat-row'}
+                      onClick={() => setExpandedCategory(isCategoryExpanded ? null : c.category)}
+                    >
+                      <span className="cat-dot" style={{ background: color }} />
+                      <span className="cat-name">{formatPlaidCategoryLabel(c.category)}</span>
+                      <div className="cat-bar-track">
+                        <div className="cat-bar-fill" style={{ width: `${pct}%`, background: color }} />
+                      </div>
+                      <span className="cat-pct">{pct.toFixed(0)}%</span>
+                      <span className="cat-amount">{formatCurrency(c.amount)}</span>
+                    </button>
+                    {isCategoryExpanded && (
+                      <CategoryDrilldown
+                        month={month.month}
+                        category={c.category}
+                        totalAmount={c.amount}
+                        transactions={transactions}
+                      />
+                    )}
                   </div>
                 );
               })}
@@ -147,7 +224,7 @@ function MonthCard({
   );
 }
 
-export function MonthlyBreakdown({ months }: { months: MonthBreakdown[] }) {
+export function MonthlyBreakdown({ months, transactions }: { months: MonthBreakdown[]; transactions: TransactionItem[] }) {
   // Most recent month first — that's the one you actually want to check in on, and the only
   // one expanded by default so 6+ months doesn't mean 6+ huge stacked cards on load.
   const ordered = [...months].reverse();
@@ -175,6 +252,7 @@ export function MonthlyBreakdown({ months }: { months: MonthBreakdown[] }) {
             categoryColors={categoryColors}
             expanded={expandedMonth === m.month}
             onToggle={() => setExpandedMonth(expandedMonth === m.month ? null : m.month)}
+            transactions={transactions}
           />
         ))}
       </div>
