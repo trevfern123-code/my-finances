@@ -5,6 +5,7 @@ import {
   createBudgetCategory,
   createManualLoan,
   createManualPayment,
+  clearTransactionSplits,
   deleteBudgetCategory,
   deleteCategoryMapping,
   deleteManualLoan,
@@ -24,6 +25,7 @@ import {
   getTransactions,
   approveTransaction,
   saveCategoryMapping,
+  saveTransactionSplits,
   setTransactionCategory,
   syncTransactions as syncTransactionsRequest,
   unlinkLoanPayment,
@@ -363,6 +365,23 @@ export default function App() {
     }
   }
 
+  // Left to throw rather than setting actionError — SplitEditor catches this itself and shows
+  // the message inline next to the line items, which is more useful than a page-level banner.
+  async function handleSaveTransactionSplits(
+    transactionId: string,
+    splits: { budget_category_id: string; amount: number }[]
+  ) {
+    const res = await saveTransactionSplits(transactionId, splits);
+    setTransactions((prev) => prev.map((t) => (t.id === transactionId ? { ...t, splits: res.splits } : t)));
+    refreshBudgetCategories();
+  }
+
+  async function handleClearTransactionSplits(transactionId: string) {
+    await clearTransactionSplits(transactionId);
+    setTransactions((prev) => prev.map((t) => (t.id === transactionId ? { ...t, splits: [] } : t)));
+    refreshBudgetCategories();
+  }
+
   async function handleCreateCategory(name: string, budgetAmount: number, emoji: string | null) {
     setActionError(null);
     try {
@@ -681,6 +700,8 @@ export default function App() {
                 onSync={handleSyncTransactions}
                 onCategorize={handleCategorize}
                 onApprove={handleApproveTransaction}
+                onSaveSplits={handleSaveTransactionSplits}
+                onClearSplits={handleClearTransactionSplits}
               />
             </div>
           )}

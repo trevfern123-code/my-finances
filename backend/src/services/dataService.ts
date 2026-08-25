@@ -10,6 +10,7 @@ import type {
   PlaidItemRow,
   RecurringStreamRow,
   TransactionRow,
+  TransactionSplitRow,
 } from '../types';
 import type {
   AccountBase,
@@ -391,7 +392,7 @@ export async function getRecentTransactionsForUser(userId: string, limit: number
   const { data, error } = await supabaseAdmin
     .from('transactions')
     .select(
-      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, plaid_items!inner(user_id, institution_name))'
+      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, plaid_items!inner(user_id, institution_name)), transaction_splits(id, budget_category_id, amount, note)'
     )
     .eq('accounts.plaid_items.user_id', userId)
     .order('date', { ascending: false })
@@ -943,21 +944,48 @@ export async function listBudgetCategories(userId: string): Promise<BudgetCatego
   return data as BudgetCategoryRow[];
 }
 
-/** Categorized transaction amounts for a user within [start, end) — the raw material for per-category spend totals. */
+/** Categorized transaction amounts for a user within [start, end) — the raw material for
+ *  per-category spend totals. A transaction with one or more splits contributes its split rows
+ *  instead of its own budget_category_id/amount — the splits are the source of truth for how a
+ *  split transaction's amount is categorized, so its own row is dropped entirely to avoid
+ *  double-counting. */
 export async function getCategorySpendRows(
   userId: string,
   range: { start: string; end: string }
 ): Promise<{ budget_category_id: string | null; amount: number }[]> {
-  const { data, error } = await supabaseAdmin
+  const { data: transactions, error: txnError } = await supabaseAdmin
     .from('transactions')
-    .select('budget_category_id, amount, accounts!inner(plaid_items!inner(user_id))')
+    .select('id, budget_category_id, amount, accounts!inner(plaid_items!inner(user_id))')
     .eq('accounts.plaid_items.user_id', userId)
-    .not('budget_category_id', 'is', null)
     .gte('date', range.start)
     .lt('date', range.end);
 
-  if (error) throw new Error(`Failed to load category spend: ${error.message}`);
-  return data;
+  if (txnError) throw new Error(`Failed to load category spend: ${txnError.message}`);
+
+  const { data: splits, error: splitError } = await supabaseAdmin
+    .from('transaction_splits')
+    .select(
+      'transaction_id, budget_category_id, amount, transactions!inner(date, accounts!inner(plaid_items!inner(user_id)))'
+    )
+    .eq('transactions.accounts.plaid_items.user_id', userId)
+    .gte('transactions.date', range.start)
+    .lt('transactions.date', range.end);
+
+  if (splitError) throw new Error(`Failed to load split spend: ${splitError.message}`);
+
+  const splitRows = splits as unknown as { transaction_id: string; budget_category_id: string; amount: number }[];
+  const splitTransactionIds = new Set(splitRows.map((s) => s.transaction_id));
+
+  const unsplitTransactionRows = (
+    transactions as unknown as { id: string; budget_category_id: string | null; amount: number }[]
+  )
+    .filter((t) => !splitTransactionIds.has(t.id))
+    .map((t) => ({ budget_category_id: t.budget_category_id, amount: t.amount }));
+
+  return [
+    ...unsplitTransactionRows,
+    ...splitRows.map((s) => ({ budget_category_id: s.budget_category_id, amount: s.amount })),
+  ];
 }
 
 export async function createBudgetCategory(
@@ -1107,4 +1135,64 @@ export async function backfillCategoryMapping(
 
   if (updateError) throw new Error(`Failed to backfill transactions: ${updateError.message}`);
   return ids.length;
+}
+
+// ---- Transaction splits ---------------------------------------------------------
+
+/** Replaces a transaction's splits wholesale (delete-then-insert — there's no natural way to
+ *  diff a list of line items against what's already there). Throws if the transaction doesn't
+ *  belong to the user, or if the new splits don't sum to the transaction's own amount — a split
+ *  reallocates the existing amount across categories, it doesn't change it. */
+export async function setTransactionSplits(
+  transactionId: string,
+  userId: string,
+  splits: { budgetCategoryId: string; amount: number; note: string | null }[]
+): Promise<TransactionSplitRow[]> {
+  const { data: txn, error: fetchError } = await supabaseAdmin
+    .from('transactions')
+    .select('amount, accounts!inner(plaid_items!inner(user_id))')
+    .eq('id', transactionId)
+    .maybeSingle();
+
+  if (fetchError) throw new Error(`Failed to load transaction: ${fetchError.message}`);
+  if (!txn) throw new Error('Transaction not found');
+
+  const owner = (txn.accounts as unknown as { plaid_items: { user_id: string } }).plaid_items.user_id;
+  if (owner !== userId) throw new Error('Transaction not found');
+
+  const total = splits.reduce((sum, s) => sum + s.amount, 0);
+  // A cent of slack absorbs float rounding error accumulated across several line items, without
+  // letting an actually-mismatched split through.
+  if (Math.abs(total - (txn.amount as number)) > 0.01) {
+    throw new Error(`Splits must add up to the transaction's amount (${(txn.amount as number).toFixed(2)})`);
+  }
+
+  const { error: deleteError } = await supabaseAdmin
+    .from('transaction_splits')
+    .delete()
+    .eq('transaction_id', transactionId);
+  if (deleteError) throw new Error(`Failed to clear existing splits: ${deleteError.message}`);
+
+  const { data, error: insertError } = await supabaseAdmin
+    .from('transaction_splits')
+    .insert(
+      splits.map((s) => ({
+        transaction_id: transactionId,
+        budget_category_id: s.budgetCategoryId,
+        amount: s.amount,
+        note: s.note,
+      }))
+    )
+    .select();
+
+  if (insertError) throw new Error(`Failed to save transaction splits: ${insertError.message}`);
+  return data as TransactionSplitRow[];
+}
+
+export async function clearTransactionSplits(transactionId: string, userId: string): Promise<void> {
+  const ownerId = await getTransactionOwnerId(transactionId);
+  if (!ownerId || ownerId !== userId) throw new Error('Transaction not found');
+
+  const { error } = await supabaseAdmin.from('transaction_splits').delete().eq('transaction_id', transactionId);
+  if (error) throw new Error(`Failed to clear transaction splits: ${error.message}`);
 }

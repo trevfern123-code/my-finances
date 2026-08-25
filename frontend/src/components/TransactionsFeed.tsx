@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
 import { budgetCategoryLabel } from '../lib/categoryLabels';
+import { SplitEditor } from './SplitEditor';
 
 function formatAmount(amount: number, currency: string | null) {
   const formatted = new Intl.NumberFormat('en-US', {
@@ -28,6 +29,8 @@ export function TransactionsFeed({
   onSync,
   onCategorize,
   onApprove,
+  onSaveSplits,
+  onClearSplits,
 }: {
   transactions: TransactionItem[];
   budgetCategories: BudgetCategory[];
@@ -35,12 +38,15 @@ export function TransactionsFeed({
   onSync: () => void;
   onCategorize: (transactionId: string, budgetCategoryId: string | null) => void;
   onApprove: (transactionId: string) => void;
+  onSaveSplits: (transactionId: string, splits: { budget_category_id: string; amount: number }[]) => Promise<void>;
+  onClearSplits: (transactionId: string) => Promise<void>;
 }) {
   const [accountFilter, setAccountFilter] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   const [needsReviewOnly, setNeedsReviewOnly] = useState(false);
+  const [splitEditingId, setSplitEditingId] = useState<string | null>(null);
 
   const categoryById = useMemo(() => {
     const map = new Map<string, BudgetCategory>();
@@ -141,44 +147,71 @@ export function TransactionsFeed({
           ) : (
             <div className="transaction-cards">
               {filtered.map((t) => {
-                const category = t.budget_category_id ? categoryById.get(t.budget_category_id) : undefined;
-                const cardClass = [
-                  'transaction-card',
-                  t.pending && 'pending',
-                  t.needs_review && 'needs-review',
-                ]
+                const hasSplits = t.splits.length > 0;
+                const category = !hasSplits && t.budget_category_id ? categoryById.get(t.budget_category_id) : undefined;
+                const isEditingSplit = splitEditingId === t.id;
+                const cardClass = ['transaction-card', t.pending && 'pending', t.needs_review && 'needs-review']
                   .filter(Boolean)
                   .join(' ');
                 return (
                   <div key={t.id} className={cardClass}>
-                    <div className="transaction-card-main">
-                      <span className="transaction-name">
-                        {category?.emoji && <span className="transaction-emoji">{category.emoji}</span>}
-                        {t.merchant_name ?? t.name}
-                        {t.pending && <span className="pending-badge">pending</span>}
+                    <div className="transaction-card-row">
+                      <div className="transaction-card-main">
+                        <span className="transaction-name">
+                          {category?.emoji && <span className="transaction-emoji">{category.emoji}</span>}
+                          {t.merchant_name ?? t.name}
+                          {t.pending && <span className="pending-badge">pending</span>}
+                        </span>
+                        <span className="hint">
+                          {formatDate(t.date)} · {t.accounts?.name ?? '—'}
+                        </span>
+                      </div>
+                      <span className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
+                        {formatAmount(t.amount, t.iso_currency_code)}
                       </span>
-                      <span className="hint">
-                        {formatDate(t.date)} · {t.accounts?.name ?? '—'}
-                      </span>
-                    </div>
-                    <span className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
-                      {formatAmount(t.amount, t.iso_currency_code)}
-                    </span>
-                    <select
-                      value={t.budget_category_id ?? ''}
-                      onChange={(e) => onCategorize(t.id, e.target.value || null)}
-                    >
-                      <option value="">Uncategorized</option>
-                      {budgetCategories.map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {budgetCategoryLabel(c)}
-                        </option>
-                      ))}
-                    </select>
-                    {t.needs_review && (
-                      <button type="button" className="approve-button" onClick={() => onApprove(t.id)}>
-                        Approve
+                      {hasSplits ? (
+                        <span className="split-summary hint">Split into {t.splits.length}</span>
+                      ) : (
+                        <select
+                          value={t.budget_category_id ?? ''}
+                          onChange={(e) => onCategorize(t.id, e.target.value || null)}
+                        >
+                          <option value="">Uncategorized</option>
+                          {budgetCategories.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {budgetCategoryLabel(c)}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {t.needs_review && (
+                        <button type="button" className="approve-button" onClick={() => onApprove(t.id)}>
+                          Approve
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="link-button"
+                        onClick={() => setSplitEditingId(isEditingSplit ? null : t.id)}
+                      >
+                        {hasSplits ? 'Edit split' : 'Split'}
                       </button>
+                    </div>
+                    {isEditingSplit && (
+                      <SplitEditor
+                        totalAmount={t.amount}
+                        budgetCategories={budgetCategories}
+                        initialSplits={t.splits}
+                        onSave={async (splits) => {
+                          await onSaveSplits(t.id, splits);
+                          setSplitEditingId(null);
+                        }}
+                        onClear={async () => {
+                          await onClearSplits(t.id);
+                          setSplitEditingId(null);
+                        }}
+                        onCancel={() => setSplitEditingId(null)}
+                      />
                     )}
                   </div>
                 );

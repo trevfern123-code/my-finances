@@ -86,6 +86,18 @@ export interface CategoryMappingRow {
   created_at: string;
 }
 
+/** One line item of a split transaction — reallocates part of the parent transaction's amount to
+ *  its own budget category. When a transaction has any splits, they (not the parent's own
+ *  budget_category_id) are the source of truth for how its amount is categorized. */
+export interface TransactionSplitRow {
+  id: string;
+  transaction_id: string;
+  budget_category_id: string;
+  amount: number;
+  note: string | null;
+  created_at: string;
+}
+
 export interface BudgetCategoryWithSpend extends BudgetCategoryRow {
   /** Sum of positive-amount (spend, not income/credit) categorized transactions in the current calendar month. */
   spent: number;

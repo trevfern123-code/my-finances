@@ -627,13 +627,8 @@ button:disabled {
 }
 
 .transaction-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
   padding: 0.65rem 0;
   border-bottom: 1px solid var(--border);
-  flex-wrap: wrap;
 }
 
 .transaction-card:last-child {
@@ -648,6 +643,71 @@ button:disabled {
   padding-left: 0.6rem;
   border-left: 3px solid var(--warn);
   background: rgba(251, 191, 36, 0.05);
+}
+
+.transaction-card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.split-summary {
+  font-size: 0.82rem;
+}
+
+.split-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.65rem;
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+.split-editor-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.split-editor-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.split-editor-row input {
+  width: 6rem;
+  padding: 0.35rem 0.5rem;
+}
+
+.split-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.82rem;
+}
+
+.split-editor-remaining {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.split-editor-remaining.balanced {
+  color: var(--accent-strong);
+}
+
+.split-editor-error {
+  margin: 0;
+}
+
+.split-editor-buttons {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
 }
 
 .transaction-card-main {

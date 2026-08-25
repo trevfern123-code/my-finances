@@ -507,3 +507,67 @@ export async function approveTransaction(req: Request, res: Response, next: Next
     next(err);
   }
 }
+
+export async function setTransactionSplits(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { transactionId } = req.params;
+    const { splits } = req.body as {
+      splits?: { budget_category_id?: string; amount?: number; note?: string | null }[];
+    };
+
+    const ownerId = await dataService.getTransactionOwnerId(transactionId);
+    if (!ownerId || ownerId !== userId) {
+      res.status(404).json({ error: 'Transaction not found' });
+      return;
+    }
+
+    if (!Array.isArray(splits) || splits.length === 0) {
+      res.status(400).json({ error: 'At least one split is required' });
+      return;
+    }
+
+    for (const split of splits) {
+      if (!split.budget_category_id || typeof split.amount !== 'number') {
+        res.status(400).json({ error: 'Each split needs a budget_category_id and a numeric amount' });
+        return;
+      }
+      const belongsToUser = await dataService.budgetCategoryBelongsToUser(split.budget_category_id, userId);
+      if (!belongsToUser) {
+        res.status(400).json({ error: 'Invalid budget category' });
+        return;
+      }
+    }
+
+    const saved = await dataService.setTransactionSplits(
+      transactionId,
+      userId,
+      splits.map((s) => ({
+        budgetCategoryId: s.budget_category_id!,
+        amount: s.amount!,
+        note: s.note ?? null,
+      }))
+    );
+    res.status(201).json({ splits: saved });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function clearTransactionSplits(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { transactionId } = req.params;
+
+    const ownerId = await dataService.getTransactionOwnerId(transactionId);
+    if (!ownerId || ownerId !== userId) {
+      res.status(404).json({ error: 'Transaction not found' });
+      return;
+    }
+
+    await dataService.clearTransactionSplits(transactionId, userId);
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+}

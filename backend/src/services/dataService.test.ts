@@ -13,6 +13,9 @@ import {
   deleteManualLoanPayment,
   updateAccountCreditLimit,
   updateAccountSavingsGoal,
+  getCategorySpendRows,
+  setTransactionSplits,
+  clearTransactionSplits,
 } from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
@@ -245,6 +248,136 @@ describe('applyTransactionChanges', () => {
   it('does nothing when there are no changes at all', async () => {
     await applyTransactionChanges({ userId: 'user-1', added: [], modified: [], removed: [], accountIdByPlaidId });
     expect(mockFrom).not.toHaveBeenCalled();
+  });
+});
+
+describe('getCategorySpendRows', () => {
+  const range = { start: '2026-08-01', end: '2026-09-01' };
+
+  it("uses a transaction's own budget_category_id/amount when it has no splits", async () => {
+    const transactionsQuery = createQueryBuilder({
+      data: [{ id: 'txn-1', budget_category_id: 'cat-a', amount: 25 }],
+      error: null,
+    });
+    const splitsQuery = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(transactionsQuery).mockReturnValueOnce(splitsQuery);
+
+    const result = await getCategorySpendRows('user-1', range);
+
+    expect(result).toEqual([{ budget_category_id: 'cat-a', amount: 25 }]);
+  });
+
+  it('substitutes split rows for a split transaction, dropping its own row entirely', async () => {
+    const transactionsQuery = createQueryBuilder({
+      data: [
+        { id: 'txn-1', budget_category_id: 'cat-a', amount: 50 },
+        { id: 'txn-2', budget_category_id: 'cat-b', amount: 10 },
+      ],
+      error: null,
+    });
+    const splitsQuery = createQueryBuilder({
+      data: [
+        { transaction_id: 'txn-1', budget_category_id: 'cat-dining', amount: 30 },
+        { transaction_id: 'txn-1', budget_category_id: 'cat-groceries', amount: 20 },
+      ],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(transactionsQuery).mockReturnValueOnce(splitsQuery);
+
+    const result = await getCategorySpendRows('user-1', range);
+
+    // txn-1's own row (cat-a, 50) is gone — its two split rows stand in for it instead.
+    // txn-2 has no splits, so it comes through unchanged.
+    expect(result).toEqual(
+      expect.arrayContaining([
+        { budget_category_id: 'cat-dining', amount: 30 },
+        { budget_category_id: 'cat-groceries', amount: 20 },
+        { budget_category_id: 'cat-b', amount: 10 },
+      ])
+    );
+    expect(result).toHaveLength(3);
+  });
+});
+
+describe('setTransactionSplits', () => {
+  it('replaces existing splits when the new splits sum to the transaction amount', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { amount: 50, accounts: { plaid_items: { user_id: 'user-1' } } },
+      error: null,
+    });
+    const deleteQuery = createQueryBuilder({ data: null, error: null });
+    const insertedSplits = [
+      { id: 'split-1', transaction_id: 'txn-1', budget_category_id: 'cat-dining', amount: 30, note: null },
+      { id: 'split-2', transaction_id: 'txn-1', budget_category_id: 'cat-groceries', amount: 20, note: null },
+    ];
+    const insertQuery = createQueryBuilder({ data: insertedSplits, error: null });
+    mockFrom.mockReturnValueOnce(fetchQuery).mockReturnValueOnce(deleteQuery).mockReturnValueOnce(insertQuery);
+
+    const result = await setTransactionSplits('txn-1', 'user-1', [
+      { budgetCategoryId: 'cat-dining', amount: 30, note: null },
+      { budgetCategoryId: 'cat-groceries', amount: 20, note: null },
+    ]);
+
+    expect(deleteQuery.delete).toHaveBeenCalled();
+    expect(deleteQuery.eq).toHaveBeenCalledWith('transaction_id', 'txn-1');
+    expect(insertQuery.insert.mock.calls[0][0]).toEqual([
+      { transaction_id: 'txn-1', budget_category_id: 'cat-dining', amount: 30, note: null },
+      { transaction_id: 'txn-1', budget_category_id: 'cat-groceries', amount: 20, note: null },
+    ]);
+    expect(result).toEqual(insertedSplits);
+  });
+
+  it("rejects splits that don't sum to the transaction's amount", async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { amount: 50, accounts: { plaid_items: { user_id: 'user-1' } } },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    await expect(
+      setTransactionSplits('txn-1', 'user-1', [{ budgetCategoryId: 'cat-dining', amount: 30, note: null }])
+    ).rejects.toThrow(/must add up to the transaction's amount \(50\.00\)/);
+
+    // Rejected before ever touching the splits table.
+    expect(mockFrom).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects when the transaction doesn't belong to the requesting user", async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { amount: 50, accounts: { plaid_items: { user_id: 'someone-else' } } },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    await expect(
+      setTransactionSplits('txn-1', 'user-1', [{ budgetCategoryId: 'cat-dining', amount: 50, note: null }])
+    ).rejects.toThrow('Transaction not found');
+  });
+});
+
+describe('clearTransactionSplits', () => {
+  it('deletes all splits for the transaction once ownership is confirmed', async () => {
+    const ownerQuery = createQueryBuilder({
+      data: { id: 'txn-1', accounts: { plaid_items: { user_id: 'user-1' } } },
+      error: null,
+    });
+    const deleteQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(ownerQuery).mockReturnValueOnce(deleteQuery);
+
+    await clearTransactionSplits('txn-1', 'user-1');
+
+    expect(deleteQuery.delete).toHaveBeenCalled();
+    expect(deleteQuery.eq).toHaveBeenCalledWith('transaction_id', 'txn-1');
+  });
+
+  it("rejects when the transaction doesn't belong to the requesting user", async () => {
+    const ownerQuery = createQueryBuilder({
+      data: { id: 'txn-1', accounts: { plaid_items: { user_id: 'someone-else' } } },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(ownerQuery);
+
+    await expect(clearTransactionSplits('txn-1', 'user-1')).rejects.toThrow('Transaction not found');
   });
 });
 

@@ -71,6 +71,15 @@ export interface LinkedItem {
   accounts: LinkedAccount[];
 }
 
+/** One line item of a split transaction. When a transaction has any splits, they — not its own
+ *  budget_category_id — are the source of truth for how its amount is categorized. */
+export interface TransactionSplit {
+  id: string;
+  budget_category_id: string;
+  amount: number;
+  note: string | null;
+}
+
 export interface TransactionItem {
   id: string;
   amount: number;
@@ -84,6 +93,7 @@ export interface TransactionItem {
   budget_category_id: string | null;
   /** True until the user approves the transaction — never reset by a later Plaid update. */
   needs_review: boolean;
+  splits: TransactionSplit[];
   accounts: { name: string; plaid_items: { institution_name: string | null } };
 }
 
@@ -409,6 +419,20 @@ export function setTransactionCategory(
 
 export function approveTransaction(transactionId: string): Promise<{ transaction: TransactionItem }> {
   return authedFetch(`/api/plaid/transactions/${transactionId}/approve`, { method: 'PATCH' });
+}
+
+export function saveTransactionSplits(
+  transactionId: string,
+  splits: { budget_category_id: string; amount: number }[]
+): Promise<{ splits: TransactionSplit[] }> {
+  return authedFetch(`/api/plaid/transactions/${transactionId}/splits`, {
+    method: 'PUT',
+    body: JSON.stringify({ splits }),
+  });
+}
+
+export function clearTransactionSplits(transactionId: string): Promise<void> {
+  return authedFetch(`/api/plaid/transactions/${transactionId}/splits`, { method: 'DELETE' });
 }
 
 export function getBudgetCategories(): Promise<{ categories: BudgetCategory[] }> {
