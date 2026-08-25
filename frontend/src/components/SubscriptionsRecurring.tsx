@@ -1,4 +1,5 @@
 import type { RecurringStream } from '../lib/api';
+import { daysBetween, dueLabel, estimateNextDueDate, todayUtc } from '../lib/recurringDates';
 
 const FREQUENCY_LABELS: Record<string, string> = {
   WEEKLY: 'Weekly',
@@ -17,28 +18,49 @@ function formatFrequency(frequency: string) {
   return FREQUENCY_LABELS[frequency] ?? frequency;
 }
 
+function formatDate(date: Date) {
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
 /** Renders one direction's streams as a bar list, bars sized by monthly_amount (the
  *  server-normalized monthly-equivalent) rather than the raw per-charge amount — so a
  *  $10/week cost and a $200/year cost compare correctly instead of looking identical. */
-function StreamList({ streams, barClass }: { streams: RecurringStream[]; barClass: string }) {
+function StreamList({
+  streams,
+  barClass,
+  nextLabel,
+}: {
+  streams: RecurringStream[];
+  barClass: string;
+  nextLabel: string;
+}) {
   const maxMonthly = Math.max(...streams.map((s) => s.monthly_amount), 1);
+  const today = todayUtc();
 
   return (
     <div className="recurring-list">
-      {streams.map((s) => (
-        <div key={s.id} className="sub-row">
-          <div className="sub-info">
-            <span className="sub-name">{s.merchant_name ?? s.description}</span>
-            <span className="sub-frequency">
-              {formatFrequency(s.frequency)} · {formatCurrency(Math.abs(s.last_amount))} per charge
-            </span>
+      {streams.map((s) => {
+        const nextDue = estimateNextDueDate(s.last_date, s.frequency);
+        return (
+          <div key={s.id} className="sub-row">
+            <div className="sub-info">
+              <span className="sub-name">{s.merchant_name ?? s.description}</span>
+              <span className="sub-frequency">
+                {formatFrequency(s.frequency)} · {formatCurrency(Math.abs(s.last_amount))} per charge
+              </span>
+              <span className="sub-next-due">
+                {nextDue
+                  ? `${nextLabel} ${formatDate(nextDue)} (${dueLabel(daysBetween(today, nextDue))})`
+                  : `${nextLabel} date not predictable — irregular cadence`}
+              </span>
+            </div>
+            <div className="sub-bar-track">
+              <div className={barClass} style={{ width: `${(s.monthly_amount / maxMonthly) * 100}%` }} />
+            </div>
+            <span className="sub-amount">{formatCurrency(s.monthly_amount)}/mo</span>
           </div>
-          <div className="sub-bar-track">
-            <div className={barClass} style={{ width: `${(s.monthly_amount / maxMonthly) * 100}%` }} />
-          </div>
-          <span className="sub-amount">{formatCurrency(s.monthly_amount)}/mo</span>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -68,7 +90,7 @@ export function SubscriptionsRecurring({
             history builds up (usually needs a few months of history per source).
           </p>
         ) : (
-          <StreamList streams={inflows} barClass="sub-bar-fill income" />
+          <StreamList streams={inflows} barClass="sub-bar-fill income" nextLabel="Next deposit" />
         )}
       </div>
 
@@ -83,7 +105,7 @@ export function SubscriptionsRecurring({
             history builds up (usually needs a few months of history per merchant).
           </p>
         ) : (
-          <StreamList streams={outflows} barClass="sub-bar-fill" />
+          <StreamList streams={outflows} barClass="sub-bar-fill" nextLabel="Next charge" />
         )}
       </div>
     </div>

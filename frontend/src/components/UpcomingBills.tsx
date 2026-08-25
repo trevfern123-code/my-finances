@@ -1,57 +1,10 @@
 import type { Loan, ManualLoan, RecurringStream } from '../lib/api';
+import { daysBetween, dueLabel, estimateNextDueDate, parseDate, todayUtc } from '../lib/recurringDates';
 
 const DAYS_AHEAD = 14;
 
 function formatCurrency(amount: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
-}
-
-function todayUtc(): Date {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-}
-
-function parseDate(date: string): Date {
-  const [y, m, d] = date.split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, d));
-}
-
-function daysBetween(a: Date, b: Date): number {
-  return Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24));
-}
-
-function dueLabel(days: number): string {
-  if (days < 0) return 'overdue';
-  if (days === 0) return 'today';
-  if (days === 1) return 'tomorrow';
-  return `in ${days} days`;
-}
-
-/** Recurring streams have no explicit "next due" date — only when it last occurred and how
- *  often. Estimate the next occurrence from last_date + frequency; irregular/unknown-cadence
- *  streams can't be estimated and are skipped rather than guessed at. */
-function estimateNextDueDate(lastDate: string, frequency: string): Date | null {
-  const date = parseDate(lastDate);
-  switch (frequency) {
-    case 'WEEKLY':
-      date.setUTCDate(date.getUTCDate() + 7);
-      break;
-    case 'BIWEEKLY':
-      date.setUTCDate(date.getUTCDate() + 14);
-      break;
-    case 'SEMI_MONTHLY':
-      date.setUTCDate(date.getUTCDate() + 15);
-      break;
-    case 'MONTHLY':
-      date.setUTCMonth(date.getUTCMonth() + 1);
-      break;
-    case 'ANNUALLY':
-      date.setUTCFullYear(date.getUTCFullYear() + 1);
-      break;
-    default:
-      return null;
-  }
-  return date;
 }
 
 interface UpcomingItem {

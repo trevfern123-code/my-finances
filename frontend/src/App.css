@@ -1175,6 +1175,11 @@ button:disabled {
   color: var(--text-muted);
 }
 
+.sub-next-due {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
 .sub-bar-track {
   width: 110px;
   height: 6px;
