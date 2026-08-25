@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm install
+
+      - name: Backend typecheck
+        run: npm run typecheck --workspace backend
+
+      - name: Backend tests
+        run: npm run test --workspace backend
+
+      - name: Backend build
+        run: npm run build --workspace backend
+
+      - name: Frontend typecheck
+        run: npm run typecheck --workspace frontend
+
+      - name: Frontend build
+        run: npm run build --workspace frontend

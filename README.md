@@ -24,6 +24,26 @@ npm install
 npm run dev
 ```
 
+## Database migrations
+
+Schema changes are tracked via the Supabase CLI (`npx supabase`, no global install needed) in
+`supabase/`, rather than as one-off SQL handed over ad hoc. `supabase/SCHEMA_NOTES.md` documents
+the schema as reconstructed from application code — read that first if `supabase/migrations/`
+doesn't exist yet or looks incomplete, since linking this repo to the live project (`supabase
+login` + `supabase link` + `supabase db pull`, all interactive/one-time) hasn't necessarily
+happened yet. Once linked, new schema changes go through `supabase migration new <name>`, get
+reviewed, and get applied with `supabase db push` (or still by hand in the SQL editor for a
+one-off change) — either way, the SQL lives in the repo afterward instead of only in chat history.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`: backend typecheck, backend tests,
+backend build, frontend typecheck, frontend build. No secrets are required — every backend test
+mocks its Supabase/Plaid config imports, so the suite passes with zero environment variables set
+(verified: `env -i npx vitest run` passes clean). This doesn't deploy anything itself — Railway
+and Vercel still deploy independently on push — it just catches a broken build/test before that
+happens.
+
 ## Testing
 
 ```bash
