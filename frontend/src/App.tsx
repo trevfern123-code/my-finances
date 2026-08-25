@@ -340,6 +340,18 @@ export default function App() {
     }
   }
 
+  async function handleReorderCategory(id: string, sortOrder: number) {
+    setActionError(null);
+    try {
+      const res = await updateBudgetCategory(id, { sort_order: sortOrder });
+      setBudgetCategories((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, ...res.category } : c))
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to reorder categories');
+    }
+  }
+
   async function handleDeleteCategory(id: string) {
     setActionError(null);
     try {
@@ -506,6 +518,7 @@ export default function App() {
               categories={budgetCategories}
               onCreate={handleCreateCategory}
               onUpdate={handleUpdateCategory}
+              onReorder={handleReorderCategory}
               onDelete={handleDeleteCategory}
             />
           )}
