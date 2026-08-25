@@ -927,6 +927,12 @@ button:disabled {
   color: var(--danger);
 }
 
+.monthly-total-badge.income {
+  background: rgba(52, 211, 153, 0.1);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .pending-badge.overdue {
   margin-left: 0;
   color: var(--danger);
@@ -1182,6 +1188,10 @@ button:disabled {
   height: 100%;
   border-radius: 999px;
   background: var(--info);
+}
+
+.sub-bar-fill.income {
+  background: var(--accent);
 }
 
 .sub-amount {

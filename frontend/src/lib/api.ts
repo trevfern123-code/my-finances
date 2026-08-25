@@ -164,6 +164,7 @@ export interface RecurringStream {
 export function getRecurringStreams(): Promise<{
   streams: RecurringStream[];
   total_monthly_outflow: number;
+  total_monthly_inflow: number;
 }> {
   return authedFetch('/api/plaid/recurring-streams');
 }

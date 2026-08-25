@@ -82,6 +82,7 @@ export default function App() {
   const [monthlyBreakdown, setMonthlyBreakdown] = useState<MonthBreakdown[]>([]);
   const [recurringStreams, setRecurringStreams] = useState<RecurringStream[]>([]);
   const [totalMonthlyOutflow, setTotalMonthlyOutflow] = useState(0);
+  const [totalMonthlyInflow, setTotalMonthlyInflow] = useState(0);
   const [loans, setLoans] = useState<Loan[]>([]);
   const [totalDebt, setTotalDebt] = useState(0);
   const [totalMinimumPayment, setTotalMinimumPayment] = useState(0);
@@ -144,6 +145,7 @@ export default function App() {
     if (recurringRes.status === 'fulfilled') {
       setRecurringStreams(recurringRes.value.streams);
       setTotalMonthlyOutflow(recurringRes.value.total_monthly_outflow);
+      setTotalMonthlyInflow(recurringRes.value.total_monthly_inflow);
     }
     if (loansRes.status === 'fulfilled') {
       setLoans(loansRes.value.loans);
@@ -213,6 +215,7 @@ export default function App() {
       const res = await getRecurringStreams();
       setRecurringStreams(res.streams);
       setTotalMonthlyOutflow(res.total_monthly_outflow);
+      setTotalMonthlyInflow(res.total_monthly_inflow);
     } catch {
       // ignore
     }
@@ -508,7 +511,11 @@ export default function App() {
           )}
 
           {activeTab === 'recurring' && (
-            <SubscriptionsRecurring streams={recurringStreams} totalMonthlyOutflow={totalMonthlyOutflow} />
+            <SubscriptionsRecurring
+              streams={recurringStreams}
+              totalMonthlyOutflow={totalMonthlyOutflow}
+              totalMonthlyInflow={totalMonthlyInflow}
+            />
           )}
 
           {activeTab === 'loans' && (

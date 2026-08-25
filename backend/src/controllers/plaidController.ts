@@ -70,15 +70,25 @@ export async function getRecurringStreams(req: Request, res: Response, next: Nex
     const withMonthlyAmount = streams
       .map((stream) => ({
         ...stream,
-        monthly_amount: normalizeToMonthlyAmount(stream.average_amount, stream.frequency),
+        // Plaid convention: inflow amounts are negative, outflow positive — monthly_amount is a
+        // display-oriented magnitude, so normalize to positive regardless of direction (which
+        // already unambiguously says which way the money moves).
+        monthly_amount: Math.abs(normalizeToMonthlyAmount(stream.average_amount, stream.frequency)),
       }))
       .sort((a, b) => b.monthly_amount - a.monthly_amount);
 
     const totalMonthlyOutflow = withMonthlyAmount
       .filter((s) => s.direction === 'outflow')
       .reduce((sum, s) => sum + s.monthly_amount, 0);
+    const totalMonthlyInflow = withMonthlyAmount
+      .filter((s) => s.direction === 'inflow')
+      .reduce((sum, s) => sum + s.monthly_amount, 0);
 
-    res.json({ streams: withMonthlyAmount, total_monthly_outflow: totalMonthlyOutflow });
+    res.json({
+      streams: withMonthlyAmount,
+      total_monthly_outflow: totalMonthlyOutflow,
+      total_monthly_inflow: totalMonthlyInflow,
+    });
   } catch (err) {
     next(err);
   }
