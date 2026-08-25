@@ -885,6 +885,40 @@ button:disabled {
   gap: 1.25rem;
 }
 
+.month-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.month-card-header:hover {
+  filter: none;
+}
+
+.month-card-header h2 {
+  flex-shrink: 0;
+}
+
+.month-expand-icon {
+  font-size: 1.1rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  width: 1.2rem;
+  text-align: center;
+}
+
+.month-card-body {
+  margin-top: 0.9rem;
+}
+
 .month-totals {
   display: flex;
   gap: 0.9rem;
@@ -927,6 +961,14 @@ button:disabled {
 
 .cat-row:last-child {
   border-bottom: none;
+}
+
+.cat-row.uncategorized {
+  opacity: 0.6;
+}
+
+.cat-row.uncategorized .cat-name {
+  font-style: italic;
 }
 
 .cat-dot {
