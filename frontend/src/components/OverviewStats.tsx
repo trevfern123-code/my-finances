@@ -1,4 +1,5 @@
 import type { AssetGroup, NetWorthPoint } from '../lib/api';
+import { computeLiquidCash } from '../lib/assets';
 
 function formatCurrency(amount: number) {
   return new Intl.NumberFormat('en-US', {
@@ -18,14 +19,6 @@ function findLastMonthSnapshot(history: NetWorthPoint[]): NetWorthPoint | null {
     if (history[i].date.slice(0, 7) !== latestMonth) return history[i];
   }
   return null;
-}
-
-/** Checking + savings — the cash actually available to spend, as opposed to net worth (which
- *  also nets out investments, loans, and other illiquid balances). */
-function computeLiquidCash(groups: AssetGroup[]): number {
-  return groups
-    .filter((g) => g.category === 'checking' || g.category === 'savings')
-    .reduce((sum, g) => sum + g.total, 0);
 }
 
 function StatDelta({

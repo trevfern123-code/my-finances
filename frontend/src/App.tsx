@@ -19,6 +19,7 @@ import {
   getRecurringStreams,
   getSpendingSummary,
   getTransactions,
+  approveTransaction,
   setTransactionCategory,
   syncTransactions as syncTransactionsRequest,
   unlinkLoanPayment,
@@ -48,6 +49,7 @@ import { LinkedAccounts } from './components/LinkedAccounts';
 import { TransactionsFeed } from './components/TransactionsFeed';
 import { BudgetCategories } from './components/BudgetCategories';
 import { OverviewStats } from './components/OverviewStats';
+import { SafeToSpend } from './components/SafeToSpend';
 import { CashFlowPace } from './components/CashFlowPace';
 import { AccountQuickView } from './components/AccountQuickView';
 import { UpcomingBills } from './components/UpcomingBills';
@@ -332,10 +334,22 @@ export default function App() {
     }
   }
 
-  async function handleCreateCategory(name: string, budgetAmount: number) {
+  async function handleApproveTransaction(transactionId: string) {
     setActionError(null);
     try {
-      const res = await createBudgetCategory({ name, budget_amount: budgetAmount });
+      await approveTransaction(transactionId);
+      setTransactions((prev) =>
+        prev.map((t) => (t.id === transactionId ? { ...t, needs_review: false } : t))
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to approve transaction');
+    }
+  }
+
+  async function handleCreateCategory(name: string, budgetAmount: number, emoji: string | null) {
+    setActionError(null);
+    try {
+      const res = await createBudgetCategory({ name, budget_amount: budgetAmount, emoji });
       // A brand-new category has no transactions assigned to it yet, so both derived fields
       // are always 0 — no need to refetch just to fill in values we already know.
       setBudgetCategories((prev) => [...prev, { ...res.category, spent: 0, recent_avg_spent: 0 }]);
@@ -355,6 +369,18 @@ export default function App() {
       );
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to update category');
+    }
+  }
+
+  async function handleUpdateCategoryEmoji(id: string, emoji: string | null) {
+    setActionError(null);
+    try {
+      const res = await updateBudgetCategory(id, { emoji });
+      setBudgetCategories((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, ...res.category } : c))
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update category emoji');
     }
   }
 
@@ -504,6 +530,13 @@ export default function App() {
                   monthlySpending={summary.monthly_spending}
                 />
               )}
+              <SafeToSpend
+                assetGroups={assetGroups}
+                recurringStreams={recurringStreams}
+                loans={loans}
+                manualLoans={manualLoans}
+                budgetCategories={budgetCategories}
+              />
               {summary && (
                 <CashFlowPace
                   budgetCategories={budgetCategories}
@@ -521,7 +554,11 @@ export default function App() {
               </div>
               <div className="dashboard-grid">
                 <div>
-                  <RecentActivity transactions={transactions} onViewAll={() => setActiveTab('accounts')} />
+                  <RecentActivity
+                    transactions={transactions}
+                    budgetCategories={budgetCategories}
+                    onViewAll={() => setActiveTab('accounts')}
+                  />
                 </div>
                 <div>{summary && <MonthlySpendingChart summary={summary} />}</div>
               </div>
@@ -536,6 +573,7 @@ export default function App() {
               categories={budgetCategories}
               onCreate={handleCreateCategory}
               onUpdate={handleUpdateCategory}
+              onUpdateEmoji={handleUpdateCategoryEmoji}
               onReorder={handleReorderCategory}
               onDelete={handleDeleteCategory}
             />
@@ -592,6 +630,7 @@ export default function App() {
                 syncing={syncing}
                 onSync={handleSyncTransactions}
                 onCategorize={handleCategorize}
+                onApprove={handleApproveTransaction}
               />
             </div>
           )}

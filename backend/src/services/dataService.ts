@@ -343,9 +343,13 @@ export async function applyTransactionChanges(params: {
     const toUpdate = upsertCandidates.filter((t) => existingByPlaidId.has(t.plaid_transaction_id));
 
     if (toInsert.length > 0) {
+      // needs_review only applies at insert time — added here rather than in
+      // mapPlaidTransaction so a later "modified" update (which reuses the same mapped row)
+      // never resets an already-reviewed transaction back to unreviewed.
+      const rowsToInsert = toInsert.map((t) => ({ ...t, needs_review: true }));
       const { data, error } = await supabaseAdmin
         .from('transactions')
-        .insert(toInsert)
+        .insert(rowsToInsert)
         .select('id, name, merchant_name, amount');
       if (error) throw new Error(`Failed to insert transactions: ${error.message}`);
       insertedRows = (data ?? []) as InsertedTransaction[];
@@ -376,7 +380,7 @@ export async function getRecentTransactionsForUser(userId: string, limit: number
   const { data, error } = await supabaseAdmin
     .from('transactions')
     .select(
-      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, accounts!inner(name, plaid_items!inner(user_id, institution_name))'
+      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, plaid_items!inner(user_id, institution_name))'
     )
     .eq('accounts.plaid_items.user_id', userId)
     .order('date', { ascending: false })
@@ -446,6 +450,18 @@ export async function setTransactionCategory(
     .single();
 
   if (error) throw new Error(`Failed to set transaction category: ${error.message}`);
+  return data as TransactionRow;
+}
+
+export async function approveTransaction(transactionId: string): Promise<TransactionRow> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .update({ needs_review: false })
+    .eq('id', transactionId)
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to approve transaction: ${error.message}`);
   return data as TransactionRow;
 }
 
@@ -935,7 +951,7 @@ export async function getCategorySpendRows(
 
 export async function createBudgetCategory(
   userId: string,
-  params: { name: string; budgetAmount: number; color: string | null; sortOrder: number }
+  params: { name: string; budgetAmount: number; color: string | null; sortOrder: number; emoji: string | null }
 ): Promise<BudgetCategoryRow> {
   const { data, error } = await supabaseAdmin
     .from('budget_categories')
@@ -945,6 +961,7 @@ export async function createBudgetCategory(
       budget_amount: params.budgetAmount,
       color: params.color,
       sort_order: params.sortOrder,
+      emoji: params.emoji,
     })
     .select()
     .single();
@@ -956,7 +973,13 @@ export async function createBudgetCategory(
 export async function updateBudgetCategory(
   id: string,
   userId: string,
-  fields: Partial<{ name: string; budget_amount: number; color: string | null; sort_order: number }>
+  fields: Partial<{
+    name: string;
+    budget_amount: number;
+    color: string | null;
+    sort_order: number;
+    emoji: string | null;
+  }>
 ): Promise<BudgetCategoryRow | null> {
   const { data, error } = await supabaseAdmin
     .from('budget_categories')

@@ -82,6 +82,8 @@ export interface TransactionItem {
   plaid_category: string | null;
   pending: boolean;
   budget_category_id: string | null;
+  /** True until the user approves the transaction — never reset by a later Plaid update. */
+  needs_review: boolean;
   accounts: { name: string; plaid_items: { institution_name: string | null } };
 }
 
@@ -91,6 +93,8 @@ export interface BudgetCategory {
   budget_amount: number;
   color: string | null;
   sort_order: number;
+  /** Optional single emoji shown next to the category name and on its transactions. */
+  emoji: string | null;
   /** Sum of positive-amount categorized transactions in the current calendar month — only present on GET /api/budget-categories. */
   spent: number;
   /** Average monthly spend over the most recent full months, excluding the in-progress current month — only present on GET /api/budget-categories. */
@@ -403,6 +407,10 @@ export function setTransactionCategory(
   });
 }
 
+export function approveTransaction(transactionId: string): Promise<{ transaction: TransactionItem }> {
+  return authedFetch(`/api/plaid/transactions/${transactionId}/approve`, { method: 'PATCH' });
+}
+
 export function getBudgetCategories(): Promise<{ categories: BudgetCategory[] }> {
   return authedFetch('/api/budget-categories');
 }
@@ -415,13 +423,20 @@ export function createBudgetCategory(params: {
   name: string;
   budget_amount: number;
   color?: string | null;
+  emoji?: string | null;
 }): Promise<{ category: BareBudgetCategory }> {
   return authedFetch('/api/budget-categories', { method: 'POST', body: JSON.stringify(params) });
 }
 
 export function updateBudgetCategory(
   id: string,
-  fields: Partial<{ name: string; budget_amount: number; color: string | null; sort_order: number }>
+  fields: Partial<{
+    name: string;
+    budget_amount: number;
+    color: string | null;
+    sort_order: number;
+    emoji: string | null;
+  }>
 ): Promise<{ category: BareBudgetCategory }> {
   return authedFetch(`/api/budget-categories/${id}`, {
     method: 'PATCH',

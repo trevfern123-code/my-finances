@@ -38,11 +38,12 @@ export async function listBudgetCategories(req: Request, res: Response, next: Ne
 
 export async function createBudgetCategory(req: Request, res: Response, next: NextFunction) {
   try {
-    const { name, budget_amount: budgetAmount, color, sort_order: sortOrder } = req.body as {
+    const { name, budget_amount: budgetAmount, color, sort_order: sortOrder, emoji } = req.body as {
       name?: string;
       budget_amount?: number;
       color?: string | null;
       sort_order?: number;
+      emoji?: string | null;
     };
 
     if (!name || typeof budgetAmount !== 'number') {
@@ -55,6 +56,7 @@ export async function createBudgetCategory(req: Request, res: Response, next: Ne
       budgetAmount,
       color: color ?? null,
       sortOrder: sortOrder ?? 0,
+      emoji: emoji ?? null,
     });
     res.status(201).json({ category });
   } catch (err) {
@@ -65,11 +67,12 @@ export async function createBudgetCategory(req: Request, res: Response, next: Ne
 export async function updateBudgetCategory(req: Request, res: Response, next: NextFunction) {
   try {
     const { id } = req.params;
-    const { name, budget_amount: budgetAmount, color, sort_order: sortOrder } = req.body as {
+    const { name, budget_amount: budgetAmount, color, sort_order: sortOrder, emoji } = req.body as {
       name?: string;
       budget_amount?: number;
       color?: string | null;
       sort_order?: number;
+      emoji?: string | null;
     };
 
     const fields: Record<string, unknown> = {};
@@ -77,6 +80,7 @@ export async function updateBudgetCategory(req: Request, res: Response, next: Ne
     if (budgetAmount !== undefined) fields.budget_amount = budgetAmount;
     if (color !== undefined) fields.color = color;
     if (sortOrder !== undefined) fields.sort_order = sortOrder;
+    if (emoji !== undefined) fields.emoji = emoji;
 
     const category = await dataService.updateBudgetCategory(id, req.user!.id, fields);
     if (!category) {

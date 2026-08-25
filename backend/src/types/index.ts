@@ -59,6 +59,9 @@ export interface TransactionRow {
   /** How much of this transaction's amount reduces the linked loan's principal — editable, since
    *  a payment on an interest-bearing loan doesn't reduce balance by the full payment amount. */
   principal_portion: number | null;
+  /** True for every newly-synced transaction until the user approves it — never reset by a
+   *  later Plaid update, only cleared explicitly via the approve endpoint. */
+  needs_review: boolean;
 }
 
 export interface BudgetCategoryRow {
@@ -68,6 +71,8 @@ export interface BudgetCategoryRow {
   budget_amount: number;
   color: string | null;
   sort_order: number;
+  /** Optional single emoji shown next to the category name and on its transactions. */
+  emoji: string | null;
 }
 
 export interface BudgetCategoryWithSpend extends BudgetCategoryRow {

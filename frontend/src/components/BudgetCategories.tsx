@@ -1,5 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { BudgetCategory } from '../lib/api';
+
+const EMOJI_OPTIONS = [
+  '🍔', '🚗', '🏠', '💊', '🎬', '✈️', '🛒', '⚡',
+  '📱', '💰', '🎓', '🐾', '🎁', '☕', '👕', '🏋️',
+  '🐶', '🔧', '📚', '🎮', '🍿', '🚕', '🧾', '💳',
+];
 
 function formatCurrency(amount: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
@@ -18,27 +24,96 @@ function progressTier(spent: number, budgetAmount: number): 'good' | 'warn' | 'o
   return 'good';
 }
 
+function EmojiPicker({
+  value,
+  onChange,
+  label,
+}: {
+  value: string | null;
+  onChange: (emoji: string | null) => void;
+  label: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [open]);
+
+  return (
+    <div className="emoji-picker" ref={ref}>
+      <button
+        type="button"
+        className="emoji-picker-trigger"
+        onClick={() => setOpen((v) => !v)}
+        aria-label={label}
+      >
+        {value ?? '＋'}
+      </button>
+      {open && (
+        <div className="emoji-picker-grid">
+          {EMOJI_OPTIONS.map((option) => (
+            <button
+              key={option}
+              type="button"
+              className="emoji-picker-option"
+              onClick={() => {
+                onChange(option);
+                setOpen(false);
+              }}
+            >
+              {option}
+            </button>
+          ))}
+          {value && (
+            <button
+              type="button"
+              className="emoji-picker-option emoji-picker-clear"
+              onClick={() => {
+                onChange(null);
+                setOpen(false);
+              }}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AddCategoryForm({
   onCreate,
   onCancel,
 }: {
-  onCreate: (name: string, budgetAmount: number) => void;
+  onCreate: (name: string, budgetAmount: number, emoji: string | null) => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState('');
   const [amount, setAmount] = useState('');
+  const [emoji, setEmoji] = useState<string | null>(null);
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const parsed = Number(amount);
     if (!name || Number.isNaN(parsed)) return;
-    onCreate(name, parsed);
+    onCreate(name, parsed, emoji);
   }
 
   return (
     <form className="card new-category-card" onSubmit={handleSubmit}>
       <h3>Add a budget category</h3>
       <div className="new-category-form-grid">
+        <label className="new-category-emoji-label">
+          Emoji
+          <EmojiPicker value={emoji} onChange={setEmoji} label="Choose an emoji for this category" />
+        </label>
         <label>
           Name
           <input
@@ -74,12 +149,14 @@ export function BudgetCategories({
   categories,
   onCreate,
   onUpdate,
+  onUpdateEmoji,
   onReorder,
   onDelete,
 }: {
   categories: BudgetCategory[];
-  onCreate: (name: string, budgetAmount: number) => void;
+  onCreate: (name: string, budgetAmount: number, emoji: string | null) => void;
   onUpdate: (id: string, budgetAmount: number) => void;
+  onUpdateEmoji: (id: string, emoji: string | null) => void;
   onReorder: (id: string, sortOrder: number) => void;
   onDelete: (id: string) => void;
 }) {
@@ -90,8 +167,8 @@ export function BudgetCategories({
   // takes effect immediately once the underlying values update, with no separate refetch.
   const sorted = [...categories].sort((a, b) => a.sort_order - b.sort_order);
 
-  function handleCreate(name: string, budgetAmount: number) {
-    onCreate(name, budgetAmount);
+  function handleCreate(name: string, budgetAmount: number, emoji: string | null) {
+    onCreate(name, budgetAmount, emoji);
     setShowAddForm(false);
   }
 
@@ -153,6 +230,11 @@ export function BudgetCategories({
                         ▼
                       </button>
                     </div>
+                    <EmojiPicker
+                      value={c.emoji}
+                      onChange={(emoji) => onUpdateEmoji(c.id, emoji)}
+                      label={`Choose an emoji for ${c.name}`}
+                    />
                     <span className="budget-category-name">{c.name}</span>
                     <div className="budget-category-actions">
                       <input

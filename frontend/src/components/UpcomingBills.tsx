@@ -1,76 +1,11 @@
 import type { Loan, ManualLoan, RecurringStream } from '../lib/api';
-import { daysBetween, dueLabel, estimateNextDueDate, parseDate, todayUtc } from '../lib/recurringDates';
+import { dueLabel } from '../lib/recurringDates';
+import { collectUpcomingItems } from '../lib/upcomingItems';
 
-const DAYS_AHEAD = 14;
+export const UPCOMING_BILLS_DAYS_AHEAD = 14;
 
 function formatCurrency(amount: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
-}
-
-interface UpcomingItem {
-  id: string;
-  name: string;
-  amount: number;
-  dueDate: Date;
-  days: number;
-  kind: 'bill' | 'loan';
-}
-
-function collectUpcoming(
-  recurringStreams: RecurringStream[],
-  loans: Loan[],
-  manualLoans: ManualLoan[]
-): UpcomingItem[] {
-  const today = todayUtc();
-  const items: UpcomingItem[] = [];
-
-  for (const s of recurringStreams) {
-    if (s.direction !== 'outflow' || !s.is_active) continue;
-    const due = estimateNextDueDate(s.last_date, s.frequency);
-    if (!due) continue;
-    const days = daysBetween(today, due);
-    if (days < 0 || days > DAYS_AHEAD) continue;
-    items.push({
-      id: `stream-${s.id}`,
-      name: s.merchant_name ?? s.description,
-      amount: s.last_amount,
-      dueDate: due,
-      days,
-      kind: 'bill',
-    });
-  }
-
-  for (const loan of loans) {
-    if (!loan.next_payment_due_date || !loan.minimum_payment_amount) continue;
-    const due = parseDate(loan.next_payment_due_date);
-    const days = daysBetween(today, due);
-    if (days < 0 || days > DAYS_AHEAD) continue;
-    items.push({
-      id: `loan-${loan.id}`,
-      name: loan.name ?? loan.account_name ?? 'Loan',
-      amount: loan.minimum_payment_amount,
-      dueDate: due,
-      days,
-      kind: 'loan',
-    });
-  }
-
-  for (const loan of manualLoans) {
-    if (!loan.next_payment_due_date || !loan.minimum_payment_amount) continue;
-    const due = parseDate(loan.next_payment_due_date);
-    const days = daysBetween(today, due);
-    if (days < 0 || days > DAYS_AHEAD) continue;
-    items.push({
-      id: `manual-loan-${loan.id}`,
-      name: loan.name,
-      amount: loan.minimum_payment_amount,
-      dueDate: due,
-      days,
-      kind: 'loan',
-    });
-  }
-
-  return items.sort((a, b) => a.dueDate.getTime() - b.dueDate.getTime());
 }
 
 export function UpcomingBills({
@@ -82,7 +17,7 @@ export function UpcomingBills({
   loans: Loan[];
   manualLoans: ManualLoan[];
 }) {
-  const items = collectUpcoming(recurringStreams, loans, manualLoans);
+  const items = collectUpcomingItems(recurringStreams, loans, manualLoans, UPCOMING_BILLS_DAYS_AHEAD);
   const total = items.reduce((sum, i) => sum + i.amount, 0);
 
   return (

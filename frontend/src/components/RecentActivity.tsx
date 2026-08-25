@@ -1,4 +1,4 @@
-import type { TransactionItem } from '../lib/api';
+import type { BudgetCategory, TransactionItem } from '../lib/api';
 
 function formatAmount(amount: number, currency: string | null) {
   const formatted = new Intl.NumberFormat('en-US', {
@@ -20,12 +20,15 @@ function formatDate(date: string) {
 
 export function RecentActivity({
   transactions,
+  budgetCategories,
   onViewAll,
 }: {
   transactions: TransactionItem[];
+  budgetCategories: BudgetCategory[];
   onViewAll: () => void;
 }) {
   const recent = transactions.slice(0, 5);
+  const categoryById = new Map(budgetCategories.map((c) => [c.id, c]));
 
   return (
     <div className="card">
@@ -39,17 +42,23 @@ export function RecentActivity({
         <p className="hint">No transactions yet.</p>
       ) : (
         <div className="quick-view-list">
-          {recent.map((t) => (
-            <div key={t.id} className="recent-activity-row">
-              <div className="transaction-card-main">
-                <span className="transaction-name">{t.merchant_name ?? t.name}</span>
-                <span className="hint">{formatDate(t.date)}</span>
+          {recent.map((t) => {
+            const emoji = t.budget_category_id ? categoryById.get(t.budget_category_id)?.emoji : null;
+            return (
+              <div key={t.id} className="recent-activity-row">
+                <div className="transaction-card-main">
+                  <span className="transaction-name">
+                    {emoji && <span className="transaction-emoji">{emoji}</span>}
+                    {t.merchant_name ?? t.name}
+                  </span>
+                  <span className="hint">{formatDate(t.date)}</span>
+                </div>
+                <span className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
+                  {formatAmount(t.amount, t.iso_currency_code)}
+                </span>
               </div>
-              <span className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
-                {formatAmount(t.amount, t.iso_currency_code)}
-              </span>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

@@ -489,3 +489,21 @@ export async function setTransactionCategory(req: Request, res: Response, next: 
     next(err);
   }
 }
+
+export async function approveTransaction(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { transactionId } = req.params;
+
+    const ownerId = await dataService.getTransactionOwnerId(transactionId);
+    if (!ownerId || ownerId !== userId) {
+      res.status(404).json({ error: 'Transaction not found' });
+      return;
+    }
+
+    const transaction = await dataService.approveTransaction(transactionId);
+    res.json({ transaction });
+  } catch (err) {
+    next(err);
+  }
+}
