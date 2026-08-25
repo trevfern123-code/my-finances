@@ -12,19 +12,20 @@ export interface UpcomingItem {
 
 /** Recurring outflows and loan payments due within `daysAhead` days — shared by the Overview
  *  page's Upcoming Bills widget and the Safe to Spend calculation, so both agree on exactly
- *  what counts as "coming up" and by how much. */
+ *  what counts as "coming up" and by how much. `today` is overridable purely for deterministic
+ *  testing, mirroring the same pattern already used by estimateNextDueDate/budgetDrilldown. */
 export function collectUpcomingItems(
   recurringStreams: RecurringStream[],
   loans: Loan[],
   manualLoans: ManualLoan[],
-  daysAhead: number
+  daysAhead: number,
+  today: Date = todayUtc()
 ): UpcomingItem[] {
-  const today = todayUtc();
   const items: UpcomingItem[] = [];
 
   for (const s of recurringStreams) {
     if (s.direction !== 'outflow' || !s.is_active) continue;
-    const due = estimateNextDueDate(s.last_date, s.frequency);
+    const due = estimateNextDueDate(s.last_date, s.frequency, today);
     if (!due) continue;
     const days = daysBetween(today, due);
     if (days < 0 || days > daysAhead) continue;
