@@ -2,6 +2,30 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      // Applies a cached theme/accent choice before first paint, so a returning user never sees
+      // a flash of the default appearance before React mounts and the real preference (fetched
+      // from the server, the actual source of truth) takes over. Mirrors the storage key and
+      // shape used by src/hooks/useAppearance.ts — kept in sync manually since this has to run
+      // standalone, before any bundled module is available.
+      (function () {
+        try {
+          var raw = localStorage.getItem('my-finances-appearance');
+          if (!raw) return;
+          var parsed = JSON.parse(raw);
+          var root = document.documentElement;
+          if (parsed.theme === 'light' || parsed.theme === 'dark') {
+            root.setAttribute('data-theme', parsed.theme);
+          }
+          if (typeof parsed.accent === 'string') {
+            root.setAttribute('data-accent', parsed.accent);
+          }
+        } catch (e) {
+          // localStorage unavailable/corrupted — falls back to the default appearance, same as
+          // a first-time visitor; the app's own hydration reconciles once it loads regardless.
+        }
+      })();
+    </script>
     <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0f172a" />

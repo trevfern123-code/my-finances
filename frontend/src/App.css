@@ -1,6 +1,100 @@
+/*
+ * Theming model: two independent axes, both expressed as tokens so no component ever branches
+ * on theme/accent itself.
+ *
+ * THEME (light/dark) — :root below holds the complete LIGHT palette (the CSS default). System
+ * (the app default) is unstamped and handled purely by `@media (prefers-color-scheme: dark)`,
+ * guarded with `:not([data-theme="light"])` so an explicit Light choice always wins over the OS
+ * setting. `:root[data-theme="dark"]` repeats the same dark values so the explicit Dark choice
+ * wins in the other direction. Every token below is redefined in both dark blocks — never only
+ * one — so nothing is ever unset in a state that reaches it.
+ *
+ * ACCENT (brand color, user-selectable, 6 presets) — deliberately kept separate from the
+ * financial-meaning tokens (--positive/--danger/--warn/--info): those always mean the same thing
+ * regardless of which accent the user picked. --accent (used as bare text/border, e.g. focus
+ * rings, links-as-accent) needs a different shade per theme for contrast against a light vs. dark
+ * page, so each preset defines both; --accent-strong/--accent-rgb/--text-on-accent describe a
+ * self-contained solid-fill button and its contrast-safe label, which doesn't depend on the
+ * surrounding page background, so those three are defined once per preset regardless of theme.
+ * Green is the default preset, in bare :root — every other preset overrides via
+ * `[data-accent="..."]` (plus its own tiny dark-context override for --accent only).
+ */
+
 :root {
-  color-scheme: dark;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  color-scheme: light;
+
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-raised: #f1f5f9;
+  --border: #e2e8f0;
+  --border-strong: #cbd5e1;
+
+  --text: #0f172a;
+  --text-muted: #64748b;
+
+  /* Financial-meaning colors — fixed regardless of the user's chosen accent. */
+  --positive: #059669;
+  --positive-rgb: 5, 150, 105;
+  --danger: #dc2626;
+  --danger-rgb: 220, 38, 38;
+  --warn: #b45309;
+  --warn-rgb: 245, 158, 11;
+  --info: #2563eb;
+  --info-hover: #1d4ed8;
+
+  /* Theme-independent (self-contained fill + label contrast, doesn't depend on page background) —
+     same value in light and dark. */
+  --warn-strong: #f59e0b;
+  --text-on-warn: #3b2a04;
+
+  /* Accent preset: Green (default). --accent is this preset's LIGHT-context value; its dark-context
+     value is set in the dark-theme blocks below. --accent-strong/--accent-rgb/--text-on-accent are
+     theme-independent — see comment above. */
+  --accent: #059669;
+  --accent-strong: #22c55e;
+  --accent-rgb: 34, 197, 94;
+  --text-on-accent: #06281a;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.08), 0 8px 24px -12px rgba(0, 0, 0, 0.18);
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --bg: #0b1120;
+    --surface: #141c30;
+    --surface-raised: #1a2438;
+    --border: #262f45;
+    --border-strong: #334155;
+
+    --text: #e8ecf4;
+    --text-muted: #8b96ac;
+
+    --positive: #34d399;
+    --positive-rgb: 52, 211, 153;
+    --danger: #f87171;
+    --danger-rgb: 248, 113, 113;
+    --warn: #fbbf24;
+    --warn-rgb: 251, 191, 36;
+    --info: #60a5fa;
+    --info-hover: #93c5fd;
+
+    --accent: #34d399;
+
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.2), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+    --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.25);
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
 
   --bg: #0b1120;
   --surface: #141c30;
@@ -11,9 +105,8 @@
   --text: #e8ecf4;
   --text-muted: #8b96ac;
 
-  --accent: #34d399;
-  --accent-rgb: 52, 211, 153;
-  --accent-strong: #22c55e;
+  --positive: #34d399;
+  --positive-rgb: 52, 211, 153;
   --danger: #f87171;
   --danger-rgb: 248, 113, 113;
   --warn: #fbbf24;
@@ -21,18 +114,77 @@
   --info: #60a5fa;
   --info-hover: #93c5fd;
 
-  /* Text colors for content sitting directly on a solid accent/warn fill, where --text (light)
-     wouldn't have enough contrast. Named by role, not by shade, so a future accent-color or
-     light-theme change only has to update these two lines, not every button/badge that uses them. */
-  --text-on-accent: #06281a;
-  --text-on-warn: #3b2a04;
-
-  --radius-sm: 8px;
-  --radius-md: 12px;
-  --radius-lg: 16px;
+  --accent: #34d399;
 
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.2), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
   --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+/* ---- Accent presets ---- */
+
+:root[data-accent='blue'] {
+  --accent: #2563eb;
+  --accent-strong: #2563eb;
+  --accent-rgb: 37, 99, 235;
+  --text-on-accent: #ffffff;
+}
+:root[data-accent='teal'] {
+  --accent: #0d9488;
+  --accent-strong: #14b8a6;
+  --accent-rgb: 20, 184, 166;
+  --text-on-accent: #042f2b;
+}
+:root[data-accent='indigo'] {
+  --accent: #4f46e5;
+  --accent-strong: #4f46e5;
+  --accent-rgb: 79, 70, 229;
+  --text-on-accent: #ffffff;
+}
+:root[data-accent='purple'] {
+  --accent: #9333ea;
+  --accent-strong: #9333ea;
+  --accent-rgb: 147, 51, 234;
+  --text-on-accent: #ffffff;
+}
+:root[data-accent='amber'] {
+  --accent: #b45309;
+  --accent-strong: #f59e0b;
+  --accent-rgb: 245, 158, 11;
+  --text-on-accent: #3b2a04;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-accent='blue']:not([data-theme='light']) {
+    --accent: #60a5fa;
+  }
+  :root[data-accent='teal']:not([data-theme='light']) {
+    --accent: #2dd4bf;
+  }
+  :root[data-accent='indigo']:not([data-theme='light']) {
+    --accent: #818cf8;
+  }
+  :root[data-accent='purple']:not([data-theme='light']) {
+    --accent: #c084fc;
+  }
+  :root[data-accent='amber']:not([data-theme='light']) {
+    --accent: #fbbf24;
+  }
+}
+
+:root[data-theme='dark'][data-accent='blue'] {
+  --accent: #60a5fa;
+}
+:root[data-theme='dark'][data-accent='teal'] {
+  --accent: #2dd4bf;
+}
+:root[data-theme='dark'][data-accent='indigo'] {
+  --accent: #818cf8;
+}
+:root[data-theme='dark'][data-accent='purple'] {
+  --accent: #c084fc;
+}
+:root[data-theme='dark'][data-accent='amber'] {
+  --accent: #fbbf24;
 }
 
 * {
@@ -322,7 +474,7 @@ button:disabled {
 }
 
 .stat-delta.positive {
-  color: var(--accent);
+  color: var(--positive);
 }
 
 .stat-delta.negative {
@@ -387,7 +539,7 @@ button:disabled {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.02em;
-  color: var(--accent);
+  color: var(--positive);
   margin: 0.3rem 0 0.15rem;
 }
 
@@ -569,7 +721,7 @@ button:disabled {
 .reconnect-banner button {
   font-size: 0.8rem;
   padding: 0.3rem 0.6rem;
-  background: var(--warn);
+  background: var(--warn-strong);
   color: var(--text-on-warn);
 }
 
@@ -708,7 +860,7 @@ button:disabled {
 }
 
 .split-editor-remaining.balanced {
-  color: var(--accent-strong);
+  color: var(--positive);
 }
 
 .split-editor-error {
@@ -764,7 +916,7 @@ button:disabled {
 }
 
 .needs-review-toggle.active {
-  background: var(--warn);
+  background: var(--warn-strong);
   color: var(--text-on-warn);
 }
 
@@ -784,7 +936,7 @@ button:disabled {
 }
 
 .amount-credit {
-  color: var(--accent);
+  color: var(--positive);
   font-variant-numeric: tabular-nums;
   font-weight: 500;
 }
@@ -947,7 +1099,7 @@ button:disabled {
 }
 
 .progress-fill.progress-good {
-  background: var(--accent);
+  background: var(--positive);
 }
 
 .progress-fill.progress-warn {
@@ -1057,6 +1209,62 @@ button:disabled {
   min-width: 0;
 }
 
+/* ---- Appearance settings ---- */
+
+.appearance-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 1.25rem;
+}
+
+.appearance-section:last-child {
+  margin-bottom: 0;
+}
+
+.appearance-theme-options {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.appearance-theme-btn {
+  padding: 0.45rem 0.9rem;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.appearance-theme-btn.active {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: var(--text-on-accent);
+}
+
+.appearance-accent-options {
+  display: flex;
+  gap: 0.65rem;
+}
+
+.appearance-accent-swatch {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  padding: 0;
+  cursor: pointer;
+}
+
+.appearance-accent-swatch.active {
+  border-color: var(--text);
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--text);
+}
+
+.appearance-accent-swatch:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 3px;
+}
+
 .new-category-card {
   margin-top: 1rem;
 }
@@ -1115,7 +1323,7 @@ button:disabled {
 }
 
 .cash-flow-bar-fill.income {
-  background: var(--accent);
+  background: var(--positive);
 }
 
 .cash-flow-bar-fill.spending {
@@ -1246,12 +1454,12 @@ button:disabled {
 }
 
 .month-total-income {
-  color: var(--accent);
+  color: var(--positive);
   font-weight: 600;
 }
 
 .month-total-net-pos {
-  color: var(--accent);
+  color: var(--positive);
   font-weight: 600;
 }
 
@@ -1442,9 +1650,9 @@ button:disabled {
 }
 
 .monthly-total-badge.income {
-  background: rgba(var(--accent-rgb), 0.1);
-  border-color: var(--accent);
-  color: var(--accent);
+  background: rgba(var(--positive-rgb), 0.1);
+  border-color: var(--positive);
+  color: var(--positive);
 }
 
 .monthly-total-badge.warn {
@@ -1716,7 +1924,7 @@ button:disabled {
 }
 
 .sub-bar-fill.income {
-  background: var(--accent);
+  background: var(--positive);
 }
 
 .sub-amount {

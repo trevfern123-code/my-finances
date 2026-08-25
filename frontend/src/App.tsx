@@ -54,6 +54,7 @@ import {
 } from './lib/api';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { useDashboardLayout } from './hooks/useDashboardLayout';
+import { useAppearance } from './hooks/useAppearance';
 import { Auth } from './components/Auth';
 import { PlaidLink } from './components/PlaidLink';
 import { LinkedAccounts } from './components/LinkedAccounts';
@@ -73,6 +74,7 @@ import { LoanProgress } from './components/LoanProgress';
 import { IncomeSavings } from './components/IncomeSavings';
 import { CategoryMappings } from './components/CategoryMappings';
 import { DashboardCustomizer } from './components/DashboardCustomizer';
+import { AppearanceSettings } from './components/AppearanceSettings';
 import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
 
@@ -116,10 +118,14 @@ export default function App() {
   // undefined = not fetched yet, null = fetched but the user has never customized anything —
   // useDashboardLayout treats both as "use the default layout," it only matters for hydration timing.
   const [dashboardLayoutRaw, setDashboardLayoutRaw] = useState<DashboardCardEntry[] | null | undefined>(undefined);
+  const [appearanceRaw, setAppearanceRaw] = useState<
+    { theme: string; accent_color: string } | null | undefined
+  >(undefined);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
+  const appearance = useAppearance(appearanceRaw);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -195,6 +201,10 @@ export default function App() {
     if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
     if (userPreferencesRes.status === 'fulfilled') {
       setDashboardLayoutRaw(userPreferencesRes.value.dashboard_layout?.cards ?? null);
+      setAppearanceRaw({
+        theme: userPreferencesRes.value.theme,
+        accent_color: userPreferencesRes.value.accent_color,
+      });
     }
 
     const failures = [
@@ -769,13 +779,21 @@ export default function App() {
           )}
 
           {activeTab === 'settings' && (
-            <CategoryMappings
-              plaidCategories={plaidCategories}
-              mappings={categoryMappings}
-              budgetCategories={budgetCategories}
-              onSave={handleSaveCategoryMapping}
-              onDelete={handleDeleteCategoryMapping}
-            />
+            <div className="tab-panel">
+              <AppearanceSettings
+                theme={appearance.theme}
+                accent={appearance.accent}
+                onSetTheme={appearance.setTheme}
+                onSetAccent={appearance.setAccent}
+              />
+              <CategoryMappings
+                plaidCategories={plaidCategories}
+                mappings={categoryMappings}
+                budgetCategories={budgetCategories}
+                onSave={handleSaveCategoryMapping}
+                onDelete={handleDeleteCategoryMapping}
+              />
+            </div>
           )}
         </>
       )}

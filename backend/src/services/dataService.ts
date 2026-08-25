@@ -1229,3 +1229,26 @@ export async function upsertDashboardLayout(
   if (error) throw new Error(`Failed to save dashboard layout: ${error.message}`);
   return data as UserPreferencesRow;
 }
+
+/** Upserts just theme/accent_color — same narrow-update reasoning as upsertDashboardLayout. */
+export async function upsertAppearance(
+  userId: string,
+  appearance: { theme: string; accentColor: string }
+): Promise<UserPreferencesRow> {
+  const { data, error } = await supabaseAdmin
+    .from('user_preferences')
+    .upsert(
+      {
+        user_id: userId,
+        theme: appearance.theme,
+        accent_color: appearance.accentColor,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'user_id' }
+    )
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to save appearance: ${error.message}`);
+  return data as UserPreferencesRow;
+}

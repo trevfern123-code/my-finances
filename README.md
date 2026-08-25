@@ -245,6 +245,50 @@ alter table public.loans enable row level security;
 
 **No migration needed at all** — this is a pure regrouping of data the app already had. `GET /api/plaid/assets-summary` reuses `getLinkedItemsForUser` (already fetched for the Accounts tab) and buckets accounts into Checking/Savings/Investments & Retirement/Other via `services/assetsSummary.ts`'s `groupAccountsForAssetsSummary` (tested), explicitly excluding `credit`/`loan` account types — those are liabilities, not assets, and already have their own place (net worth's liability side, and the Loan Progress tab). **Verified working in-browser with real data already** — Checking and Savings groups render correctly with no further setup, since those account types existed before this session. Investment/401k accounts are the only part of this tab that needs the Investments product + a fresh link described above.
 
+## Appearance (theme + accent color)
+
+System / Light / Dark theme, and 6 accent color presets (Green/default, Blue, Teal, Indigo,
+Purple, Amber) — both live in the Settings tab. Financial-meaning colors are deliberately kept
+out of the accent system: `--positive` (income, "good" budget status, positive deltas),
+`--danger`, `--warn`, and `--info` always mean the same thing regardless of which accent the user
+picked — only brand/UI elements (buttons, focus rings, links-as-accent) shift with the choice.
+See the theming-model comment at the top of `App.css` for the full token architecture.
+
+**Requires a migration** (on top of the `user_preferences` table from Dashboard customization
+below):
+
+```sql
+alter table public.user_preferences
+  add column theme text not null default 'system',
+  add column accent_color text not null default 'green';
+
+alter table public.user_preferences
+  add constraint user_preferences_theme_check
+    check (theme in ('system', 'light', 'dark'));
+
+alter table public.user_preferences
+  add constraint user_preferences_accent_color_check
+    check (accent_color in ('green', 'blue', 'teal', 'indigo', 'purple', 'amber'));
+```
+
+Also tracked as `supabase/migrations/20260825230000_add_appearance_preferences.sql`. Until it's
+applied, the theme/accent switcher still works interactively (every visual change applies
+immediately — verified live), it just can't persist: `PUT /api/user-preferences/appearance` 500s
+with "Could not find the 'accent_color' column," caught by the same best-effort `.catch()` used
+for dashboard-layout saves, so nothing else breaks — the choice just won't survive a page reload
+until the migration is applied.
+
+**Flash prevention**: a small inline script in `index.html` reads a `localStorage` cache and
+applies `data-theme`/`data-accent` before first paint, so a returning user never sees a flash of
+the default appearance. That cache is a startup optimization only — `hooks/useAppearance.ts`
+always treats the fetched `user_preferences` row as authoritative once it loads, overwriting the
+cache to match it, never the reverse.
+
+**Architecture**: same shape as Dashboard customization — `lib/theme.ts` (pure: preset
+definitions, id validation, and the one function that actually touches
+`document.documentElement`) + `hooks/useAppearance.ts` (thin React wrapper: state, localStorage,
+auto-save persistence).
+
 ## Dashboard customization
 
 The Overview tab's 8 cards (stats strip, Safe to Spend, Cash Flow & Budget Pace, Accounts at a

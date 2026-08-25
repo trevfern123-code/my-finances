@@ -98,15 +98,20 @@ export interface TransactionSplitRow {
   created_at: string;
 }
 
-/** Per-user preferences. Structured/free-form settings (dashboard layout today; appearance,
- *  financial preferences, etc. later) live in their own jsonb column each rather than one giant
- *  blob — a genuinely simple future preference (e.g. accent_color text) should get its own
- *  column instead of being folded into an existing jsonb column. */
+/** Per-user preferences. Structured/free-form settings (dashboard layout) live in their own jsonb
+ *  column; a genuinely simple preference (theme, accent_color) gets its own dedicated column
+ *  instead of being folded into an existing jsonb column — this table is meant to grow this way,
+ *  not become one giant blob. */
 export interface UserPreferencesRow {
   user_id: string;
   /** Null until the user customizes their dashboard at least once — the frontend falls back to
    *  its own built-in default layout in that case, not an empty/broken one. */
   dashboard_layout: { cards: { id: string; visible: boolean }[] } | null;
+  /** 'system' | 'light' | 'dark' — validated/defaulted at the controller layer, stored as plain
+   *  text here since a check constraint plus app-layer validation is enough for a 3-value enum. */
+  theme: string;
+  /** One of a small fixed set of preset ids (see frontend lib/theme.ts) — same reasoning as theme. */
+  accent_color: string;
   created_at: string;
   updated_at: string;
 }

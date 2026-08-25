@@ -522,9 +522,17 @@ export interface DashboardLayout {
   cards: DashboardCardEntry[];
 }
 
-/** Null dashboard_layout means the user has never customized anything — the caller falls back
- *  to the built-in default layout, not an empty one. */
-export function getUserPreferences(): Promise<{ dashboard_layout: DashboardLayout | null }> {
+export interface UserPreferences {
+  /** Null means the user has never customized anything — the caller falls back to the built-in
+   *  default layout, not an empty one. */
+  dashboard_layout: DashboardLayout | null;
+  /** Raw strings on the wire, same reasoning as DashboardCardEntry.id above — lib/theme.ts's
+   *  normalizeTheme/normalizeAccent own turning these into real, known-good ids. */
+  theme: string;
+  accent_color: string;
+}
+
+export function getUserPreferences(): Promise<UserPreferences> {
   return authedFetch('/api/user-preferences');
 }
 
@@ -532,5 +540,15 @@ export function updateDashboardLayout(layout: DashboardLayout): Promise<{ dashbo
   return authedFetch('/api/user-preferences/dashboard-layout', {
     method: 'PUT',
     body: JSON.stringify(layout),
+  });
+}
+
+export function updateAppearance(appearance: {
+  theme: string;
+  accent_color: string;
+}): Promise<{ theme: string; accent_color: string }> {
+  return authedFetch('/api/user-preferences/appearance', {
+    method: 'PUT',
+    body: JSON.stringify(appearance),
   });
 }
