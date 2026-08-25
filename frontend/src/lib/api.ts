@@ -509,3 +509,28 @@ export function saveCategoryMapping(
 export function deleteCategoryMapping(id: string): Promise<void> {
   return authedFetch(`/api/category-mappings/${id}`, { method: 'DELETE' });
 }
+
+/** One card's saved state in a user's dashboard layout. `id` is a plain string on the wire —
+ *  it's `lib/dashboardLayout.ts`'s job to reconcile it against the known set of card ids (a
+ *  saved id might be stale/unknown after an app update), not this file's. */
+export interface DashboardCardEntry {
+  id: string;
+  visible: boolean;
+}
+
+export interface DashboardLayout {
+  cards: DashboardCardEntry[];
+}
+
+/** Null dashboard_layout means the user has never customized anything — the caller falls back
+ *  to the built-in default layout, not an empty one. */
+export function getUserPreferences(): Promise<{ dashboard_layout: DashboardLayout | null }> {
+  return authedFetch('/api/user-preferences');
+}
+
+export function updateDashboardLayout(layout: DashboardLayout): Promise<{ dashboard_layout: DashboardLayout }> {
+  return authedFetch('/api/user-preferences/dashboard-layout', {
+    method: 'PUT',
+    body: JSON.stringify(layout),
+  });
+}

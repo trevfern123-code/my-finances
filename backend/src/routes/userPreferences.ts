@@ -1,0 +1,10 @@
+import { Router } from 'express';
+import { requireAuth } from '../middleware/auth';
+import * as userPreferencesController from '../controllers/userPreferencesController';
+
+export const userPreferencesRouter = Router();
+
+userPreferencesRouter.use(requireAuth);
+
+userPreferencesRouter.get('/', userPreferencesController.getUserPreferences);
+userPreferencesRouter.put('/dashboard-layout', userPreferencesController.updateDashboardLayout);

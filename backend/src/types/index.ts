@@ -98,6 +98,19 @@ export interface TransactionSplitRow {
   created_at: string;
 }
 
+/** Per-user preferences. Structured/free-form settings (dashboard layout today; appearance,
+ *  financial preferences, etc. later) live in their own jsonb column each rather than one giant
+ *  blob — a genuinely simple future preference (e.g. accent_color text) should get its own
+ *  column instead of being folded into an existing jsonb column. */
+export interface UserPreferencesRow {
+  user_id: string;
+  /** Null until the user customizes their dashboard at least once — the frontend falls back to
+   *  its own built-in default layout in that case, not an empty/broken one. */
+  dashboard_layout: { cards: { id: string; visible: boolean }[] } | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface BudgetCategoryWithSpend extends BudgetCategoryRow {
   /** Sum of positive-amount (spend, not income/credit) categorized transactions in the current calendar month. */
   spent: number;

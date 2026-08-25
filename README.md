@@ -245,6 +245,56 @@ alter table public.loans enable row level security;
 
 **No migration needed at all** — this is a pure regrouping of data the app already had. `GET /api/plaid/assets-summary` reuses `getLinkedItemsForUser` (already fetched for the Accounts tab) and buckets accounts into Checking/Savings/Investments & Retirement/Other via `services/assetsSummary.ts`'s `groupAccountsForAssetsSummary` (tested), explicitly excluding `credit`/`loan` account types — those are liabilities, not assets, and already have their own place (net worth's liability side, and the Loan Progress tab). **Verified working in-browser with real data already** — Checking and Savings groups render correctly with no further setup, since those account types existed before this session. Investment/401k accounts are the only part of this tab that needs the Investments product + a fresh link described above.
 
+## Dashboard customization
+
+The Overview tab's 8 cards (stats strip, Safe to Spend, Cash Flow & Budget Pace, Accounts at a
+Glance, Upcoming Bills, Recent Activity, Monthly Spending chart, Net Worth chart) are individually
+hideable and reorderable, with four starting presets (Standard / Budget Focus / Net Worth Focus /
+Minimal) that just apply a layout snapshot — not a persisted "mode," fully editable afterward like
+any other layout.
+
+**Requires a migration**:
+
+```sql
+create table public.user_preferences (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  dashboard_layout jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.user_preferences enable row level security;
+
+create policy "Users can view own preferences"
+  on public.user_preferences for select
+  using (auth.uid() = user_id);
+```
+
+Also tracked as `supabase/migrations/20260825210000_create_user_preferences.sql` now that schema
+changes go through the tracked-migration workflow (see `supabase/SCHEMA_NOTES.md`). Until it's
+applied, `GET /api/user-preferences` 500s and the frontend falls back to the built-in default
+layout (same `Promise.allSettled` resilience as every other optional dashboard section) — nothing
+else on the Overview tab is affected, only customization can't persist yet.
+
+**Data model**: one `user_preferences` row per user, with a `dashboard_layout jsonb` column for
+this feature specifically — deliberately *not* one big JSON blob for every future preference.
+A genuinely simple future preference (theme, accent color, default currency) should get its own
+dedicated column on this same table when it's built, not a key inside this jsonb column.
+
+**Forward compatibility**: `lib/dashboardLayout.ts`'s `mergeDashboardLayout` reconciles whatever
+was saved against the full known-card set — a card added after a user last saved their layout is
+appended at the end, visible by default, rather than silently disappearing; a saved id that no
+longer maps to a real card is dropped. A user who's never customized anything (`dashboard_layout`
+is `null`) sees the exact same layout as before this feature existed.
+
+**Architecture**: all of the actual layout logic (merging, presets, move/toggle, and which cards
+render side by side vs. full width) lives in `lib/dashboardLayout.ts` — pure, framework-agnostic,
+fully unit-tested, and reusable as-is by a future mobile app. `hooks/useDashboardLayout.ts` is a
+thin React wrapper (state + persistence) around that logic. Card components (`OverviewStats`,
+`SafeToSpend`, etc.) know nothing about customization at all — `App.tsx`'s `renderOverviewCard`
+is the only place that maps a card id to its actual rendering, which is deliberately *not*
+extracted, since which props each card needs only exists as live app state in `App.tsx` today.
+
 ## Flow
 
 1. User signs in via Supabase Auth in the frontend.

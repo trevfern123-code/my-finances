@@ -12,6 +12,7 @@ import type {
   RecurringStreamRow,
   TransactionRow,
   TransactionSplitRow,
+  UserPreferencesRow,
 } from '../types';
 import type {
   AccountBase,
@@ -1194,4 +1195,37 @@ export async function clearTransactionSplits(transactionId: string, userId: stri
 
   const { error } = await supabaseAdmin.from('transaction_splits').delete().eq('transaction_id', transactionId);
   if (error) throw new Error(`Failed to clear transaction splits: ${error.message}`);
+}
+
+// ---- User preferences ---------------------------------------------------------
+
+export async function getUserPreferences(userId: string): Promise<UserPreferencesRow | null> {
+  const { data, error } = await supabaseAdmin
+    .from('user_preferences')
+    .select('*')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error) throw new Error(`Failed to load user preferences: ${error.message}`);
+  return data as UserPreferencesRow | null;
+}
+
+/** Upserts just the dashboard_layout column — deliberately not a general "save the whole
+ *  preferences row" function, so a future preference (e.g. a dedicated accent_color column) gets
+ *  its own equally-narrow update function instead of every caller having to pass every column. */
+export async function upsertDashboardLayout(
+  userId: string,
+  dashboardLayout: { cards: { id: string; visible: boolean }[] }
+): Promise<UserPreferencesRow> {
+  const { data, error } = await supabaseAdmin
+    .from('user_preferences')
+    .upsert(
+      { user_id: userId, dashboard_layout: dashboardLayout, updated_at: new Date().toISOString() },
+      { onConflict: 'user_id' }
+    )
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to save dashboard layout: ${error.message}`);
+  return data as UserPreferencesRow;
 }

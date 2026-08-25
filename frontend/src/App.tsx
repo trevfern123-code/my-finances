@@ -23,6 +23,7 @@ import {
   getRecurringStreams,
   getSpendingSummary,
   getTransactions,
+  getUserPreferences,
   approveTransaction,
   saveCategoryMapping,
   saveTransactionSplits,
@@ -38,6 +39,7 @@ import {
   type AssetGroup,
   type BudgetCategory,
   type CategoryMapping,
+  type DashboardCardEntry,
   type LinkedItem,
   type Loan,
   type LoanPayment,
@@ -50,6 +52,8 @@ import {
   type SpendingSummary,
   type TransactionItem,
 } from './lib/api';
+import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
+import { useDashboardLayout } from './hooks/useDashboardLayout';
 import { Auth } from './components/Auth';
 import { PlaidLink } from './components/PlaidLink';
 import { LinkedAccounts } from './components/LinkedAccounts';
@@ -68,6 +72,7 @@ import { SubscriptionsRecurring } from './components/SubscriptionsRecurring';
 import { LoanProgress } from './components/LoanProgress';
 import { IncomeSavings } from './components/IncomeSavings';
 import { CategoryMappings } from './components/CategoryMappings';
+import { DashboardCustomizer } from './components/DashboardCustomizer';
 import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
 
@@ -108,9 +113,13 @@ export default function App() {
   const [totalAssets, setTotalAssets] = useState(0);
   const [categoryMappings, setCategoryMappings] = useState<CategoryMapping[]>([]);
   const [plaidCategories, setPlaidCategories] = useState<string[]>([]);
+  // undefined = not fetched yet, null = fetched but the user has never customized anything —
+  // useDashboardLayout treats both as "use the default layout," it only matters for hydration timing.
+  const [dashboardLayoutRaw, setDashboardLayoutRaw] = useState<DashboardCardEntry[] | null | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -141,6 +150,7 @@ export default function App() {
       manualLoansRes,
       categoryMappingsRes,
       plaidCategoriesRes,
+      userPreferencesRes,
     ] = await Promise.allSettled([
       getLinkedItems(),
       getTransactions(TRANSACTIONS_FETCH_LIMIT),
@@ -154,6 +164,7 @@ export default function App() {
       getManualLoans(),
       getCategoryMappings(),
       getPlaidCategories(),
+      getUserPreferences(),
     ]);
 
     if (itemsRes.status === 'fulfilled') {
@@ -182,6 +193,9 @@ export default function App() {
     if (manualLoansRes.status === 'fulfilled') setManualLoans(manualLoansRes.value.loans);
     if (categoryMappingsRes.status === 'fulfilled') setCategoryMappings(categoryMappingsRes.value.mappings);
     if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
+    if (userPreferencesRes.status === 'fulfilled') {
+      setDashboardLayoutRaw(userPreferencesRes.value.dashboard_layout?.cards ?? null);
+    }
 
     const failures = [
       itemsRes,
@@ -196,6 +210,7 @@ export default function App() {
       manualLoansRes,
       categoryMappingsRes,
       plaidCategoriesRes,
+      userPreferencesRes,
     ].filter((r): r is PromiseRejectedResult => r.status === 'rejected');
     if (failures.length > 0) {
       console.error('Some dashboard data failed to load:', failures.map((f) => f.reason));
@@ -570,6 +585,59 @@ export default function App() {
     }
   }
 
+  // Card components know nothing about customization — this is the one place that maps a card
+  // id to what it actually renders, preserving each card's existing data-availability guard
+  // (e.g. `stats` needs `summary`) exactly as it worked before dashboard customization existed.
+  function renderOverviewCard(id: CardId) {
+    switch (id) {
+      case 'stats':
+        return summary ? (
+          <OverviewStats
+            netWorth={summary.net_worth}
+            netWorthHistory={netWorthHistory}
+            assetGroups={assetGroups}
+            monthlySpending={summary.monthly_spending}
+          />
+        ) : null;
+      case 'safe_to_spend':
+        return (
+          <SafeToSpend
+            assetGroups={assetGroups}
+            recurringStreams={recurringStreams}
+            loans={loans}
+            manualLoans={manualLoans}
+            budgetCategories={budgetCategories}
+          />
+        );
+      case 'cash_flow_pace':
+        return summary ? (
+          <CashFlowPace
+            budgetCategories={budgetCategories}
+            currentMonthIncome={summary.monthly_spending[summary.monthly_spending.length - 1]?.income ?? 0}
+            currentMonthSpent={summary.monthly_spending[summary.monthly_spending.length - 1]?.spent ?? 0}
+          />
+        ) : null;
+      case 'accounts_quick_view':
+        return <AccountQuickView assetGroups={assetGroups} />;
+      case 'upcoming_bills':
+        return <UpcomingBills recurringStreams={recurringStreams} loans={loans} manualLoans={manualLoans} />;
+      case 'recent_activity':
+        return (
+          <RecentActivity
+            transactions={transactions}
+            budgetCategories={budgetCategories}
+            onViewAll={() => setActiveTab('accounts')}
+          />
+        );
+      case 'monthly_spending_chart':
+        return summary ? <MonthlySpendingChart summary={summary} /> : null;
+      case 'net_worth_chart':
+        return <NetWorthChart history={netWorthHistory} />;
+      default:
+        return null;
+    }
+  }
+
   if (!session) {
     return <Auth />;
   }
@@ -596,47 +664,35 @@ export default function App() {
 
           {activeTab === 'overview' && (
             <div className="tab-panel">
-              {summary && (
-                <OverviewStats
-                  netWorth={summary.net_worth}
-                  netWorthHistory={netWorthHistory}
-                  assetGroups={assetGroups}
-                  monthlySpending={summary.monthly_spending}
-                />
-              )}
-              <SafeToSpend
-                assetGroups={assetGroups}
-                recurringStreams={recurringStreams}
-                loans={loans}
-                manualLoans={manualLoans}
-                budgetCategories={budgetCategories}
-              />
-              {summary && (
-                <CashFlowPace
-                  budgetCategories={budgetCategories}
-                  currentMonthIncome={summary.monthly_spending[summary.monthly_spending.length - 1]?.income ?? 0}
-                  currentMonthSpent={summary.monthly_spending[summary.monthly_spending.length - 1]?.spent ?? 0}
-                />
-              )}
-              <div className="dashboard-grid">
-                <div>
-                  <AccountQuickView assetGroups={assetGroups} />
-                </div>
-                <div>
-                  <UpcomingBills recurringStreams={recurringStreams} loans={loans} manualLoans={manualLoans} />
-                </div>
+              <div className="section-header overview-header">
+                <span className="hint">Overview</span>
+                <button type="button" className="link-button" onClick={() => dashboardLayout.setCustomizing(true)}>
+                  Customize dashboard
+                </button>
               </div>
-              <div className="dashboard-grid">
-                <div>
-                  <RecentActivity
-                    transactions={transactions}
-                    budgetCategories={budgetCategories}
-                    onViewAll={() => setActiveTab('accounts')}
-                  />
-                </div>
-                <div>{summary && <MonthlySpendingChart summary={summary} />}</div>
-              </div>
-              <NetWorthChart history={netWorthHistory} />
+
+              {dashboardLayout.customizing ? (
+                <DashboardCustomizer
+                  layout={dashboardLayout.layout}
+                  onToggleVisibility={dashboardLayout.toggleVisibility}
+                  onMove={dashboardLayout.move}
+                  onApplyPreset={dashboardLayout.applyPreset}
+                  onDone={() => dashboardLayout.setCustomizing(false)}
+                />
+              ) : (
+                groupCardsIntoRows(
+                  dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id)
+                ).map((row) =>
+                  row.length === 2 ? (
+                    <div className="dashboard-grid" key={row.join('+')}>
+                      <div>{renderOverviewCard(row[0])}</div>
+                      <div>{renderOverviewCard(row[1])}</div>
+                    </div>
+                  ) : (
+                    <div key={row[0]}>{renderOverviewCard(row[0])}</div>
+                  )
+                )
+              )}
             </div>
           )}
 
