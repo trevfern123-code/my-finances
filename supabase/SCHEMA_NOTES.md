@@ -1,20 +1,66 @@
-# Schema reconstruction notes
+# Schema notes
 
-**Status: reconstructed from application code, not verified against the live database.**
-This file exists to document the schema as best-understood *before* running `supabase db pull`
-for the first time (see "Linking to the live project" below) — once that's run, the generated
-migration file in `migrations/` is the authoritative source and this file becomes historical
-context only. Do not treat the column types/constraints below as certain; several are inferred
-from how the application queries the table, not from a verified `pg_dump`/introspection.
+**Status: reconciled against the live database.** `supabase/migrations/20260825195130_remote_schema.sql`
+(pulled via `npx supabase db pull` from the linked project) is now the authoritative schema —
+that file, not this one, is the source of truth going forward. This document records how the
+earlier hand-reconstructed schema (kept below for history) compared against it, and calls out
+the handful of real discrepancies worth knowing about.
 
-High confidence: table names, column names, and nullability (all directly observable from what
-`backend/src/services/dataService.ts` selects/inserts/updates, and from `backend/src/types/index.ts`).
-Lower confidence: exact SQL types where more than one type would behave identically from the
-application's point of view (e.g. `text` vs `varchar`), default values, and whether a few
-Phase-1 tables (`budget_categories`, `manual_loans`, `manual_loan_payments`) already have RLS
-enabled — the project's later tables definitely do (a Supabase security-linter prompt caught
-`accounts`/`transactions` missing it and it was added), but whether that pass covered the
-earlier direct-`user_id` tables too isn't recorded anywhere in code or history.
+From here on, schema changes go through `supabase migration new <name>` + review + Trevor
+applying it with `supabase db push` (or pasting the SQL by hand, as before, then immediately
+adding the matching migration file to this repo so the two never drift again) — not ad hoc SQL
+pasted into the Supabase SQL editor with nothing tracked in the repo.
+
+## Reconciliation findings (2026-08-25)
+
+The hand-reconstructed schema was correct on every table name, column name, and nullability —
+it was built directly from what the application code actually selects/inserts/updates, so that
+tracked closely. The real, pulled schema added information no amount of reading the app code
+could have revealed, and surfaced one genuine finding worth flagging:
+
+- **`budget_categories.name` has a database-wide `unique` constraint** (`budget_categories_name_key`),
+  not scoped per user. Today, with one real user, this is invisible. But it means the database
+  itself — not just app logic — would currently reject two *different* users both naming a
+  category e.g. "Groceries". This is a real pre-existing constraint in production, not something
+  introduced by this reconciliation, and **it has not been changed** (changing it means dropping
+  and re-adding the constraint as `unique (user_id, name)`, a live schema change on production
+  data that deserves its own reviewed migration, not a drive-by fix while reconciling docs).
+  Worth deciding on deliberately before a second real user ever signs up.
+- Every Phase-1 table's RLS status is now confirmed rather than guessed: `plaid_items`,
+  `budget_categories`, `manual_loans`, and `manual_loan_payments` all have RLS enabled *and* an
+  explicit `auth.uid() = user_id` select policy. `accounts` has RLS enabled with **no** policy —
+  consistent with the documented "join-derived ownership, deny-all-but-service-role" pattern used
+  for `transactions`/`loans`/`recurring_streams`/`transaction_splits`, now confirmed rather than
+  assumed.
+- The two most financially-important columns are already precision-constrained at the schema
+  level: `transactions.amount` and `accounts.current_balance`/`available_balance` are
+  `numeric(12,2)`, and `budget_categories.budget_amount` is `numeric(10,2)` — genuinely good news
+  for the money-precision work already planned (item B on the roadmap). Every other money column
+  (`transaction_splits.amount`, `manual_loan_payments.principal_portion`/`interest_portion`, loan
+  amounts, `net_worth_snapshots` totals, `credit_limit`, `savings_goal`) is plain unconstrained
+  `numeric` — inconsistent, but not urgent; worth standardizing to `numeric(12,2)` as part of the
+  broader precision work rather than as its own migration.
+- Several `updated_at`/`created_at` timestamp columns exist that the application never reads or
+  writes (`accounts.updated_at`, `plaid_items.created_at`/`updated_at`, `transactions.created_at`,
+  `budget_categories.updated_at`) — harmless bookkeeping, not used anywhere, not a concern.
+- `plaid_items.plaid_item_id` and `accounts.plaid_account_id` are also globally unique — but
+  unlike `budget_categories.name`, these are Plaid-assigned identifiers, not user-chosen text, so
+  a global uniqueness constraint on them is correct and carries no cross-user collision risk.
+- The dump's broad `grant ... to "anon", "authenticated", ...` statements look alarming in
+  isolation but are Supabase's standard default grants — RLS is what actually gates access, and
+  since no table has an insert/update/delete policy anywhere, `anon`/`authenticated` remain fully
+  blocked from writing to anything regardless of these grants; only the tables with an explicit
+  select policy are readable by their owning user, and only for reads. Confirms the access-control
+  posture described in the main README is accurate, not just documented intent.
+- All 11 tables the application code touches were present in the pull, nothing missing, nothing
+  extra beyond what the app already queries.
+
+## Hand-reconstructed schema (superseded, kept for history — do not treat as authoritative)
+
+**Status when written: reconstructed from application code, not yet verified against the live
+database.** Superseded by `migrations/20260825195130_remote_schema.sql` as of the reconciliation
+above — kept here only as a record of what was inferable from code alone vs. what actually
+needed a real schema pull to know for certain.
 
 ## Phase 1 tables (original MVP — reconstructed, not verified)
 
@@ -215,19 +261,3 @@ create table public.transaction_splits (
 );
 alter table public.transaction_splits enable row level security;
 ```
-
-## Linking to the live project (do this once, gives us the real authoritative schema)
-
-These need to run in a real terminal on your machine (interactive browser login — can't be
-automated) and use the Supabase CLI, available via `npx supabase` without a global install:
-
-```bash
-npx supabase login
-npx supabase link --project-ref <your-project-ref>   # from the Supabase dashboard URL
-npx supabase db pull
-```
-
-`db pull` introspects the live database and writes the actual current schema as the first file
-in `supabase/migrations/`. Once that's done, tell me and I'll reconcile it against this document
-(fix anything I guessed wrong above) and from then on every schema change goes through
-`supabase migration new <name>` + a review + you applying it, instead of ad hoc SQL in chat.
