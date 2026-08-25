@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { BudgetCategory, TransactionSplit } from '../lib/api';
 import { budgetCategoryLabel } from '../lib/categoryLabels';
+import { computeSplitBalance, hasIncompleteRow } from '../lib/splitValidation';
 
 interface DraftSplit {
   budget_category_id: string;
@@ -37,9 +38,7 @@ export function SplitEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const parsedTotal = rows.reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
-  const remaining = totalAmount - parsedTotal;
-  const balanced = Math.abs(remaining) < 0.01;
+  const { remaining, balanced } = computeSplitBalance(rows, totalAmount);
 
   function updateRow(index: number, fields: Partial<DraftSplit>) {
     setRows((prev) => prev.map((r, i) => (i === index ? { ...r, ...fields } : r)));
@@ -55,7 +54,7 @@ export function SplitEditor({
 
   async function handleSave() {
     setError(null);
-    if (rows.some((r) => !r.budget_category_id || !r.amount || Number(r.amount) <= 0)) {
+    if (hasIncompleteRow(rows)) {
       setError('Every split needs a category and a positive amount');
       return;
     }

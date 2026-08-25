@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../config/supabase';
+import { roundToCents } from './money';
 import type {
   AccountRow,
   BudgetCategoryRow,
@@ -713,7 +714,7 @@ async function adjustManualLoanBalance(loanId: string, delta: number): Promise<v
 
   if (fetchError) throw new Error(`Failed to load manual loan balance: ${fetchError.message}`);
 
-  const newBalance = Math.max(0, (loan.current_balance as number) + delta);
+  const newBalance = Math.max(0, roundToCents((loan.current_balance as number) + delta));
   const { error: updateError } = await supabaseAdmin
     .from('manual_loans')
     .update({ current_balance: newBalance, updated_at: new Date().toISOString() })
@@ -1160,10 +1161,8 @@ export async function setTransactionSplits(
   const owner = (txn.accounts as unknown as { plaid_items: { user_id: string } }).plaid_items.user_id;
   if (owner !== userId) throw new Error('Transaction not found');
 
-  const total = splits.reduce((sum, s) => sum + s.amount, 0);
-  // A cent of slack absorbs float rounding error accumulated across several line items, without
-  // letting an actually-mismatched split through.
-  if (Math.abs(total - (txn.amount as number)) > 0.01) {
+  const total = roundToCents(splits.reduce((sum, s) => sum + s.amount, 0));
+  if (total !== roundToCents(txn.amount as number)) {
     throw new Error(`Splits must add up to the transaction's amount (${(txn.amount as number).toFixed(2)})`);
   }
 

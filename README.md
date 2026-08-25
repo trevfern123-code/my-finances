@@ -38,11 +38,33 @@ one-off change) — either way, the SQL lives in the repo afterward instead of o
 ## CI
 
 `.github/workflows/ci.yml` runs on every push/PR to `main`: backend typecheck, backend tests,
-backend build, frontend typecheck, frontend build. No secrets are required — every backend test
-mocks its Supabase/Plaid config imports, so the suite passes with zero environment variables set
-(verified: `env -i npx vitest run` passes clean). This doesn't deploy anything itself — Railway
-and Vercel still deploy independently on push — it just catches a broken build/test before that
-happens.
+backend build, frontend typecheck, frontend tests, frontend build. No secrets are required —
+every backend test mocks its Supabase/Plaid config imports, so the suite passes with zero
+environment variables set (verified: `env -i npx vitest run` passes clean). This doesn't deploy
+anything itself — Railway and Vercel still deploy independently on push — it just catches a
+broken build/test before that happens.
+
+## Financial precision
+
+Money is `numeric` in Postgres and a plain JS `number` everywhere in application code — no
+decimal library. `backend/src/services/money.ts` and `frontend/src/lib/money.ts` each export a
+`roundToCents()` used at every point that *writes a computed* (summed/subtracted) monetary value,
+as opposed to relaying one Plaid already gave us: the manual-loan running balance
+(`adjustManualLoanBalance`), net worth snapshots, and transaction-split validation (which compares
+the rounded sum of split amounts to the rounded transaction amount for exact equality, rather than
+the ad hoc 1-cent tolerance it used before). The frontend's `SplitEditor` uses the same rounding
+(via `frontend/src/lib/splitValidation.ts`) so it never tells a user a split is "balanced" when
+the backend would actually reject it. Values that are only ever *displayed*, not written back
+(monthly breakdown totals, budget spend aggregates, etc.), aren't rounded at the source — they're
+recomputed fresh from Plaid-sourced numbers on every request, so there's no compounding-drift risk
+there, only display formatting (already handled by `Intl.NumberFormat`).
+
+**Currency**: USD-only, deliberately, for now. `iso_currency_code` is still stored per
+account/transaction (preserved for future multi-currency support) but every aggregation (net
+worth, budget spend, monthly breakdown, Safe to Spend) sums raw amounts across every linked
+account with no currency conversion or same-currency check — fine as long as every account really
+is USD, which Plaid's country-code config (`PLAID_COUNTRY_CODES=US`) makes the only realistic case
+today.
 
 ## Testing
 
@@ -61,6 +83,19 @@ Backend unit tests (Vitest), with Supabase and Plaid mocked — no real network 
 - **`services/plaidErrors.test.ts`** — which Plaid error codes mean "this item needs re-authentication" vs. everything else.
 
 Test files are excluded from the production build (`tsconfig.build.json`, used by `npm run build`) but still typechecked by `npm run typecheck` (which uses the base `tsconfig.json`) — so a type error in a test fails CI-equivalent checks without ending up in `dist/`.
+
+**Frontend** (`cd frontend && npm test`, Vitest, `frontend/vitest.config.ts`) — started incrementally,
+prioritizing pure business logic involving money/dates over UI/component coverage (no
+jsdom/testing-library set up yet, since nothing needed it so far):
+
+- **`lib/money.test.ts`** — `roundToCents`, incl. classic float-drift cases (`0.1 + 0.2`, `4.33 - 3`).
+- **`lib/splitValidation.test.ts`** — the transaction-split balance/completeness checks the Accounts tab's split editor uses to enable/disable Save.
+- **`lib/budgetDrilldown.test.ts`** — the Budget tab drill-down's split-aware category filter (mirrors the backend's `getCategorySpendRows` two-source combine — a split transaction contributes its split share, not its own row).
+- **`lib/recurringDates.test.ts`** — next-due-date estimation cadence stepping, day-count math, due-label thresholds.
+
+Not yet covered: any component, and the Monthly Breakdown drill-down's equivalent filter
+(`components/MonthlyBreakdown.tsx`'s `transactionsForMonthCategory` — still inline, not yet
+extracted to `lib/`).
 
 ## Deployment
 

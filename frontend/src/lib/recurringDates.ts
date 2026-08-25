@@ -40,8 +40,7 @@ function advance(date: Date, frequency: string): Date | null {
  *  from last_date until reaching today or later, so a stream whose last known charge was months
  *  ago still projects a plausible upcoming date instead of a stale one in the past. Irregular/
  *  unknown-cadence streams can't be estimated this way and return null rather than a guess. */
-export function estimateNextDueDate(lastDate: string, frequency: string): Date | null {
-  const today = todayUtc();
+export function estimateNextDueDate(lastDate: string, frequency: string, today: Date = todayUtc()): Date | null {
   let date = parseDate(lastDate);
 
   while (date.getTime() < today.getTime()) {

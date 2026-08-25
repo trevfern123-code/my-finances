@@ -8,10 +8,11 @@ export interface DrilldownItem {
   isSplit: boolean;
 }
 
-/** The [start, end) calendar-month range containing today, in UTC — mirrors the backend's
- *  getCurrentMonthRange so this matches exactly what BudgetCategory.spent counts. */
-function currentMonthRange(): { start: string; end: string } {
-  const now = todayUtc();
+/** The [start, end) calendar-month range containing `now`, in UTC — mirrors the backend's
+ *  getCurrentMonthRange so this matches exactly what BudgetCategory.spent counts. Exported (and
+ *  `now` is overridable) purely so this can be tested deterministically without depending on the
+ *  actual wall-clock date. */
+export function currentMonthRange(now: Date = todayUtc()): { start: string; end: string } {
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth();
   const start = new Date(Date.UTC(year, month, 1)).toISOString().slice(0, 10);
@@ -25,9 +26,10 @@ function currentMonthRange(): { start: string; end: string } {
  *  calendar month and positive (spend) amounts only, matching what BudgetCategory.spent counts. */
 export function getCurrentMonthCategoryItems(
   transactions: TransactionItem[],
-  budgetCategoryId: string
+  budgetCategoryId: string,
+  now: Date = todayUtc()
 ): DrilldownItem[] {
-  const { start, end } = currentMonthRange();
+  const { start, end } = currentMonthRange(now);
   const items: DrilldownItem[] = [];
 
   for (const t of transactions) {

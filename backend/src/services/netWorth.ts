@@ -1,4 +1,5 @@
 import * as dataService from './dataService';
+import { roundToCents } from './money';
 
 const LIABILITY_ACCOUNT_TYPES = new Set(['credit', 'loan']);
 
@@ -56,8 +57,8 @@ export async function recordSnapshotForUser(userId: string): Promise<void> {
   await dataService.upsertNetWorthSnapshot({
     userId,
     date: getTodayDateString(),
-    totalAssets: assets,
-    totalLiabilities: liabilities,
-    netWorth: assets - liabilities,
+    totalAssets: roundToCents(assets),
+    totalLiabilities: roundToCents(liabilities),
+    netWorth: roundToCents(assets - liabilities),
   });
 }
