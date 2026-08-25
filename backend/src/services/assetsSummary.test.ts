@@ -11,6 +11,7 @@ function account(overrides: Partial<AssetAccount> = {}): AssetAccount {
     current_balance: 100,
     iso_currency_code: 'USD',
     institution_name: 'Chase',
+    savings_goal: null,
     ...overrides,
   };
 }

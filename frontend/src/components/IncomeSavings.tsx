@@ -1,11 +1,168 @@
-import type { AssetGroup } from '../lib/api';
+import { useState } from 'react';
+import type { AssetAccountSummary, AssetGroup, RecurringStream } from '../lib/api';
+
+const FREQUENCY_LABELS: Record<string, string> = {
+  WEEKLY: 'Weekly',
+  BIWEEKLY: 'Biweekly',
+  SEMI_MONTHLY: 'Twice a month',
+  MONTHLY: 'Monthly',
+  ANNUALLY: 'Annually',
+  UNKNOWN: 'Irregular',
+};
 
 function formatCurrency(amount: number | null, currency: string | null) {
   if (amount === null) return '—';
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency ?? 'USD' }).format(amount);
 }
 
-export function IncomeSavings({ groups, totalAssets }: { groups: AssetGroup[]; totalAssets: number }) {
+/** Classic personal-finance rule of thumb: saving 15%+ of income is healthy, under that is
+ *  worth a nudge, and negative (spending more than you earned) is the one that actually matters. */
+function savingsRateTier(rate: number): 'good' | 'warn' | 'over' {
+  if (rate < 0) return 'over';
+  if (rate < 0.15) return 'warn';
+  return 'good';
+}
+
+function SavingsRateCard({ income, spent }: { income: number; spent: number }) {
+  const rate = income > 0 ? (income - spent) / income : null;
+  const tier = rate !== null ? savingsRateTier(rate) : 'good';
+  const pct = rate !== null ? Math.max(0, Math.min(rate, 1)) * 100 : 0;
+
+  return (
+    <div className="card">
+      <div className="section-header">
+        <h2>Savings rate</h2>
+        <span className={tier === 'good' ? 'monthly-total-badge income' : `monthly-total-badge ${tier}`}>
+          {rate !== null ? `${(rate * 100).toFixed(0)}%` : '—'} this month
+        </span>
+      </div>
+      {rate === null ? (
+        <p className="hint">No income recorded yet this month.</p>
+      ) : (
+        <>
+          <div className="progress-track">
+            <div className={`progress-fill progress-${tier}`} style={{ width: `${pct}%` }} />
+          </div>
+          <p className="hint budget-pace-hint">
+            {formatCurrency(income - spent, null)} saved of {formatCurrency(income, null)} income this month
+            {tier === 'over' && ' — spending exceeded income'}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function IncomeBreakdown({ recurringStreams }: { recurringStreams: RecurringStream[] }) {
+  const inflows = recurringStreams.filter((s) => s.direction === 'inflow');
+  const maxMonthly = Math.max(...inflows.map((s) => s.monthly_amount), 1);
+
+  return (
+    <div className="card">
+      <h2>Income sources</h2>
+      {inflows.length === 0 ? (
+        <p className="hint">
+          No recurring income detected yet — this is picked up automatically as transaction
+          history builds up (usually needs a few months of history per source).
+        </p>
+      ) : (
+        <div className="recurring-list">
+          {inflows.map((s) => (
+            <div key={s.id} className="sub-row">
+              <div className="sub-info">
+                <span className="sub-name">{s.merchant_name ?? s.description}</span>
+                <span className="sub-frequency">{FREQUENCY_LABELS[s.frequency] ?? s.frequency}</span>
+              </div>
+              <div className="sub-bar-track">
+                <div
+                  className="sub-bar-fill income"
+                  style={{ width: `${(s.monthly_amount / maxMonthly) * 100}%` }}
+                />
+              </div>
+              <span className="sub-amount">{formatCurrency(s.monthly_amount, 'USD')}/mo</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SavingsGoalRow({
+  account,
+  onUpdateSavingsGoal,
+}: {
+  account: AssetAccountSummary;
+  onUpdateSavingsGoal: (accountId: string, savingsGoal: number | null) => void;
+}) {
+  const [editing, setEditing] = useState<string | undefined>(undefined);
+  const balance = account.current_balance ?? 0;
+  const goal = account.savings_goal;
+  const hasGoal = goal !== null && goal > 0;
+  const pct = hasGoal ? Math.min((balance / goal) * 100, 100) : 0;
+  const reached = hasGoal && balance >= goal;
+
+  return (
+    <li className="account-list-item">
+      <div className="account-row">
+        <span>
+          {account.name}
+          {account.institution_name && <span className="account-type"> — {account.institution_name}</span>}
+        </span>
+        <span className="balance">{formatCurrency(account.current_balance, account.iso_currency_code)}</span>
+      </div>
+      <div className="savings-goal">
+        <div className="savings-goal-header">
+          <span className="hint">Goal</span>
+          <input
+            type="number"
+            step="0.01"
+            className="budget-amount-input"
+            value={editing ?? goal ?? ''}
+            placeholder="Not set"
+            onChange={(e) => setEditing(e.target.value)}
+            onBlur={() => {
+              if (editing === undefined) return;
+              const value = editing.trim() === '' ? null : Number(editing);
+              if (value === null || !Number.isNaN(value)) onUpdateSavingsGoal(account.id, value);
+              setEditing(undefined);
+            }}
+          />
+        </div>
+        {hasGoal && (
+          <>
+            <div className="progress-track">
+              <div
+                className={reached ? 'progress-fill progress-good' : 'progress-fill progress-warn'}
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            <span className="hint">
+              {pct.toFixed(0)}% of {formatCurrency(goal, account.iso_currency_code)}
+              {reached && ' — goal reached'}
+            </span>
+          </>
+        )}
+      </div>
+    </li>
+  );
+}
+
+export function IncomeSavings({
+  groups,
+  totalAssets,
+  recurringStreams,
+  currentMonthIncome,
+  currentMonthSpent,
+  onUpdateSavingsGoal,
+}: {
+  groups: AssetGroup[];
+  totalAssets: number;
+  recurringStreams: RecurringStream[];
+  currentMonthIncome: number;
+  currentMonthSpent: number;
+  onUpdateSavingsGoal: (accountId: string, savingsGoal: number | null) => void;
+}) {
   if (groups.length === 0) {
     return (
       <div className="card">
@@ -20,13 +177,16 @@ export function IncomeSavings({ groups, totalAssets }: { groups: AssetGroup[]; t
   }
 
   return (
-    <div>
+    <div className="tab-panel">
       <div className="card">
         <div className="section-header">
           <h2>Income &amp; savings</h2>
           <span className="monthly-total-badge">{formatCurrency(totalAssets, 'USD')} total assets</span>
         </div>
       </div>
+
+      <SavingsRateCard income={currentMonthIncome} spent={currentMonthSpent} />
+      <IncomeBreakdown recurringStreams={recurringStreams} />
 
       <div className="asset-groups">
         {groups.map((group) => (
@@ -35,21 +195,29 @@ export function IncomeSavings({ groups, totalAssets }: { groups: AssetGroup[]; t
               <h3>{group.label}</h3>
               <span className="hint">{formatCurrency(group.total, 'USD')}</span>
             </div>
-            <ul className="asset-account-list">
-              {group.accounts.map((account) => (
-                <li key={account.id} className="account-row">
-                  <span>
-                    {account.name}
-                    {account.institution_name && (
-                      <span className="account-type"> — {account.institution_name}</span>
-                    )}
-                  </span>
-                  <span className="balance">
-                    {formatCurrency(account.current_balance, account.iso_currency_code)}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            {group.category === 'savings' ? (
+              <ul className="quick-view-list">
+                {group.accounts.map((account) => (
+                  <SavingsGoalRow key={account.id} account={account} onUpdateSavingsGoal={onUpdateSavingsGoal} />
+                ))}
+              </ul>
+            ) : (
+              <ul className="asset-account-list">
+                {group.accounts.map((account) => (
+                  <li key={account.id} className="account-row">
+                    <span>
+                      {account.name}
+                      {account.institution_name && (
+                        <span className="account-type"> — {account.institution_name}</span>
+                      )}
+                    </span>
+                    <span className="balance">
+                      {formatCurrency(account.current_balance, account.iso_currency_code)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         ))}
       </div>

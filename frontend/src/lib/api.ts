@@ -2,7 +2,18 @@ import { supabase } from './supabaseClient';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
-async function authedFetch(path: string, init: RequestInit = {}) {
+// Local clock drift can put a freshly-minted session token's issued-at a few seconds ahead of
+// Supabase's own server clock, which it rejects. We don't control that validation (it happens
+// on Supabase's infrastructure, not in our code), but the condition is transient — waiting a
+// moment and retrying once almost always succeeds once real time catches up.
+const CLOCK_SKEW_RETRY_DELAY_MS = 1500;
+
+function isClockSkewError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return normalized.includes('issued at future') || normalized.includes('issued in the future');
+}
+
+async function authedFetch(path: string, init: RequestInit = {}, isRetry = false): Promise<any> {
   const {
     data: { session },
   } = await supabase.auth.getSession();
@@ -22,7 +33,14 @@ async function authedFetch(path: string, init: RequestInit = {}) {
 
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new Error(body.error ?? `Request failed: ${response.status}`);
+    const message = body.error ?? `Request failed: ${response.status}`;
+
+    if (!isRetry && isClockSkewError(message)) {
+      await new Promise((resolve) => setTimeout(resolve, CLOCK_SKEW_RETRY_DELAY_MS));
+      return authedFetch(path, init, true);
+    }
+
+    throw new Error(message);
   }
 
   if (response.status === 204) return undefined;
@@ -41,6 +59,8 @@ export interface LinkedAccount {
   iso_currency_code: string | null;
   /** User-entered — only meaningful for type: "credit" accounts, used to compute utilization. */
   credit_limit: number | null;
+  /** User-entered target balance — only meaningful for savings accounts, used for goal progress. */
+  savings_goal: number | null;
 }
 
 export interface LinkedItem {
@@ -322,6 +342,8 @@ export interface AssetAccountSummary {
   current_balance: number | null;
   iso_currency_code: string | null;
   institution_name: string | null;
+  /** User-entered target balance for a savings account — null unless the user set one. */
+  savings_goal: number | null;
 }
 
 export interface AssetGroup {
@@ -333,6 +355,16 @@ export interface AssetGroup {
 
 export function getAssetsSummary(): Promise<{ groups: AssetGroup[]; total_assets: number }> {
   return authedFetch('/api/plaid/assets-summary');
+}
+
+export function updateAccountSavingsGoal(
+  accountId: string,
+  savingsGoal: number | null
+): Promise<{ account: LinkedAccount }> {
+  return authedFetch(`/api/plaid/accounts/${accountId}/savings-goal`, {
+    method: 'PATCH',
+    body: JSON.stringify({ savings_goal: savingsGoal }),
+  });
 }
 
 export function createReauthLinkToken(itemId: string): Promise<{ link_token: string }> {

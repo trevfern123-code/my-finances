@@ -38,6 +38,8 @@ export interface AccountRow {
   /** User-entered, not from Plaid — Plaid's own credit-limit data is unreliable across
    *  institutions, so utilization is computed from whatever the user fills in here. */
   credit_limit: number | null;
+  /** User-entered target balance for a savings account, used for goal-progress tracking. */
+  savings_goal: number | null;
 }
 
 export interface TransactionRow {

@@ -12,6 +12,7 @@ import {
   updateManualLoanPayment,
   deleteManualLoanPayment,
   updateAccountCreditLimit,
+  updateAccountSavingsGoal,
 } from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
@@ -422,6 +423,30 @@ describe('updateAccountCreditLimit', () => {
     mockFrom.mockReturnValueOnce(ownershipQuery);
 
     const result = await updateAccountCreditLimit('account-1', 'user-1', 5000);
+
+    expect(result).toBeNull();
+    expect(mockFrom).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('updateAccountSavingsGoal', () => {
+  it('updates the savings goal after verifying the account belongs to the user', async () => {
+    const ownershipQuery = createQueryBuilder({ data: { id: 'account-1' }, error: null });
+    const updateQuery = createQueryBuilder({ data: { id: 'account-1', savings_goal: 10000 }, error: null });
+    mockFrom.mockReturnValueOnce(ownershipQuery).mockReturnValueOnce(updateQuery);
+
+    const result = await updateAccountSavingsGoal('account-1', 'user-1', 10000);
+
+    expect(ownershipQuery.eq).toHaveBeenCalledWith('plaid_items.user_id', 'user-1');
+    expect(updateQuery.update).toHaveBeenCalledWith({ savings_goal: 10000 });
+    expect(result).toEqual({ id: 'account-1', savings_goal: 10000 });
+  });
+
+  it('returns null without updating when the account does not belong to the user', async () => {
+    const ownershipQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(ownershipQuery);
+
+    const result = await updateAccountSavingsGoal('account-1', 'user-1', 10000);
 
     expect(result).toBeNull();
     expect(mockFrom).toHaveBeenCalledTimes(1);

@@ -102,7 +102,7 @@ export async function getLinkedItemsForUser(userId: string) {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
     .select(
-      'id, institution_id, institution_name, status, accounts(id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit)'
+      'id, institution_id, institution_name, status, accounts(id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal)'
     )
     .eq('user_id', userId);
 
@@ -213,12 +213,24 @@ export async function upsertAccountsForItem(
   const { data: final, error: finalError } = await supabaseAdmin
     .from('accounts')
     .select(
-      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit'
+      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal'
     )
     .eq('item_id', itemRowId);
 
   if (finalError) throw new Error(`Failed to reload accounts: ${finalError.message}`);
   return final as AccountRow[];
+}
+
+async function verifyAccountOwnership(accountId: string, userId: string): Promise<boolean> {
+  const { data: owned, error: ownError } = await supabaseAdmin
+    .from('accounts')
+    .select('id, plaid_items!inner(user_id)')
+    .eq('id', accountId)
+    .eq('plaid_items.user_id', userId)
+    .maybeSingle();
+
+  if (ownError) throw new Error(`Failed to verify account ownership: ${ownError.message}`);
+  return !!owned;
 }
 
 /** credit_limit is user-entered (see AccountRow), never touched by the Plaid balance-refresh
@@ -228,26 +240,40 @@ export async function updateAccountCreditLimit(
   userId: string,
   creditLimit: number | null
 ): Promise<AccountRow | null> {
-  const { data: owned, error: ownError } = await supabaseAdmin
-    .from('accounts')
-    .select('id, plaid_items!inner(user_id)')
-    .eq('id', accountId)
-    .eq('plaid_items.user_id', userId)
-    .maybeSingle();
-
-  if (ownError) throw new Error(`Failed to verify account ownership: ${ownError.message}`);
-  if (!owned) return null;
+  if (!(await verifyAccountOwnership(accountId, userId))) return null;
 
   const { data, error } = await supabaseAdmin
     .from('accounts')
     .update({ credit_limit: creditLimit })
     .eq('id', accountId)
     .select(
-      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit'
+      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal'
     )
     .single();
 
   if (error) throw new Error(`Failed to update credit limit: ${error.message}`);
+  return data as AccountRow;
+}
+
+/** savings_goal is user-entered (see AccountRow), never touched by the Plaid balance-refresh
+ *  path above — this is the only place it's written. */
+export async function updateAccountSavingsGoal(
+  accountId: string,
+  userId: string,
+  savingsGoal: number | null
+): Promise<AccountRow | null> {
+  if (!(await verifyAccountOwnership(accountId, userId))) return null;
+
+  const { data, error } = await supabaseAdmin
+    .from('accounts')
+    .update({ savings_goal: savingsGoal })
+    .eq('id', accountId)
+    .select(
+      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal'
+    )
+    .single();
+
+  if (error) throw new Error(`Failed to update savings goal: ${error.message}`);
   return data as AccountRow;
 }
 

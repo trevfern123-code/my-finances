@@ -23,6 +23,7 @@ import {
   syncTransactions as syncTransactionsRequest,
   unlinkLoanPayment,
   updateAccountCreditLimit,
+  updateAccountSavingsGoal,
   updateBudgetCategory,
   updateLinkedLoanPayment,
   updateManualLoan,
@@ -276,6 +277,23 @@ export default function App() {
       );
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to update credit limit');
+    }
+  }
+
+  async function handleUpdateSavingsGoal(accountId: string, savingsGoal: number | null) {
+    setActionError(null);
+    try {
+      const res = await updateAccountSavingsGoal(accountId, savingsGoal);
+      setAssetGroups((prev) =>
+        prev.map((group) => ({
+          ...group,
+          accounts: group.accounts.map((a) =>
+            a.id === accountId ? { ...a, savings_goal: res.account.savings_goal } : a
+          ),
+        }))
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update savings goal');
     }
   }
 
@@ -549,7 +567,16 @@ export default function App() {
             />
           )}
 
-          {activeTab === 'income' && <IncomeSavings groups={assetGroups} totalAssets={totalAssets} />}
+          {activeTab === 'income' && (
+            <IncomeSavings
+              groups={assetGroups}
+              totalAssets={totalAssets}
+              recurringStreams={recurringStreams}
+              currentMonthIncome={summary?.monthly_spending[summary.monthly_spending.length - 1]?.income ?? 0}
+              currentMonthSpent={summary?.monthly_spending[summary.monthly_spending.length - 1]?.spent ?? 0}
+              onUpdateSavingsGoal={handleUpdateSavingsGoal}
+            />
+          )}
 
           {activeTab === 'accounts' && (
             <div className="tab-panel">

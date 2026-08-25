@@ -128,6 +128,7 @@ export async function getAssetsSummary(req: Request, res: Response, next: NextFu
         current_balance: account.current_balance,
         iso_currency_code: account.iso_currency_code,
         institution_name: item.institution_name,
+        savings_goal: account.savings_goal,
       }))
     );
 
@@ -285,6 +286,29 @@ export async function updateAccountCreditLimit(req: Request, res: Response, next
     }
 
     const account = await dataService.updateAccountCreditLimit(accountId, userId, creditLimit ?? null);
+    if (!account) {
+      res.status(404).json({ error: 'Account not found' });
+      return;
+    }
+
+    res.json({ account });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateAccountSavingsGoal(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { accountId } = req.params;
+    const { savings_goal: savingsGoal } = req.body as { savings_goal?: number | null };
+
+    if (savingsGoal !== null && savingsGoal !== undefined && typeof savingsGoal !== 'number') {
+      res.status(400).json({ error: 'savings_goal must be a number or null' });
+      return;
+    }
+
+    const account = await dataService.updateAccountSavingsGoal(accountId, userId, savingsGoal ?? null);
     if (!account) {
       res.status(404).json({ error: 'Account not found' });
       return;

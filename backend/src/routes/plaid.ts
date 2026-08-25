@@ -17,6 +17,7 @@ plaidRouter.get('/loans', plaidController.getLoans);
 plaidRouter.get('/assets-summary', plaidController.getAssetsSummary);
 plaidRouter.post('/accounts/refresh', plaidController.refreshAccounts);
 plaidRouter.patch('/accounts/:accountId/credit-limit', plaidController.updateAccountCreditLimit);
+plaidRouter.patch('/accounts/:accountId/savings-goal', plaidController.updateAccountSavingsGoal);
 plaidRouter.post('/transactions/sync', plaidController.syncTransactions);
 plaidRouter.get('/transactions', plaidController.listTransactions);
 plaidRouter.patch('/transactions/:transactionId/category', plaidController.setTransactionCategory);

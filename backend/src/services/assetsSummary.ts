@@ -7,6 +7,7 @@ export interface AssetAccount {
   current_balance: number | null;
   iso_currency_code: string | null;
   institution_name: string | null;
+  savings_goal: number | null;
 }
 
 export type AssetCategory = 'checking' | 'savings' | 'investment' | 'other';
