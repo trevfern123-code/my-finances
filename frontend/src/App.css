@@ -10,14 +10,19 @@
  * one — so nothing is ever unset in a state that reaches it.
  *
  * ACCENT (brand color, user-selectable, 6 presets) — deliberately kept separate from the
- * financial-meaning tokens (--positive/--danger/--warn/--info): those always mean the same thing
- * regardless of which accent the user picked. --accent (used as bare text/border, e.g. focus
- * rings, links-as-accent) needs a different shade per theme for contrast against a light vs. dark
- * page, so each preset defines both; --accent-strong/--accent-rgb/--text-on-accent describe a
- * self-contained solid-fill button and its contrast-safe label, which doesn't depend on the
- * surrounding page background, so those three are defined once per preset regardless of theme.
- * Green is the default preset, in bare :root — every other preset overrides via
- * `[data-accent="..."]` (plus its own tiny dark-context override for --accent only).
+ * financial-meaning tokens (--positive/--danger/--warn): those always mean the same thing
+ * regardless of which accent the user picked, never accent. Everything else interactive and
+ * non-semantic is fair game for --accent: primary buttons, active nav state, links, focus rings,
+ * selected/toggled controls, hover feedback, and chart elements that are just magnitude (not a
+ * pos/neg signal) — see e.g. .tab-btn.active, .link-button, .reorder-btn:hover, .sub-bar-fill.
+ * --accent (used as bare text/border) needs a different shade per theme for contrast against a
+ * light vs. dark page, so each preset defines both; --accent-strong/--accent-rgb/--text-on-accent
+ * describe a self-contained solid-fill button and its contrast-safe label, which doesn't depend
+ * on the surrounding page background, so those three are defined once per preset regardless of
+ * theme. Green is the default preset, in bare :root — every other preset overrides via
+ * `[data-accent="..."]` (plus its own tiny dark-context override for --accent only). Hover states
+ * on accent-colored text prefer `opacity` over a second hand-picked "hover shade" — see the
+ * comment on .link-button:hover for why.
  */
 
 :root {
@@ -40,8 +45,6 @@
   --danger-rgb: 220, 38, 38;
   --warn: #b45309;
   --warn-rgb: 245, 158, 11;
-  --info: #2563eb;
-  --info-hover: #1d4ed8;
 
   /* Theme-independent (self-contained fill + label contrast, doesn't depend on page background) —
      same value in light and dark. */
@@ -83,8 +86,6 @@
     --danger-rgb: 248, 113, 113;
     --warn: #fbbf24;
     --warn-rgb: 251, 191, 36;
-    --info: #60a5fa;
-    --info-hover: #93c5fd;
 
     --accent: #34d399;
 
@@ -111,8 +112,6 @@
   --danger-rgb: 248, 113, 113;
   --warn: #fbbf24;
   --warn-rgb: 251, 191, 36;
-  --info: #60a5fa;
-  --info-hover: #93c5fd;
 
   --accent: #34d399;
 
@@ -300,16 +299,20 @@ button:disabled {
 
 .link-button {
   background: none;
-  color: var(--info);
+  color: var(--accent);
   font-weight: 500;
   padding: 0.2rem 0;
   text-decoration: underline;
   text-underline-offset: 2px;
 }
 
+/* Opacity rather than a second hand-picked color — with 6 accent presets across 2 themes,
+   a fixed "hover shade" would need 12 individually-tuned values (and some presets share their
+   light-context --accent with --accent-strong, which would make certain choices invisible).
+   Opacity dims correctly regardless of what --accent actually resolves to. */
 .link-button:hover:not(:disabled) {
   filter: none;
-  color: var(--info-hover);
+  opacity: 0.75;
 }
 
 .error {
@@ -371,12 +374,13 @@ button:disabled {
 
 .tab-btn:hover:not(.active) {
   color: var(--text);
+  background: rgba(var(--accent-rgb), 0.08);
   filter: none;
 }
 
 .tab-btn.active {
-  background: var(--surface-raised);
-  color: var(--text);
+  background: rgba(var(--accent-rgb), 0.15);
+  color: var(--accent);
 }
 
 .dashboard-grid {
@@ -570,7 +574,7 @@ button:disabled {
   font-size: 1.1rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  color: var(--info);
+  color: var(--positive);
 }
 
 .stat-value-inline.negative {
@@ -591,7 +595,7 @@ button:disabled {
 
 .networth-line {
   fill: none;
-  stroke: var(--info);
+  stroke: var(--positive);
   stroke-width: 2.5;
   stroke-linejoin: round;
   stroke-linecap: round;
@@ -604,7 +608,7 @@ button:disabled {
 }
 
 .networth-point {
-  fill: var(--info);
+  fill: var(--positive);
 }
 
 .networth-point.negative {
@@ -982,8 +986,8 @@ button:disabled {
 
 .reorder-btn:hover:not(:disabled) {
   filter: none;
-  color: var(--text);
-  border-color: var(--text-muted);
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .reorder-btn:disabled {
@@ -1027,7 +1031,7 @@ button:disabled {
 
 .emoji-picker-trigger:hover {
   filter: none;
-  border-color: var(--text-muted);
+  border-color: var(--accent);
 }
 
 .emoji-picker-grid {
@@ -1062,8 +1066,8 @@ button:disabled {
 
 .emoji-picker-option:hover {
   filter: none;
-  background: var(--bg);
-  border-color: var(--border-strong);
+  background: rgba(var(--accent-rgb), 0.12);
+  border-color: var(--accent);
 }
 
 .emoji-picker-clear {
@@ -1261,7 +1265,7 @@ button:disabled {
 }
 
 .appearance-accent-swatch:focus-visible {
-  outline: 2px solid var(--text);
+  outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
 
@@ -1423,6 +1427,7 @@ button:disabled {
 
 .month-card-header:hover {
   filter: none;
+  background: rgba(var(--accent-rgb), 0.06);
 }
 
 .month-card-header h2 {
@@ -1494,7 +1499,7 @@ button:disabled {
 
 .cat-row:hover {
   filter: none;
-  background: var(--bg);
+  background: rgba(var(--accent-rgb), 0.08);
 }
 
 .cat-row:last-child {
@@ -1612,8 +1617,8 @@ button:disabled {
 
 .collapse-toggle:hover {
   filter: none;
-  color: var(--text);
-  border-color: var(--text-muted);
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .collapse-toggle.collapsed {
@@ -1920,7 +1925,7 @@ button:disabled {
 .sub-bar-fill {
   height: 100%;
   border-radius: 999px;
-  background: var(--info);
+  background: var(--accent);
 }
 
 .sub-bar-fill.income {
