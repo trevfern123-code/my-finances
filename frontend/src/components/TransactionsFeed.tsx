@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
-import { budgetCategoryLabel } from '../lib/categoryLabels';
+import { budgetCategoryLabel, selectableCategories } from '../lib/categoryLabels';
 import { SplitEditor } from './SplitEditor';
 
 function formatAmount(amount: number, currency: string | null) {
@@ -54,6 +54,14 @@ export function TransactionsFeed({
     for (const c of budgetCategories) map.set(c.id, c);
     return map;
   }, [budgetCategories]);
+
+  // The filter dropdown is a historical-browsing view, not a categorizing action, so archived
+  // categories stay filterable — just grouped separately so they read as no-longer-active.
+  const activeCategories = useMemo(() => budgetCategories.filter((c) => c.archived_at === null), [budgetCategories]);
+  const archivedCategories = useMemo(
+    () => budgetCategories.filter((c) => c.archived_at !== null),
+    [budgetCategories]
+  );
 
   const needsReviewCount = useMemo(() => transactions.filter((t) => t.needs_review).length, [transactions]);
 
@@ -131,11 +139,20 @@ export function TransactionsFeed({
             <select value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
               <option value="">All categories</option>
               <option value="uncategorized">Uncategorized</option>
-              {budgetCategories.map((c) => (
+              {activeCategories.map((c) => (
                 <option key={c.id} value={c.id}>
                   {budgetCategoryLabel(c)}
                 </option>
               ))}
+              {archivedCategories.length > 0 && (
+                <optgroup label="Archived">
+                  {archivedCategories.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {budgetCategoryLabel(c)}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </select>
             <label className="transaction-filter-date">
               From
@@ -187,7 +204,7 @@ export function TransactionsFeed({
                           onChange={(e) => onCategorize(t.id, e.target.value || null)}
                         >
                           <option value="">Uncategorized</option>
-                          {budgetCategories.map((c) => (
+                          {selectableCategories(budgetCategories, t.budget_category_id).map((c) => (
                             <option key={c.id} value={c.id}>
                               {budgetCategoryLabel(c)}
                             </option>

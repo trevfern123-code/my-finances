@@ -105,6 +105,10 @@ export interface BudgetCategory {
   sort_order: number;
   /** Optional single emoji shown next to the category name and on its transactions. */
   emoji: string | null;
+  /** Null for an active category; set to when it was archived otherwise. An archived category is
+   *  excluded from active budgeting/selection flows but stays attached to its historical
+   *  transactions, splits, and spend totals unchanged. */
+  archived_at: string | null;
   /** Sum of positive-amount categorized transactions in the current calendar month — only present on GET /api/budget-categories. */
   spent: number;
   /** Average monthly spend over the most recent full months, excluding the in-progress current month — only present on GET /api/budget-categories. */
@@ -460,8 +464,9 @@ export function updateBudgetCategory(
     color: string | null;
     sort_order: number;
     emoji: string | null;
+    archived: boolean;
   }>
-): Promise<{ category: BareBudgetCategory }> {
+): Promise<{ category: BareBudgetCategory; removed_mapping_ids?: string[] }> {
   return authedFetch(`/api/budget-categories/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(fields),

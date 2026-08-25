@@ -16,6 +16,8 @@ import {
   getCategorySpendRows,
   setTransactionSplits,
   clearTransactionSplits,
+  deleteCategoryMappingsForBudgetCategory,
+  getBudgetCategoryForUser,
 } from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
@@ -638,5 +640,56 @@ describe('updateAccountSavingsGoal', () => {
 
     expect(result).toBeNull();
     expect(mockFrom).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('deleteCategoryMappingsForBudgetCategory', () => {
+  it('deletes mappings targeting the given category and returns their ids', async () => {
+    const deleteQuery = createQueryBuilder({
+      data: [{ id: 'mapping-1' }, { id: 'mapping-2' }],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(deleteQuery);
+
+    const result = await deleteCategoryMappingsForBudgetCategory('cat-1', 'user-1');
+
+    expect(deleteQuery.delete).toHaveBeenCalled();
+    expect(deleteQuery.eq).toHaveBeenCalledWith('budget_category_id', 'cat-1');
+    expect(deleteQuery.eq).toHaveBeenCalledWith('user_id', 'user-1');
+    expect(result).toEqual(['mapping-1', 'mapping-2']);
+  });
+
+  it('returns an empty array when no mappings target the category', async () => {
+    const deleteQuery = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(deleteQuery);
+
+    const result = await deleteCategoryMappingsForBudgetCategory('cat-1', 'user-1');
+
+    expect(result).toEqual([]);
+  });
+});
+
+describe('getBudgetCategoryForUser', () => {
+  it("returns the category row when it belongs to the user", async () => {
+    const query = createQueryBuilder({
+      data: { id: 'cat-1', user_id: 'user-1', archived_at: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getBudgetCategoryForUser('cat-1', 'user-1');
+
+    expect(query.eq).toHaveBeenCalledWith('id', 'cat-1');
+    expect(query.eq).toHaveBeenCalledWith('user_id', 'user-1');
+    expect(result).toEqual({ id: 'cat-1', user_id: 'user-1', archived_at: null });
+  });
+
+  it('returns null when no matching category is found', async () => {
+    const query = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getBudgetCategoryForUser('cat-1', 'user-1');
+
+    expect(result).toBeNull();
   });
 });

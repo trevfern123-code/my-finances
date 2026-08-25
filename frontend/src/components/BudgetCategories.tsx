@@ -1,12 +1,37 @@
 import { useEffect, useRef, useState } from 'react';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
 import { getCurrentMonthCategoryItems } from '../lib/budgetDrilldown';
+import { CATEGORY_COLOR_OPTIONS } from '../lib/categoryColors';
 
+// A curated set covering the categories real budgets tend to have, loosely grouped (food,
+// transport, housing/bills, shopping, entertainment, health, travel, education, personal care,
+// finance, pets, family, misc) — not exhaustive, since anything missing is one paste away via the
+// custom-emoji input below the grid.
 const EMOJI_OPTIONS = [
-  '🍔', '🚗', '🏠', '💊', '🎬', '✈️', '🛒', '⚡',
-  '📱', '💰', '🎓', '🐾', '🎁', '☕', '👕', '🏋️',
-  '🐶', '🔧', '📚', '🎮', '🍿', '🚕', '🧾', '💳',
+  '🍔', '🍕', '🍜', '🍱', '🍿', '☕', '🍺', '🍷', '🥗',
+  '🚗', '🚕', '🚌', '🚆', '✈️', '⛽', '🅿️', '🚲', '🛵',
+  '🏠', '💡', '💧', '🔥', '📶', '🛠️', '🧹',
+  '🛒', '👕', '👟', '💄', '🎁', '📦',
+  '🎬', '🎮', '🎵', '🎉', '📺', '🎟️',
+  '💊', '🏥', '🦷', '🏋️', '🧘', '🩺',
+  '🧳', '🏨', '🗺️', '⛱️',
+  '🎓', '📚', '✏️',
+  '💇', '🧴', '🧖',
+  '💰', '💳', '🏦', '📈', '💵', '🔁',
+  '🐶', '🐱', '🐾',
+  '👶', '🧸',
+  '📱', '⚡', '🧾', '🔧',
 ];
+
+/** Light sanity-check for a pasted custom emoji, not a strict grapheme validator — this is a
+ *  single-user personal finance app, not a public input surface, so trimming and a generous
+ *  length cap (enough for skin-tone modifiers and short ZWJ sequences like a family emoji) is
+ *  enough to keep the field from silently accepting pasted sentences. */
+function sanitizeCustomEmoji(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed || trimmed.length > 8) return null;
+  return trimmed;
+}
 
 function formatCurrency(amount: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
@@ -44,6 +69,7 @@ function EmojiPicker({
   label: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [customEmoji, setCustomEmoji] = useState('');
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -54,6 +80,15 @@ function EmojiPicker({
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [open]);
+
+  function handleCustomSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const sanitized = sanitizeCustomEmoji(customEmoji);
+    if (!sanitized) return;
+    onChange(sanitized);
+    setCustomEmoji('');
+    setOpen(false);
+  }
 
   return (
     <div className="emoji-picker" ref={ref}>
@@ -66,30 +101,44 @@ function EmojiPicker({
         {value ?? '＋'}
       </button>
       {open && (
-        <div className="emoji-picker-grid">
-          {EMOJI_OPTIONS.map((option) => (
-            <button
-              key={option}
-              type="button"
-              className="emoji-picker-option"
-              onClick={() => {
-                onChange(option);
-                setOpen(false);
-              }}
-            >
-              {option}
+        <div className="emoji-picker-panel">
+          <div className="emoji-picker-grid">
+            {EMOJI_OPTIONS.map((option) => (
+              <button
+                key={option}
+                type="button"
+                className="emoji-picker-option"
+                onClick={() => {
+                  onChange(option);
+                  setOpen(false);
+                }}
+              >
+                {option}
+              </button>
+            ))}
+          </div>
+          <form className="emoji-picker-custom" onSubmit={handleCustomSubmit}>
+            <input
+              type="text"
+              value={customEmoji}
+              onChange={(e) => setCustomEmoji(e.target.value)}
+              placeholder="Paste any emoji"
+              aria-label="Custom emoji"
+            />
+            <button type="submit" className="link-button" disabled={!sanitizeCustomEmoji(customEmoji)}>
+              Use
             </button>
-          ))}
+          </form>
           {value && (
             <button
               type="button"
-              className="emoji-picker-option emoji-picker-clear"
+              className="link-button emoji-picker-clear"
               onClick={() => {
                 onChange(null);
                 setOpen(false);
               }}
             >
-              Clear
+              Clear emoji
             </button>
           )}
         </div>
@@ -98,22 +147,93 @@ function EmojiPicker({
   );
 }
 
+function ColorPicker({
+  value,
+  onChange,
+  label,
+}: {
+  value: string | null;
+  onChange: (color: string | null) => void;
+  label: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [open]);
+
+  return (
+    <div className="color-picker" ref={ref}>
+      <button
+        type="button"
+        className="color-picker-trigger"
+        style={value ? { background: value } : undefined}
+        onClick={() => setOpen((v) => !v)}
+        aria-label={label}
+      />
+      {open && (
+        <div className="color-picker-panel">
+          <div className="color-picker-grid">
+            {CATEGORY_COLOR_OPTIONS.map((option) => (
+              <button
+                key={option}
+                type="button"
+                className={value === option ? 'color-picker-option active' : 'color-picker-option'}
+                style={{ background: option }}
+                aria-label={option}
+                onClick={() => {
+                  onChange(option);
+                  setOpen(false);
+                }}
+              />
+            ))}
+          </div>
+          {value && (
+            <button
+              type="button"
+              className="link-button color-picker-clear"
+              onClick={() => {
+                onChange(null);
+                setOpen(false);
+              }}
+            >
+              Clear color
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CategoryColorDot({ color }: { color: string | null }) {
+  if (!color) return null;
+  return <span className="category-color-dot" style={{ background: color }} />;
+}
+
 function AddCategoryForm({
   onCreate,
   onCancel,
 }: {
-  onCreate: (name: string, budgetAmount: number, emoji: string | null) => void;
+  onCreate: (name: string, budgetAmount: number, emoji: string | null, color: string | null) => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState('');
   const [amount, setAmount] = useState('');
   const [emoji, setEmoji] = useState<string | null>(null);
+  const [color, setColor] = useState<string | null>(null);
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const parsed = Number(amount);
     if (!name || Number.isNaN(parsed)) return;
-    onCreate(name, parsed, emoji);
+    onCreate(name, parsed, emoji, color);
   }
 
   return (
@@ -123,6 +243,10 @@ function AddCategoryForm({
         <label className="new-category-emoji-label">
           Emoji
           <EmojiPicker value={emoji} onChange={setEmoji} label="Choose an emoji for this category" />
+        </label>
+        <label className="new-category-color-label">
+          Color
+          <ColorPicker value={color} onChange={setColor} label="Choose a color for this category" />
         </label>
         <label>
           Name
@@ -200,27 +324,33 @@ export function BudgetCategories({
   onCreate,
   onUpdate,
   onUpdateEmoji,
+  onUpdateColor,
   onReorder,
-  onDelete,
+  onArchive,
+  onUnarchive,
 }: {
   categories: BudgetCategory[];
   transactions: TransactionItem[];
-  onCreate: (name: string, budgetAmount: number, emoji: string | null) => void;
+  onCreate: (name: string, budgetAmount: number, emoji: string | null, color: string | null) => void;
   onUpdate: (id: string, budgetAmount: number) => void;
   onUpdateEmoji: (id: string, emoji: string | null) => void;
+  onUpdateColor: (id: string, color: string | null) => void;
   onReorder: (id: string, sortOrder: number) => void;
-  onDelete: (id: string) => void;
+  onArchive: (id: string) => void;
+  onUnarchive: (id: string) => void;
 }) {
   const [editing, setEditing] = useState<Record<string, string>>({});
   const [showAddForm, setShowAddForm] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
 
   // Always render in sort_order regardless of the order the array arrived in, so a reorder
   // takes effect immediately once the underlying values update, with no separate refetch.
-  const sorted = [...categories].sort((a, b) => a.sort_order - b.sort_order);
+  const sorted = categories.filter((c) => c.archived_at === null).sort((a, b) => a.sort_order - b.sort_order);
+  const archived = categories.filter((c) => c.archived_at !== null).sort((a, b) => a.name.localeCompare(b.name));
 
-  function handleCreate(name: string, budgetAmount: number, emoji: string | null) {
-    onCreate(name, budgetAmount, emoji);
+  function handleCreate(name: string, budgetAmount: number, emoji: string | null, color: string | null) {
+    onCreate(name, budgetAmount, emoji, color);
     setShowAddForm(false);
   }
 
@@ -287,6 +417,11 @@ export function BudgetCategories({
                       onChange={(emoji) => onUpdateEmoji(c.id, emoji)}
                       label={`Choose an emoji for ${c.name}`}
                     />
+                    <ColorPicker
+                      value={c.color}
+                      onChange={(color) => onUpdateColor(c.id, color)}
+                      label={`Choose a color for ${c.name}`}
+                    />
                     <span className="budget-category-name">{c.name}</span>
                     <div className="budget-category-actions">
                       <input
@@ -301,8 +436,8 @@ export function BudgetCategories({
                           }
                         }}
                       />
-                      <button className="link-button" onClick={() => onDelete(c.id)}>
-                        Delete
+                      <button className="link-button" onClick={() => onArchive(c.id)}>
+                        Archive
                       </button>
                     </div>
                   </div>
@@ -340,6 +475,35 @@ export function BudgetCategories({
           </div>
         )}
       </div>
+
+      {archived.length > 0 && (
+        <div className="card archived-categories-card">
+          <button
+            type="button"
+            className="link-button archived-categories-toggle"
+            onClick={() => setShowArchived((v) => !v)}
+            aria-expanded={showArchived}
+          >
+            {showArchived ? 'Hide' : 'Show'} archived categories ({archived.length})
+          </button>
+          {showArchived && (
+            <div className="archived-categories-list">
+              {archived.map((c) => (
+                <div key={c.id} className="archived-category-row">
+                  <CategoryColorDot color={c.color} />
+                  <span className="archived-category-name">
+                    {c.emoji && <span className="archived-category-emoji">{c.emoji}</span>}
+                    {c.name}
+                  </span>
+                  <button type="button" className="link-button" onClick={() => onUnarchive(c.id)}>
+                    Unarchive
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {showAddForm && <AddCategoryForm onCreate={handleCreate} onCancel={() => setShowAddForm(false)} />}
     </div>

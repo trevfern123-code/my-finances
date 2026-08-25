@@ -37,9 +37,13 @@ export async function upsertCategoryMapping(req: Request, res: Response, next: N
       return;
     }
 
-    const ownsCategory = await dataService.budgetCategoryBelongsToUser(budgetCategoryId, userId);
-    if (!ownsCategory) {
+    const category = await dataService.getBudgetCategoryForUser(budgetCategoryId, userId);
+    if (!category) {
       res.status(404).json({ error: 'Budget category not found' });
+      return;
+    }
+    if (category.archived_at !== null) {
+      res.status(400).json({ error: 'Cannot map to an archived category' });
       return;
     }
 

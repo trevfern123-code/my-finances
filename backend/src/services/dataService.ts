@@ -1020,6 +1020,7 @@ export async function updateBudgetCategory(
     color: string | null;
     sort_order: number;
     emoji: string | null;
+    archived_at: string | null;
   }>
 ): Promise<BudgetCategoryRow | null> {
   const { data, error } = await supabaseAdmin
@@ -1044,6 +1045,22 @@ export async function budgetCategoryBelongsToUser(id: string, userId: string): P
 
   if (error) throw new Error(`Failed to verify budget category: ${error.message}`);
   return data !== null;
+}
+
+/** Used where a caller needs more than ownership (e.g. checking archived_at before allowing a new
+ *  category mapping) — budgetCategoryBelongsToUser stays boolean-only for its existing call sites,
+ *  which must keep accepting archived categories (categorizing/splitting a transaction against an
+ *  already-archived category is a historical edit, not a new-mapping action). */
+export async function getBudgetCategoryForUser(id: string, userId: string): Promise<BudgetCategoryRow | null> {
+  const { data, error } = await supabaseAdmin
+    .from('budget_categories')
+    .select('*')
+    .eq('id', id)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error) throw new Error(`Failed to load budget category: ${error.message}`);
+  return data as BudgetCategoryRow | null;
 }
 
 export async function deleteBudgetCategory(id: string, userId: string): Promise<void> {
@@ -1109,6 +1126,25 @@ export async function deleteCategoryMapping(id: string, userId: string): Promise
     .eq('user_id', userId);
 
   if (error) throw new Error(`Failed to delete category mapping: ${error.message}`);
+}
+
+/** Called when a budget category is archived — mappings exist to drive ongoing auto-categorization
+ *  of newly-synced transactions, which should stop once their target category is archived, so the
+ *  mapped Plaid category reverts to "Unmapped" until remapped to an active category. Returns the
+ *  ids of the mappings removed, so the caller can update its own state without a refetch. */
+export async function deleteCategoryMappingsForBudgetCategory(
+  budgetCategoryId: string,
+  userId: string
+): Promise<string[]> {
+  const { data, error } = await supabaseAdmin
+    .from('category_mappings')
+    .delete()
+    .eq('budget_category_id', budgetCategoryId)
+    .eq('user_id', userId)
+    .select('id');
+
+  if (error) throw new Error(`Failed to remove mappings for archived category: ${error.message}`);
+  return (data as { id: string }[] | null ?? []).map((row) => row.id);
 }
 
 /** Applies a mapping retroactively to the user's already-synced transactions that match its Plaid

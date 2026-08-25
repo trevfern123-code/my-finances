@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { BudgetCategory, TransactionSplit } from '../lib/api';
-import { budgetCategoryLabel } from '../lib/categoryLabels';
+import { budgetCategoryLabel, selectableCategories } from '../lib/categoryLabels';
 import { computeSplitBalance, hasIncompleteRow } from '../lib/splitValidation';
 
 interface DraftSplit {
@@ -93,7 +93,7 @@ export function SplitEditor({
             onChange={(e) => updateRow(i, { budget_category_id: e.target.value })}
           >
             <option value="">Choose category…</option>
-            {budgetCategories.map((c) => (
+            {selectableCategories(budgetCategories, row.budget_category_id || null).map((c) => (
               <option key={c.id} value={c.id}>
                 {budgetCategoryLabel(c)}
               </option>

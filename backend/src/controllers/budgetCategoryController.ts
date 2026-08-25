@@ -67,12 +67,24 @@ export async function createBudgetCategory(req: Request, res: Response, next: Ne
 export async function updateBudgetCategory(req: Request, res: Response, next: NextFunction) {
   try {
     const { id } = req.params;
-    const { name, budget_amount: budgetAmount, color, sort_order: sortOrder, emoji } = req.body as {
+    const userId = req.user!.id;
+    const {
+      name,
+      budget_amount: budgetAmount,
+      color,
+      sort_order: sortOrder,
+      emoji,
+      archived,
+    } = req.body as {
       name?: string;
       budget_amount?: number;
       color?: string | null;
       sort_order?: number;
       emoji?: string | null;
+      /** Action-oriented rather than a client-supplied timestamp, since this app already treats
+       *  client clock skew as untrustworthy (see the JWT clock-skew mitigation elsewhere) — the
+       *  actual archived_at value is always set server-side from `now()`. */
+      archived?: boolean;
     };
 
     const fields: Record<string, unknown> = {};
@@ -81,14 +93,24 @@ export async function updateBudgetCategory(req: Request, res: Response, next: Ne
     if (color !== undefined) fields.color = color;
     if (sortOrder !== undefined) fields.sort_order = sortOrder;
     if (emoji !== undefined) fields.emoji = emoji;
+    if (archived !== undefined) fields.archived_at = archived ? new Date().toISOString() : null;
 
-    const category = await dataService.updateBudgetCategory(id, req.user!.id, fields);
+    const category = await dataService.updateBudgetCategory(id, userId, fields);
     if (!category) {
       res.status(404).json({ error: 'Budget category not found' });
       return;
     }
 
-    res.json({ category });
+    // Archiving stops the category from receiving new auto-categorized transactions going
+    // forward — any existing mapping that targets it no longer serves a purpose and would
+    // silently keep routing new spend into an "archived" category, so it's removed here. This
+    // never touches transactions/splits that already reference the category historically.
+    let removedMappingIds: string[] | undefined;
+    if (archived === true) {
+      removedMappingIds = await dataService.deleteCategoryMappingsForBudgetCategory(id, userId);
+    }
+
+    res.json({ category, ...(removedMappingIds && removedMappingIds.length > 0 ? { removed_mapping_ids: removedMappingIds } : {}) });
   } catch (err) {
     next(err);
   }

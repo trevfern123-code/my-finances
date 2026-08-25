@@ -6,7 +6,6 @@ import {
   createManualLoan,
   createManualPayment,
   clearTransactionSplits,
-  deleteBudgetCategory,
   deleteCategoryMapping,
   deleteManualLoan,
   deleteManualPayment,
@@ -412,10 +411,15 @@ export default function App() {
     refreshBudgetCategories();
   }
 
-  async function handleCreateCategory(name: string, budgetAmount: number, emoji: string | null) {
+  async function handleCreateCategory(
+    name: string,
+    budgetAmount: number,
+    emoji: string | null,
+    color: string | null
+  ) {
     setActionError(null);
     try {
-      const res = await createBudgetCategory({ name, budget_amount: budgetAmount, emoji });
+      const res = await createBudgetCategory({ name, budget_amount: budgetAmount, emoji, color });
       // A brand-new category has no transactions assigned to it yet, so both derived fields
       // are always 0 — no need to refetch just to fill in values we already know.
       setBudgetCategories((prev) => [...prev, { ...res.category, spent: 0, recent_avg_spent: 0 }]);
@@ -450,6 +454,18 @@ export default function App() {
     }
   }
 
+  async function handleUpdateCategoryColor(id: string, color: string | null) {
+    setActionError(null);
+    try {
+      const res = await updateBudgetCategory(id, { color });
+      setBudgetCategories((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, ...res.category } : c))
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update category color');
+    }
+  }
+
   async function handleReorderCategory(id: string, sortOrder: number) {
     setActionError(null);
     try {
@@ -462,13 +478,29 @@ export default function App() {
     }
   }
 
-  async function handleDeleteCategory(id: string) {
+  async function handleArchiveCategory(id: string) {
     setActionError(null);
     try {
-      await deleteBudgetCategory(id);
-      setBudgetCategories((prev) => prev.filter((c) => c.id !== id));
+      const res = await updateBudgetCategory(id, { archived: true });
+      setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
+      // Archiving removes any mapping that targeted this category server-side (so future synced
+      // transactions stop landing here) — drop those from local state too, without a refetch.
+      if (res.removed_mapping_ids && res.removed_mapping_ids.length > 0) {
+        const removed = new Set(res.removed_mapping_ids);
+        setCategoryMappings((prev) => prev.filter((m) => !removed.has(m.id)));
+      }
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to delete category');
+      setActionError(err instanceof Error ? err.message : 'Failed to archive category');
+    }
+  }
+
+  async function handleUnarchiveCategory(id: string) {
+    setActionError(null);
+    try {
+      const res = await updateBudgetCategory(id, { archived: false });
+      setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to unarchive category');
     }
   }
 
@@ -595,6 +627,12 @@ export default function App() {
     }
   }
 
+  // Active-only view for anything that budgets/selects going forward (remaining-budget math, the
+  // mapping target list) — components that need to resolve or offer an already-archived category
+  // (transaction/split editing, the Budget tab's own archived section) keep receiving the full
+  // budgetCategories array and decide per-row whether to surface it.
+  const activeBudgetCategories = budgetCategories.filter((c) => c.archived_at === null);
+
   // Card components know nothing about customization — this is the one place that maps a card
   // id to what it actually renders, preserving each card's existing data-availability guard
   // (e.g. `stats` needs `summary`) exactly as it worked before dashboard customization existed.
@@ -616,13 +654,13 @@ export default function App() {
             recurringStreams={recurringStreams}
             loans={loans}
             manualLoans={manualLoans}
-            budgetCategories={budgetCategories}
+            budgetCategories={activeBudgetCategories}
           />
         );
       case 'cash_flow_pace':
         return summary ? (
           <CashFlowPace
-            budgetCategories={budgetCategories}
+            budgetCategories={activeBudgetCategories}
             currentMonthIncome={summary.monthly_spending[summary.monthly_spending.length - 1]?.income ?? 0}
             currentMonthSpent={summary.monthly_spending[summary.monthly_spending.length - 1]?.spent ?? 0}
           />
@@ -715,8 +753,10 @@ export default function App() {
               onCreate={handleCreateCategory}
               onUpdate={handleUpdateCategory}
               onUpdateEmoji={handleUpdateCategoryEmoji}
+              onUpdateColor={handleUpdateCategoryColor}
               onReorder={handleReorderCategory}
-              onDelete={handleDeleteCategory}
+              onArchive={handleArchiveCategory}
+              onUnarchive={handleUnarchiveCategory}
             />
           )}
 
@@ -789,7 +829,7 @@ export default function App() {
               <CategoryMappings
                 plaidCategories={plaidCategories}
                 mappings={categoryMappings}
-                budgetCategories={budgetCategories}
+                budgetCategories={activeBudgetCategories}
                 onSave={handleSaveCategoryMapping}
                 onDelete={handleDeleteCategoryMapping}
               />

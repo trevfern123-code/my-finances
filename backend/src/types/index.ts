@@ -73,6 +73,10 @@ export interface BudgetCategoryRow {
   sort_order: number;
   /** Optional single emoji shown next to the category name and on its transactions. */
   emoji: string | null;
+  /** Null for an active category; set to when it was archived otherwise. An archived category is
+   *  excluded from active budgeting/selection flows but stays attached to its historical
+   *  transactions, splits, and spend totals unchanged. */
+  archived_at: string | null;
 }
 
 /** Maps one of Plaid's own category values (transactions.category — the personal_finance_category

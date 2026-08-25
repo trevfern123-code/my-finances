@@ -1034,20 +1034,26 @@ button:disabled {
   border-color: var(--accent);
 }
 
-.emoji-picker-grid {
+.emoji-picker-panel {
   position: absolute;
   top: calc(100% + 0.35rem);
   left: 0;
   z-index: 20;
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: 0.2rem;
   padding: 0.5rem;
   background: var(--surface, var(--bg));
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-popover);
-  width: 12.5rem;
+  width: 13rem;
+}
+
+.emoji-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0.2rem;
+  max-height: 9.5rem;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .emoji-picker-option {
@@ -1070,9 +1076,24 @@ button:disabled {
   border-color: var(--accent);
 }
 
+.emoji-picker-custom {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.4rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--border);
+}
+
+.emoji-picker-custom input {
+  min-width: 0;
+  flex: 1;
+  padding: 0.3rem 0.4rem;
+  font-size: 0.8rem;
+}
+
 .emoji-picker-clear {
-  grid-column: 1 / -1;
-  width: auto;
+  display: block;
+  margin-top: 0.35rem;
   font-size: 0.75rem;
   color: var(--text-muted);
 }
@@ -1080,6 +1101,70 @@ button:disabled {
 .new-category-emoji-label .emoji-picker-trigger {
   width: 100%;
   height: 2.3rem;
+}
+
+.color-picker {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.color-picker-trigger {
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+}
+
+.color-picker-trigger:hover {
+  filter: none;
+  border-color: var(--accent);
+}
+
+.color-picker-panel {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  left: 0;
+  z-index: 20;
+  padding: 0.5rem;
+  background: var(--surface, var(--bg));
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-popover);
+  width: 9.5rem;
+}
+
+.color-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0.35rem;
+}
+
+.color-picker-option {
+  width: 1.4rem;
+  height: 1.4rem;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+}
+
+.color-picker-option.active {
+  border-color: var(--text);
+}
+
+.color-picker-clear {
+  display: block;
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.category-color-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
 
 .budget-amount-input {
@@ -1296,6 +1381,47 @@ button:disabled {
   align-items: center;
   gap: 1rem;
   margin-top: 1.1rem;
+}
+
+.new-category-color-label .color-picker-trigger {
+  width: 1.75rem;
+  height: 1.75rem;
+}
+
+.archived-categories-card {
+  margin-top: 1rem;
+}
+
+.archived-categories-toggle {
+  font-size: 0.85rem;
+}
+
+.archived-categories-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.8rem;
+}
+
+.archived-category-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.archived-category-row:last-child {
+  border-bottom: none;
+}
+
+.archived-category-name {
+  flex: 1;
+  color: var(--text-muted);
+}
+
+.archived-category-emoji {
+  margin-right: 0.35rem;
 }
 
 /* ---- Cash flow & budget pace ---- */
