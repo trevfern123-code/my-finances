@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
+import { budgetCategoryLabel } from '../lib/categoryLabels';
 
 function formatAmount(amount: number, currency: string | null) {
   const formatted = new Intl.NumberFormat('en-US', {
@@ -18,10 +19,6 @@ function formatDate(date: string) {
     year: 'numeric',
     timeZone: 'UTC',
   });
-}
-
-function categoryLabel(category: BudgetCategory) {
-  return category.emoji ? `${category.emoji} ${category.name}` : category.name;
 }
 
 export function TransactionsFeed({
@@ -120,7 +117,7 @@ export function TransactionsFeed({
               <option value="uncategorized">Uncategorized</option>
               {budgetCategories.map((c) => (
                 <option key={c.id} value={c.id}>
-                  {categoryLabel(c)}
+                  {budgetCategoryLabel(c)}
                 </option>
               ))}
             </select>
@@ -174,7 +171,7 @@ export function TransactionsFeed({
                       <option value="">Uncategorized</option>
                       {budgetCategories.map((c) => (
                         <option key={c.id} value={c.id}>
-                          {categoryLabel(c)}
+                          {budgetCategoryLabel(c)}
                         </option>
                       ))}
                     </select>

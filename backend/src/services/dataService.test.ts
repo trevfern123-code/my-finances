@@ -115,11 +115,13 @@ describe('applyTransactionChanges', () => {
 
   it('inserts added transactions that map to a known account, and returns the inserted rows', async () => {
     const existingQuery = createQueryBuilder({ data: [], error: null });
+    const mappingsQuery = createQueryBuilder({ data: [], error: null });
     const insertedRow = { id: 'txn-row-new', name: 'Coffee Shop', merchant_name: 'Coffee Shop', amount: 12.5 };
     const insertQuery = createQueryBuilder({ data: [insertedRow], error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(insertQuery);
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery).mockReturnValueOnce(insertQuery);
 
     const result = await applyTransactionChanges({
+      userId: 'user-1',
       added: [fakeTransaction()],
       modified: [],
       removed: [],
@@ -137,10 +139,60 @@ describe('applyTransactionChanges', () => {
     expect(result).toEqual([insertedRow]);
   });
 
+  it("auto-assigns budget_category_id from a matching category mapping when inserting", async () => {
+    const existingQuery = createQueryBuilder({ data: [], error: null });
+    const mappingsQuery = createQueryBuilder({
+      data: [
+        {
+          id: 'map-1',
+          user_id: 'user-1',
+          plaid_category: 'FOOD_AND_DRINK',
+          budget_category_id: 'cat-dining',
+          created_at: '2026-01-01',
+        },
+      ],
+      error: null,
+    });
+    const insertedRow = { id: 'txn-row-new', name: 'Coffee Shop', merchant_name: 'Coffee Shop', amount: 12.5 };
+    const insertQuery = createQueryBuilder({ data: [insertedRow], error: null });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery).mockReturnValueOnce(insertQuery);
+
+    await applyTransactionChanges({
+      userId: 'user-1',
+      added: [fakeTransaction()],
+      modified: [],
+      removed: [],
+      accountIdByPlaidId,
+    });
+
+    const inserted = insertQuery.insert.mock.calls[0][0] as Record<string, unknown>[];
+    expect(inserted[0]).toMatchObject({ category: 'FOOD_AND_DRINK', budget_category_id: 'cat-dining' });
+  });
+
+  it("leaves budget_category_id null when no mapping matches the transaction's category", async () => {
+    const existingQuery = createQueryBuilder({ data: [], error: null });
+    const mappingsQuery = createQueryBuilder({ data: [], error: null });
+    const insertedRow = { id: 'txn-row-new', name: 'Coffee Shop', merchant_name: 'Coffee Shop', amount: 12.5 };
+    const insertQuery = createQueryBuilder({ data: [insertedRow], error: null });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery).mockReturnValueOnce(insertQuery);
+
+    await applyTransactionChanges({
+      userId: 'user-1',
+      added: [fakeTransaction()],
+      modified: [],
+      removed: [],
+      accountIdByPlaidId,
+    });
+
+    const inserted = insertQuery.insert.mock.calls[0][0] as Record<string, unknown>[];
+    expect(inserted[0].budget_category_id).toBeNull();
+  });
+
   it('silently skips a transaction whose account is not in our accountIdByPlaidId map', async () => {
     // No known local account for this transaction (e.g. account not yet synced) — should be
     // dropped rather than inserted with a broken account_id.
     const result = await applyTransactionChanges({
+      userId: 'user-1',
       added: [fakeTransaction({ account_id: 'unknown-plaid-account' })],
       modified: [],
       removed: [],
@@ -160,6 +212,7 @@ describe('applyTransactionChanges', () => {
     mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
 
     await applyTransactionChanges({
+      userId: 'user-1',
       added: [],
       modified: [fakeTransaction({ pending: true })],
       removed: [],
@@ -168,7 +221,8 @@ describe('applyTransactionChanges', () => {
 
     expect(updateQuery.update.mock.calls[0][0]).toMatchObject({ pending: true });
     expect(updateQuery.eq).toHaveBeenCalledWith('id', 'txn-row-1');
-    // Only the existence-check select happened on the table — no separate insert call.
+    // Only the existence-check select happened on the table — no separate insert call, and no
+    // category-mapping lookup either (that only runs when there's something to insert).
     expect(mockFrom).toHaveBeenCalledTimes(2);
   });
 
@@ -177,6 +231,7 @@ describe('applyTransactionChanges', () => {
     mockFrom.mockReturnValueOnce(deleteQuery);
 
     await applyTransactionChanges({
+      userId: 'user-1',
       added: [],
       modified: [],
       removed: [fakeRemoved],
@@ -188,7 +243,7 @@ describe('applyTransactionChanges', () => {
   });
 
   it('does nothing when there are no changes at all', async () => {
-    await applyTransactionChanges({ added: [], modified: [], removed: [], accountIdByPlaidId });
+    await applyTransactionChanges({ userId: 'user-1', added: [], modified: [], removed: [], accountIdByPlaidId });
     expect(mockFrom).not.toHaveBeenCalled();
   });
 });

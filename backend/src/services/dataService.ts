@@ -2,6 +2,7 @@ import { supabaseAdmin } from '../config/supabase';
 import type {
   AccountRow,
   BudgetCategoryRow,
+  CategoryMappingRow,
   InsertedTransaction,
   LoanRow,
   ManualLoanPaymentRow,
@@ -312,6 +313,7 @@ function mapPlaidTransaction(transaction: PlaidTransaction, accountId: string) {
  * can run loan-payment matching against them without a second round-trip.
  */
 export async function applyTransactionChanges(params: {
+  userId: string;
   added: PlaidTransaction[];
   modified: PlaidTransaction[];
   removed: RemovedTransaction[];
@@ -343,10 +345,19 @@ export async function applyTransactionChanges(params: {
     const toUpdate = upsertCandidates.filter((t) => existingByPlaidId.has(t.plaid_transaction_id));
 
     if (toInsert.length > 0) {
-      // needs_review only applies at insert time — added here rather than in
-      // mapPlaidTransaction so a later "modified" update (which reuses the same mapped row)
-      // never resets an already-reviewed transaction back to unreviewed.
-      const rowsToInsert = toInsert.map((t) => ({ ...t, needs_review: true }));
+      // needs_review and budget_category_id (via any matching category mapping) only apply at
+      // insert time — added here rather than in mapPlaidTransaction so a later "modified" update
+      // (which reuses the same mapped row) never resets an already-reviewed or already-categorized
+      // transaction.
+      const mappings = await listCategoryMappings(params.userId);
+      const budgetCategoryIdByPlaidCategory = new Map(
+        mappings.map((m) => [m.plaid_category, m.budget_category_id])
+      );
+      const rowsToInsert = toInsert.map((t) => ({
+        ...t,
+        needs_review: true,
+        budget_category_id: t.category ? budgetCategoryIdByPlaidCategory.get(t.category) ?? null : null,
+      }));
       const { data, error } = await supabaseAdmin
         .from('transactions')
         .insert(rowsToInsert)
@@ -1013,4 +1024,87 @@ export async function deleteBudgetCategory(id: string, userId: string): Promise<
     .eq('user_id', userId);
 
   if (error) throw new Error(`Failed to delete budget category: ${error.message}`);
+}
+
+// ---- Category mappings ---------------------------------------------------------
+
+export async function listCategoryMappings(userId: string): Promise<CategoryMappingRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('category_mappings')
+    .select('*')
+    .eq('user_id', userId)
+    .order('plaid_category', { ascending: true });
+
+  if (error) throw new Error(`Failed to load category mappings: ${error.message}`);
+  return data as CategoryMappingRow[];
+}
+
+/** The distinct Plaid categories present across the user's own synced transactions — the set of
+ *  values a mapping can usefully target, shown as options in the mapping UI. */
+export async function listDistinctPlaidCategoriesForUser(userId: string): Promise<string[]> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select('category, accounts!inner(plaid_items!inner(user_id))')
+    .eq('accounts.plaid_items.user_id', userId)
+    .not('category', 'is', null);
+
+  if (error) throw new Error(`Failed to load transaction categories: ${error.message}`);
+  const unique = new Set((data as unknown as { category: string }[]).map((row) => row.category));
+  return [...unique].sort();
+}
+
+export async function upsertCategoryMapping(
+  userId: string,
+  plaidCategory: string,
+  budgetCategoryId: string
+): Promise<CategoryMappingRow> {
+  const { data, error } = await supabaseAdmin
+    .from('category_mappings')
+    .upsert(
+      { user_id: userId, plaid_category: plaidCategory, budget_category_id: budgetCategoryId },
+      { onConflict: 'user_id,plaid_category' }
+    )
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to save category mapping: ${error.message}`);
+  return data as CategoryMappingRow;
+}
+
+export async function deleteCategoryMapping(id: string, userId: string): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from('category_mappings')
+    .delete()
+    .eq('id', id)
+    .eq('user_id', userId);
+
+  if (error) throw new Error(`Failed to delete category mapping: ${error.message}`);
+}
+
+/** Applies a mapping retroactively to the user's already-synced transactions that match its Plaid
+ *  category and have no budget category yet — never overwrites a transaction the user (or a
+ *  previous mapping) already categorized. Returns how many rows were updated. */
+export async function backfillCategoryMapping(
+  userId: string,
+  plaidCategory: string,
+  budgetCategoryId: string
+): Promise<number> {
+  const { data: matches, error: fetchError } = await supabaseAdmin
+    .from('transactions')
+    .select('id, accounts!inner(plaid_items!inner(user_id))')
+    .eq('accounts.plaid_items.user_id', userId)
+    .eq('category', plaidCategory)
+    .is('budget_category_id', null);
+
+  if (fetchError) throw new Error(`Failed to find transactions to backfill: ${fetchError.message}`);
+  const ids = (matches as unknown as { id: string }[]).map((m) => m.id);
+  if (ids.length === 0) return 0;
+
+  const { error: updateError } = await supabaseAdmin
+    .from('transactions')
+    .update({ budget_category_id: budgetCategoryId })
+    .in('id', ids);
+
+  if (updateError) throw new Error(`Failed to backfill transactions: ${updateError.message}`);
+  return ids.length;
 }

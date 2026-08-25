@@ -447,3 +447,41 @@ export function updateBudgetCategory(
 export function deleteBudgetCategory(id: string): Promise<void> {
   return authedFetch(`/api/budget-categories/${id}`, { method: 'DELETE' });
 }
+
+/** Maps one of Plaid's own category values (a transaction's `category` field, e.g.
+ *  "FOOD_AND_DRINK") to one of the user's own budget categories, so a newly-synced transaction
+ *  in that category gets auto-assigned without the user touching it. */
+export interface CategoryMapping {
+  id: string;
+  plaid_category: string;
+  budget_category_id: string;
+}
+
+export function getCategoryMappings(): Promise<{ mappings: CategoryMapping[] }> {
+  return authedFetch('/api/category-mappings');
+}
+
+/** The distinct Plaid categories seen across the user's own synced transactions — the set of
+ *  values a mapping can usefully target. */
+export function getPlaidCategories(): Promise<{ categories: string[] }> {
+  return authedFetch('/api/category-mappings/plaid-categories');
+}
+
+export function saveCategoryMapping(
+  plaidCategory: string,
+  budgetCategoryId: string,
+  backfill: boolean
+): Promise<{ mapping: CategoryMapping; backfilled_count: number }> {
+  return authedFetch('/api/category-mappings', {
+    method: 'POST',
+    body: JSON.stringify({
+      plaid_category: plaidCategory,
+      budget_category_id: budgetCategoryId,
+      backfill,
+    }),
+  });
+}
+
+export function deleteCategoryMapping(id: string): Promise<void> {
+  return authedFetch(`/api/category-mappings/${id}`, { method: 'DELETE' });
+}

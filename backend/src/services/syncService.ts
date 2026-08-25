@@ -19,6 +19,7 @@ export async function syncItemTransactions(item: {
 
   const accountIdByPlaidId = await dataService.getAccountIdMapForItem(item.id);
   const insertedTransactions = await dataService.applyTransactionChanges({
+    userId: item.user_id,
     added,
     modified,
     removed,

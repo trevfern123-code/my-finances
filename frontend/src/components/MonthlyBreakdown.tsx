@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { CategoryAmount, MonthBreakdown } from '../lib/api';
+import { formatPlaidCategoryLabel } from '../lib/categoryLabels';
 
 const CATEGORY_COLORS = [
   '#60a5fa',
@@ -33,15 +34,6 @@ function formatShortMonth(month: string) {
     month: 'short',
     timeZone: 'UTC',
   });
-}
-
-function formatCategoryLabel(category: string) {
-  if (category === 'Uncategorized') return category;
-  return category
-    .toLowerCase()
-    .split('_')
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ');
 }
 
 /** Assigns each category a color by its name, from a stable alphabetical ordering across every
@@ -138,7 +130,7 @@ function MonthCard({
                 return (
                   <div key={c.category} className={isUncategorized ? 'cat-row uncategorized' : 'cat-row'}>
                     <span className="cat-dot" style={{ background: color }} />
-                    <span className="cat-name">{formatCategoryLabel(c.category)}</span>
+                    <span className="cat-name">{formatPlaidCategoryLabel(c.category)}</span>
                     <div className="cat-bar-track">
                       <div className="cat-bar-fill" style={{ width: `${pct}%`, background: color }} />
                     </div>

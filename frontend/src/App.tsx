@@ -6,20 +6,24 @@ import {
   createManualLoan,
   createManualPayment,
   deleteBudgetCategory,
+  deleteCategoryMapping,
   deleteManualLoan,
   deleteManualPayment,
   getAssetsSummary,
   getBudgetCategories,
+  getCategoryMappings,
   getLinkedItems,
   getLoanPayments,
   getLoans,
   getManualLoans,
   getMonthlyBreakdown,
   getNetWorthHistory,
+  getPlaidCategories,
   getRecurringStreams,
   getSpendingSummary,
   getTransactions,
   approveTransaction,
+  saveCategoryMapping,
   setTransactionCategory,
   syncTransactions as syncTransactionsRequest,
   unlinkLoanPayment,
@@ -31,6 +35,7 @@ import {
   updateManualPayment,
   type AssetGroup,
   type BudgetCategory,
+  type CategoryMapping,
   type LinkedItem,
   type Loan,
   type LoanPayment,
@@ -60,6 +65,7 @@ import { MonthlyBreakdown } from './components/MonthlyBreakdown';
 import { SubscriptionsRecurring } from './components/SubscriptionsRecurring';
 import { LoanProgress } from './components/LoanProgress';
 import { IncomeSavings } from './components/IncomeSavings';
+import { CategoryMappings } from './components/CategoryMappings';
 import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
 
@@ -71,6 +77,7 @@ const TABS: Tab[] = [
   { id: 'loans', label: 'Loans' },
   { id: 'income', label: 'Income & Savings' },
   { id: 'accounts', label: 'Accounts' },
+  { id: 'settings', label: 'Settings' },
 ];
 
 export default function App() {
@@ -92,6 +99,8 @@ export default function App() {
   const [manualLoans, setManualLoans] = useState<ManualLoan[]>([]);
   const [assetGroups, setAssetGroups] = useState<AssetGroup[]>([]);
   const [totalAssets, setTotalAssets] = useState(0);
+  const [categoryMappings, setCategoryMappings] = useState<CategoryMapping[]>([]);
+  const [plaidCategories, setPlaidCategories] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -123,6 +132,8 @@ export default function App() {
       loansRes,
       assetsRes,
       manualLoansRes,
+      categoryMappingsRes,
+      plaidCategoriesRes,
     ] = await Promise.allSettled([
       getLinkedItems(),
       getTransactions(),
@@ -134,6 +145,8 @@ export default function App() {
       getLoans(),
       getAssetsSummary(),
       getManualLoans(),
+      getCategoryMappings(),
+      getPlaidCategories(),
     ]);
 
     if (itemsRes.status === 'fulfilled') {
@@ -160,6 +173,8 @@ export default function App() {
       setTotalAssets(assetsRes.value.total_assets);
     }
     if (manualLoansRes.status === 'fulfilled') setManualLoans(manualLoansRes.value.loans);
+    if (categoryMappingsRes.status === 'fulfilled') setCategoryMappings(categoryMappingsRes.value.mappings);
+    if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
 
     const failures = [
       itemsRes,
@@ -172,6 +187,8 @@ export default function App() {
       loansRes,
       assetsRes,
       manualLoansRes,
+      categoryMappingsRes,
+      plaidCategoriesRes,
     ].filter((r): r is PromiseRejectedResult => r.status === 'rejected');
     if (failures.length > 0) {
       console.error('Some dashboard data failed to load:', failures.map((f) => f.reason));
@@ -406,6 +423,39 @@ export default function App() {
     }
   }
 
+  async function handleSaveCategoryMapping(
+    plaidCategory: string,
+    budgetCategoryId: string,
+    backfill: boolean
+  ): Promise<number> {
+    setActionError(null);
+    try {
+      const res = await saveCategoryMapping(plaidCategory, budgetCategoryId, backfill);
+      setCategoryMappings((prev) => [...prev.filter((m) => m.plaid_category !== plaidCategory), res.mapping]);
+      if (backfill && res.backfilled_count > 0) {
+        // Backfilling updates transaction rows directly in the database — refetch so the
+        // Accounts and Budget tabs reflect the newly-assigned categories.
+        const transactionsRes = await getTransactions();
+        setTransactions(transactionsRes.transactions);
+        refreshBudgetCategories();
+      }
+      return res.backfilled_count;
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to save category mapping');
+      throw err;
+    }
+  }
+
+  async function handleDeleteCategoryMapping(id: string) {
+    setActionError(null);
+    try {
+      await deleteCategoryMapping(id);
+      setCategoryMappings((prev) => prev.filter((m) => m.id !== id));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to remove category mapping');
+    }
+  }
+
   async function handleCreateManualLoan(input: ManualLoanInput) {
     setActionError(null);
     try {
@@ -633,6 +683,16 @@ export default function App() {
                 onApprove={handleApproveTransaction}
               />
             </div>
+          )}
+
+          {activeTab === 'settings' && (
+            <CategoryMappings
+              plaidCategories={plaidCategories}
+              mappings={categoryMappings}
+              budgetCategories={budgetCategories}
+              onSave={handleSaveCategoryMapping}
+              onDelete={handleDeleteCategoryMapping}
+            />
           )}
         </>
       )}

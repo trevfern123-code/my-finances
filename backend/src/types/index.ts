@@ -75,6 +75,17 @@ export interface BudgetCategoryRow {
   emoji: string | null;
 }
 
+/** Maps one of Plaid's own category values (transactions.category — the personal_finance_category
+ *  primary bucket, e.g. "FOOD_AND_DRINK") to one of the user's budget categories, so a newly-synced
+ *  transaction can be auto-categorized at insert time without the user touching it. */
+export interface CategoryMappingRow {
+  id: string;
+  user_id: string;
+  plaid_category: string;
+  budget_category_id: string;
+  created_at: string;
+}
+
 export interface BudgetCategoryWithSpend extends BudgetCategoryRow {
   /** Sum of positive-amount (spend, not income/credit) categorized transactions in the current calendar month. */
   spent: number;

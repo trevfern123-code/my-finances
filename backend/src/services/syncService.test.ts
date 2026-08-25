@@ -57,6 +57,7 @@ describe('syncItemTransactions', () => {
     await syncItemTransactions(item);
 
     expect(mockApplyTransactionChanges).toHaveBeenCalledWith({
+      userId: 'user-1',
       added,
       modified,
       removed,
