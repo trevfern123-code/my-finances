@@ -574,6 +574,12 @@ export interface UserPreferences {
    *  normalizeTheme/normalizeAccent own turning these into real, known-good ids. */
   theme: string;
   accent_color: string;
+  /** Financial Preferences v1 — raw numbers on the wire, lib/financialPreferences.ts's clamp*
+   *  functions own validating/defaulting them, same reasoning as theme/accent above. */
+  minimum_cash_buffer: number;
+  upcoming_bills_days: number;
+  recent_avg_months: number;
+  savings_rate_target: number;
 }
 
 export function getUserPreferences(): Promise<UserPreferences> {
@@ -594,5 +600,22 @@ export function updateAppearance(appearance: {
   return authedFetch('/api/user-preferences/appearance', {
     method: 'PUT',
     body: JSON.stringify(appearance),
+  });
+}
+
+export function updateFinancialPreferences(prefs: {
+  minimum_cash_buffer: number;
+  upcoming_bills_days: number;
+  recent_avg_months: number;
+  savings_rate_target: number;
+}): Promise<{
+  minimum_cash_buffer: number;
+  upcoming_bills_days: number;
+  recent_avg_months: number;
+  savings_rate_target: number;
+}> {
+  return authedFetch('/api/user-preferences/financial', {
+    method: 'PUT',
+    body: JSON.stringify(prefs),
   });
 }

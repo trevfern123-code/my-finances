@@ -7,13 +7,19 @@ import {
 } from '../services/budgetPeriod';
 import type { BudgetCategoryWithSpend } from '../types';
 
-const RECENT_AVG_MONTHS = 2;
+const DEFAULT_RECENT_AVG_MONTHS = 2;
 
 export async function listBudgetCategories(req: Request, res: Response, next: NextFunction) {
   try {
     const userId = req.user!.id;
     const currentRange = getCurrentMonthRange();
-    const recentRange = getRecentMonthsRange(RECENT_AVG_MONTHS);
+
+    // recent_avg_months is user-configurable (Settings → Financial preferences); fall back to
+    // the same default that was hardcoded here before that existed, for a user with no saved
+    // preference yet.
+    const prefs = await dataService.getUserPreferences(userId);
+    const recentAvgMonths = prefs?.recent_avg_months ?? DEFAULT_RECENT_AVG_MONTHS;
+    const recentRange = getRecentMonthsRange(recentAvgMonths);
 
     const [categories, currentSpendRows, recentSpendRows] = await Promise.all([
       dataService.listBudgetCategories(userId),
@@ -27,7 +33,7 @@ export async function listBudgetCategories(req: Request, res: Response, next: Ne
     const categoriesWithSpend: BudgetCategoryWithSpend[] = categories.map((category) => ({
       ...category,
       spent: currentSpendByCategory.get(category.id) ?? 0,
-      recent_avg_spent: (recentSpendByCategory.get(category.id) ?? 0) / RECENT_AVG_MONTHS,
+      recent_avg_spent: (recentSpendByCategory.get(category.id) ?? 0) / recentAvgMonths,
     }));
 
     res.json({ categories: categoriesWithSpend });

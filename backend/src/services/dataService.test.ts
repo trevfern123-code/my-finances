@@ -20,6 +20,7 @@ import {
   getBudgetCategoryForUser,
   updateAccountCustomization,
   getRecurringStreamsForUser,
+  upsertFinancialPreferences,
 } from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
@@ -753,5 +754,41 @@ describe('getRecurringStreamsForUser', () => {
     const result = await getRecurringStreamsForUser('user-1');
 
     expect(result.map((r) => r.id)).toEqual(['stream-1']);
+  });
+});
+
+describe('upsertFinancialPreferences', () => {
+  it('upserts all four fields together, keyed by user_id', async () => {
+    const query = createQueryBuilder({
+      data: {
+        user_id: 'user-1',
+        minimum_cash_buffer: 500,
+        upcoming_bills_days: 30,
+        recent_avg_months: 3,
+        savings_rate_target: 20,
+      },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await upsertFinancialPreferences('user-1', {
+      minimumCashBuffer: 500,
+      upcomingBillsDays: 30,
+      recentAvgMonths: 3,
+      savingsRateTarget: 20,
+    });
+
+    expect(query.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user_id: 'user-1',
+        minimum_cash_buffer: 500,
+        upcoming_bills_days: 30,
+        recent_avg_months: 3,
+        savings_rate_target: 20,
+      }),
+      { onConflict: 'user_id' }
+    );
+    expect(result.minimum_cash_buffer).toBe(500);
+    expect(result.savings_rate_target).toBe(20);
   });
 });

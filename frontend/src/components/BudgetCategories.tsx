@@ -132,6 +132,7 @@ function CategoryDrilldown({
 export function BudgetCategories({
   categories,
   transactions,
+  recentAvgMonths,
   onCreate,
   onUpdate,
   onUpdateEmoji,
@@ -142,6 +143,9 @@ export function BudgetCategories({
 }: {
   categories: BudgetCategory[];
   transactions: TransactionItem[];
+  /** Window (Settings → Financial preferences) the server used to compute recent_avg_spent —
+   *  purely for labeling here, since the number itself already reflects it. */
+  recentAvgMonths: number;
   onCreate: (name: string, budgetAmount: number, emoji: string | null, color: string | null) => void;
   onUpdate: (id: string, budgetAmount: number) => void;
   onUpdateEmoji: (id: string, emoji: string | null) => void;
@@ -247,7 +251,7 @@ export function BudgetCategories({
                       <div
                         className={overRecentAvg ? 'recent-avg-marker over' : 'recent-avg-marker'}
                         style={{ left: `${recentAvgPct}%` }}
-                        title={`Recent average: ${formatCurrency(c.recent_avg_spent)}/mo`}
+                        title={`Recent average (last ${recentAvgMonths} mo${recentAvgMonths === 1 ? '' : 's'}): ${formatCurrency(c.recent_avg_spent)}/mo`}
                       />
                     )}
                   </div>
@@ -257,7 +261,7 @@ export function BudgetCategories({
                     </span>
                     {c.recent_avg_spent > 0 && (
                       <span className={overRecentAvg ? 'recent-avg-text over' : 'recent-avg-text'}>
-                        Recent avg: {formatCurrency(c.recent_avg_spent)}/mo
+                        Recent avg (last {recentAvgMonths} mo{recentAvgMonths === 1 ? '' : 's'}): {formatCurrency(c.recent_avg_spent)}/mo
                       </span>
                     )}
                     <button

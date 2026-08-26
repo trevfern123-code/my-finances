@@ -3,18 +3,20 @@ import { dueLabel } from '../lib/recurringDates';
 import { collectUpcomingItems } from '../lib/upcomingItems';
 import { formatCurrency } from '../lib/currency';
 
-export const UPCOMING_BILLS_DAYS_AHEAD = 14;
-
 export function UpcomingBills({
   recurringStreams,
   loans,
   manualLoans,
+  daysAhead,
 }: {
   recurringStreams: RecurringStream[];
   loans: Loan[];
   manualLoans: ManualLoan[];
+  /** User-configurable look-ahead window (Settings → Financial preferences) — also drives Safe to
+   *  Spend's "Upcoming bills" figure, so the two always agree on what "upcoming" means. */
+  daysAhead: number;
 }) {
-  const items = collectUpcomingItems(recurringStreams, loans, manualLoans, UPCOMING_BILLS_DAYS_AHEAD);
+  const items = collectUpcomingItems(recurringStreams, loans, manualLoans, daysAhead);
   const total = items.reduce((sum, i) => sum + i.amount, 0);
 
   return (
@@ -22,11 +24,13 @@ export function UpcomingBills({
       <div className="section-header">
         <h2>Upcoming bills</h2>
         {items.length > 0 && (
-          <span className="monthly-total-badge">{formatCurrency(total)} due in 14 days</span>
+          <span className="monthly-total-badge">
+            {formatCurrency(total)} due in {daysAhead} days
+          </span>
         )}
       </div>
       {items.length === 0 ? (
-        <p className="hint">Nothing due in the next 14 days.</p>
+        <p className="hint">Nothing due in the next {daysAhead} days.</p>
       ) : (
         <ul className="quick-view-list">
           {items.map((item) => (

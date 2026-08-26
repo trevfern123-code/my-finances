@@ -55,6 +55,7 @@ import {
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { useDashboardLayout } from './hooks/useDashboardLayout';
 import { useAppearance } from './hooks/useAppearance';
+import { useFinancialPreferences } from './hooks/useFinancialPreferences';
 import { Auth } from './components/Auth';
 import { PlaidLink } from './components/PlaidLink';
 import { LinkedAccounts } from './components/LinkedAccounts';
@@ -75,6 +76,7 @@ import { IncomeSavings } from './components/IncomeSavings';
 import { CategoryMappings } from './components/CategoryMappings';
 import { DashboardCustomizer } from './components/DashboardCustomizer';
 import { AppearanceSettings } from './components/AppearanceSettings';
+import { FinancialPreferencesSettings } from './components/FinancialPreferencesSettings';
 import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
 
@@ -121,11 +123,22 @@ export default function App() {
   const [appearanceRaw, setAppearanceRaw] = useState<
     { theme: string; accent_color: string } | null | undefined
   >(undefined);
+  const [financialPreferencesRaw, setFinancialPreferencesRaw] = useState<
+    | {
+        minimum_cash_buffer: number;
+        upcoming_bills_days: number;
+        recent_avg_months: number;
+        savings_rate_target: number;
+      }
+    | null
+    | undefined
+  >(undefined);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
   const appearance = useAppearance(appearanceRaw);
+  const financialPreferences = useFinancialPreferences(financialPreferencesRaw);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -204,6 +217,12 @@ export default function App() {
       setAppearanceRaw({
         theme: userPreferencesRes.value.theme,
         accent_color: userPreferencesRes.value.accent_color,
+      });
+      setFinancialPreferencesRaw({
+        minimum_cash_buffer: userPreferencesRes.value.minimum_cash_buffer,
+        upcoming_bills_days: userPreferencesRes.value.upcoming_bills_days,
+        recent_avg_months: userPreferencesRes.value.recent_avg_months,
+        savings_rate_target: userPreferencesRes.value.savings_rate_target,
       });
     }
 
@@ -698,6 +717,8 @@ export default function App() {
             loans={loans}
             manualLoans={manualLoans}
             budgetCategories={activeBudgetCategories}
+            upcomingBillsDays={financialPreferences.upcomingBillsDays}
+            minimumCashBuffer={financialPreferences.minimumCashBuffer}
           />
         );
       case 'cash_flow_pace':
@@ -711,7 +732,14 @@ export default function App() {
       case 'accounts_quick_view':
         return <AccountQuickView assetGroups={assetGroups} />;
       case 'upcoming_bills':
-        return <UpcomingBills recurringStreams={recurringStreams} loans={loans} manualLoans={manualLoans} />;
+        return (
+          <UpcomingBills
+            recurringStreams={recurringStreams}
+            loans={loans}
+            manualLoans={manualLoans}
+            daysAhead={financialPreferences.upcomingBillsDays}
+          />
+        );
       case 'recent_activity':
         return (
           <RecentActivity
@@ -793,6 +821,7 @@ export default function App() {
             <BudgetCategories
               categories={budgetCategories}
               transactions={transactions}
+              recentAvgMonths={financialPreferences.recentAvgMonths}
               onCreate={handleCreateCategory}
               onUpdate={handleUpdateCategory}
               onUpdateEmoji={handleUpdateCategoryEmoji}
@@ -836,6 +865,7 @@ export default function App() {
               recurringStreams={recurringStreams}
               currentMonthIncome={summary?.monthly_spending[summary.monthly_spending.length - 1]?.income ?? 0}
               currentMonthSpent={summary?.monthly_spending[summary.monthly_spending.length - 1]?.spent ?? 0}
+              savingsRateTarget={financialPreferences.savingsRateTarget}
               onUpdateSavingsGoal={handleUpdateSavingsGoal}
             />
           )}
@@ -869,6 +899,16 @@ export default function App() {
                 accent={appearance.accent}
                 onSetTheme={appearance.setTheme}
                 onSetAccent={appearance.setAccent}
+              />
+              <FinancialPreferencesSettings
+                minimumCashBuffer={financialPreferences.minimumCashBuffer}
+                upcomingBillsDays={financialPreferences.upcomingBillsDays}
+                recentAvgMonths={financialPreferences.recentAvgMonths}
+                savingsRateTarget={financialPreferences.savingsRateTarget}
+                onSetMinimumCashBuffer={financialPreferences.setMinimumCashBuffer}
+                onSetUpcomingBillsDays={financialPreferences.setUpcomingBillsDays}
+                onSetRecentAvgMonths={financialPreferences.setRecentAvgMonths}
+                onSetSavingsRateTarget={financialPreferences.setSavingsRateTarget}
               />
               <CategoryMappings
                 plaidCategories={plaidCategories}

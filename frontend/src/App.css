@@ -1439,6 +1439,39 @@ button:disabled {
   outline-offset: 3px;
 }
 
+.financial-prefs-intro {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin-bottom: 1.1rem;
+}
+
+.financial-prefs-row-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.financial-prefs-input-group {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.financial-prefs-input-group .budget-amount-input {
+  width: 5.5rem;
+}
+
+.financial-prefs-unit {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.financial-prefs-desc {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
 .new-category-card {
   margin-top: 1rem;
 }

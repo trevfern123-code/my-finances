@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { AssetAccountSummary, AssetGroup, RecurringStream } from '../lib/api';
 import { accountDisplayName } from '../lib/accountDisplay';
 import { formatCurrency } from '../lib/currency';
+import { savingsRateTier } from '../lib/financialPreferences';
 
 const FREQUENCY_LABELS: Record<string, string> = {
   WEEKLY: 'Weekly',
@@ -12,17 +13,19 @@ const FREQUENCY_LABELS: Record<string, string> = {
   UNKNOWN: 'Irregular',
 };
 
-/** Classic personal-finance rule of thumb: saving 15%+ of income is healthy, under that is
- *  worth a nudge, and negative (spending more than you earned) is the one that actually matters. */
-function savingsRateTier(rate: number): 'good' | 'warn' | 'over' {
-  if (rate < 0) return 'over';
-  if (rate < 0.15) return 'warn';
-  return 'good';
-}
-
-function SavingsRateCard({ income, spent }: { income: number; spent: number }) {
+function SavingsRateCard({
+  income,
+  spent,
+  targetPercent,
+}: {
+  income: number;
+  spent: number;
+  /** User's savings-rate goal (Settings → Financial preferences), a percentage like 15, not a
+   *  fraction. Changes the target/comparison shown here — never the calculated rate itself. */
+  targetPercent: number;
+}) {
   const rate = income > 0 ? (income - spent) / income : null;
-  const tier = rate !== null ? savingsRateTier(rate) : 'good';
+  const tier = rate !== null ? savingsRateTier(rate, targetPercent) : 'good';
   const pct = rate !== null ? Math.max(0, Math.min(rate, 1)) * 100 : 0;
 
   return (
@@ -44,6 +47,7 @@ function SavingsRateCard({ income, spent }: { income: number; spent: number }) {
             {formatCurrency(income - spent, null)} saved of {formatCurrency(income, null)} income this month
             {tier === 'over' && ' — spending exceeded income'}
           </p>
+          <p className="hint">Goal: {targetPercent}% of income saved</p>
         </>
       )}
     </div>
@@ -155,6 +159,7 @@ export function IncomeSavings({
   recurringStreams,
   currentMonthIncome,
   currentMonthSpent,
+  savingsRateTarget,
   onUpdateSavingsGoal,
 }: {
   groups: AssetGroup[];
@@ -162,6 +167,9 @@ export function IncomeSavings({
   recurringStreams: RecurringStream[];
   currentMonthIncome: number;
   currentMonthSpent: number;
+  /** Percentage (e.g. 15), from Settings → Financial preferences. Distinct from a per-account
+   *  dollar savings_goal below — this is a single overall rate target, not a balance target. */
+  savingsRateTarget: number;
   onUpdateSavingsGoal: (accountId: string, savingsGoal: number | null) => void;
 }) {
   if (groups.length === 0) {
@@ -186,7 +194,7 @@ export function IncomeSavings({
         </div>
       </div>
 
-      <SavingsRateCard income={currentMonthIncome} spent={currentMonthSpent} />
+      <SavingsRateCard income={currentMonthIncome} spent={currentMonthSpent} targetPercent={savingsRateTarget} />
       <IncomeBreakdown recurringStreams={recurringStreams} />
 
       <div className="asset-groups">

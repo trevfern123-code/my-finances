@@ -1336,3 +1336,35 @@ export async function upsertAppearance(
   if (error) throw new Error(`Failed to save appearance: ${error.message}`);
   return data as UserPreferencesRow;
 }
+
+/** Upserts the four Financial Preferences v1 columns — same narrow-update reasoning as
+ *  upsertDashboardLayout/upsertAppearance. Validation/clamping happens at the controller layer;
+ *  this just persists whatever it's given. */
+export async function upsertFinancialPreferences(
+  userId: string,
+  prefs: {
+    minimumCashBuffer: number;
+    upcomingBillsDays: number;
+    recentAvgMonths: number;
+    savingsRateTarget: number;
+  }
+): Promise<UserPreferencesRow> {
+  const { data, error } = await supabaseAdmin
+    .from('user_preferences')
+    .upsert(
+      {
+        user_id: userId,
+        minimum_cash_buffer: prefs.minimumCashBuffer,
+        upcoming_bills_days: prefs.upcomingBillsDays,
+        recent_avg_months: prefs.recentAvgMonths,
+        savings_rate_target: prefs.savingsRateTarget,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'user_id' }
+    )
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to save financial preferences: ${error.message}`);
+  return data as UserPreferencesRow;
+}

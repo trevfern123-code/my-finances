@@ -321,6 +321,59 @@ definitions, id validation, and the one function that actually touches
 `document.documentElement`) + `hooks/useAppearance.ts` (thin React wrapper: state, localStorage,
 auto-save persistence).
 
+## Financial Preferences
+
+Four global settings, in the Settings tab directly below Appearance: **minimum cash buffer**
+(dollar amount, default $0, subtracted from Safe to Spend as its own breakdown line — never
+alters any account balance, budget target, or transaction), **upcoming-bills look-ahead window**
+(1–90 days, default 14, used consistently by both the Upcoming Bills card and Safe to Spend so the
+two always agree on what "upcoming" means), **recent-average window** (1–12 months, default 2,
+what the Budget tab's "recent avg" spend figure averages over — the label always states the
+current window, e.g. "Recent avg (last 4 mos)"), and **savings-rate target** (0–100%, default 15,
+a personal goal compared against the already-calculated savings rate — changes the target/tier
+shown, never the calculated rate itself, and is deliberately separate from a per-account dollar
+`savings_goal`).
+
+**Requires a migration** (on top of `user_preferences` from Dashboard/Appearance above):
+
+```sql
+alter table public.user_preferences
+  add column minimum_cash_buffer numeric(12,2) not null default 0,
+  add column upcoming_bills_days integer not null default 14,
+  add column recent_avg_months integer not null default 2,
+  add column savings_rate_target numeric(5,2) not null default 15.00;
+
+alter table public.user_preferences
+  add constraint user_preferences_minimum_cash_buffer_check
+    check (minimum_cash_buffer >= 0),
+  add constraint user_preferences_upcoming_bills_days_check
+    check (upcoming_bills_days between 1 and 90),
+  add constraint user_preferences_recent_avg_months_check
+    check (recent_avg_months between 1 and 12),
+  add constraint user_preferences_savings_rate_target_check
+    check (savings_rate_target between 0 and 100);
+```
+
+Also tracked as `supabase/migrations/20260826020000_financial_preferences.sql`. Every default
+matches the value that was already hardcoded before this feature existed, so behavior is unchanged
+for any user who never touches these settings.
+
+**Architecture**: same shape as Appearance/Dashboard customization — `lib/financialPreferences.ts`
+(pure: defaults, bounds, clamp functions, and `savingsRateTier`) + `lib/safeToSpend.ts` (pure:
+`computeSafeToSpend`/`computeRemainingBudget`, both unit-tested including the combination of a
+custom look-ahead window with a minimum cash buffer applied together) + `hooks/useFinancialPreferences.ts`
+(thin React wrapper: state + auto-save persistence, no localStorage cache — unlike theme/accent,
+these numbers have no pre-paint flash to prevent, so hydration is a plain `useEffect` keyed on the
+fetched value, exactly like `useAppearance`'s hydration effect).
+
+**Found and fixed during verification**: the hook's first version hydrated by mutating a `useRef`
+flag directly in the render body instead of inside a `useEffect`. That works by accident on a
+component's very first render, but React's dev-mode double-invocation can run that branch on a
+throwaway pass whose `setState` never reaches the committed render — the state visibly reverted to
+defaults on every render after the first one, even though the ref itself correctly read `true`.
+Moved the hydration into a `useEffect` (matching `useAppearance`'s proven pattern) and confirmed
+persistence survives a reload.
+
 ## Dashboard customization
 
 The Overview tab's 8 cards (stats strip, Safe to Spend, Cash Flow & Budget Pace, Accounts at a

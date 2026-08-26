@@ -136,6 +136,18 @@ export interface UserPreferencesRow {
   theme: string;
   /** One of a small fixed set of preset ids (see frontend lib/theme.ts) — same reasoning as theme. */
   accent_color: string;
+  /** Dollar amount, non-negative — money the user never wants counted as spendable in Safe to
+   *  Spend. Never alters any actual account balance, budget target, or transaction. */
+  minimum_cash_buffer: number;
+  /** Days ahead counted as "upcoming" for bills — shared by Safe to Spend and the Upcoming Bills
+   *  widget so the two always agree on what "upcoming" means. */
+  upcoming_bills_days: number;
+  /** How many recent full months the Budget tab's "recent avg" spend figure averages over. */
+  recent_avg_months: number;
+  /** A percentage (0-100), not a fraction — the user's personal savings-rate goal. Changes the
+   *  target/comparison shown against the Savings Rate card, never the calculated rate itself.
+   *  Deliberately separate from a per-account dollar savings_goal (see AccountRow). */
+  savings_rate_target: number;
   created_at: string;
   updated_at: string;
 }

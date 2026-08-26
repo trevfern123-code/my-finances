@@ -12,6 +12,7 @@ export function createQueryBuilder(result: { data: unknown; error: unknown }) {
     'select',
     'insert',
     'update',
+    'upsert',
     'delete',
     'eq',
     'in',
