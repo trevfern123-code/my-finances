@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { LinkedAccount, LinkedItem } from '../lib/api';
 import { refreshAccountBalances, sandboxFireWebhook, sandboxResetLogin } from '../lib/api';
 import { accountDisplayName, sortAccountsByOrder } from '../lib/accountDisplay';
+import { computeReorder } from '../lib/reorder';
 import { ReconnectButton } from './ReconnectButton';
 import { EmojiPicker } from './EmojiPicker';
 import { ColorPicker } from './ColorPicker';
@@ -235,16 +236,9 @@ export function LinkedAccounts({
   // accounts) — renumbers sequentially and persists only what actually changed, same pattern as
   // budget category reordering.
   function handleMove(sorted: LinkedAccount[], accountId: string, direction: 'up' | 'down') {
-    const index = sorted.findIndex((a) => a.id === accountId);
-    const swapWith = direction === 'up' ? index - 1 : index + 1;
-    if (index < 0 || swapWith < 0 || swapWith >= sorted.length) return;
-
-    const reordered = [...sorted];
-    [reordered[index], reordered[swapWith]] = [reordered[swapWith], reordered[index]];
-
-    reordered.forEach((a, i) => {
-      if (a.sort_order !== i) onUpdateCustomization(a.id, { sort_order: i });
-    });
+    computeReorder(sorted, accountId, direction).forEach((update) =>
+      onUpdateCustomization(update.id, { sort_order: update.sort_order })
+    );
   }
 
   return (

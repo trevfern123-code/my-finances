@@ -23,11 +23,13 @@ export const EMOJI_OPTIONS = [
 
 /** Light sanity-check for a pasted custom emoji, not a strict grapheme validator — this is a
  *  single-user personal finance app, not a public input surface, so trimming and a generous
- *  length cap (enough for skin-tone modifiers and short ZWJ sequences like a family emoji) is
- *  enough to keep the field from silently accepting pasted sentences. */
+ *  length cap is enough to keep the field from silently accepting pasted sentences. 16 UTF-16
+ *  code units comfortably covers real multi-codepoint sequences (a 4-person family emoji with
+ *  ZWJ joiners is 11; a skin-toned couple-with-heart sequence is 8) without being so loose that
+ *  short sentences slip through undetected. */
 export function sanitizeCustomEmoji(input: string): string | null {
   const trimmed = input.trim();
-  if (!trimmed || trimmed.length > 8) return null;
+  if (!trimmed || trimmed.length > 16) return null;
   return trimmed;
 }
 

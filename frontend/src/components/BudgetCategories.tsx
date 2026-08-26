@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
 import { getCurrentMonthCategoryItems } from '../lib/budgetDrilldown';
+import { computeReorder } from '../lib/reorder';
 import { EmojiPicker } from './EmojiPicker';
 import { ColorPicker, ColorDot } from './ColorPicker';
 
@@ -167,19 +168,8 @@ export function BudgetCategories({
     setShowAddForm(false);
   }
 
-  function handleMove(index: number, direction: 'up' | 'down') {
-    const swapWith = direction === 'up' ? index - 1 : index + 1;
-    if (swapWith < 0 || swapWith >= sorted.length) return;
-
-    const reordered = [...sorted];
-    [reordered[index], reordered[swapWith]] = [reordered[swapWith], reordered[index]];
-
-    // Renumber sequentially and persist only what actually changed — on a freshly-created set
-    // of categories sort_order may all be 0, so the first move establishes a real baseline for
-    // every row, not just the two that were swapped.
-    reordered.forEach((c, i) => {
-      if (c.sort_order !== i) onReorder(c.id, i);
-    });
+  function handleMove(id: string, direction: 'up' | 'down') {
+    computeReorder(sorted, id, direction).forEach((update) => onReorder(update.id, update.sort_order));
   }
 
   return (
@@ -210,7 +200,7 @@ export function BudgetCategories({
                         type="button"
                         className="reorder-btn"
                         disabled={index === 0}
-                        onClick={() => handleMove(index, 'up')}
+                        onClick={() => handleMove(c.id, 'up')}
                         aria-label={`Move ${c.name} up`}
                       >
                         ▲
@@ -219,7 +209,7 @@ export function BudgetCategories({
                         type="button"
                         className="reorder-btn"
                         disabled={index === sorted.length - 1}
-                        onClick={() => handleMove(index, 'down')}
+                        onClick={() => handleMove(c.id, 'down')}
                         aria-label={`Move ${c.name} down`}
                       >
                         ▼
