@@ -10,6 +10,13 @@ export interface FinancialPreferences {
   /** A percentage (0-100), not a fraction — the user's personal savings-rate goal. Changes the
    *  target/comparison shown against the Savings Rate card, never the calculated rate itself. */
   savingsRateTarget: number;
+  /** Safe to Spend Customization v1 — whether upcoming bills (and the credit-card-minimums line
+   *  broken out from them) are subtracted from Safe to Spend at all. Defaults true, matching the
+   *  calculation's pre-existing behavior. */
+  includeUpcomingBills: boolean;
+  /** Whether unspent budget headroom is subtracted from Safe to Spend at all. Defaults true,
+   *  matching the calculation's pre-existing behavior. */
+  includeRemainingBudget: boolean;
 }
 
 export const DEFAULT_FINANCIAL_PREFERENCES: FinancialPreferences = {
@@ -17,6 +24,8 @@ export const DEFAULT_FINANCIAL_PREFERENCES: FinancialPreferences = {
   upcomingBillsDays: 14,
   recentAvgMonths: 2,
   savingsRateTarget: 15,
+  includeUpcomingBills: true,
+  includeRemainingBudget: true,
 };
 
 export const UPCOMING_BILLS_DAYS_MIN = 1;

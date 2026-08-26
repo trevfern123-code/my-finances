@@ -15,6 +15,8 @@ export async function getUserPreferences(req: Request, res: Response, next: Next
       upcoming_bills_days: prefs?.upcoming_bills_days ?? 14,
       recent_avg_months: prefs?.recent_avg_months ?? 2,
       savings_rate_target: prefs?.savings_rate_target ?? 15,
+      safe_to_spend_include_upcoming_bills: prefs?.safe_to_spend_include_upcoming_bills ?? true,
+      safe_to_spend_include_remaining_budget: prefs?.safe_to_spend_include_remaining_budget ?? true,
     });
   } catch (err) {
     next(err);
@@ -72,6 +74,8 @@ interface FinancialPreferencesBody {
   upcoming_bills_days?: number;
   recent_avg_months?: number;
   savings_rate_target?: number;
+  safe_to_spend_include_upcoming_bills?: boolean;
+  safe_to_spend_include_remaining_budget?: boolean;
 }
 
 export async function updateFinancialPreferences(req: Request, res: Response, next: NextFunction) {
@@ -81,6 +85,8 @@ export async function updateFinancialPreferences(req: Request, res: Response, ne
       upcoming_bills_days: upcomingBillsDays,
       recent_avg_months: recentAvgMonths,
       savings_rate_target: savingsRateTarget,
+      safe_to_spend_include_upcoming_bills: safeToSpendIncludeUpcomingBills,
+      safe_to_spend_include_remaining_budget: safeToSpendIncludeRemainingBudget,
     } = req.body as FinancialPreferencesBody;
 
     if (typeof minimumCashBuffer !== 'number' || !Number.isFinite(minimumCashBuffer) || minimumCashBuffer < 0) {
@@ -114,18 +120,30 @@ export async function updateFinancialPreferences(req: Request, res: Response, ne
       res.status(400).json({ error: 'savings_rate_target must be a number between 0 and 100' });
       return;
     }
+    if (typeof safeToSpendIncludeUpcomingBills !== 'boolean') {
+      res.status(400).json({ error: 'safe_to_spend_include_upcoming_bills must be a boolean' });
+      return;
+    }
+    if (typeof safeToSpendIncludeRemainingBudget !== 'boolean') {
+      res.status(400).json({ error: 'safe_to_spend_include_remaining_budget must be a boolean' });
+      return;
+    }
 
     const prefs = await dataService.upsertFinancialPreferences(req.user!.id, {
       minimumCashBuffer,
       upcomingBillsDays,
       recentAvgMonths,
       savingsRateTarget,
+      safeToSpendIncludeUpcomingBills,
+      safeToSpendIncludeRemainingBudget,
     });
     res.json({
       minimum_cash_buffer: prefs.minimum_cash_buffer,
       upcoming_bills_days: prefs.upcoming_bills_days,
       recent_avg_months: prefs.recent_avg_months,
       savings_rate_target: prefs.savings_rate_target,
+      safe_to_spend_include_upcoming_bills: prefs.safe_to_spend_include_upcoming_bills,
+      safe_to_spend_include_remaining_budget: prefs.safe_to_spend_include_remaining_budget,
     });
   } catch (err) {
     next(err);

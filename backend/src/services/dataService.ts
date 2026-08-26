@@ -629,11 +629,17 @@ export interface LoanWithAccount extends LoanRow {
   iso_currency_code: string | null;
 }
 
+/** Excludes loans whose account is flagged exclude_from_cash_flow — a loan's minimum payment is
+ *  a cash-flow obligation (it feeds Upcoming Bills / Safe to Spend), same reasoning as
+ *  getRecurringStreamsForUser. account_id is nullable on this table, so the accounts relation is
+ *  a left embed (not `!inner`) filtered in application code rather than the query itself — an
+ *  inner join/filter here would silently drop any loan with no account_id, which isn't what
+ *  exclusion means. */
 export async function getLoansForUser(userId: string): Promise<LoanWithAccount[]> {
   const { data, error } = await supabaseAdmin
     .from('loans')
     .select(
-      'id, item_id, account_id, plaid_account_id, loan_type, name, interest_rate_percentage, origination_principal_amount, origination_date, minimum_payment_amount, next_payment_due_date, last_payment_amount, last_payment_date, is_overdue, plaid_items!inner(user_id), accounts(name, current_balance, iso_currency_code)'
+      'id, item_id, account_id, plaid_account_id, loan_type, name, interest_rate_percentage, origination_principal_amount, origination_date, minimum_payment_amount, next_payment_due_date, last_payment_amount, last_payment_date, is_overdue, plaid_items!inner(user_id), accounts(name, current_balance, iso_currency_code, exclude_from_cash_flow)'
     )
     .eq('plaid_items.user_id', userId);
 
@@ -641,14 +647,21 @@ export async function getLoansForUser(userId: string): Promise<LoanWithAccount[]
 
   return (
     data as unknown as (LoanRow & {
-      accounts: { name: string; current_balance: number | null; iso_currency_code: string | null } | null;
+      accounts: {
+        name: string;
+        current_balance: number | null;
+        iso_currency_code: string | null;
+        exclude_from_cash_flow: boolean;
+      } | null;
     })[]
-  ).map(({ accounts, ...loan }) => ({
-    ...loan,
-    account_name: accounts?.name ?? null,
-    current_balance: accounts?.current_balance ?? null,
-    iso_currency_code: accounts?.iso_currency_code ?? null,
-  }));
+  )
+    .filter((row) => !row.accounts?.exclude_from_cash_flow)
+    .map(({ accounts, ...loan }) => ({
+      ...loan,
+      account_name: accounts?.name ?? null,
+      current_balance: accounts?.current_balance ?? null,
+      iso_currency_code: accounts?.iso_currency_code ?? null,
+    }));
 }
 
 // ---- Manual loans -----------------------------------------------------------------
@@ -1337,9 +1350,9 @@ export async function upsertAppearance(
   return data as UserPreferencesRow;
 }
 
-/** Upserts the four Financial Preferences v1 columns — same narrow-update reasoning as
- *  upsertDashboardLayout/upsertAppearance. Validation/clamping happens at the controller layer;
- *  this just persists whatever it's given. */
+/** Upserts the Financial Preferences v1 columns plus the Safe to Spend Customization v1 toggles —
+ *  same narrow-update reasoning as upsertDashboardLayout/upsertAppearance. Validation/clamping
+ *  happens at the controller layer; this just persists whatever it's given. */
 export async function upsertFinancialPreferences(
   userId: string,
   prefs: {
@@ -1347,6 +1360,8 @@ export async function upsertFinancialPreferences(
     upcomingBillsDays: number;
     recentAvgMonths: number;
     savingsRateTarget: number;
+    safeToSpendIncludeUpcomingBills: boolean;
+    safeToSpendIncludeRemainingBudget: boolean;
   }
 ): Promise<UserPreferencesRow> {
   const { data, error } = await supabaseAdmin
@@ -1358,6 +1373,8 @@ export async function upsertFinancialPreferences(
         upcoming_bills_days: prefs.upcomingBillsDays,
         recent_avg_months: prefs.recentAvgMonths,
         savings_rate_target: prefs.savingsRateTarget,
+        safe_to_spend_include_upcoming_bills: prefs.safeToSpendIncludeUpcomingBills,
+        safe_to_spend_include_remaining_budget: prefs.safeToSpendIncludeRemainingBudget,
         updated_at: new Date().toISOString(),
       },
       { onConflict: 'user_id' }

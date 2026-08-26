@@ -148,6 +148,13 @@ export interface UserPreferencesRow {
    *  target/comparison shown against the Savings Rate card, never the calculated rate itself.
    *  Deliberately separate from a per-account dollar savings_goal (see AccountRow). */
   savings_rate_target: number;
+  /** Safe to Spend Customization v1 — whether the upcoming-bills total (including the credit-card
+   *  minimum-payments sub-total) is subtracted from Safe to Spend at all. Defaults true, matching
+   *  the calculation's pre-existing behavior. */
+  safe_to_spend_include_upcoming_bills: boolean;
+  /** Whether unspent budget headroom is subtracted from Safe to Spend at all. Defaults true,
+   *  matching the calculation's pre-existing behavior. */
+  safe_to_spend_include_remaining_budget: boolean;
   created_at: string;
   updated_at: string;
 }

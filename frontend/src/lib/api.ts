@@ -580,6 +580,11 @@ export interface UserPreferences {
   upcoming_bills_days: number;
   recent_avg_months: number;
   savings_rate_target: number;
+  /** Safe to Spend Customization v1 — whether upcoming bills / remaining budget are subtracted
+   *  from Safe to Spend at all. Both default true, matching the calculation's pre-existing
+   *  behavior. */
+  safe_to_spend_include_upcoming_bills: boolean;
+  safe_to_spend_include_remaining_budget: boolean;
 }
 
 export function getUserPreferences(): Promise<UserPreferences> {
@@ -608,11 +613,15 @@ export function updateFinancialPreferences(prefs: {
   upcoming_bills_days: number;
   recent_avg_months: number;
   savings_rate_target: number;
+  safe_to_spend_include_upcoming_bills: boolean;
+  safe_to_spend_include_remaining_budget: boolean;
 }): Promise<{
   minimum_cash_buffer: number;
   upcoming_bills_days: number;
   recent_avg_months: number;
   savings_rate_target: number;
+  safe_to_spend_include_upcoming_bills: boolean;
+  safe_to_spend_include_remaining_budget: boolean;
 }> {
   return authedFetch('/api/user-preferences/financial', {
     method: 'PUT',

@@ -109,6 +109,22 @@ describe('collectUpcomingItems', () => {
     ]);
   });
 
+  it('tags a credit-type Plaid loan as credit_card_minimum, not plain loan', () => {
+    const card = fakeLoan({ loan_type: 'credit', name: 'Chase Sapphire', minimum_payment_amount: 35 });
+    const items = collectUpcomingItems([], [card], [], 14, TODAY);
+    expect(items).toEqual([
+      { id: 'loan-loan-1', name: 'Chase Sapphire', amount: 35, dueDate: new Date('2026-08-20T00:00:00.000Z'), days: 5, kind: 'credit_card_minimum' },
+    ]);
+  });
+
+  it('keeps student/mortgage Plaid loans and manual loans tagged as plain loan, not credit_card_minimum', () => {
+    const student = fakeLoan({ loan_type: 'student' });
+    const mortgage = fakeLoan({ id: 'loan-2', loan_type: 'mortgage', next_payment_due_date: '2026-08-21' });
+    const manual = fakeManualLoan();
+    const items = collectUpcomingItems([], [student, mortgage], [manual], 14, TODAY);
+    expect(items.every((i) => i.kind === 'loan')).toBe(true);
+  });
+
   it('excludes a loan with no next_payment_due_date or no minimum_payment_amount', () => {
     const noDueDate = fakeLoan({ next_payment_due_date: null });
     const noMinPayment = fakeLoan({ minimum_payment_amount: null });

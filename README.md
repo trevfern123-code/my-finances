@@ -374,6 +374,62 @@ defaults on every render after the first one, even though the ref itself correct
 Moved the hydration into a `useEffect` (matching `useAppearance`'s proven pattern) and confirmed
 persistence survives a reload.
 
+## Safe to Spend Customization
+
+Two toggles, under a "Safe to Spend calculation" subheading in the same Financial Preferences
+settings card: **include upcoming bills** and **include remaining budget** — both default `true`,
+preserving the original formula exactly for anyone who never touches them. When a toggle is off,
+that line shows `$0` with a muted "— Not included" label rather than being hidden, so the
+breakdown always explains its own math instead of quietly dropping a line.
+
+**Credit-card minimum payments got their own breakdown line**, broken out of the generic "Upcoming
+bills" line rather than added alongside it. `collectUpcomingItems` (`lib/upcomingItems.ts`) tags a
+Plaid loan with `loan_type: 'credit'` as `kind: 'credit_card_minimum'` instead of the generic
+`'loan'`; `splitUpcomingTotals` (`lib/safeToSpend.ts`) then sums each `UpcomingItem` into exactly
+one of `billsTotal`/`creditCardMinimumsTotal` — never both — so the split can never double-count a
+dollar between the two lines. The "include upcoming bills" toggle gates both lines together (the
+credit-card line is a breakout of the same obligation category, not a separate one), matching the
+approved two-toggle scope. Full breakdown order: Liquid cash / Upcoming bills / Credit card minimum
+payments / Remaining budget / Minimum cash buffer / Safe to Spend.
+
+**Savings-goal contributions were deliberately excluded from this v1.** The existing
+`accounts.savings_goal` is a target *balance*, not a monthly planned contribution — inferring a
+monthly reservation amount from a target balance alone would require assumptions (a target date, a
+contribution rate) the data doesn't support. Revisit only if a dedicated recurring-contribution
+feature gets built later.
+
+**A real pre-existing gap was fixed alongside this work**: `getLoansForUser` never filtered by
+`exclude_from_cash_flow`, unlike `getRecurringStreamsForUser` — a loan's minimum payment could
+still count toward Upcoming Bills/Safe to Spend even after its account was flagged excluded from
+cash flow. Fixed to filter identically (left-embed the accounts relation, filter in application
+code so a loan with no linked account is kept, not silently dropped), with regression tests for
+both the exclusion and the no-linked-account case. Verified live: flagging the sandbox "Plaid
+Credit Card" account's `exclude_from_cash_flow` made its loan disappear from `/api/plaid/loans`;
+un-flagging it brought the loan back.
+
+**Requires a migration** (on top of `user_preferences` from Financial Preferences above):
+
+```sql
+alter table public.user_preferences
+  add column safe_to_spend_include_upcoming_bills boolean not null default true,
+  add column safe_to_spend_include_remaining_budget boolean not null default true;
+```
+
+Also tracked as `supabase/migrations/20260826030000_safe_to_spend_customization.sql`. Persisted
+through the same `PUT /api/user-preferences/financial` endpoint and `useFinancialPreferences` hook
+as the rest of Financial Preferences v1 — no new endpoint or hook needed.
+
+**Verified live in every combination Trevor asked for**: all four toggle combinations (both on,
+both off, each one individually off) reconciled exactly against the displayed Safe to Spend figure;
+combined with a nonzero minimum cash buffer ($300) and a custom upcoming-bills window (7 days)
+together — e.g. $640 liquid cash − $500 (7-day bills) − $0 (excluded remaining budget) − $300
+buffer = **−$160.00**, matching to the cent; and confirmed the setting survives a page reload.
+Reset back to the original defaults (all toggles on, $0 buffer, 14-day window) afterward. Because
+the sandbox Plaid data's only credit-type loan has a stale multi-year-old due date, a genuinely
+nonzero "Credit card minimum payments" line couldn't be exercised live without editing synced Plaid
+data directly (out of scope) — that exact scenario is covered instead by `upcomingItems.test.ts`
+and `safeToSpend.test.ts`, which construct a credit-type loan with a due date inside the window.
+
 ## Dashboard customization
 
 The Overview tab's 8 cards (stats strip, Safe to Spend, Cash Flow & Budget Pace, Accounts at a

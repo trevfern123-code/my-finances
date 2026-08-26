@@ -7,7 +7,10 @@ export interface UpcomingItem {
   amount: number;
   dueDate: Date;
   days: number;
-  kind: 'bill' | 'loan';
+  /** 'credit_card_minimum' is a Plaid-linked loan with loan_type 'credit' — broken out from plain
+   *  'loan' (student/mortgage/personal) so Safe to Spend can give it its own breakdown line
+   *  without double-counting it in the generic bills total. */
+  kind: 'bill' | 'loan' | 'credit_card_minimum';
 }
 
 /** Recurring outflows and loan payments due within `daysAhead` days — shared by the Overview
@@ -50,7 +53,7 @@ export function collectUpcomingItems(
       amount: loan.minimum_payment_amount,
       dueDate: due,
       days,
-      kind: 'loan',
+      kind: loan.loan_type === 'credit' ? 'credit_card_minimum' : 'loan',
     });
   }
 

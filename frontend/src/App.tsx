@@ -129,6 +129,8 @@ export default function App() {
         upcoming_bills_days: number;
         recent_avg_months: number;
         savings_rate_target: number;
+        safe_to_spend_include_upcoming_bills: boolean;
+        safe_to_spend_include_remaining_budget: boolean;
       }
     | null
     | undefined
@@ -223,6 +225,8 @@ export default function App() {
         upcoming_bills_days: userPreferencesRes.value.upcoming_bills_days,
         recent_avg_months: userPreferencesRes.value.recent_avg_months,
         savings_rate_target: userPreferencesRes.value.savings_rate_target,
+        safe_to_spend_include_upcoming_bills: userPreferencesRes.value.safe_to_spend_include_upcoming_bills,
+        safe_to_spend_include_remaining_budget: userPreferencesRes.value.safe_to_spend_include_remaining_budget,
       });
     }
 
@@ -719,6 +723,8 @@ export default function App() {
             budgetCategories={activeBudgetCategories}
             upcomingBillsDays={financialPreferences.upcomingBillsDays}
             minimumCashBuffer={financialPreferences.minimumCashBuffer}
+            includeUpcomingBills={financialPreferences.includeUpcomingBills}
+            includeRemainingBudget={financialPreferences.includeRemainingBudget}
           />
         );
       case 'cash_flow_pace':
@@ -905,10 +911,14 @@ export default function App() {
                 upcomingBillsDays={financialPreferences.upcomingBillsDays}
                 recentAvgMonths={financialPreferences.recentAvgMonths}
                 savingsRateTarget={financialPreferences.savingsRateTarget}
+                includeUpcomingBills={financialPreferences.includeUpcomingBills}
+                includeRemainingBudget={financialPreferences.includeRemainingBudget}
                 onSetMinimumCashBuffer={financialPreferences.setMinimumCashBuffer}
                 onSetUpcomingBillsDays={financialPreferences.setUpcomingBillsDays}
                 onSetRecentAvgMonths={financialPreferences.setRecentAvgMonths}
                 onSetSavingsRateTarget={financialPreferences.setSavingsRateTarget}
+                onSetIncludeUpcomingBills={financialPreferences.setIncludeUpcomingBills}
+                onSetIncludeRemainingBudget={financialPreferences.setIncludeRemainingBudget}
               />
               <CategoryMappings
                 plaidCategories={plaidCategories}

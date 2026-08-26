@@ -20,6 +20,7 @@ import {
   getBudgetCategoryForUser,
   updateAccountCustomization,
   getRecurringStreamsForUser,
+  getLoansForUser,
   upsertFinancialPreferences,
 } from './dataService';
 
@@ -757,8 +758,38 @@ describe('getRecurringStreamsForUser', () => {
   });
 });
 
+describe('getLoansForUser', () => {
+  it('excludes a loan whose account is flagged exclude_from_cash_flow', async () => {
+    const query = createQueryBuilder({
+      data: [
+        { id: 'loan-1', account_id: 'acc-1', accounts: { name: 'Card', current_balance: -100, iso_currency_code: 'USD', exclude_from_cash_flow: false } },
+        { id: 'loan-2', account_id: 'acc-2', accounts: { name: 'Card 2', current_balance: -200, iso_currency_code: 'USD', exclude_from_cash_flow: true } },
+      ],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getLoansForUser('user-1');
+
+    expect(result.map((r) => r.id)).toEqual(['loan-1']);
+    expect((result[0] as unknown as { accounts?: unknown }).accounts).toBeUndefined();
+  });
+
+  it('keeps a loan with no linked account rather than dropping it', async () => {
+    const query = createQueryBuilder({
+      data: [{ id: 'loan-1', account_id: null, accounts: null }],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getLoansForUser('user-1');
+
+    expect(result.map((r) => r.id)).toEqual(['loan-1']);
+  });
+});
+
 describe('upsertFinancialPreferences', () => {
-  it('upserts all four fields together, keyed by user_id', async () => {
+  it('upserts all six fields together, keyed by user_id', async () => {
     const query = createQueryBuilder({
       data: {
         user_id: 'user-1',
@@ -766,6 +797,8 @@ describe('upsertFinancialPreferences', () => {
         upcoming_bills_days: 30,
         recent_avg_months: 3,
         savings_rate_target: 20,
+        safe_to_spend_include_upcoming_bills: false,
+        safe_to_spend_include_remaining_budget: false,
       },
       error: null,
     });
@@ -776,6 +809,8 @@ describe('upsertFinancialPreferences', () => {
       upcomingBillsDays: 30,
       recentAvgMonths: 3,
       savingsRateTarget: 20,
+      safeToSpendIncludeUpcomingBills: false,
+      safeToSpendIncludeRemainingBudget: false,
     });
 
     expect(query.upsert).toHaveBeenCalledWith(
@@ -785,6 +820,8 @@ describe('upsertFinancialPreferences', () => {
         upcoming_bills_days: 30,
         recent_avg_months: 3,
         savings_rate_target: 20,
+        safe_to_spend_include_upcoming_bills: false,
+        safe_to_spend_include_remaining_budget: false,
       }),
       { onConflict: 'user_id' }
     );
