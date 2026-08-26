@@ -36,7 +36,11 @@
   --border-strong: #cbd5e1;
 
   --text: #0f172a;
-  --text-muted: #64748b;
+  /* #64748b (slate-500) measured 4.34:1 against --surface-raised — just under WCAG AA's 4.5:1
+     for normal text. Nudged one step darker; --surface-raised is the tightest case, comfortably
+     4.58:1 now, with --bg/--surface even higher. Dark theme's muted value is unaffected — its
+     contrast was already well clear of 4.5:1. */
+  --text-muted: #60708a;
 
   /* Financial-meaning colors — fixed regardless of the user's chosen accent. */
   --positive: #059669;
@@ -53,8 +57,11 @@
 
   /* Accent preset: Green (default). --accent is this preset's LIGHT-context value; its dark-context
      value is set in the dark-theme blocks below. --accent-strong/--accent-rgb/--text-on-accent are
-     theme-independent — see comment above. */
-  --accent: #059669;
+     theme-independent — see comment above. Light-context value is one shade darker than the
+     "true" brand green (#059669, emerald-600) — that measured only 3.44:1 against
+     --surface-raised as normal-size text, short of WCAG AA's 4.5:1. #047857 (emerald-700) clears
+     5.01:1 in that same worst case while still reading unmistakably as the same green. */
+  --accent: #047857;
   --accent-strong: #22c55e;
   --accent-rgb: 34, 197, 94;
   --text-on-accent: #06281a;
@@ -128,7 +135,10 @@
   --text-on-accent: #ffffff;
 }
 :root[data-accent='teal'] {
-  --accent: #0d9488;
+  /* Light-context value one shade darker than the "true" brand teal (#0d9488, teal-600), which
+     measured only 3.42:1 against --surface-raised — short of WCAG AA's 4.5:1 for normal text.
+     #0f766e (teal-700) clears 5.00:1 in that same worst case. */
+  --accent: #0f766e;
   --accent-strong: #14b8a6;
   --accent-rgb: 20, 184, 166;
   --text-on-accent: #042f2b;
