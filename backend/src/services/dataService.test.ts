@@ -21,7 +21,10 @@ import {
   updateAccountCustomization,
   getRecurringStreamsForUser,
   getLoansForUser,
+  getTransactionsSince,
+  getRecentTransactionsForUser,
   upsertFinancialPreferences,
+  upsertReportingRange,
 } from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
@@ -758,6 +761,51 @@ describe('getRecurringStreamsForUser', () => {
   });
 });
 
+describe('getTransactionsSince', () => {
+  it('queries only a lower bound when untilDate is omitted, matching the pre-existing open-ended behavior', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getTransactionsSince('user-1', '2026-03-01');
+
+    expect(query.gte).toHaveBeenCalledWith('date', '2026-03-01');
+    expect(query.lt).not.toHaveBeenCalled();
+  });
+
+  it('also applies an exclusive upper bound when untilDate is given', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getTransactionsSince('user-1', '2026-07-01', '2026-08-01');
+
+    expect(query.gte).toHaveBeenCalledWith('date', '2026-07-01');
+    expect(query.lt).toHaveBeenCalledWith('date', '2026-08-01');
+  });
+});
+
+describe('getRecentTransactionsForUser', () => {
+  it('applies no date filter when start/end are omitted, matching the pre-existing limit-only behavior', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getRecentTransactionsForUser('user-1', 50);
+
+    expect(query.gte).not.toHaveBeenCalled();
+    expect(query.lte).not.toHaveBeenCalled();
+    expect(query.limit).toHaveBeenCalledWith(50);
+  });
+
+  it('applies inclusive start/end bounds when given', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getRecentTransactionsForUser('user-1', 50, '2026-06-01', '2026-06-30');
+
+    expect(query.gte).toHaveBeenCalledWith('date', '2026-06-01');
+    expect(query.lte).toHaveBeenCalledWith('date', '2026-06-30');
+  });
+});
+
 describe('getLoansForUser', () => {
   it('excludes a loan whose account is flagged exclude_from_cash_flow', async () => {
     const query = createQueryBuilder({
@@ -827,5 +875,23 @@ describe('upsertFinancialPreferences', () => {
     );
     expect(result.minimum_cash_buffer).toBe(500);
     expect(result.savings_rate_target).toBe(20);
+  });
+});
+
+describe('upsertReportingRange', () => {
+  it('upserts reporting_range keyed by user_id', async () => {
+    const query = createQueryBuilder({
+      data: { user_id: 'user-1', reporting_range: 'last_12_months' },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await upsertReportingRange('user-1', 'last_12_months');
+
+    expect(query.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: 'user-1', reporting_range: 'last_12_months' }),
+      { onConflict: 'user_id' }
+    );
+    expect(result.reporting_range).toBe('last_12_months');
   });
 });

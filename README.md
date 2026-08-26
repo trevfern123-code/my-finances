@@ -430,6 +430,84 @@ nonzero "Credit card minimum payments" line couldn't be exercised live without e
 data directly (out of scope) — that exact scenario is covered instead by `upcomingItems.test.ts`
 and `safeToSpend.test.ts`, which construct a credit-type loan with a due date inside the window.
 
+## Date-Range Customization
+
+One shared `reporting_range` preference (`this_month | last_month | last_3_months | last_6_months
+| last_12_months`, default `last_6_months`) drives the three historical/trend widgets that already
+shared one "N months" concept before this feature existed: Monthly Breakdown, the Overview tab's
+Monthly Spending chart, and the Net Worth chart. Shown as one horizontally-scrollable pill row
+(`ReportingRangeSelector`, no dropdown/calendar) rendered in both places it applies — Overview
+(only when a range-following card is actually visible) and Monthly Breakdown — sharing the same
+state so the two can never drift apart.
+
+**Deliberately excluded from following the range** — current-period-intrinsic or independently
+configured, per an explicit product decision rather than an oversight:
+- **Safe to Spend** and **Cash Flow Pace** — both answer "how am I doing *right now*/*this month*,"
+  which has no coherent meaning over an arbitrary historical window.
+- **Budget tab's recent-average comparison** — stays driven solely by the pre-existing
+  `recent_avg_months` Financial Preference. It's a calculation baseline ("what's typical"), not a
+  reporting view, even though both happen to be phrased as "N months."
+- **The Transactions feed** — its date/account/category/search filters stay fully independent by
+  design; picking a reporting range never silently restricts the transaction history someone's
+  looking at.
+
+**Backend**: `services/reportingRange.ts` resolves a range id into date bounds, reusing existing,
+already-tested functions rather than inventing new date math — `this_month`/`last_month` reuse
+`budgetPeriod.ts`'s `getCurrentMonthRange`/`getRecentMonthsRange(1)` (true bounded periods); the
+three rolling presets reuse `netWorth.ts`'s `getMonthsAgoStart` (open-ended through today, so the
+current in-progress month keeps appearing as the most recent, still-filling-in bar — exactly
+today's pre-existing chart behavior, just user-selectable instead of hardcoded). `GET
+/api/plaid/summary`, `/monthly-breakdown`, and `/net-worth-history` all accept a new `range_id`
+query param; the legacy `months` param (default 6) is preserved unchanged as a fallback whenever
+`range_id` is absent or unrecognized, so nothing breaks for a caller that only knows about it.
+
+**A real correctness gap was fixed alongside this, not left to interact unpredictably with the new
+range**: Cash Flow Pace and Income & Savings' Savings Rate card used to read whatever the *last*
+bucket of a 6-months-back array happened to be — a coincidence, not a query, and one that would've
+silently shown *last month's* numbers mislabeled as "this month" the instant a user picked the new
+`last_month` reporting preset (which deliberately excludes the current month from that array
+entirely). `GET /api/plaid/summary` now always additionally computes an explicit `current_month:
+{ income, spent }` field via its own `getCurrentMonthRange()` query, completely independent of
+whatever historical range was requested — Cash Flow Pace and Income & Savings now read from that
+instead. Verified live: with `last_month` selected, Monthly Breakdown/the spending chart correctly
+showed July-only data, while Cash Flow Pace and the Savings Rate card kept showing the real current
+month (August) — matching each other and matching what `this_month` independently produced.
+
+**Custom start/end dates deliberately deferred**, per explicit product decision — the presets cover
+the common cases, and none of the three bucketed-chart widgets are built to render a partial-month
+bucket. The architecture stays ready for it later: `getRecentTransactionsForUser` and the
+transactions endpoint now accept optional, additive `start`/`end` (inclusive) query params — not
+wired to any UI yet, since the Transactions feed intentionally stays independent of this feature,
+but real server-side range filtering (as opposed to filtering an already-fetched, limit-capped
+array) is there for a future drill-down or date picker to use.
+
+**Requires a migration** (on top of `user_preferences` from Safe to Spend Customization above):
+
+```sql
+alter table public.user_preferences
+  add column reporting_range text not null default 'last_6_months';
+
+alter table public.user_preferences
+  add constraint user_preferences_reporting_range_check
+    check (reporting_range in ('this_month', 'last_month', 'last_3_months', 'last_6_months', 'last_12_months'));
+```
+
+Also tracked as `supabase/migrations/20260826040000_reporting_range.sql`. Persisted through its own
+narrow `PUT /api/user-preferences/reporting-range` endpoint and `useFinancialPreferences`-shaped
+`hooks/useReportingRange.ts` hook (effect-based hydration from the start, matching the fix already
+applied to `useFinancialPreferences` — no localStorage cache needed here either).
+
+**Verified live in every combination Trevor asked for**: all 5 presets individually; confirmed
+Monthly Breakdown, the spending chart, and the Net Worth chart all update together and stay in sync
+between the Overview and Monthly Breakdown tabs (a range picked on one tab is still selected when
+switching to the other); confirmed Safe to Spend, Cash Flow Pace, Budget's recent-average, and
+Upcoming Bills stayed byte-for-byte unchanged across every preset switch; confirmed the setting
+survives a page reload (including the expected, harmless one-time double-fetch on initial load for
+a saved non-default value — first with the default while `reporting_range` is still loading, then
+corrected once it arrives, visible in the network log as two `range_id` requests in quick
+succession — a deliberate simplicity/correctness tradeoff, not a bug). Reset back to `last_6_months`
+afterward.
+
 ## Dashboard customization
 
 The Overview tab's 8 cards (stats strip, Safe to Spend, Cash Flow & Budget Pace, Accounts at a

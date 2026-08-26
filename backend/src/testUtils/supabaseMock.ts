@@ -19,6 +19,7 @@ export function createQueryBuilder(result: { data: unknown; error: unknown }) {
     'not',
     'gte',
     'lt',
+    'lte',
     'order',
     'limit',
   ];

@@ -56,6 +56,7 @@ import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { useDashboardLayout } from './hooks/useDashboardLayout';
 import { useAppearance } from './hooks/useAppearance';
 import { useFinancialPreferences } from './hooks/useFinancialPreferences';
+import { useReportingRange } from './hooks/useReportingRange';
 import { Auth } from './components/Auth';
 import { PlaidLink } from './components/PlaidLink';
 import { LinkedAccounts } from './components/LinkedAccounts';
@@ -77,6 +78,7 @@ import { CategoryMappings } from './components/CategoryMappings';
 import { DashboardCustomizer } from './components/DashboardCustomizer';
 import { AppearanceSettings } from './components/AppearanceSettings';
 import { FinancialPreferencesSettings } from './components/FinancialPreferencesSettings';
+import { ReportingRangeSelector } from './components/ReportingRangeSelector';
 import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
 
@@ -135,12 +137,14 @@ export default function App() {
     | null
     | undefined
   >(undefined);
+  const [reportingRangeRaw, setReportingRangeRaw] = useState<string | null | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
   const appearance = useAppearance(appearanceRaw);
   const financialPreferences = useFinancialPreferences(financialPreferencesRaw);
+  const reportingRange = useReportingRange(reportingRangeRaw);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -176,9 +180,9 @@ export default function App() {
       getLinkedItems(),
       getTransactions(TRANSACTIONS_FETCH_LIMIT),
       getBudgetCategories(),
-      getSpendingSummary(),
-      getNetWorthHistory(),
-      getMonthlyBreakdown(),
+      getSpendingSummary(reportingRange.range),
+      getNetWorthHistory(reportingRange.range),
+      getMonthlyBreakdown(reportingRange.range),
       getRecurringStreams(),
       getLoans(),
       getAssetsSummary(),
@@ -228,6 +232,7 @@ export default function App() {
         safe_to_spend_include_upcoming_bills: userPreferencesRes.value.safe_to_spend_include_upcoming_bills,
         safe_to_spend_include_remaining_budget: userPreferencesRes.value.safe_to_spend_include_remaining_budget,
       });
+      setReportingRangeRaw(userPreferencesRes.value.reporting_range);
     }
 
     const failures = [
@@ -251,7 +256,7 @@ export default function App() {
     }
 
     setLoading(false);
-  }, []);
+  }, [reportingRange.range]);
 
   useEffect(() => {
     if (session) refreshAll();
@@ -261,7 +266,7 @@ export default function App() {
   // so a failure here shouldn't surface as an error for an action the user didn't take.
   async function refreshSummary() {
     try {
-      setSummary(await getSpendingSummary());
+      setSummary(await getSpendingSummary(reportingRange.range));
     } catch {
       // ignore
     }
@@ -269,7 +274,7 @@ export default function App() {
 
   async function refreshNetWorthHistory() {
     try {
-      const res = await getNetWorthHistory();
+      const res = await getNetWorthHistory(reportingRange.range);
       setNetWorthHistory(res.history);
     } catch {
       // ignore
@@ -278,7 +283,7 @@ export default function App() {
 
   async function refreshMonthlyBreakdown() {
     try {
-      const res = await getMonthlyBreakdown();
+      const res = await getMonthlyBreakdown(reportingRange.range);
       setMonthlyBreakdown(res.months);
     } catch {
       // ignore
@@ -731,8 +736,8 @@ export default function App() {
         return summary ? (
           <CashFlowPace
             budgetCategories={activeBudgetCategories}
-            currentMonthIncome={summary.monthly_spending[summary.monthly_spending.length - 1]?.income ?? 0}
-            currentMonthSpent={summary.monthly_spending[summary.monthly_spending.length - 1]?.spent ?? 0}
+            currentMonthIncome={summary.current_month.income}
+            currentMonthSpent={summary.current_month.spent}
           />
         ) : null;
       case 'accounts_quick_view':
@@ -796,6 +801,11 @@ export default function App() {
                 </button>
               </div>
 
+              {!dashboardLayout.customizing &&
+                dashboardLayout.layout.some(
+                  (c) => c.visible && (c.id === 'monthly_spending_chart' || c.id === 'net_worth_chart')
+                ) && <ReportingRangeSelector range={reportingRange.range} onChange={reportingRange.setRange} />}
+
               {dashboardLayout.customizing ? (
                 <DashboardCustomizer
                   layout={dashboardLayout.layout}
@@ -821,7 +831,14 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === 'monthly' && <MonthlyBreakdown months={monthlyBreakdown} transactions={transactions} />}
+          {activeTab === 'monthly' && (
+            <MonthlyBreakdown
+              months={monthlyBreakdown}
+              transactions={transactions}
+              reportingRange={reportingRange.range}
+              onSetReportingRange={reportingRange.setRange}
+            />
+          )}
 
           {activeTab === 'budget' && (
             <BudgetCategories
@@ -869,8 +886,8 @@ export default function App() {
               groups={assetGroups}
               totalAssets={totalAssets}
               recurringStreams={recurringStreams}
-              currentMonthIncome={summary?.monthly_spending[summary.monthly_spending.length - 1]?.income ?? 0}
-              currentMonthSpent={summary?.monthly_spending[summary.monthly_spending.length - 1]?.spent ?? 0}
+              currentMonthIncome={summary?.current_month.income ?? 0}
+              currentMonthSpent={summary?.current_month.spent ?? 0}
               savingsRateTarget={financialPreferences.savingsRateTarget}
               onUpdateSavingsGoal={handleUpdateSavingsGoal}
             />

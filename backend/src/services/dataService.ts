@@ -156,14 +156,19 @@ export async function upsertNetWorthSnapshot(params: {
 
 export async function getNetWorthHistory(
   userId: string,
-  sinceDate: string
+  sinceDate: string,
+  /** Exclusive upper bound (YYYY-MM-DD) — omitted for an open-ended range through today, used by
+   *  the reporting-range presets that deliberately include the current in-progress period. */
+  untilDate?: string
 ): Promise<{ date: string; net_worth: number; total_assets: number; total_liabilities: number }[]> {
-  const { data, error } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('net_worth_snapshots')
     .select('date, net_worth, total_assets, total_liabilities')
     .eq('user_id', userId)
-    .gte('date', sinceDate)
-    .order('date', { ascending: true });
+    .gte('date', sinceDate);
+  if (untilDate) query = query.lt('date', untilDate);
+
+  const { data, error } = await query.order('date', { ascending: true });
 
   if (error) throw new Error(`Failed to load net worth history: ${error.message}`);
   return data;
@@ -421,15 +426,29 @@ export async function applyTransactionChanges(params: {
   return insertedRows;
 }
 
-export async function getRecentTransactionsForUser(userId: string, limit: number) {
-  const { data, error } = await supabaseAdmin
+/** `start`/`end` are both inclusive (YYYY-MM-DD) — matches TransactionsFeed's existing client-side
+ *  dateFrom/dateTo filter convention, unlike the exclusive `untilDate` used by the reporting-range
+ *  endpoints elsewhere. Optional and additive: omitted, this behaves exactly as before (the most
+ *  recent `limit` transactions) — Date-Range Customization v1 deliberately does not wire any UI to
+ *  these yet (the main Transactions feed stays independent of the global reporting range), this
+ *  just gives a future drill-down or date-picker a real server-side range to query instead of
+ *  filtering an already-fetched, limit-capped array. */
+export async function getRecentTransactionsForUser(
+  userId: string,
+  limit: number,
+  start?: string,
+  end?: string
+) {
+  let query = supabaseAdmin
     .from('transactions')
     .select(
       'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, nickname, plaid_items!inner(user_id, institution_name)), splits:transaction_splits(id, budget_category_id, amount, note)'
     )
-    .eq('accounts.plaid_items.user_id', userId)
-    .order('date', { ascending: false })
-    .limit(limit);
+    .eq('accounts.plaid_items.user_id', userId);
+  if (start) query = query.gte('date', start);
+  if (end) query = query.lte('date', end);
+
+  const { data, error } = await query.order('date', { ascending: false }).limit(limit);
 
   if (error) throw new Error(`Failed to load transactions: ${error.message}`);
   return data;
@@ -441,15 +460,20 @@ export async function getRecentTransactionsForUser(userId: string, limit: number
  *  has no such filter. */
 export async function getTransactionsSince(
   userId: string,
-  sinceDate: string
+  sinceDate: string,
+  /** Exclusive upper bound (YYYY-MM-DD) — omitted for an open-ended range through today, used by
+   *  the reporting-range presets that deliberately include the current in-progress period. */
+  untilDate?: string
 ): Promise<{ amount: number; date: string }[]> {
-  const { data, error } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('transactions')
     .select('amount, date, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))')
     .eq('accounts.plaid_items.user_id', userId)
     .eq('accounts.exclude_from_cash_flow', false)
-    .gte('date', sinceDate)
-    .order('date', { ascending: true });
+    .gte('date', sinceDate);
+  if (untilDate) query = query.lt('date', untilDate);
+
+  const { data, error } = await query.order('date', { ascending: true });
 
   if (error) throw new Error(`Failed to load transaction history: ${error.message}`);
   return data;
@@ -460,15 +484,18 @@ export async function getTransactionsSince(
  *  (Plaid categorizes essentially every transaction; budget categories are optional/sparse). */
 export async function getCategorizedTransactionsSince(
   userId: string,
-  sinceDate: string
+  sinceDate: string,
+  untilDate?: string
 ): Promise<{ amount: number; date: string; category: string | null }[]> {
-  const { data, error } = await supabaseAdmin
+  let query = supabaseAdmin
     .from('transactions')
     .select('amount, date, category, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))')
     .eq('accounts.plaid_items.user_id', userId)
     .eq('accounts.exclude_from_cash_flow', false)
-    .gte('date', sinceDate)
-    .order('date', { ascending: true });
+    .gte('date', sinceDate);
+  if (untilDate) query = query.lt('date', untilDate);
+
+  const { data, error } = await query.order('date', { ascending: true });
 
   if (error) throw new Error(`Failed to load categorized transaction history: ${error.message}`);
   return data;
@@ -1383,5 +1410,24 @@ export async function upsertFinancialPreferences(
     .single();
 
   if (error) throw new Error(`Failed to save financial preferences: ${error.message}`);
+  return data as UserPreferencesRow;
+}
+
+/** Upserts just reporting_range — same narrow-update reasoning as upsertDashboardLayout/
+ *  upsertAppearance. A dedicated endpoint/function rather than folding into
+ *  upsertFinancialPreferences: this is a reporting/view filter, not a calculation input, and
+ *  keeping it separate avoids conflating the two concepts the way recent_avg_months and
+ *  reporting_range could otherwise be mistaken for the same "N months" idea. */
+export async function upsertReportingRange(userId: string, reportingRange: string): Promise<UserPreferencesRow> {
+  const { data, error } = await supabaseAdmin
+    .from('user_preferences')
+    .upsert(
+      { user_id: userId, reporting_range: reportingRange, updated_at: new Date().toISOString() },
+      { onConflict: 'user_id' }
+    )
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to save reporting range: ${error.message}`);
   return data as UserPreferencesRow;
 }

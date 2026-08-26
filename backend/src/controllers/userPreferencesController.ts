@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
+import { isReportingRangeId, REPORTING_RANGE_IDS, DEFAULT_REPORTING_RANGE } from '../services/reportingRange';
 
 const THEME_IDS = ['system', 'light', 'dark'];
 const ACCENT_IDS = ['green', 'blue', 'teal', 'indigo', 'purple', 'amber'];
@@ -17,6 +18,7 @@ export async function getUserPreferences(req: Request, res: Response, next: Next
       savings_rate_target: prefs?.savings_rate_target ?? 15,
       safe_to_spend_include_upcoming_bills: prefs?.safe_to_spend_include_upcoming_bills ?? true,
       safe_to_spend_include_remaining_budget: prefs?.safe_to_spend_include_remaining_budget ?? true,
+      reporting_range: prefs?.reporting_range ?? DEFAULT_REPORTING_RANGE,
     });
   } catch (err) {
     next(err);
@@ -145,6 +147,26 @@ export async function updateFinancialPreferences(req: Request, res: Response, ne
       safe_to_spend_include_upcoming_bills: prefs.safe_to_spend_include_upcoming_bills,
       safe_to_spend_include_remaining_budget: prefs.safe_to_spend_include_remaining_budget,
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+interface ReportingRangeBody {
+  reporting_range?: string;
+}
+
+export async function updateReportingRange(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { reporting_range: reportingRange } = req.body as ReportingRangeBody;
+
+    if (!isReportingRangeId(reportingRange)) {
+      res.status(400).json({ error: `reporting_range must be one of: ${REPORTING_RANGE_IDS.join(', ')}` });
+      return;
+    }
+
+    const prefs = await dataService.upsertReportingRange(req.user!.id, reportingRange);
+    res.json({ reporting_range: prefs.reporting_range });
   } catch (err) {
     next(err);
   }

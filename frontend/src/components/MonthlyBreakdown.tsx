@@ -3,6 +3,8 @@ import type { CategoryAmount, MonthBreakdown, TransactionItem } from '../lib/api
 import { formatPlaidCategoryLabel } from '../lib/categoryLabels';
 import { transactionsForMonthCategory } from '../lib/monthlyBreakdownDrilldown';
 import { formatCurrency } from '../lib/currency';
+import type { ReportingRangeId } from '../lib/reportingRange';
+import { ReportingRangeSelector } from './ReportingRangeSelector';
 
 const CATEGORY_COLORS = [
   '#60a5fa',
@@ -210,7 +212,19 @@ function MonthCard({
   );
 }
 
-export function MonthlyBreakdown({ months, transactions }: { months: MonthBreakdown[]; transactions: TransactionItem[] }) {
+export function MonthlyBreakdown({
+  months,
+  transactions,
+  reportingRange,
+  onSetReportingRange,
+}: {
+  months: MonthBreakdown[];
+  transactions: TransactionItem[];
+  /** Date-Range Customization v1 — shared with the Overview tab's charts so switching it in
+   *  either place stays in sync everywhere it applies. */
+  reportingRange: ReportingRangeId;
+  onSetReportingRange: (range: ReportingRangeId) => void;
+}) {
   // Most recent month first — that's the one you actually want to check in on, and the only
   // one expanded by default so 6+ months doesn't mean 6+ huge stacked cards on load.
   const ordered = [...months].reverse();
@@ -218,9 +232,12 @@ export function MonthlyBreakdown({ months, transactions }: { months: MonthBreakd
 
   if (months.length === 0) {
     return (
-      <div className="card">
-        <h2>Monthly breakdown</h2>
-        <p className="hint">No transaction history yet.</p>
+      <div className="tab-panel">
+        <ReportingRangeSelector range={reportingRange} onChange={onSetReportingRange} />
+        <div className="card">
+          <h2>Monthly breakdown</h2>
+          <p className="hint">No transaction history yet.</p>
+        </div>
       </div>
     );
   }
@@ -229,6 +246,7 @@ export function MonthlyBreakdown({ months, transactions }: { months: MonthBreakd
 
   return (
     <div className="tab-panel">
+      <ReportingRangeSelector range={reportingRange} onChange={onSetReportingRange} />
       {months.length > 1 && <SpendingTrendChart months={months} />}
       <div className="months-breakdown">
         {ordered.map((m) => (

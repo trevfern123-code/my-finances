@@ -1,4 +1,5 @@
 import { supabase } from './supabaseClient';
+import type { ReportingRangeId } from './reportingRange';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
@@ -177,11 +178,17 @@ export interface SpendingSummary {
   net_worth: number;
   total_assets: number;
   total_liabilities: number;
+  /** Follows the reporting-range preference (Date-Range Customization v1). */
   monthly_spending: { month: string; spent: number; income: number }[];
+  /** Always the real current calendar month, regardless of the reporting-range preference —
+   *  Cash Flow Pace and the Savings Rate card are current-period-intrinsic ("how am I doing this
+   *  month") and must never silently follow a historical filter like 'last_month', which would
+   *  otherwise exclude the current month from `monthly_spending` entirely. */
+  current_month: { income: number; spent: number };
 }
 
-export function getSpendingSummary(months = 6): Promise<SpendingSummary> {
-  return authedFetch(`/api/plaid/summary?months=${months}`);
+export function getSpendingSummary(rangeId?: ReportingRangeId): Promise<SpendingSummary> {
+  return authedFetch(`/api/plaid/summary${rangeId ? `?range_id=${rangeId}` : ''}`);
 }
 
 export interface NetWorthPoint {
@@ -191,8 +198,8 @@ export interface NetWorthPoint {
   total_liabilities: number;
 }
 
-export function getNetWorthHistory(months = 6): Promise<{ history: NetWorthPoint[] }> {
-  return authedFetch(`/api/plaid/net-worth-history?months=${months}`);
+export function getNetWorthHistory(rangeId?: ReportingRangeId): Promise<{ history: NetWorthPoint[] }> {
+  return authedFetch(`/api/plaid/net-worth-history${rangeId ? `?range_id=${rangeId}` : ''}`);
 }
 
 export interface CategoryAmount {
@@ -207,8 +214,8 @@ export interface MonthBreakdown {
   by_category: CategoryAmount[];
 }
 
-export function getMonthlyBreakdown(months = 6): Promise<{ months: MonthBreakdown[] }> {
-  return authedFetch(`/api/plaid/monthly-breakdown?months=${months}`);
+export function getMonthlyBreakdown(rangeId?: ReportingRangeId): Promise<{ months: MonthBreakdown[] }> {
+  return authedFetch(`/api/plaid/monthly-breakdown${rangeId ? `?range_id=${rangeId}` : ''}`);
 }
 
 export interface RecurringStream {
@@ -585,6 +592,9 @@ export interface UserPreferences {
    *  behavior. */
   safe_to_spend_include_upcoming_bills: boolean;
   safe_to_spend_include_remaining_budget: boolean;
+  /** Date-Range Customization v1 — raw string on the wire, lib/reportingRange.ts's
+   *  normalizeReportingRange owns turning it into a known-good id, same reasoning as theme/accent. */
+  reporting_range: string;
 }
 
 export function getUserPreferences(): Promise<UserPreferences> {
@@ -605,6 +615,13 @@ export function updateAppearance(appearance: {
   return authedFetch('/api/user-preferences/appearance', {
     method: 'PUT',
     body: JSON.stringify(appearance),
+  });
+}
+
+export function updateReportingRange(prefs: { reporting_range: ReportingRangeId }): Promise<{ reporting_range: string }> {
+  return authedFetch('/api/user-preferences/reporting-range', {
+    method: 'PUT',
+    body: JSON.stringify(prefs),
   });
 }
 

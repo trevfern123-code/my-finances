@@ -10,3 +10,4 @@ userPreferencesRouter.get('/', userPreferencesController.getUserPreferences);
 userPreferencesRouter.put('/dashboard-layout', userPreferencesController.updateDashboardLayout);
 userPreferencesRouter.put('/appearance', userPreferencesController.updateAppearance);
 userPreferencesRouter.put('/financial', userPreferencesController.updateFinancialPreferences);
+userPreferencesRouter.put('/reporting-range', userPreferencesController.updateReportingRange);

@@ -155,6 +155,13 @@ export interface UserPreferencesRow {
   /** Whether unspent budget headroom is subtracted from Safe to Spend at all. Defaults true,
    *  matching the calculation's pre-existing behavior. */
   safe_to_spend_include_remaining_budget: boolean;
+  /** Date-Range Customization v1 — one of ReportingRangeId ('this_month' | 'last_month' |
+   *  'last_3_months' | 'last_6_months' | 'last_12_months'), validated/defaulted at the
+   *  controller layer same as theme/accent_color. Drives Monthly Breakdown, the Overview
+   *  spending chart, and the Net Worth chart only — never Safe to Spend, Cash Flow Pace, the
+   *  Budget tab's recent-average comparison, or the Transactions feed, all of which are either
+   *  current-period-intrinsic or independently configured. */
+  reporting_range: string;
   created_at: string;
   updated_at: string;
 }

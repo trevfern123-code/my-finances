@@ -7,29 +7,52 @@ import { aggregateByMonth } from '../services/monthlyBreakdown';
 import { normalizeToMonthlyAmount } from '../services/recurringStreams';
 import { computePayoffProgressPct, refreshLoansForItem } from '../services/loans';
 import { groupAccountsForAssetsSummary, type AssetAccount } from '../services/assetsSummary';
+import { getCurrentMonthRange } from '../services/budgetPeriod';
+import { isReportingRangeId, resolveReportingRange, type ResolvedRange } from '../services/reportingRange';
 import { env } from '../config/env';
+
+/** Date-Range Customization v1: `range_id` (one of the 5 reporting-range presets) takes
+ *  precedence when present and valid; falls back to the legacy `months` count (default 6,
+ *  clamped 1-24) otherwise, preserving the exact pre-existing behavior for any caller that
+ *  doesn't pass `range_id` — including this app's own frontend before it's updated, and any
+ *  future client that only knows about `months`. */
+function resolveRangeFromQuery(query: Request['query']): ResolvedRange {
+  const rangeIdParam = query.range_id;
+  if (isReportingRangeId(rangeIdParam)) {
+    return resolveReportingRange(rangeIdParam);
+  }
+  const months = Math.min(Math.max(Number(query.months ?? 6), 1), 24);
+  return { sinceDate: netWorthService.getMonthsAgoStart(months) };
+}
+
+function sumIncomeAndSpent(transactions: { amount: number }[]): { spent: number; income: number } {
+  return transactions.reduce(
+    (totals, t) => {
+      // Plaid convention: positive amount = money out (spend), negative = money in (income/credit).
+      if (t.amount >= 0) totals.spent += t.amount;
+      else totals.income += -t.amount;
+      return totals;
+    },
+    { spent: 0, income: 0 }
+  );
+}
 
 export async function getSpendingSummary(req: Request, res: Response, next: NextFunction) {
   try {
     const userId = req.user!.id;
-    const months = Math.min(Math.max(Number(req.query.months ?? 6), 1), 24);
+    const { sinceDate, untilDate } = resolveRangeFromQuery(req.query);
 
     const accounts = await dataService.getAccountBalancesForUser(userId);
     const { assets, liabilities } = netWorthService.aggregateAssetsAndLiabilities(accounts);
 
-    const sinceDate = netWorthService.getMonthsAgoStart(months);
-    const transactions = await dataService.getTransactionsSince(userId, sinceDate);
+    const transactions = await dataService.getTransactionsSince(userId, sinceDate, untilDate);
 
     const byMonth = new Map<string, { spent: number; income: number }>();
     for (const t of transactions) {
       const month = t.date.slice(0, 7);
       const bucket = byMonth.get(month) ?? { spent: 0, income: 0 };
-      // Plaid convention: positive amount = money out (spend), negative = money in (income/credit).
-      if (t.amount >= 0) {
-        bucket.spent += t.amount;
-      } else {
-        bucket.income += -t.amount;
-      }
+      if (t.amount >= 0) bucket.spent += t.amount;
+      else bucket.income += -t.amount;
       byMonth.set(month, bucket);
     }
 
@@ -37,11 +60,24 @@ export async function getSpendingSummary(req: Request, res: Response, next: Next
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([month, totals]) => ({ month, ...totals }));
 
+    // Current-period operational metrics (Cash Flow Pace, Income & Savings' Savings Rate) mean
+    // "how am I doing this month" intrinsically — that must stay true no matter what historical
+    // reporting range the user has selected, so this is always its own explicit current-month
+    // query rather than reused from whatever `monthly_spending` happens to contain (which, for
+    // the 'last_month' preset, deliberately excludes the current month entirely).
+    const currentRange = getCurrentMonthRange();
+    const currentMonthTransactions = await dataService.getTransactionsSince(
+      userId,
+      currentRange.start,
+      currentRange.end
+    );
+
     res.json({
       net_worth: assets - liabilities,
       total_assets: assets,
       total_liabilities: liabilities,
       monthly_spending: monthlySpending,
+      current_month: sumIncomeAndSpent(currentMonthTransactions),
     });
   } catch (err) {
     next(err);
@@ -51,10 +87,9 @@ export async function getSpendingSummary(req: Request, res: Response, next: Next
 export async function getMonthlyBreakdown(req: Request, res: Response, next: NextFunction) {
   try {
     const userId = req.user!.id;
-    const months = Math.min(Math.max(Number(req.query.months ?? 6), 1), 24);
+    const { sinceDate, untilDate } = resolveRangeFromQuery(req.query);
 
-    const sinceDate = netWorthService.getMonthsAgoStart(months);
-    const transactions = await dataService.getCategorizedTransactionsSince(userId, sinceDate);
+    const transactions = await dataService.getCategorizedTransactionsSince(userId, sinceDate, untilDate);
 
     res.json({ months: aggregateByMonth(transactions) });
   } catch (err) {
@@ -150,10 +185,9 @@ export async function getAssetsSummary(req: Request, res: Response, next: NextFu
 export async function getNetWorthHistory(req: Request, res: Response, next: NextFunction) {
   try {
     const userId = req.user!.id;
-    const months = Math.min(Math.max(Number(req.query.months ?? 6), 1), 24);
+    const { sinceDate, untilDate } = resolveRangeFromQuery(req.query);
 
-    const sinceDate = netWorthService.getMonthsAgoStart(months);
-    const history = await dataService.getNetWorthHistory(userId, sinceDate);
+    const history = await dataService.getNetWorthHistory(userId, sinceDate, untilDate);
 
     res.json({ history });
   } catch (err) {
@@ -512,8 +546,13 @@ export async function listTransactions(req: Request, res: Response, next: NextFu
     const limit = Number.isFinite(requestedLimit)
       ? Math.min(Math.max(requestedLimit, 1), 200)
       : 50;
+    // Optional, additive server-side range — not yet used by any frontend call site (the main
+    // Transactions feed stays independent of the global reporting range by design), but keeps the
+    // architecture ready for a future report drill-down or explicit date picker.
+    const start = typeof req.query.start === 'string' ? req.query.start : undefined;
+    const end = typeof req.query.end === 'string' ? req.query.end : undefined;
 
-    const transactions = await dataService.getRecentTransactionsForUser(userId, limit);
+    const transactions = await dataService.getRecentTransactionsForUser(userId, limit, start, end);
     res.json({ transactions });
   } catch (err) {
     next(err);
