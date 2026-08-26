@@ -12,6 +12,12 @@ function account(overrides: Partial<AssetAccount> = {}): AssetAccount {
     iso_currency_code: 'USD',
     institution_name: 'Chase',
     savings_goal: null,
+    nickname: null,
+    color: null,
+    icon: null,
+    sort_order: 0,
+    hidden: false,
+    exclude_from_net_worth: false,
     ...overrides,
   };
 }
@@ -66,5 +72,32 @@ describe('groupAccountsForAssetsSummary', () => {
 
   it('returns an empty array for no accounts', () => {
     expect(groupAccountsForAssetsSummary([])).toEqual([]);
+  });
+
+  it('never excludes a hidden account from the total — hidden is display-only, not a calculation input', () => {
+    const groups = groupAccountsForAssetsSummary([
+      account({ id: 'a', current_balance: 100, hidden: false }),
+      account({ id: 'b', current_balance: 50, hidden: true }),
+    ]);
+    expect(groups[0].accounts.map((a) => a.id)).toEqual(['a', 'b']);
+    expect(groups[0].total).toBe(150);
+  });
+
+  it('keeps a net-worth-excluded account visible in its bucket but leaves it out of the total', () => {
+    const groups = groupAccountsForAssetsSummary([
+      account({ id: 'a', current_balance: 100, exclude_from_net_worth: false }),
+      account({ id: 'b', current_balance: 50, exclude_from_net_worth: true }),
+    ]);
+    expect(groups[0].accounts.map((a) => a.id)).toEqual(['a', 'b']);
+    expect(groups[0].total).toBe(100);
+  });
+
+  it('an account that is both hidden and net-worth-excluded is still excluded only from the total, not the list', () => {
+    const groups = groupAccountsForAssetsSummary([
+      account({ id: 'a', current_balance: 100 }),
+      account({ id: 'b', current_balance: 50, hidden: true, exclude_from_net_worth: true }),
+    ]);
+    expect(groups[0].accounts.map((a) => a.id)).toEqual(['a', 'b']);
+    expect(groups[0].total).toBe(100);
   });
 });

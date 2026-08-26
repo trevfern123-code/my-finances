@@ -30,6 +30,7 @@ import {
   syncTransactions as syncTransactionsRequest,
   unlinkLoanPayment,
   updateAccountCreditLimit,
+  updateAccountCustomization,
   updateAccountSavingsGoal,
   updateBudgetCategory,
   updateLinkedLoanPayment,
@@ -344,6 +345,48 @@ export default function App() {
       );
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to update savings goal');
+    }
+  }
+
+  async function handleUpdateAccountCustomization(
+    accountId: string,
+    fields: Partial<{
+      nickname: string | null;
+      color: string | null;
+      icon: string | null;
+      sort_order: number;
+      hidden: boolean;
+      exclude_from_net_worth: boolean;
+      exclude_from_cash_flow: boolean;
+    }>
+  ) {
+    setActionError(null);
+    try {
+      const res = await updateAccountCustomization(accountId, fields);
+      setItems((prev) =>
+        prev.map((item) => ({
+          ...item,
+          accounts: item.accounts.map((a) => (a.id === accountId ? res.account : a)),
+        }))
+      );
+      // hidden/exclude_from_net_worth change which accounts appear in or count toward
+      // assets-summary's grouped totals — simplest to refetch rather than hand-patch a
+      // filtered, grouped structure locally.
+      refreshAssetsSummary();
+      if (fields.exclude_from_net_worth !== undefined) {
+        // The backend already re-snapshotted today's net worth on this change — refresh the
+        // live stat and the chart so both reflect it immediately, not just at the next sync.
+        refreshSummary();
+        refreshNetWorthHistory();
+      }
+      if (fields.exclude_from_cash_flow !== undefined) {
+        refreshSummary();
+        refreshBudgetCategories();
+        refreshMonthlyBreakdown();
+        refreshRecurringStreams();
+      }
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update account');
     }
   }
 
@@ -804,6 +847,7 @@ export default function App() {
                 isSandbox={isSandbox}
                 onRefreshed={handleAccountsRefreshed}
                 onUpdateCreditLimit={handleUpdateCreditLimit}
+                onUpdateCustomization={handleUpdateAccountCustomization}
               />
               <TransactionsFeed
                 transactions={transactions}

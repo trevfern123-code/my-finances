@@ -40,6 +40,26 @@ export interface AccountRow {
   credit_limit: number | null;
   /** User-entered target balance for a savings account, used for goal-progress tracking. */
   savings_goal: number | null;
+  /** Display override — Plaid's own `name` is used everywhere nickname is null. User-entered,
+   *  never touched by Plaid sync. */
+  nickname: string | null;
+  /** Organizational/identity color, never touched by Plaid sync. Not a semantic financial color. */
+  color: string | null;
+  /** Organizational/identity icon (single emoji), never touched by Plaid sync. */
+  icon: string | null;
+  /** Manual display order, never touched by Plaid sync. */
+  sort_order: number;
+  /** Display-only — removes the account from glanceable summary widgets. Never affects net worth,
+   *  cash-flow calculations, sync, or historical data. Never touched by Plaid sync. */
+  hidden: boolean;
+  /** Excludes this account's balance from net-worth/liquid-cash calculations. Never touched by
+   *  Plaid sync. */
+  exclude_from_net_worth: boolean;
+  /** Excludes this account's transactions/recurring streams from personal cash-flow aggregates
+   *  (Monthly Spending, Monthly Breakdown, Budget spend, Cash Flow Pace, Savings Rate, recurring
+   *  summaries) — individual transactions stay visible in the feed. Never affects net worth.
+   *  Never touched by Plaid sync. */
+  exclude_from_cash_flow: boolean;
 }
 
 export interface TransactionRow {

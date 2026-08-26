@@ -61,6 +61,17 @@ export interface LinkedAccount {
   credit_limit: number | null;
   /** User-entered target balance — only meaningful for savings accounts, used for goal progress. */
   savings_goal: number | null;
+  /** Display override — use accountDisplayName() rather than reading this directly. */
+  nickname: string | null;
+  color: string | null;
+  icon: string | null;
+  sort_order: number;
+  /** Display-only — never affects net worth, cash flow, sync, or historical data. */
+  hidden: boolean;
+  exclude_from_net_worth: boolean;
+  /** Excludes this account's transactions/recurring streams from personal cash-flow aggregates.
+   *  Individual transactions stay visible in the feed; never affects net worth. */
+  exclude_from_cash_flow: boolean;
 }
 
 export interface LinkedItem {
@@ -94,7 +105,7 @@ export interface TransactionItem {
   /** True until the user approves the transaction — never reset by a later Plaid update. */
   needs_review: boolean;
   splits: TransactionSplit[];
-  accounts: { name: string; plaid_items: { institution_name: string | null } };
+  accounts: { name: string; nickname: string | null; plaid_items: { institution_name: string | null } };
 }
 
 export interface BudgetCategory {
@@ -141,6 +152,24 @@ export function updateAccountCreditLimit(
   return authedFetch(`/api/plaid/accounts/${accountId}/credit-limit`, {
     method: 'PATCH',
     body: JSON.stringify({ credit_limit: creditLimit }),
+  });
+}
+
+export function updateAccountCustomization(
+  accountId: string,
+  fields: Partial<{
+    nickname: string | null;
+    color: string | null;
+    icon: string | null;
+    sort_order: number;
+    hidden: boolean;
+    exclude_from_net_worth: boolean;
+    exclude_from_cash_flow: boolean;
+  }>
+): Promise<{ account: LinkedAccount }> {
+  return authedFetch(`/api/plaid/accounts/${accountId}/customization`, {
+    method: 'PATCH',
+    body: JSON.stringify(fields),
   });
 }
 
@@ -362,6 +391,16 @@ export interface AssetAccountSummary {
   institution_name: string | null;
   /** User-entered target balance for a savings account — null unless the user set one. */
   savings_goal: number | null;
+  /** Display override — use accountDisplayName() rather than reading this directly. */
+  nickname: string | null;
+  color: string | null;
+  icon: string | null;
+  sort_order: number;
+  /** Included here (accounts hidden entirely are already excluded by the backend, so this is
+   *  always false for anything in an AssetGroup) — kept for type-symmetry with LinkedAccount. */
+  hidden: boolean;
+  /** True when this account's balance is shown but excluded from its group's total. */
+  exclude_from_net_worth: boolean;
 }
 
 export interface AssetGroup {

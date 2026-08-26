@@ -106,7 +106,7 @@ export async function getLinkedItemsForUser(userId: string) {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
     .select(
-      'id, institution_id, institution_name, status, accounts(id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal)'
+      'id, institution_id, institution_name, status, accounts(id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal, nickname, color, icon, sort_order, hidden, exclude_from_net_worth, exclude_from_cash_flow)'
     )
     .eq('user_id', userId);
 
@@ -116,13 +116,16 @@ export async function getLinkedItemsForUser(userId: string) {
 
 // ---- Accounts ---------------------------------------------------------------
 
+/** Excludes accounts flagged exclude_from_net_worth — net worth and liquid-cash figures should
+ *  never include their balances. */
 export async function getAccountBalancesForUser(
   userId: string
 ): Promise<{ type: string; current_balance: number | null }[]> {
   const { data, error } = await supabaseAdmin
     .from('accounts')
     .select('type, current_balance, plaid_items!inner(user_id)')
-    .eq('plaid_items.user_id', userId);
+    .eq('plaid_items.user_id', userId)
+    .eq('exclude_from_net_worth', false);
 
   if (error) throw new Error(`Failed to load account balances: ${error.message}`);
   return data;
@@ -217,7 +220,7 @@ export async function upsertAccountsForItem(
   const { data: final, error: finalError } = await supabaseAdmin
     .from('accounts')
     .select(
-      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal'
+      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal, nickname, color, icon, sort_order, hidden, exclude_from_net_worth, exclude_from_cash_flow'
     )
     .eq('item_id', itemRowId);
 
@@ -237,6 +240,9 @@ async function verifyAccountOwnership(accountId: string, userId: string): Promis
   return !!owned;
 }
 
+const ACCOUNT_SELECT_COLUMNS =
+  'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal, nickname, color, icon, sort_order, hidden, exclude_from_net_worth, exclude_from_cash_flow';
+
 /** credit_limit is user-entered (see AccountRow), never touched by the Plaid balance-refresh
  *  path above — this is the only place it's written. */
 export async function updateAccountCreditLimit(
@@ -250,9 +256,7 @@ export async function updateAccountCreditLimit(
     .from('accounts')
     .update({ credit_limit: creditLimit })
     .eq('id', accountId)
-    .select(
-      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal'
-    )
+    .select(ACCOUNT_SELECT_COLUMNS)
     .single();
 
   if (error) throw new Error(`Failed to update credit limit: ${error.message}`);
@@ -272,12 +276,39 @@ export async function updateAccountSavingsGoal(
     .from('accounts')
     .update({ savings_goal: savingsGoal })
     .eq('id', accountId)
-    .select(
-      'id, item_id, plaid_account_id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal'
-    )
+    .select(ACCOUNT_SELECT_COLUMNS)
     .single();
 
   if (error) throw new Error(`Failed to update savings goal: ${error.message}`);
+  return data as AccountRow;
+}
+
+/** Every field here is user-owned (see AccountRow) and never touched by the Plaid sync/refresh
+ *  path — this (plus updateAccountCreditLimit/updateAccountSavingsGoal above) is the only place
+ *  any of them are written. Partial update — only the provided fields change. */
+export async function updateAccountCustomization(
+  accountId: string,
+  userId: string,
+  fields: Partial<{
+    nickname: string | null;
+    color: string | null;
+    icon: string | null;
+    sort_order: number;
+    hidden: boolean;
+    exclude_from_net_worth: boolean;
+    exclude_from_cash_flow: boolean;
+  }>
+): Promise<AccountRow | null> {
+  if (!(await verifyAccountOwnership(accountId, userId))) return null;
+
+  const { data, error } = await supabaseAdmin
+    .from('accounts')
+    .update(fields)
+    .eq('id', accountId)
+    .select(ACCOUNT_SELECT_COLUMNS)
+    .single();
+
+  if (error) throw new Error(`Failed to update account: ${error.message}`);
   return data as AccountRow;
 }
 
@@ -394,7 +425,7 @@ export async function getRecentTransactionsForUser(userId: string, limit: number
   const { data, error } = await supabaseAdmin
     .from('transactions')
     .select(
-      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, plaid_items!inner(user_id, institution_name)), splits:transaction_splits(id, budget_category_id, amount, note)'
+      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, nickname, plaid_items!inner(user_id, institution_name)), splits:transaction_splits(id, budget_category_id, amount, note)'
     )
     .eq('accounts.plaid_items.user_id', userId)
     .order('date', { ascending: false })
@@ -404,14 +435,19 @@ export async function getRecentTransactionsForUser(userId: string, limit: number
   return data;
 }
 
+/** Excludes transactions on an account flagged exclude_from_cash_flow — feeds Monthly
+ *  Spending/Cash Flow Pace/Savings Rate, all personal cash-flow aggregates. The individual
+ *  transactions still appear in the main feed (getRecentTransactionsForUser), which deliberately
+ *  has no such filter. */
 export async function getTransactionsSince(
   userId: string,
   sinceDate: string
 ): Promise<{ amount: number; date: string }[]> {
   const { data, error } = await supabaseAdmin
     .from('transactions')
-    .select('amount, date, accounts!inner(plaid_items!inner(user_id))')
+    .select('amount, date, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))')
     .eq('accounts.plaid_items.user_id', userId)
+    .eq('accounts.exclude_from_cash_flow', false)
     .gte('date', sinceDate)
     .order('date', { ascending: true });
 
@@ -428,8 +464,9 @@ export async function getCategorizedTransactionsSince(
 ): Promise<{ amount: number; date: string; category: string | null }[]> {
   const { data, error } = await supabaseAdmin
     .from('transactions')
-    .select('amount, date, category, accounts!inner(plaid_items!inner(user_id))')
+    .select('amount, date, category, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))')
     .eq('accounts.plaid_items.user_id', userId)
+    .eq('accounts.exclude_from_cash_flow', false)
     .gte('date', sinceDate)
     .order('date', { ascending: true });
 
@@ -531,17 +568,26 @@ export async function upsertRecurringStreams(
   if (error) throw new Error(`Failed to save recurring streams: ${error.message}`);
 }
 
+/** Excludes streams on an account flagged exclude_from_cash_flow — feeds Subscriptions &
+ *  Recurring totals, Income & Savings' income breakdown, and Overview's Upcoming Bills, all of
+ *  which are personal cash-flow views. account_id is nullable on this table, so the accounts
+ *  relation is a left embed (not `!inner`) filtered in application code rather than the query
+ *  itself — an inner join/filter here would silently drop any stream with no account_id, which
+ *  isn't what exclusion means. */
 export async function getRecurringStreamsForUser(userId: string): Promise<RecurringStreamRow[]> {
   const { data, error } = await supabaseAdmin
     .from('recurring_streams')
     .select(
-      'id, item_id, account_id, plaid_stream_id, description, merchant_name, direction, frequency, average_amount, last_amount, iso_currency_code, first_date, last_date, is_active, status, category, plaid_items!inner(user_id)'
+      'id, item_id, account_id, plaid_stream_id, description, merchant_name, direction, frequency, average_amount, last_amount, iso_currency_code, first_date, last_date, is_active, status, category, plaid_items!inner(user_id), accounts(exclude_from_cash_flow)'
     )
     .eq('plaid_items.user_id', userId)
     .eq('is_active', true);
 
   if (error) throw new Error(`Failed to load recurring streams: ${error.message}`);
-  return data as unknown as RecurringStreamRow[];
+  const rows = data as unknown as (RecurringStreamRow & { accounts: { exclude_from_cash_flow: boolean } | null })[];
+  return rows
+    .filter((row) => !row.accounts?.exclude_from_cash_flow)
+    .map(({ accounts: _accounts, ...row }) => row);
 }
 
 // ---- Loans ----------------------------------------------------------------------
@@ -957,8 +1003,9 @@ export async function getCategorySpendRows(
 ): Promise<{ budget_category_id: string | null; amount: number }[]> {
   const { data: transactions, error: txnError } = await supabaseAdmin
     .from('transactions')
-    .select('id, budget_category_id, amount, accounts!inner(plaid_items!inner(user_id))')
+    .select('id, budget_category_id, amount, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))')
     .eq('accounts.plaid_items.user_id', userId)
+    .eq('accounts.exclude_from_cash_flow', false)
     .gte('date', range.start)
     .lt('date', range.end);
 
@@ -967,9 +1014,10 @@ export async function getCategorySpendRows(
   const { data: splits, error: splitError } = await supabaseAdmin
     .from('transaction_splits')
     .select(
-      'transaction_id, budget_category_id, amount, transactions!inner(date, accounts!inner(plaid_items!inner(user_id)))'
+      'transaction_id, budget_category_id, amount, transactions!inner(date, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id)))'
     )
     .eq('transactions.accounts.plaid_items.user_id', userId)
+    .eq('transactions.accounts.exclude_from_cash_flow', false)
     .gte('transactions.date', range.start)
     .lt('transactions.date', range.end);
 

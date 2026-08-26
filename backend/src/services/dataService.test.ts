@@ -18,6 +18,8 @@ import {
   clearTransactionSplits,
   deleteCategoryMappingsForBudgetCategory,
   getBudgetCategoryForUser,
+  updateAccountCustomization,
+  getRecurringStreamsForUser,
 } from './dataService';
 
 const mockFrom = vi.hoisted(() => vi.fn());
@@ -691,5 +693,65 @@ describe('getBudgetCategoryForUser', () => {
     const result = await getBudgetCategoryForUser('cat-1', 'user-1');
 
     expect(result).toBeNull();
+  });
+});
+
+describe('updateAccountCustomization', () => {
+  it('updates only the provided fields after verifying account ownership', async () => {
+    const ownershipQuery = createQueryBuilder({ data: { id: 'account-1' }, error: null });
+    const updateQuery = createQueryBuilder({
+      data: { id: 'account-1', nickname: 'Joint checking', hidden: true },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(ownershipQuery).mockReturnValueOnce(updateQuery);
+
+    const result = await updateAccountCustomization('account-1', 'user-1', {
+      nickname: 'Joint checking',
+      hidden: true,
+    });
+
+    expect(ownershipQuery.eq).toHaveBeenCalledWith('plaid_items.user_id', 'user-1');
+    expect(updateQuery.update).toHaveBeenCalledWith({ nickname: 'Joint checking', hidden: true });
+    expect(result).toEqual({ id: 'account-1', nickname: 'Joint checking', hidden: true });
+  });
+
+  it('returns null without updating when the account does not belong to the user', async () => {
+    const ownershipQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(ownershipQuery);
+
+    const result = await updateAccountCustomization('account-1', 'user-1', { hidden: true });
+
+    expect(result).toBeNull();
+    expect(mockFrom).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('getRecurringStreamsForUser', () => {
+  it('excludes a stream whose account is flagged exclude_from_cash_flow', async () => {
+    const query = createQueryBuilder({
+      data: [
+        { id: 'stream-1', account_id: 'acc-1', accounts: { exclude_from_cash_flow: false } },
+        { id: 'stream-2', account_id: 'acc-2', accounts: { exclude_from_cash_flow: true } },
+      ],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getRecurringStreamsForUser('user-1');
+
+    expect(result.map((r) => r.id)).toEqual(['stream-1']);
+    expect((result[0] as unknown as { accounts?: unknown }).accounts).toBeUndefined();
+  });
+
+  it('keeps a stream with no linked account rather than dropping it', async () => {
+    const query = createQueryBuilder({
+      data: [{ id: 'stream-1', account_id: null, accounts: null }],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getRecurringStreamsForUser('user-1');
+
+    expect(result.map((r) => r.id)).toEqual(['stream-1']);
   });
 });

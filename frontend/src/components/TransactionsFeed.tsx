@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
 import { budgetCategoryLabel, selectableCategories } from '../lib/categoryLabels';
+import { accountDisplayName } from '../lib/accountDisplay';
 import { SplitEditor } from './SplitEditor';
 
 function formatAmount(amount: number, currency: string | null) {
@@ -66,14 +67,17 @@ export function TransactionsFeed({
   const needsReviewCount = useMemo(() => transactions.filter((t) => t.needs_review).length, [transactions]);
 
   const accountNames = useMemo(
-    () => Array.from(new Set(transactions.map((t) => t.accounts?.name).filter((n): n is string => !!n))).sort(),
+    () =>
+      Array.from(
+        new Set(transactions.map((t) => (t.accounts ? accountDisplayName(t.accounts) : null)).filter((n): n is string => !!n))
+      ).sort(),
     [transactions]
   );
 
   const filtered = useMemo(() => {
     return transactions.filter((t) => {
       if (needsReviewOnly && !t.needs_review) return false;
-      if (accountFilter && t.accounts?.name !== accountFilter) return false;
+      if (accountFilter && (!t.accounts || accountDisplayName(t.accounts) !== accountFilter)) return false;
       if (categoryFilter === 'uncategorized' && t.budget_category_id !== null) return false;
       if (categoryFilter && categoryFilter !== 'uncategorized' && t.budget_category_id !== categoryFilter) {
         return false;
@@ -190,7 +194,7 @@ export function TransactionsFeed({
                           {t.pending && <span className="pending-badge">pending</span>}
                         </span>
                         <span className="hint">
-                          {formatDate(t.date)} · {t.accounts?.name ?? '—'}
+                          {formatDate(t.date)} · {t.accounts ? accountDisplayName(t.accounts) : '—'}
                         </span>
                       </div>
                       <span className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>

@@ -129,6 +129,12 @@ export async function getAssetsSummary(req: Request, res: Response, next: NextFu
         iso_currency_code: account.iso_currency_code,
         institution_name: item.institution_name,
         savings_goal: account.savings_goal,
+        nickname: account.nickname,
+        color: account.color,
+        icon: account.icon,
+        sort_order: account.sort_order,
+        hidden: account.hidden,
+        exclude_from_net_worth: account.exclude_from_net_worth,
       }))
     );
 
@@ -312,6 +318,57 @@ export async function updateAccountSavingsGoal(req: Request, res: Response, next
     if (!account) {
       res.status(404).json({ error: 'Account not found' });
       return;
+    }
+
+    res.json({ account });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateAccountCustomization(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { accountId } = req.params;
+    const {
+      nickname,
+      color,
+      icon,
+      sort_order: sortOrder,
+      hidden,
+      exclude_from_net_worth: excludeFromNetWorth,
+      exclude_from_cash_flow: excludeFromCashFlow,
+    } = req.body as {
+      nickname?: string | null;
+      color?: string | null;
+      icon?: string | null;
+      sort_order?: number;
+      hidden?: boolean;
+      exclude_from_net_worth?: boolean;
+      exclude_from_cash_flow?: boolean;
+    };
+
+    const fields: Record<string, unknown> = {};
+    if (nickname !== undefined) fields.nickname = nickname;
+    if (color !== undefined) fields.color = color;
+    if (icon !== undefined) fields.icon = icon;
+    if (sortOrder !== undefined) fields.sort_order = sortOrder;
+    if (hidden !== undefined) fields.hidden = hidden;
+    if (excludeFromNetWorth !== undefined) fields.exclude_from_net_worth = excludeFromNetWorth;
+    if (excludeFromCashFlow !== undefined) fields.exclude_from_cash_flow = excludeFromCashFlow;
+
+    const account = await dataService.updateAccountCustomization(accountId, userId, fields);
+    if (!account) {
+      res.status(404).json({ error: 'Account not found' });
+      return;
+    }
+
+    // Net worth is a recorded snapshot (not computed live for the history chart), so a change to
+    // which accounts count toward it needs an immediate re-snapshot for today — otherwise the
+    // chart would lag until the next natural sync/balance refresh. Historical snapshots from
+    // earlier dates are never rewritten.
+    if (excludeFromNetWorth !== undefined) {
+      await netWorthService.recordSnapshotForUser(userId);
     }
 
     res.json({ account });

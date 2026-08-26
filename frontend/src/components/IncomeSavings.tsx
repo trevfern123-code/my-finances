@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { AssetAccountSummary, AssetGroup, RecurringStream } from '../lib/api';
+import { accountDisplayName } from '../lib/accountDisplay';
 
 const FREQUENCY_LABELS: Record<string, string> = {
   WEEKLY: 'Weekly',
@@ -106,8 +107,12 @@ function SavingsGoalRow({
     <li className="account-list-item">
       <div className="account-row">
         <span>
-          {account.name}
+          {account.icon && <span className="account-icon">{account.icon}</span>}
+          {accountDisplayName(account)}
           {account.institution_name && <span className="account-type"> — {account.institution_name}</span>}
+          {account.exclude_from_net_worth && (
+            <span className="account-flag-indicator"> · Excluded from net worth</span>
+          )}
         </span>
         <span className="balance">{formatCurrency(account.current_balance, account.iso_currency_code)}</span>
       </div>
@@ -197,18 +202,24 @@ export function IncomeSavings({
             </div>
             {group.category === 'savings' ? (
               <ul className="quick-view-list">
-                {group.accounts.map((account) => (
-                  <SavingsGoalRow key={account.id} account={account} onUpdateSavingsGoal={onUpdateSavingsGoal} />
-                ))}
+                {group.accounts
+                  .filter((account) => !account.hidden)
+                  .map((account) => (
+                    <SavingsGoalRow key={account.id} account={account} onUpdateSavingsGoal={onUpdateSavingsGoal} />
+                  ))}
               </ul>
             ) : (
               <ul className="asset-account-list">
-                {group.accounts.map((account) => (
+                {group.accounts.filter((account) => !account.hidden).map((account) => (
                   <li key={account.id} className="account-row">
                     <span>
-                      {account.name}
+                      {account.icon && <span className="account-icon">{account.icon}</span>}
+                      {accountDisplayName(account)}
                       {account.institution_name && (
                         <span className="account-type"> — {account.institution_name}</span>
+                      )}
+                      {account.exclude_from_net_worth && (
+                        <span className="account-flag-indicator"> · Excluded from net worth</span>
                       )}
                     </span>
                     <span className="balance">

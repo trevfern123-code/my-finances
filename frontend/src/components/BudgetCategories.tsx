@@ -1,37 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
 import { getCurrentMonthCategoryItems } from '../lib/budgetDrilldown';
-import { CATEGORY_COLOR_OPTIONS } from '../lib/categoryColors';
-
-// A curated set covering the categories real budgets tend to have, loosely grouped (food,
-// transport, housing/bills, shopping, entertainment, health, travel, education, personal care,
-// finance, pets, family, misc) — not exhaustive, since anything missing is one paste away via the
-// custom-emoji input below the grid.
-const EMOJI_OPTIONS = [
-  '🍔', '🍕', '🍜', '🍱', '🍿', '☕', '🍺', '🍷', '🥗',
-  '🚗', '🚕', '🚌', '🚆', '✈️', '⛽', '🅿️', '🚲', '🛵',
-  '🏠', '💡', '💧', '🔥', '📶', '🛠️', '🧹',
-  '🛒', '👕', '👟', '💄', '🎁', '📦',
-  '🎬', '🎮', '🎵', '🎉', '📺', '🎟️',
-  '💊', '🏥', '🦷', '🏋️', '🧘', '🩺',
-  '🧳', '🏨', '🗺️', '⛱️',
-  '🎓', '📚', '✏️',
-  '💇', '🧴', '🧖',
-  '💰', '💳', '🏦', '📈', '💵', '🔁',
-  '🐶', '🐱', '🐾',
-  '👶', '🧸',
-  '📱', '⚡', '🧾', '🔧',
-];
-
-/** Light sanity-check for a pasted custom emoji, not a strict grapheme validator — this is a
- *  single-user personal finance app, not a public input surface, so trimming and a generous
- *  length cap (enough for skin-tone modifiers and short ZWJ sequences like a family emoji) is
- *  enough to keep the field from silently accepting pasted sentences. */
-function sanitizeCustomEmoji(input: string): string | null {
-  const trimmed = input.trim();
-  if (!trimmed || trimmed.length > 8) return null;
-  return trimmed;
-}
+import { EmojiPicker } from './EmojiPicker';
+import { ColorPicker, ColorDot } from './ColorPicker';
 
 function formatCurrency(amount: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
@@ -57,164 +28,6 @@ function progressTier(spent: number, budgetAmount: number): 'good' | 'warn' | 'o
   if (pct >= 1) return 'over';
   if (pct >= 0.7) return 'warn';
   return 'good';
-}
-
-function EmojiPicker({
-  value,
-  onChange,
-  label,
-}: {
-  value: string | null;
-  onChange: (emoji: string | null) => void;
-  label: string;
-}) {
-  const [open, setOpen] = useState(false);
-  const [customEmoji, setCustomEmoji] = useState('');
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function handleClickOutside(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    }
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [open]);
-
-  function handleCustomSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    const sanitized = sanitizeCustomEmoji(customEmoji);
-    if (!sanitized) return;
-    onChange(sanitized);
-    setCustomEmoji('');
-    setOpen(false);
-  }
-
-  return (
-    <div className="emoji-picker" ref={ref}>
-      <button
-        type="button"
-        className="emoji-picker-trigger"
-        onClick={() => setOpen((v) => !v)}
-        aria-label={label}
-      >
-        {value ?? '＋'}
-      </button>
-      {open && (
-        <div className="emoji-picker-panel">
-          <div className="emoji-picker-grid">
-            {EMOJI_OPTIONS.map((option) => (
-              <button
-                key={option}
-                type="button"
-                className="emoji-picker-option"
-                onClick={() => {
-                  onChange(option);
-                  setOpen(false);
-                }}
-              >
-                {option}
-              </button>
-            ))}
-          </div>
-          <form className="emoji-picker-custom" onSubmit={handleCustomSubmit}>
-            <input
-              type="text"
-              value={customEmoji}
-              onChange={(e) => setCustomEmoji(e.target.value)}
-              placeholder="Paste any emoji"
-              aria-label="Custom emoji"
-            />
-            <button type="submit" className="link-button" disabled={!sanitizeCustomEmoji(customEmoji)}>
-              Use
-            </button>
-          </form>
-          {value && (
-            <button
-              type="button"
-              className="link-button emoji-picker-clear"
-              onClick={() => {
-                onChange(null);
-                setOpen(false);
-              }}
-            >
-              Clear emoji
-            </button>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ColorPicker({
-  value,
-  onChange,
-  label,
-}: {
-  value: string | null;
-  onChange: (color: string | null) => void;
-  label: string;
-}) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function handleClickOutside(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    }
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [open]);
-
-  return (
-    <div className="color-picker" ref={ref}>
-      <button
-        type="button"
-        className="color-picker-trigger"
-        style={value ? { background: value } : undefined}
-        onClick={() => setOpen((v) => !v)}
-        aria-label={label}
-      />
-      {open && (
-        <div className="color-picker-panel">
-          <div className="color-picker-grid">
-            {CATEGORY_COLOR_OPTIONS.map((option) => (
-              <button
-                key={option}
-                type="button"
-                className={value === option ? 'color-picker-option active' : 'color-picker-option'}
-                style={{ background: option }}
-                aria-label={option}
-                onClick={() => {
-                  onChange(option);
-                  setOpen(false);
-                }}
-              />
-            ))}
-          </div>
-          {value && (
-            <button
-              type="button"
-              className="link-button color-picker-clear"
-              onClick={() => {
-                onChange(null);
-                setOpen(false);
-              }}
-            >
-              Clear color
-            </button>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function CategoryColorDot({ color }: { color: string | null }) {
-  if (!color) return null;
-  return <span className="category-color-dot" style={{ background: color }} />;
 }
 
 function AddCategoryForm({
@@ -490,7 +303,7 @@ export function BudgetCategories({
             <div className="archived-categories-list">
               {archived.map((c) => (
                 <div key={c.id} className="archived-category-row">
-                  <CategoryColorDot color={c.color} />
+                  <ColorDot color={c.color} />
                   <span className="archived-category-name">
                     {c.emoji && <span className="archived-category-emoji">{c.emoji}</span>}
                     {c.name}

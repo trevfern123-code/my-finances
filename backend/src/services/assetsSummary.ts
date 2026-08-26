@@ -8,6 +8,12 @@ export interface AssetAccount {
   iso_currency_code: string | null;
   institution_name: string | null;
   savings_goal: number | null;
+  nickname: string | null;
+  color: string | null;
+  icon: string | null;
+  sort_order: number;
+  hidden: boolean;
+  exclude_from_net_worth: boolean;
 }
 
 export type AssetCategory = 'checking' | 'savings' | 'investment' | 'other';
@@ -37,7 +43,15 @@ function categorize(account: AssetAccount): AssetCategory {
   return 'other';
 }
 
-/** Groups accounts into checking/savings/investment/other, excluding liability-type accounts entirely. */
+/** Groups accounts into checking/savings/investment/other, excluding liability-type accounts
+ *  entirely. `hidden` is deliberately NOT filtered here — this function backs both a display
+ *  widget (Accounts at a glance) and a real calculation (Safe to Spend's liquid cash), and hidden
+ *  must never affect a calculation. Every non-liability account is included in both `accounts`
+ *  and `total` regardless of hidden status; callers that only want to *display* a glanceable list
+ *  filter `hidden` out themselves at render time. An account excluded from net worth still
+ *  appears in its bucket's `accounts` list (so its balance stays visible for transparency) but is
+ *  left out of that bucket's `total`, and therefore out of the overall total_assets the caller
+ *  derives from summing bucket totals. */
 export function groupAccountsForAssetsSummary(accounts: AssetAccount[]): AssetGroup[] {
   const buckets: Record<AssetCategory, AssetAccount[]> = {
     checking: [],
@@ -56,7 +70,9 @@ export function groupAccountsForAssetsSummary(accounts: AssetAccount[]): AssetGr
     .map((category) => ({
       category,
       label: CATEGORY_LABELS[category],
-      total: buckets[category].reduce((sum, a) => sum + (a.current_balance ?? 0), 0),
+      total: buckets[category]
+        .filter((a) => !a.exclude_from_net_worth)
+        .reduce((sum, a) => sum + (a.current_balance ?? 0), 0),
       accounts: buckets[category],
     }));
 }

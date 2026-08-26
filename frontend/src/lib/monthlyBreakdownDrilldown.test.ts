@@ -16,7 +16,7 @@ function fakeTransaction(overrides: Partial<TransactionItem> = {}): TransactionI
     budget_category_id: 'cat-a',
     needs_review: false,
     splits: [],
-    accounts: { name: 'Checking', plaid_items: { institution_name: null } },
+    accounts: { name: 'Checking', nickname: null, plaid_items: { institution_name: null } },
     ...overrides,
   };
 }
