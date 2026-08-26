@@ -1,12 +1,9 @@
 import type { Loan, ManualLoan, RecurringStream } from '../lib/api';
 import { dueLabel } from '../lib/recurringDates';
 import { collectUpcomingItems } from '../lib/upcomingItems';
+import { formatCurrency } from '../lib/currency';
 
 export const UPCOMING_BILLS_DAYS_AHEAD = 14;
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
-}
 
 export function UpcomingBills({
   recurringStreams,

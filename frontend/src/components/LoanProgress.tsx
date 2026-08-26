@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { LoanPayment, ManualPaymentInput, Loan, ManualLoan, ManualLoanInput } from '../lib/api';
+import { formatCurrency } from '../lib/currency';
 
 const LOAN_TYPE_LABELS: Record<string, string> = {
   student: 'Student Loan',
@@ -17,11 +18,6 @@ const MANUAL_LOAN_TYPE_OPTIONS: { value: ManualLoanInput['loan_type']; label: st
   { value: 'auto', label: 'Auto Loan' },
   { value: 'other', label: 'Other' },
 ];
-
-function formatCurrency(amount: number | null, currency: string | null) {
-  if (amount === null) return '—';
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency ?? 'USD' }).format(amount);
-}
 
 function formatDate(date: string | null) {
   if (!date) return '—';

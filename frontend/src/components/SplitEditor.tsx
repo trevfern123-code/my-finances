@@ -2,14 +2,11 @@ import { useState } from 'react';
 import type { BudgetCategory, TransactionSplit } from '../lib/api';
 import { budgetCategoryLabel, selectableCategories } from '../lib/categoryLabels';
 import { computeSplitBalance, hasIncompleteRow } from '../lib/splitValidation';
+import { formatCurrency } from '../lib/currency';
 
 interface DraftSplit {
   budget_category_id: string;
   amount: string;
-}
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 }
 
 export function SplitEditor({

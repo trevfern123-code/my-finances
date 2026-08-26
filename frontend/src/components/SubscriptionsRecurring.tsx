@@ -1,5 +1,6 @@
 import type { RecurringStream } from '../lib/api';
 import { daysBetween, dueLabel, estimateNextDueDate, todayUtc } from '../lib/recurringDates';
+import { formatCurrency } from '../lib/currency';
 
 const FREQUENCY_LABELS: Record<string, string> = {
   WEEKLY: 'Weekly',
@@ -9,10 +10,6 @@ const FREQUENCY_LABELS: Record<string, string> = {
   ANNUALLY: 'Annually',
   UNKNOWN: 'Irregular',
 };
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
-}
 
 function formatFrequency(frequency: string) {
   return FREQUENCY_LABELS[frequency] ?? frequency;

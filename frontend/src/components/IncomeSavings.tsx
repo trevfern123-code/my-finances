@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { AssetAccountSummary, AssetGroup, RecurringStream } from '../lib/api';
 import { accountDisplayName } from '../lib/accountDisplay';
+import { formatCurrency } from '../lib/currency';
 
 const FREQUENCY_LABELS: Record<string, string> = {
   WEEKLY: 'Weekly',
@@ -10,11 +11,6 @@ const FREQUENCY_LABELS: Record<string, string> = {
   ANNUALLY: 'Annually',
   UNKNOWN: 'Irregular',
 };
-
-function formatCurrency(amount: number | null, currency: string | null) {
-  if (amount === null) return '—';
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency ?? 'USD' }).format(amount);
-}
 
 /** Classic personal-finance rule of thumb: saving 15%+ of income is healthy, under that is
  *  worth a nudge, and negative (spending more than you earned) is the one that actually matters. */

@@ -1,10 +1,6 @@
 import type { AssetGroup } from '../lib/api';
 import { accountDisplayName } from '../lib/accountDisplay';
-
-function formatCurrency(amount: number | null, currency: string | null) {
-  if (amount === null) return '—';
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency ?? 'USD' }).format(amount);
-}
+import { formatCurrency } from '../lib/currency';
 
 export function AccountQuickView({ assetGroups }: { assetGroups: AssetGroup[] }) {
   // hidden only affects what's *displayed* here — the group totals feeding Liquid Cash

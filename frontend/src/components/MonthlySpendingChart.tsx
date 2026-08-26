@@ -1,12 +1,5 @@
 import type { SpendingSummary } from '../lib/api';
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
+import { formatCurrencyWhole as formatCurrency } from '../lib/currency';
 
 function formatMonth(month: string) {
   const [year, monthNum] = month.split('-').map(Number);

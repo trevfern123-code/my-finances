@@ -2,12 +2,9 @@ import { useState } from 'react';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
 import { getCurrentMonthCategoryItems } from '../lib/budgetDrilldown';
 import { computeReorder } from '../lib/reorder';
+import { formatCurrency } from '../lib/currency';
 import { EmojiPicker } from './EmojiPicker';
 import { ColorPicker, ColorDot } from './ColorPicker';
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
-}
 
 function currentMonthLabel() {
   return new Date().toLocaleDateString('en-US', { month: 'long' });

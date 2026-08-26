@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { CategoryAmount, MonthBreakdown, TransactionItem } from '../lib/api';
 import { formatPlaidCategoryLabel } from '../lib/categoryLabels';
 import { transactionsForMonthCategory } from '../lib/monthlyBreakdownDrilldown';
+import { formatCurrency } from '../lib/currency';
 
 const CATEGORY_COLORS = [
   '#60a5fa',
@@ -15,10 +16,6 @@ const CATEGORY_COLORS = [
 ];
 
 const UNCATEGORIZED_COLOR = '#6b7280';
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
-}
 
 function formatMonthLabel(month: string) {
   const [year, monthNum] = month.split('-').map(Number);

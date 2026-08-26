@@ -1,11 +1,8 @@
 import type { AssetGroup, BudgetCategory, Loan, ManualLoan, RecurringStream } from '../lib/api';
 import { computeLiquidCash } from '../lib/assets';
 import { collectUpcomingItems } from '../lib/upcomingItems';
+import { formatCurrency } from '../lib/currency';
 import { UPCOMING_BILLS_DAYS_AHEAD } from './UpcomingBills';
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
-}
 
 /** Money still earmarked for a budget category but not yet spent. A category already over
  *  budget contributes 0 here rather than a negative number — the overspend already left the

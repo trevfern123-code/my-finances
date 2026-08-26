@@ -1,8 +1,5 @@
 import type { BudgetCategory } from '../lib/api';
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
-}
+import { formatCurrency } from '../lib/currency';
 
 /** How far the current calendar month has progressed, as a 0..1 fraction — the baseline "pace"
  *  a budget should be tracking against (e.g. day 15 of a 30-day month is 0.5). */

@@ -1,13 +1,6 @@
 import type { AssetGroup, NetWorthPoint } from '../lib/api';
 import { computeLiquidCash } from '../lib/assets';
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
+import { formatCurrencyWhole as formatCurrency } from '../lib/currency';
 
 /** Most recent snapshot from a calendar month strictly before the latest snapshot's month —
  *  the "last month" comparison point for the Net Worth delta. Null if there isn't one yet

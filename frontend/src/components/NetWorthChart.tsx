@@ -1,12 +1,5 @@
 import type { NetWorthPoint } from '../lib/api';
-
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
+import { formatCurrencyWhole as formatCurrency } from '../lib/currency';
 
 function formatDate(date: string) {
   const [year, month, day] = date.split('-').map(Number);
