@@ -8,24 +8,10 @@ export interface PlaidItemRow {
   id: string;
   user_id: string;
   plaid_item_id: string;
-  /** Plaintext access token. Nullable as of the Plaid Token Encryption migration — a row written
-   *  under Phase 2b (encrypted-only) or fully backfilled (Phase 5+) has this as null, with the
-   *  encrypted columns below as the sole representation. See
-   *  PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md. */
-  access_token: string | null;
-  /** The five columns below are all null together, or all non-null together (enforced by the
-   *  `plaid_items_encrypted_token_complete` check constraint) — see the design doc §2/§3. */
-  access_token_ciphertext: string | null;
-  access_token_nonce: string | null;
-  access_token_auth_tag: string | null;
-  access_token_key_id: string | null;
-  access_token_enc_version: number | null;
+  access_token: string;
   institution_id: string | null;
   institution_name: string | null;
   transactions_cursor: string | null;
-  /** 'credential_error' (added alongside encryption) means this app failed to decrypt/read the
-   *  stored credential — distinct from 'login_required', which means Plaid itself rejected it.
-   *  Never conflate the two (PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §9/§10). */
   status: string;
 }
 
