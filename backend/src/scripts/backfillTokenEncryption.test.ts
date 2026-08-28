@@ -14,14 +14,17 @@ vi.mock('../services/plaidService', () => ({ verifyAccessTokenLive: mockVerifyAc
 
 // Real crypto math still runs (so these tests exercise genuine encrypt/decrypt round trips, not a
 // mocked stub) — only the environment-backed singleton is swapped for a fixed test key ring, the
-// same pattern already used by dataService.test.ts. Two keys are configured so the
-// historical/non-current-key test below has something real to decrypt with.
+// same pattern already used by dataService.test.ts. Three keys are configured: RAILWAY_PROD_V2
+// (current, matching this script's post-rotation retarget), RAILWAY_PROD_V1 (still configured but
+// no longer current or approved — used for "row still on the old key" tests), and OLD_V1 (a third,
+// unrelated historical key, purely for the generic historical-key-decryption test).
 vi.mock('../services/tokenEncryption', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../services/tokenEncryption')>();
   const testKeyRing = actual.loadKeyRing({
     PLAID_TOKEN_KEY_RAILWAY_PROD_V1: Buffer.alloc(32, 7).toString('base64'),
+    PLAID_TOKEN_KEY_RAILWAY_PROD_V2: Buffer.alloc(32, 11).toString('base64'),
     PLAID_TOKEN_KEY_OLD_V1: Buffer.alloc(32, 9).toString('base64'),
-    PLAID_TOKEN_CURRENT_KEY_ID: 'RAILWAY_PROD_V1',
+    PLAID_TOKEN_CURRENT_KEY_ID: 'RAILWAY_PROD_V2',
   });
   return { ...actual, getKeyRing: () => testKeyRing };
 });
@@ -53,10 +56,14 @@ const UNKNOWN_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 
 const TEST_KEY_RING: KeyRing = loadKeyRing({
   PLAID_TOKEN_KEY_RAILWAY_PROD_V1: Buffer.alloc(32, 7).toString('base64'),
+  PLAID_TOKEN_KEY_RAILWAY_PROD_V2: Buffer.alloc(32, 11).toString('base64'),
   PLAID_TOKEN_KEY_OLD_V1: Buffer.alloc(32, 9).toString('base64'),
-  PLAID_TOKEN_CURRENT_KEY_ID: 'RAILWAY_PROD_V1',
+  PLAID_TOKEN_CURRENT_KEY_ID: 'RAILWAY_PROD_V2',
 });
 const OLD_KEY_RING: KeyRing = { currentKeyId: 'OLD_V1', keys: TEST_KEY_RING.keys };
+// Represents a row still on the pre-rotation key — configured in the ring (V1 stays available
+// throughout the rotation window) but no longer this script's approved current key.
+const V1_KEY_RING: KeyRing = { currentKeyId: 'RAILWAY_PROD_V1', keys: TEST_KEY_RING.keys };
 
 // ---- Fixture builders -----------------------------------------------------------------------
 
@@ -103,7 +110,7 @@ function encryptedRow(
  *  `encryptAccessToken` (which always hardcodes version 1) to prove the "internally valid but
  *  rejected anyway" policy check (§22 point 4) is a real fixed-version *policy* boundary, not a
  *  side effect of decryption already failing on its own. */
-function rowWithVersion(id: string, plaintext: string, version: number, keyId = 'RAILWAY_PROD_V1'): FakeRow {
+function rowWithVersion(id: string, plaintext: string, version: number, keyId = 'RAILWAY_PROD_V2'): FakeRow {
   const key = TEST_KEY_RING.keys.get(keyId)!;
   const nonce = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, nonce);
@@ -474,6 +481,16 @@ describe('runPreflight — cohort and resume invariants', () => {
     expect(result.failures).toContain('unexpected_key_id');
   });
 
+  it('fails when the non-target (Tartan) row is still on the pre-rotation V1 key, not yet rotated to V2', async () => {
+    // Explicit regression test for the retargeting requirement: this backfill may only run once
+    // Tartan has already been rotated to V2 — a lingering V1 non-target row must block it.
+    const rows = [plaintextRow(TARGET_A, 'a'), plaintextRow(TARGET_B, 'b'), encryptedRow(NON_TARGET, 'z', { keyRing: V1_KEY_RING })];
+    setupFakeSupabase(rows);
+    const result = await runPreflight(argsFor());
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContain('unexpected_key_id');
+  });
+
   it('fails when an already-encrypted row uses an unexpected enc_version', async () => {
     const rows = [rowWithVersion(TARGET_A, 'a', 2), plaintextRow(TARGET_B, 'b'), nonTargetRow()];
     setupFakeSupabase(rows);
@@ -624,7 +641,7 @@ describe('processTarget — plaintext-only target, apply mode', () => {
     const result = await processTarget(TARGET_A, true);
     expect(result.outcome).toBe('verified');
     const row = fake.getRows()[0];
-    expect(row.access_token_key_id).toBe('RAILWAY_PROD_V1');
+    expect(row.access_token_key_id).toBe('RAILWAY_PROD_V2');
     expect(row.access_token).toBe('secret-a'); // never cleared
   });
 
@@ -921,7 +938,7 @@ describe('main — full apply run reaches postflight and succeeds end to end', (
     const { entries } = captureLogs();
     const code = await main(baseArgv(['--apply', '--confirm', CONFIRM]));
     expect(code).toBe(0);
-    expect(fake.getRows().every((r) => r.access_token_key_id === 'RAILWAY_PROD_V1')).toBe(true);
+    expect(fake.getRows().every((r) => r.access_token_key_id === 'RAILWAY_PROD_V2')).toBe(true);
     expect(fake.getRows().every((r) => r.access_token !== null)).toBe(true);
     expect(entries.some((e) => e.outcome === 'all_targets_verified_and_postflight_passed')).toBe(true);
   });
@@ -974,6 +991,7 @@ describe('logging — never leaks credential material or raw error/argument text
       expect(line).not.toContain(realCiphertext);
       expect(line).not.toContain(realNonce);
       expect(line).not.toContain(realAuthTag);
+      expect(line).not.toContain(TEST_KEY_RING.keys.get('RAILWAY_PROD_V2')!.toString('base64'));
       expect(line).not.toContain(TEST_KEY_RING.keys.get('RAILWAY_PROD_V1')!.toString('base64'));
     }
   });
@@ -1059,7 +1077,7 @@ describe('mid-flight interruption — signal immediately after a committed updat
     // The write committed and is left intact.
     expect(fake.getUpdateCallCount()).toBe(1);
     const row = fake.getRows()[0];
-    expect(row.access_token_key_id).toBe('RAILWAY_PROD_V1');
+    expect(row.access_token_key_id).toBe('RAILWAY_PROD_V2');
     expect(row.access_token).toBe('secret-a');
     expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
 
