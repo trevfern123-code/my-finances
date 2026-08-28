@@ -3,6 +3,12 @@
  * See PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §22 for the full design this implements — read
  * that before changing anything here.
  *
+ * This script is intentionally locked to one exact, known production operation — exactly two
+ * named target rows, out of an exactly-three-row table, encrypted under exactly one known key —
+ * not a general-purpose "backfill whatever needs it" tool. That is a deliberate safety property,
+ * not a limitation to work around: there is no flag or code path that selects rows by a query
+ * rather than by an explicit, pre-validated id supplied on the command line.
+ *
  * NOT part of the request-serving code path. Never imported by `index.ts` or anything else the
  * running Express server's module graph reaches — its presence in a deploy is inert. As a second,
  * redundant safety net, this file also refuses to do anything unless invoked directly as the
@@ -13,6 +19,16 @@
  * Manual, one-off, idempotent, concurrency-safe, safe to interrupt and rerun, structurally
  * incapable of writing or clearing plaintext, and halts on the first verification failure rather
  * than continuing past it. Defaults to a dry run — no `--apply` flag means no writes, ever.
+ *
+ * Before running this for real, verify the two Phase 1 check constraints exist by hand (this
+ * script cannot verify them itself — see "Constraints attestation" below):
+ *
+ *   select conname from pg_constraint
+ *   where conrelid = 'public.plaid_items'::regclass
+ *     and conname in ('plaid_items_token_present', 'plaid_items_encrypted_token_complete');
+ *
+ * Both names must come back. Only after confirming this by hand does `--constraints-confirmed
+ * PLAID_PHASE1_CONSTRAINTS_VERIFIED` become an honest attestation rather than a rubber stamp.
  */
 
 import { supabaseAdmin } from '../config/supabase';
@@ -29,14 +45,22 @@ import {
   type EncryptedAccessToken,
 } from '../services/tokenEncryption';
 import { verifyAccessTokenLive } from '../services/plaidService';
-import { summarizeErrorSafely } from '../services/errorSanitizer';
+
+// ---- Constants locking this script to the one operation it exists for -------------------------
 
 const CONFIRM_TOKEN = 'BACKFILL_PLAID_TOKENS';
+const CONSTRAINTS_ATTESTATION_TOKEN = 'PLAID_PHASE1_CONSTRAINTS_VERIFIED';
 const EXPECTED_CURRENT_KEY_ID = 'RAILWAY_PROD_V1';
-const CONSTRAINT_TOKEN_PRESENT = 'plaid_items_token_present';
-const CONSTRAINT_ENCRYPTED_COMPLETE = 'plaid_items_encrypted_token_complete';
+const EXPECTED_ENC_VERSION = 1; // mirrors tokenEncryption.ts's own (unexported) ENC_VERSION
+const REQUIRED_EXPECTED_TOTAL = 3;
+const REQUIRED_EXPECTED_PLAID_ENV = 'sandbox';
+const REQUIRED_TARGET_COUNT = 2;
 const TRANSIENT_RETRY_LIMIT = 3;
 const TRANSIENT_RETRY_BASE_DELAY_MS = 500;
+
+// RFC 4122-shaped UUID (version 1-5, variant 8/9/a/b) — matches what `crypto.randomUUID()`
+// (used by `insertPlaidItem` for every `plaid_items.id`) actually produces.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const TOKEN_ROW_COLUMNS =
   'id, access_token, access_token_ciphertext, access_token_nonce, access_token_auth_tag, access_token_key_id, access_token_enc_version';
@@ -53,11 +77,10 @@ interface TokenRow {
 
 // ---- Structured, allow-listed logging (§22 "Logging") ----------------------------------------
 //
-// Every log line is built from exactly these three named fields — never a spread of a row, a raw
-// error, or `process.env`. Deliberately stricter than the rest of this codebase (which does log
-// the *external* Plaid item_id in a couple of places, e.g. webhookController.ts): this script
-// never logs it at all, since it has no operational need to here and the smaller allow-list is
-// easy to audit in isolation.
+// Every log line is built from exactly these three named fields, and `outcome` is always a fixed
+// code from a small enum — never free text, never a raw error message, never an unrecognized CLI
+// argument echoed back. `id` is only ever a value already proven to be a canonical UUID (validated
+// at parse time, or read back from a row keyed by one) — nothing else is ever logged as `id`.
 
 interface LogFields {
   id?: string;
@@ -77,11 +100,6 @@ export function logEntry(fields: LogFields): void {
 }
 
 // ---- Three separate concepts (§22) ------------------------------------------------------------
-//
-// Target identity (a `plaid_items.id`) is supplied explicitly by the caller and never discovered
-// by a broad query. Storage state is always read fresh from the database — never cached across
-// an invocation, and never treated as a proxy for verification result. Verification result is
-// always computed fresh too, every invocation, for every target, regardless of storage state.
 
 export type StorageState =
   | { kind: 'plaintext_only' }
@@ -110,9 +128,6 @@ export function classifyStorageState(row: TokenRow): StorageState {
   if (encCount === 0) {
     return row.access_token === null ? { kind: 'missing_both' } : { kind: 'plaintext_only' };
   }
-  // Shouldn't be reachable given the plaid_items_encrypted_token_complete check constraint, but
-  // detected explicitly rather than assumed impossible — see the constraint-existence preflight
-  // check below, which is exactly what's meant to prevent this from ever being reachable.
   return { kind: 'partial' };
 }
 
@@ -126,177 +141,299 @@ export interface ParsedArgs {
   confirm: string | null;
 }
 
-export class ArgError extends Error {}
+export type ArgErrorCode =
+  | 'unrecognized_argument'
+  | 'repeated_flag'
+  | 'missing_flag_value'
+  | 'target_ids_required'
+  | 'target_ids_wrong_count'
+  | 'target_ids_duplicate'
+  | 'target_ids_malformed'
+  | 'expected_total_required'
+  | 'expected_total_invalid'
+  | 'expected_plaid_env_required'
+  | 'expected_plaid_env_invalid'
+  | 'constraints_confirmed_required'
+  | 'constraints_confirmed_invalid'
+  | 'apply_requires_confirm';
+
+export class ArgError extends Error {
+  code: ArgErrorCode;
+  constructor(code: ArgErrorCode, message: string) {
+    // `message` is for a human operator reading direct script/stderr output only — the
+    // structured log (main()'s catch) uses `code` exclusively, never this message.
+    super(message);
+    this.code = code;
+  }
+}
+
+const KNOWN_FLAGS = ['target-ids', 'expected-total', 'expected-plaid-env', 'constraints-confirmed', 'confirm', 'apply'];
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const opts: Record<string, string | true> = {};
+  const seen = new Set<string>();
+
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    let key: string;
+    let value: string | true;
+
     if (arg === '--apply') {
-      opts.apply = true;
-      continue;
+      key = 'apply';
+      value = true;
+    } else {
+      if (!arg.startsWith('--')) {
+        throw new ArgError('unrecognized_argument', 'Unrecognized argument.');
+      }
+      key = arg.slice(2);
+      const raw = argv[i + 1];
+      if (raw === undefined || raw.startsWith('--')) {
+        throw new ArgError('missing_flag_value', `Missing value for --${key}.`);
+      }
+      value = raw;
+      i++;
     }
-    if (!arg.startsWith('--')) {
-      throw new ArgError(`Unrecognized argument: ${arg}`);
+
+    if (!KNOWN_FLAGS.includes(key)) {
+      throw new ArgError('unrecognized_argument', 'Unrecognized argument.');
     }
-    const key = arg.slice(2);
-    const value = argv[i + 1];
-    if (value === undefined || value.startsWith('--')) {
-      throw new ArgError(`Missing value for --${key}.`);
+    if (seen.has(key)) {
+      throw new ArgError('repeated_flag', `--${key} was supplied more than once.`);
     }
+    seen.add(key);
     opts[key] = value;
-    i++;
   }
 
   const targetIdsRaw = opts['target-ids'];
   if (typeof targetIdsRaw !== 'string' || targetIdsRaw.trim() === '') {
-    throw new ArgError('--target-ids is required: a comma-separated list of exact plaid_items.id values.');
+    throw new ArgError('target_ids_required', '--target-ids is required: a comma-separated list of exact plaid_items.id values.');
   }
   const targetIds = targetIdsRaw
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  if (targetIds.length === 0) {
-    throw new ArgError('--target-ids must name at least one row.');
+  if (targetIds.length !== REQUIRED_TARGET_COUNT) {
+    throw new ArgError('target_ids_wrong_count', `--target-ids must name exactly ${REQUIRED_TARGET_COUNT} rows.`);
   }
   if (new Set(targetIds).size !== targetIds.length) {
-    throw new ArgError('--target-ids contains a duplicate id.');
+    throw new ArgError('target_ids_duplicate', '--target-ids contains a duplicate id.');
+  }
+  for (const id of targetIds) {
+    if (!UUID_RE.test(id)) {
+      // Deliberately never echoes the malformed value itself.
+      throw new ArgError('target_ids_malformed', 'One or more --target-ids values is not a canonical UUID.');
+    }
   }
 
   const expectedTotalRaw = opts['expected-total'];
   if (typeof expectedTotalRaw !== 'string') {
-    throw new ArgError('--expected-total is required.');
+    throw new ArgError('expected_total_required', '--expected-total is required.');
   }
-  const expectedTotal = Number(expectedTotalRaw);
-  if (!Number.isInteger(expectedTotal) || expectedTotal < 0) {
-    throw new ArgError('--expected-total must be a non-negative integer.');
+  if (expectedTotalRaw !== String(REQUIRED_EXPECTED_TOTAL)) {
+    throw new ArgError('expected_total_invalid', `--expected-total must be exactly ${REQUIRED_EXPECTED_TOTAL}.`);
   }
 
-  const expectedPlaidEnv = opts['expected-plaid-env'];
-  if (typeof expectedPlaidEnv !== 'string' || expectedPlaidEnv.trim() === '') {
-    throw new ArgError('--expected-plaid-env is required.');
+  const expectedPlaidEnvRaw = opts['expected-plaid-env'];
+  if (typeof expectedPlaidEnvRaw !== 'string') {
+    throw new ArgError('expected_plaid_env_required', '--expected-plaid-env is required.');
+  }
+  if (expectedPlaidEnvRaw !== REQUIRED_EXPECTED_PLAID_ENV) {
+    throw new ArgError('expected_plaid_env_invalid', `--expected-plaid-env must be exactly "${REQUIRED_EXPECTED_PLAID_ENV}".`);
+  }
+
+  const constraintsConfirmedRaw = opts['constraints-confirmed'];
+  if (typeof constraintsConfirmedRaw !== 'string') {
+    throw new ArgError('constraints_confirmed_required', '--constraints-confirmed is required.');
+  }
+  if (constraintsConfirmedRaw !== CONSTRAINTS_ATTESTATION_TOKEN) {
+    throw new ArgError('constraints_confirmed_invalid', `--constraints-confirmed must be exactly ${CONSTRAINTS_ATTESTATION_TOKEN}.`);
   }
 
   const apply = opts.apply === true;
-  const confirm = typeof opts.confirm === 'string' ? opts.confirm : null;
-
-  if (apply && confirm !== CONFIRM_TOKEN) {
-    throw new ArgError(`--apply requires --confirm ${CONFIRM_TOKEN} (exact match) to also be present.`);
+  const confirmRaw = opts.confirm;
+  if (apply && (typeof confirmRaw !== 'string' || confirmRaw !== CONFIRM_TOKEN)) {
+    throw new ArgError('apply_requires_confirm', `--apply requires --confirm ${CONFIRM_TOKEN} (exact match).`);
   }
 
-  return { targetIds, expectedTotal, expectedPlaidEnv, apply, confirm };
+  return {
+    targetIds,
+    expectedTotal: REQUIRED_EXPECTED_TOTAL,
+    expectedPlaidEnv: REQUIRED_EXPECTED_PLAID_ENV,
+    apply,
+    confirm: typeof confirmRaw === 'string' ? confirmRaw : null,
+  };
 }
 
-// ---- Preflight (§22 "Command-line interface" / "Preflight") -----------------------------------
+// ---- Preflight (§22 "Preflight") ---------------------------------------------------------------
 //
 // Runs identically for dry-run and apply — apply is "dry-run, plus writes if it passes," not a
 // separate, less-checked path. Nothing here writes anything.
 
+export type PreflightFailureCode =
+  | 'unexpected_plaid_environment'
+  | 'key_ring_unavailable'
+  | 'unexpected_current_key_id'
+  | 'plaid_items_read_failed'
+  | 'unexpected_total_count'
+  | 'target_not_found'
+  | 'partial_or_missing_representation'
+  | 'unexpected_plaintext_only_row'
+  | 'non_target_not_encrypted'
+  | 'unexpected_encrypted_only_row'
+  | 'unexpected_key_id'
+  | 'unexpected_enc_version';
+
 export interface PreflightResult {
   ok: boolean;
-  failures: string[];
+  failures: PreflightFailureCode[];
   targetStates: Map<string, StorageState>;
 }
 
-async function checkPhase1ConstraintsExist(): Promise<{ ok: boolean; detail: string }> {
-  // Best-effort and deliberately fails closed: PostgREST only exposes information_schema if the
-  // project's exposed-schema configuration includes it, which this script has no way to guarantee
-  // from the client side without adding a new database function — itself a Supabase schema
-  // change, out of scope for a read-only preflight check. If this query fails for *any* reason
-  // (schema not exposed, permission denied, network error), we do NOT assume the constraints are
-  // fine — we report the check as failed and ask for manual confirmation instead, exactly like
-  // every other unverifiable safety check in this script.
-  try {
-    const { data, error } = await supabaseAdmin
-      .from('information_schema.table_constraints')
-      .select('constraint_name')
-      .eq('table_name', 'plaid_items')
-      .in('constraint_name', [CONSTRAINT_TOKEN_PRESENT, CONSTRAINT_ENCRYPTED_COMPLETE]);
-    if (error) throw error;
-    const found = new Set((data ?? []).map((r: { constraint_name: string }) => r.constraint_name));
-    const missing = [CONSTRAINT_TOKEN_PRESENT, CONSTRAINT_ENCRYPTED_COMPLETE].filter((c) => !found.has(c));
-    if (missing.length > 0) {
-      return { ok: false, detail: `Missing expected Phase 1 constraint(s): ${missing.join(', ')}.` };
-    }
-    return { ok: true, detail: 'Both Phase 1 constraints confirmed present.' };
-  } catch {
-    return {
-      ok: false,
-      detail:
-        'Unable to verify Phase 1 constraints via the Supabase REST API (information_schema may not be exposed to this client). Confirm manually before proceeding.',
-    };
-  }
-}
-
 export async function runPreflight(args: ParsedArgs): Promise<PreflightResult> {
-  const failures: string[] = [];
+  const failures: PreflightFailureCode[] = [];
   const targetStates = new Map<string, StorageState>();
 
   if (env.plaidEnv !== args.expectedPlaidEnv) {
-    failures.push(`Expected Plaid environment "${args.expectedPlaidEnv}", configured environment is "${env.plaidEnv}".`);
+    failures.push('unexpected_plaid_environment');
   }
 
-  let currentKeyId: string;
+  let currentKeyId = '';
   try {
     currentKeyId = getKeyRing().currentKeyId;
-  } catch (err) {
-    failures.push(`Unable to load the encryption key ring: ${summarizeErrorSafely(err).message}`);
-    currentKeyId = '';
+  } catch {
+    failures.push('key_ring_unavailable');
   }
   if (currentKeyId && currentKeyId !== EXPECTED_CURRENT_KEY_ID) {
-    failures.push(`Expected current key id "${EXPECTED_CURRENT_KEY_ID}", configured current key id is "${currentKeyId}".`);
+    failures.push('unexpected_current_key_id');
   }
 
   const { data: allRows, error: fetchError } = await supabaseAdmin.from('plaid_items').select(TOKEN_ROW_COLUMNS);
   if (fetchError) {
-    failures.push(`Unable to read plaid_items: ${fetchError.message}`);
+    failures.push('plaid_items_read_failed');
     return { ok: false, failures, targetStates };
   }
   const rows = (allRows ?? []) as TokenRow[];
 
   if (rows.length !== args.expectedTotal) {
-    failures.push(`Expected total plaid_items count ${args.expectedTotal}, found ${rows.length}.`);
+    failures.push('unexpected_total_count');
   }
 
+  const targetIdSet = new Set(args.targetIds);
   let anyPartialOrMissing = false;
-  let anyEncryptedOnly = false;
+  let anyUnexpectedPlaintextOnly = false;
+  let anyEncryptedOnlyRow = false;
+  let anyUnexpectedKeyId = false;
+  let anyUnexpectedVersion = false;
+  let nonTargetRowCount = 0;
+  let nonTargetEncryptedCount = 0;
+
   for (const row of rows) {
     const state = classifyStorageState(row);
+    const isTarget = targetIdSet.has(row.id);
+    if (isTarget) targetStates.set(row.id, state);
+
     if (state.kind === 'partial' || state.kind === 'missing_both') anyPartialOrMissing = true;
-    if (state.kind === 'encrypted' && !state.plaintextAlsoPresent) anyEncryptedOnly = true;
-  }
-  if (anyPartialOrMissing) {
-    failures.push('At least one plaid_items row has a partial or missing token representation.');
-  }
-  if (anyEncryptedOnly) {
-    // The documented data-level proxy for "Phase 2b hasn't begun yet" (§22): this *infers*
-    // Phase 2a is still the deployed write behavior from the absence of any encrypted-only row —
-    // it does not, and cannot, directly inspect the deployed server's source code.
-    failures.push(
-      'At least one plaid_items row is already encrypted-only (no plaintext). This is the data-level signal that Phase 2b may already be active — stop and confirm before proceeding, since this proposal assumes Phase 2a dual-write is still the deployed behavior.'
-    );
+    if (state.kind === 'plaintext_only' && !isTarget) anyUnexpectedPlaintextOnly = true;
+    if (state.kind === 'encrypted') {
+      if (!state.plaintextAlsoPresent) anyEncryptedOnlyRow = true;
+      if (state.keyId !== EXPECTED_CURRENT_KEY_ID) anyUnexpectedKeyId = true;
+      if (state.encVersion !== EXPECTED_ENC_VERSION) anyUnexpectedVersion = true;
+    }
+
+    if (!isTarget) {
+      nonTargetRowCount++;
+      if (state.kind === 'encrypted') nonTargetEncryptedCount++;
+    }
   }
 
-  const rowsById = new Map(rows.map((r) => [r.id, r]));
+  if (anyPartialOrMissing) failures.push('partial_or_missing_representation');
+  if (anyUnexpectedPlaintextOnly) failures.push('unexpected_plaintext_only_row');
+  if (anyEncryptedOnlyRow) failures.push('unexpected_encrypted_only_row');
+  if (anyUnexpectedKeyId) failures.push('unexpected_key_id');
+  if (anyUnexpectedVersion) failures.push('unexpected_enc_version');
+  // Every row that isn't a supplied target must already be fully (dual-write) encrypted — the
+  // one-non-target-row shape this script is locked to (§22 point 3). Skipped when there's no
+  // non-target row at all (already caught by the total-count check above in that case).
+  if (nonTargetRowCount > 0 && nonTargetEncryptedCount !== nonTargetRowCount) {
+    failures.push('non_target_not_encrypted');
+  }
+
   for (const id of args.targetIds) {
-    const row = rowsById.get(id);
-    if (!row) {
-      failures.push(`Target ${id} was not found.`);
-      continue;
-    }
-    const state = classifyStorageState(row);
-    targetStates.set(id, state);
-    if (row.access_token === null) {
-      failures.push(`Target ${id} has no plaintext present — cannot verify against it.`);
-    }
-  }
-
-  const constraintCheck = await checkPhase1ConstraintsExist();
-  if (!constraintCheck.ok) {
-    failures.push(constraintCheck.detail);
+    if (!rows.some((r) => r.id === id)) failures.push('target_not_found');
   }
 
   return { ok: failures.length === 0, failures, targetStates };
+}
+
+// ---- Final global postflight (§22 point 7) -----------------------------------------------------
+
+export type PostflightFailureCode =
+  | 'plaid_items_read_failed'
+  | 'unexpected_total_count'
+  | 'unexpected_encrypted_count'
+  | 'plaintext_only_remaining'
+  | 'plaintext_missing_items'
+  | 'partial_encrypted_items'
+  | 'unexpected_key_id'
+  | 'unexpected_enc_version'
+  | 'duplicate_nonce'
+  | 'plaintext_missing_after_backfill';
+
+export interface PostflightResult {
+  ok: boolean;
+  failures: PostflightFailureCode[];
+}
+
+/** Reread everything, from scratch, after every target has individually verified — a successful
+ *  apply run means both "every supplied target verified this invocation" AND "the whole table's
+ *  integrity holds," not just the former. */
+export async function runPostflight(expectedTotal: number): Promise<PostflightResult> {
+  const failures: PostflightFailureCode[] = [];
+  const { data: allRows, error } = await supabaseAdmin.from('plaid_items').select(TOKEN_ROW_COLUMNS);
+  if (error) {
+    failures.push('plaid_items_read_failed');
+    return { ok: false, failures };
+  }
+  const rows = (allRows ?? []) as TokenRow[];
+
+  if (rows.length !== expectedTotal) failures.push('unexpected_total_count');
+
+  let encryptedCount = 0;
+  let plaintextOnlyCount = 0;
+  let missingBothCount = 0;
+  let partialCount = 0;
+  let anyUnexpectedKeyId = false;
+  let anyUnexpectedVersion = false;
+  let anyMissingPlaintext = false;
+  const nonces = new Set<string>();
+
+  for (const row of rows) {
+    const state = classifyStorageState(row);
+    if (state.kind === 'encrypted') {
+      encryptedCount++;
+      if (state.keyId !== EXPECTED_CURRENT_KEY_ID) anyUnexpectedKeyId = true;
+      if (state.encVersion !== EXPECTED_ENC_VERSION) anyUnexpectedVersion = true;
+      if (!state.plaintextAlsoPresent) anyMissingPlaintext = true;
+      if (row.access_token_nonce) nonces.add(row.access_token_nonce);
+    } else if (state.kind === 'plaintext_only') {
+      plaintextOnlyCount++;
+    } else if (state.kind === 'missing_both') {
+      missingBothCount++;
+    } else {
+      partialCount++;
+    }
+  }
+
+  if (encryptedCount !== expectedTotal) failures.push('unexpected_encrypted_count');
+  if (plaintextOnlyCount !== 0) failures.push('plaintext_only_remaining');
+  if (missingBothCount !== 0) failures.push('plaintext_missing_items');
+  if (partialCount !== 0) failures.push('partial_encrypted_items');
+  if (anyUnexpectedKeyId) failures.push('unexpected_key_id');
+  if (anyUnexpectedVersion) failures.push('unexpected_enc_version');
+  if (nonces.size !== encryptedCount) failures.push('duplicate_nonce');
+  if (anyMissingPlaintext) failures.push('plaintext_missing_after_backfill');
+
+  return { ok: failures.length === 0, failures };
 }
 
 // ---- Verification helpers ----------------------------------------------------------------------
@@ -307,10 +444,11 @@ async function rereadRow(id: string): Promise<TokenRow | null> {
   return (data as TokenRow | null) ?? null;
 }
 
-/** The guarded conditional update (§22 "Verification model"): `access_token` never appears in
- *  this `set` list — the script is structurally incapable of writing or clearing plaintext, not
- *  merely instructed not to. Returns the number of rows actually affected so the caller can tell
- *  a win from a lost race. */
+/** The guarded conditional update (§22 "Verification model"): updates *only* the five encrypted
+ *  columns — `access_token` never appears here, and neither does `updated_at` — the script is
+ *  structurally incapable of writing or clearing plaintext, or touching anything beyond exactly
+ *  these five columns. Returns the number of rows actually affected so the caller can tell a win
+ *  from a lost race. */
 async function guardedEncryptUpdate(id: string, enc: EncryptedAccessToken): Promise<number> {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
@@ -320,7 +458,6 @@ async function guardedEncryptUpdate(id: string, enc: EncryptedAccessToken): Prom
       access_token_auth_tag: enc.authTagBase64,
       access_token_key_id: enc.keyId,
       access_token_enc_version: enc.encVersion,
-      updated_at: new Date().toISOString(),
     })
     .eq('id', id)
     .is('access_token_key_id', null)
@@ -395,11 +532,11 @@ export async function verifyLiveWithRetry(id: string, accessToken: string, baseD
   }
 }
 
-// ---- Per-target processing (§22 "Resumable processing") ---------------------------------------
+// ---- Per-target processing (§22 "Resumable processing" / point 8 "Improve dry-run usefulness") -
 
 export interface TargetOutcome {
   id: string;
-  outcome: 'verified' | 'skipped_dry_run';
+  outcome: 'verified' | 'dry_run_verified';
 }
 
 export async function processTarget(id: string, apply: boolean): Promise<TargetOutcome> {
@@ -422,23 +559,27 @@ export async function processTarget(id: string, apply: boolean): Promise<TargetO
   let verifyRow = initialRow;
 
   if (initialState.kind === 'plaintext_only') {
-    if (!apply) {
-      logEntry({ id, stage: 'done', outcome: 'skipped_dry_run' });
-      return { id, outcome: 'skipped_dry_run' };
-    }
-
-    logEntry({ id, stage: 'encrypt', outcome: 'started' });
+    // Local crypto exercise — runs for dry-run and apply alike, and writes nothing: proves the
+    // encrypt/decrypt round trip works for this exact plaintext + row id before anything is
+    // persisted (§22 point 8).
+    logEntry({ id, stage: 'local_crypto_check', outcome: 'started' });
     const keyRing = getKeyRing();
     const enc = encryptAccessToken(plaintextForCompare, keyRing, id);
-
-    // Local precheck: decrypt what we're about to write and compare it to the plaintext we hold
-    // in memory, *before* it ever reaches the database — defense in depth against a same-process
-    // crypto bug, never a substitute for the mandatory post-write, database-stored-ciphertext
-    // verification below.
-    const localCheck = decryptAccessToken(enc, keyRing, id);
-    if (localCheck !== plaintextForCompare) {
-      logEntry({ id, stage: 'encrypt', outcome: 'failed:local_precheck_mismatch' });
+    const localDecrypted = decryptAccessToken(enc, keyRing, id);
+    if (localDecrypted !== plaintextForCompare) {
+      logEntry({ id, stage: 'local_crypto_check', outcome: 'failed:local_precheck_mismatch' });
       throw new HaltError(id, 'local_precheck_mismatch');
+    }
+
+    // Read-only Plaid liveness check against the *current* plaintext token — runs for dry-run
+    // and apply alike, and (for apply) deliberately happens before any write, so a dead
+    // credential is caught before it's ever encrypted and stored, not only after.
+    logEntry({ id, stage: 'verify_plaid_pre_write', outcome: 'started' });
+    await verifyLiveWithRetry(id, plaintextForCompare);
+
+    if (!apply) {
+      logEntry({ id, stage: 'done', outcome: 'dry_run_verified' });
+      return { id, outcome: 'dry_run_verified' };
     }
 
     logEntry({ id, stage: 'write', outcome: 'started' });
@@ -446,7 +587,7 @@ export async function processTarget(id: string, apply: boolean): Promise<TargetO
     logEntry({ id, stage: 'write', outcome: affected === 1 ? 'committed' : 'lost_race' });
 
     // Whether we won or lost the race, always reread the database's own current value — the
-    // local `enc` object computed above is never itself the thing that gets verified.
+    // local `enc` object computed above is never itself the thing that gets verified next.
     const rereadAfterWrite = await rereadRow(id);
     if (!rereadAfterWrite) throw new HaltError(id, 'target_not_found_after_write');
     verifyRow = rereadAfterWrite;
@@ -461,6 +602,22 @@ export async function processTarget(id: string, apply: boolean): Promise<TargetO
   // From here on, every target — freshly encrypted just now, already encrypted from a prior run,
   // or the winner of a lost race above — goes through the exact same, unconditional verification.
   // A non-null access_token_key_id is never itself treated as proof a previous run verified it.
+  const currentState = classifyStorageState(verifyRow);
+  if (currentState.kind === 'encrypted') {
+    // This one-off backfill is locked to one known-good key/version — historical-key support
+    // stays in the general crypto layer (tokenEncryption.ts), but this script rejects anything
+    // else outright, even a self-consistent, genuinely decryptable representation under a
+    // different key or version (§22 point 4).
+    if (currentState.keyId !== EXPECTED_CURRENT_KEY_ID) {
+      logEntry({ id, stage: 'verify_state_check', outcome: 'failed:unexpected_key_id' });
+      throw new HaltError(id, 'unexpected_key_id');
+    }
+    if (currentState.encVersion !== EXPECTED_ENC_VERSION) {
+      logEntry({ id, stage: 'verify_state_check', outcome: 'failed:unexpected_enc_version' });
+      throw new HaltError(id, 'unexpected_enc_version');
+    }
+  }
+
   logEntry({ id, stage: 'verify_decrypt', outcome: 'started' });
   const enc: EncryptedAccessToken = {
     ciphertextBase64: verifyRow.access_token_ciphertext as string,
@@ -505,7 +662,7 @@ let interruptRequested = false;
 function installSignalHandlers(): void {
   const onSignal = (signal: string) => {
     interruptRequested = true;
-    logEntry({ stage: 'signal', outcome: `received:${signal}` });
+    logEntry({ stage: 'signal', outcome: `received_${signal.toLowerCase()}` });
   };
   process.on('SIGINT', () => onSignal('SIGINT'));
   process.on('SIGTERM', () => onSignal('SIGTERM'));
@@ -523,7 +680,8 @@ export async function main(argv: string[]): Promise<number> {
   try {
     args = parseArgs(argv);
   } catch (err) {
-    logEntry({ stage: 'startup', outcome: `failed:${err instanceof Error ? err.message : 'invalid_arguments'}` });
+    const code = err instanceof ArgError ? err.code : 'invalid_arguments';
+    logEntry({ stage: 'startup', outcome: `failed:${code}` });
     return 1;
   }
 
@@ -541,9 +699,8 @@ export async function main(argv: string[]): Promise<number> {
   logEntry({ stage: 'preflight', outcome: 'passed' });
 
   // Every target is processed on every invocation, dry-run or apply — dry-run still fully
-  // rereads and reverifies any target that's already encrypted (read-only: `processTarget`'s own
-  // `apply` flag governs whether it's allowed to write anything, not whether it verifies). Only
-  // a plaintext-only target's *encryption* step is apply-gated.
+  // rereads and reverifies any target that's already encrypted, and now also exercises the local
+  // crypto path + a read-only Plaid check for a still-plaintext target (§22 point 8).
   for (const id of args.targetIds) {
     if (interruptRequested) {
       logEntry({ id, stage: 'run', outcome: 'interrupted' });
@@ -555,7 +712,7 @@ export async function main(argv: string[]): Promise<number> {
       if (err instanceof HaltError) {
         logEntry({ id: err.targetId, stage: 'run', outcome: `halted:${err.reason}` });
       } else {
-        logEntry({ id, stage: 'run', outcome: `halted:${summarizeErrorSafely(err).name}` });
+        logEntry({ id, stage: 'run', outcome: 'halted:unexpected_error' });
       }
       return 1;
     }
@@ -566,7 +723,24 @@ export async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
-  logEntry({ stage: 'done', outcome: args.apply ? 'all_targets_verified' : 'dry_run_complete' });
+  if (!args.apply) {
+    logEntry({ stage: 'done', outcome: 'dry_run_complete' });
+    return 0;
+  }
+
+  // A successful apply exit means every supplied target verified *this* invocation AND the
+  // whole table's integrity holds afterward — not just the former (§22 point 7).
+  logEntry({ stage: 'postflight', outcome: 'started' });
+  const postflight = await runPostflight(args.expectedTotal);
+  for (const failure of postflight.failures) {
+    logEntry({ stage: 'postflight', outcome: `failed:${failure}` });
+  }
+  if (!postflight.ok) {
+    logEntry({ stage: 'postflight', outcome: 'failed' });
+    return 1;
+  }
+
+  logEntry({ stage: 'done', outcome: 'all_targets_verified_and_postflight_passed' });
   return 0;
 }
 
@@ -576,8 +750,8 @@ if (require.main === module) {
     .then((code) => {
       process.exitCode = code;
     })
-    .catch((err) => {
-      logEntry({ stage: 'fatal', outcome: `failed:${summarizeErrorSafely(err).name}` });
+    .catch(() => {
+      logEntry({ stage: 'fatal', outcome: 'failed:unexpected_error' });
       process.exitCode = 1;
     });
 }
