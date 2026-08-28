@@ -83,6 +83,87 @@ describe('loadKeyRing', () => {
   });
 });
 
+describe('loadKeyRing — strict canonical Base64 validation (round-trip check)', () => {
+  // Node's Buffer.from(str, 'base64') is permissive: it silently skips whitespace and any
+  // character outside the base64 alphabet, and tolerates missing/extra padding, rather than
+  // rejecting any of it. A decoded-length check alone can't distinguish a canonical, correctly-
+  // formed value from one of those malformed-but-still-decodes cases — these tests exercise the
+  // decoded.toString('base64') === value round-trip check that catches all of them.
+
+  it('accepts a valid 32-byte canonical Base64 key exactly as randomBytes(32).toString("base64") produces it', () => {
+    expect(() => loadKeyRing(fixtureEnv())).not.toThrow();
+  });
+
+  it('rejects a value containing characters outside the base64 alphabet', () => {
+    const invalidChars = `${VALID_KEY_B64.slice(0, -1)}!`;
+    expect(() => loadKeyRing(fixtureEnv({ PLAID_TOKEN_KEY_TEST_V1: invalidChars }))).toThrow(
+      InvalidKeyConfigurationError
+    );
+  });
+
+  it('rejects a value with embedded whitespace, even though Node would otherwise decode around it', () => {
+    const withWhitespace = `${VALID_KEY_B64.slice(0, 10)} ${VALID_KEY_B64.slice(10)}`;
+    expect(() => loadKeyRing(fixtureEnv({ PLAID_TOKEN_KEY_TEST_V1: withWhitespace }))).toThrow(
+      InvalidKeyConfigurationError
+    );
+  });
+
+  it('rejects truncated Base64 (missing trailing padding)', () => {
+    // A 32-byte value's canonical encoding always ends in exactly one '=' pad character —
+    // stripping it is a truncation Node's decoder would otherwise silently tolerate.
+    expect(VALID_KEY_B64.endsWith('=')).toBe(true);
+    const truncated = VALID_KEY_B64.slice(0, -1);
+    expect(() => loadKeyRing(fixtureEnv({ PLAID_TOKEN_KEY_TEST_V1: truncated }))).toThrow(
+      InvalidKeyConfigurationError
+    );
+  });
+
+  it('rejects a value with extra trailing characters beyond the correct encoded length', () => {
+    const withExtra = `${VALID_KEY_B64}AB`;
+    expect(() => loadKeyRing(fixtureEnv({ PLAID_TOKEN_KEY_TEST_V1: withExtra }))).toThrow(
+      InvalidKeyConfigurationError
+    );
+  });
+
+  it('rejects valid, canonical Base64 that decodes to the wrong length (16 bytes, not 32)', () => {
+    const sixteenByteKey = randomBytes(16).toString('base64');
+    expect(() => loadKeyRing(fixtureEnv({ PLAID_TOKEN_KEY_TEST_V1: sixteenByteKey }))).toThrow(
+      InvalidKeyConfigurationError
+    );
+  });
+
+  it('rejects a non-canonical (base64url-alphabet) representation of otherwise-valid bytes', () => {
+    // Bytes chosen deterministically (not random) so the standard encoding is guaranteed to
+    // contain '/' characters — 0xff 0xff 0xff encodes to "////" under standard base64, letting
+    // this test reliably construct a base64url variant ('_' in place of '/') without depending
+    // on chance.
+    const knownBytes = Buffer.concat([Buffer.from([0xff, 0xff, 0xff]), Buffer.alloc(29, 0)]);
+    const canonical = knownBytes.toString('base64');
+    expect(canonical).toContain('/');
+    const base64UrlVariant = canonical.replace(/\//g, '_');
+    expect(() => loadKeyRing(fixtureEnv({ PLAID_TOKEN_KEY_TEST_V1: base64UrlVariant }))).toThrow(
+      InvalidKeyConfigurationError
+    );
+  });
+
+  it('never includes the key value itself in the thrown error message for any of the above', () => {
+    const cases = [
+      `${VALID_KEY_B64.slice(0, -1)}!`,
+      `${VALID_KEY_B64.slice(0, 10)} ${VALID_KEY_B64.slice(10)}`,
+      VALID_KEY_B64.slice(0, -1),
+      `${VALID_KEY_B64}AB`,
+    ];
+    for (const badValue of cases) {
+      try {
+        loadKeyRing(fixtureEnv({ PLAID_TOKEN_KEY_TEST_V1: badValue }));
+        throw new Error('expected loadKeyRing to throw');
+      } catch (err) {
+        expect((err as Error).message).not.toContain(badValue);
+      }
+    }
+  });
+});
+
 describe('encryptAccessToken / decryptAccessToken round trip', () => {
   it('decrypts back to the original plaintext, through the full Base64 EncryptedAccessToken shape', () => {
     const ring = fixtureKeyRing();

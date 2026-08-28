@@ -121,6 +121,16 @@ export function loadKeyRing(source: NodeJS.ProcessEnv = process.env): KeyRing {
     if (!name.startsWith(KEY_ENV_PREFIX) || !value) continue;
     const keyId = name.slice(KEY_ENV_PREFIX.length);
     const decoded = Buffer.from(value, 'base64');
+    // Node's base64 decoder is permissive — it silently skips whitespace and any character
+    // outside the base64 alphabet, and tolerates missing/extra padding, rather than rejecting
+    // any of that. A decoded-length check alone can't tell a canonical, correctly-formed value
+    // from one of those malformed-but-still-decodes cases. Re-encoding and comparing back against
+    // the original string is what actually proves the configured value *is* the canonical base64
+    // this app generates (`randomBytes(32).toString('base64')`) — anything the decoder had to
+    // silently tolerate re-encodes to something different, and fails this check.
+    if (decoded.toString('base64') !== value) {
+      throw new InvalidKeyConfigurationError(`Encryption key "${keyId}" is not valid canonical Base64.`);
+    }
     if (decoded.length !== KEY_LENGTH_BYTES) {
       throw new InvalidKeyConfigurationError(
         `Encryption key "${keyId}" must decode to exactly ${KEY_LENGTH_BYTES} bytes.`
