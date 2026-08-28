@@ -113,10 +113,19 @@ function cohort(tartanState: 'v1' | 'v2' = 'v1'): FakeRow[] {
 
 function setupFakeSupabase(
   initialRows: FakeRow[],
-  opts: { onBeforeUpdateFilter?: (rows: FakeRow[]) => void; forceZeroAffectedUpdate?: boolean } = {}
+  opts: {
+    onBeforeUpdateFilter?: (rows: FakeRow[]) => void;
+    forceZeroAffectedUpdate?: boolean;
+    /** Fires immediately before each `.maybeSingle()` resolves, with a 1-based call count — lets
+     *  a test mutate the fake table's state *between* two separate rereads within one invocation
+     *  (e.g. simulating the row changing between the already-V2 fast path's initial read and its
+     *  mandatory fresh reread, immediately before `verifyStoredV2` is called on it). */
+    onBeforeMaybeSingle?: (rows: FakeRow[], callNumber: number) => void;
+  } = {}
 ) {
   const rows = initialRows.map((r) => ({ ...r }));
   let updateCallCount = 0;
+  let maybeSingleCallCount = 0;
   const updatePayloads: Record<string, unknown>[] = [];
   const updateFilters: { eq: Record<string, unknown>; notNull: string[] }[] = [];
 
@@ -151,6 +160,8 @@ function setupFakeSupabase(
         return chain;
       },
       maybeSingle: async () => {
+        maybeSingleCallCount++;
+        opts.onBeforeMaybeSingle?.(rows, maybeSingleCallCount);
         const found = matches();
         return { data: found[0] ?? null, error: null };
       },
@@ -540,6 +551,102 @@ describe('rotateTartan — resume/crash behavior', () => {
     expect(mockVerifyAccessTokenLive).toHaveBeenCalledTimes(2);
   });
 
+  // Codex re-audit regression (blocking): the already-V2 fast path's initial read was classified
+  // clean, but the *mandatory fresh reread* right before verifyStoredV2() was never itself
+  // reclassified — so if the row changed between those two reads, verification would run against
+  // whatever the fresh row actually was, decrypt successfully under its own stored key/version,
+  // and incorrectly report `verified`. verifyStoredV2() now enforces this invariant itself,
+  // independent of what the caller already believed about the row.
+  describe('the mandatory fresh reread before verifyStoredV2() is independently reclassified, not trusted from the initial read', () => {
+    const plaintext = 'tartan-secret';
+
+    it('initial read V2, fresh reread has reverted to V1: fails closed, zero writes, never verified', async () => {
+      const stillV1 = encryptedRow(TARTAN_ID, plaintext, { keyRing: V1_KEY_RING });
+      const fake = setupFakeSupabase([encryptedRow(TARTAN_ID, plaintext, { keyRing: TEST_KEY_RING })], {
+        onBeforeMaybeSingle: (rows, callNumber) => {
+          if (callNumber === 2) {
+            const row = rows.find((r) => r.id === TARTAN_ID);
+            if (row) Object.assign(row, stillV1);
+          }
+        },
+      });
+      const { entries } = captureLogs();
+      await expect(rotateTartan(TARTAN_ID, true)).rejects.toMatchObject({ reason: 'still_v1_in_stored_state' });
+      expect(fake.getUpdateCallCount()).toBe(0);
+      expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
+      expect(entries.some((e) => e.outcome === 'rotation_complete')).toBe(false);
+    });
+
+    it('initial read V2/version 1, fresh reread has V2 at the wrong version: fails closed, zero writes, never verified', async () => {
+      const wrongVersion = encryptedRow(TARTAN_ID, plaintext, { keyRing: TEST_KEY_RING, encVersion: 2 });
+      const fake = setupFakeSupabase([encryptedRow(TARTAN_ID, plaintext, { keyRing: TEST_KEY_RING })], {
+        onBeforeMaybeSingle: (rows, callNumber) => {
+          if (callNumber === 2) {
+            const row = rows.find((r) => r.id === TARTAN_ID);
+            if (row) Object.assign(row, wrongVersion);
+          }
+        },
+      });
+      const { entries } = captureLogs();
+      await expect(rotateTartan(TARTAN_ID, true)).rejects.toMatchObject({ reason: 'wrong_version_in_stored_state' });
+      expect(fake.getUpdateCallCount()).toBe(0);
+      expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
+      expect(entries.some((e) => e.outcome === 'rotation_complete')).toBe(false);
+    });
+
+    it('initial read V2, fresh reread has switched to an unrelated third key: fails closed, zero writes, never verified', async () => {
+      const otherKey = encryptedRow(TARTAN_ID, plaintext, { keyRing: OTHER_KEY_RING });
+      const fake = setupFakeSupabase([encryptedRow(TARTAN_ID, plaintext, { keyRing: TEST_KEY_RING })], {
+        onBeforeMaybeSingle: (rows, callNumber) => {
+          if (callNumber === 2) {
+            const row = rows.find((r) => r.id === TARTAN_ID);
+            if (row) Object.assign(row, otherKey);
+          }
+        },
+      });
+      const { entries } = captureLogs();
+      await expect(rotateTartan(TARTAN_ID, true)).rejects.toMatchObject({ reason: 'wrong_key_in_stored_state' });
+      expect(fake.getUpdateCallCount()).toBe(0);
+      expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
+      expect(entries.some((e) => e.outcome === 'rotation_complete')).toBe(false);
+    });
+
+    it('initial read V2, fresh reread has become a partial encrypted representation: fails closed, zero writes, never verified', async () => {
+      const partial = encryptedRow(TARTAN_ID, plaintext, { keyRing: TEST_KEY_RING });
+      partial.access_token_auth_tag = null;
+      const fake = setupFakeSupabase([encryptedRow(TARTAN_ID, plaintext, { keyRing: TEST_KEY_RING })], {
+        onBeforeMaybeSingle: (rows, callNumber) => {
+          if (callNumber === 2) {
+            const row = rows.find((r) => r.id === TARTAN_ID);
+            if (row) Object.assign(row, partial);
+          }
+        },
+      });
+      const { entries } = captureLogs();
+      await expect(rotateTartan(TARTAN_ID, true)).rejects.toMatchObject({ reason: 'partial' });
+      expect(fake.getUpdateCallCount()).toBe(0);
+      expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
+      expect(entries.some((e) => e.outcome === 'rotation_complete')).toBe(false);
+    });
+
+    it('initial read V2, fresh reread is missing plaintext: fails closed, zero writes, never verified', async () => {
+      const missingPlaintext = encryptedRow(TARTAN_ID, plaintext, { keyRing: TEST_KEY_RING, keepPlaintext: false });
+      const fake = setupFakeSupabase([encryptedRow(TARTAN_ID, plaintext, { keyRing: TEST_KEY_RING })], {
+        onBeforeMaybeSingle: (rows, callNumber) => {
+          if (callNumber === 2) {
+            const row = rows.find((r) => r.id === TARTAN_ID);
+            if (row) Object.assign(row, missingPlaintext);
+          }
+        },
+      });
+      const { entries } = captureLogs();
+      await expect(rotateTartan(TARTAN_ID, true)).rejects.toMatchObject({ reason: 'plaintext_missing_in_stored_state' });
+      expect(fake.getUpdateCallCount()).toBe(0);
+      expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
+      expect(entries.some((e) => e.outcome === 'rotation_complete')).toBe(false);
+    });
+  });
+
   it('crash simulation: row already V2 (as if a prior run committed but never verified) is fully verified on this run', async () => {
     const fake = setupFakeSupabase([encryptedRow(TARTAN_ID, 'tartan-secret', { keyRing: TEST_KEY_RING })]);
     captureLogs();
@@ -677,6 +784,24 @@ describe('interruption — mid-flight SIGINT/SIGTERM', () => {
     expect(fake.getUpdateCallCount()).toBe(1); // no second write
   });
 
+  it('signal during the post-write verification\'s Plaid check (write already committed cleanly, interrupt happens after): row stays V2, no success log', async () => {
+    const fake = setupFakeSupabase([encryptedRow(TARTAN_ID, 'tartan-secret', { keyRing: V1_KEY_RING })]);
+    const { entries } = captureLogs();
+    // First call = pre-write check, succeeds normally. Second call = the post-write verification
+    // (verifyStoredV2's own itemGet) — the signal "arrives" while *that* call is in flight.
+    mockVerifyAccessTokenLive.mockResolvedValueOnce(undefined).mockImplementationOnce(async () => {
+      __setInterruptedForTests(true);
+      return undefined;
+    });
+
+    await expect(rotateTartan(TARTAN_ID, true)).rejects.toBeInstanceOf(InterruptedError);
+
+    expect(fake.getUpdateCallCount()).toBe(1); // the write itself already committed, cleanly
+    expect(fake.getRows()[0].access_token_key_id).toBe('RAILWAY_PROD_V2');
+    expect(mockVerifyAccessTokenLive).toHaveBeenCalledTimes(2); // pre-write + the interrupted post-write call
+    expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
+  });
+
   it('signal during a retry sleep: no further retry attempt begins', async () => {
     vi.useFakeTimers();
     mockVerifyAccessTokenLive.mockRejectedValue({ response: { status: 429 } });
@@ -724,13 +849,59 @@ describe('logging — never leaks plaintext, either key, ciphertext, nonce, tag,
   const SENTINEL_PLAINTEXT = 'SENTINEL_TARTAN_PLAINTEXT_zzz';
 
   it('a successful apply run never logs plaintext, ciphertext, nonce, auth tag, or either key’s bytes', async () => {
-    setupFakeSupabase([encryptedRow(TARTAN_ID, SENTINEL_PLAINTEXT, { keyRing: V1_KEY_RING })]);
+    const startingRow = encryptedRow(TARTAN_ID, SENTINEL_PLAINTEXT, { keyRing: V1_KEY_RING });
+    const fake = setupFakeSupabase([startingRow]);
     const { rawLines } = captureLogs();
     await rotateTartan(TARTAN_ID, true);
+    const finalRow = fake.getRows()[0];
     for (const line of rawLines) {
       expect(line).not.toContain(SENTINEL_PLAINTEXT);
       expect(line).not.toContain(TEST_KEY_RING.keys.get('RAILWAY_PROD_V1')!.toString('base64'));
       expect(line).not.toContain(TEST_KEY_RING.keys.get('RAILWAY_PROD_V2')!.toString('base64'));
+      // The original (pre-rotation) V1 ciphertext/nonce/tag, and the freshly-written V2
+      // ciphertext/nonce/tag actually committed — neither ever appears in any log line.
+      expect(line).not.toContain(startingRow.access_token_ciphertext!);
+      expect(line).not.toContain(startingRow.access_token_nonce!);
+      expect(line).not.toContain(startingRow.access_token_auth_tag!);
+      expect(line).not.toContain(finalRow.access_token_ciphertext!);
+      expect(line).not.toContain(finalRow.access_token_nonce!);
+      expect(line).not.toContain(finalRow.access_token_auth_tag!);
+    }
+  });
+
+  it('a rejected Plaid call carrying a full Axios-shaped error object never leaks any of its fields — only the fixed reason code is logged', async () => {
+    // Mirrors errorSanitizer.test.ts's approach, applied to this script's own log call sites:
+    // this script never calls summarizeErrorSafely at all — it only ever logs a fixed reason
+    // string derived from classifyPlaidFailure/classifyDecryptError, so nothing from a raw
+    // Axios/Plaid error object should be able to reach a log line, structurally, regardless of
+    // what that object contains.
+    const SENTINEL_ACCESS_TOKEN = 'SENTINEL_AXIOS_CONFIG_ACCESS_TOKEN_zzz';
+    const SENTINEL_CLIENT_ID = 'SENTINEL_AXIOS_CONFIG_CLIENT_ID_zzz';
+    const SENTINEL_AUTH_HEADER = 'SENTINEL_AXIOS_AUTH_HEADER_zzz';
+    const fakeAxiosError = {
+      message: `Request failed with status code 400`,
+      response: {
+        status: 400,
+        data: { error_code: 'ITEM_LOGIN_REQUIRED', error_type: 'ITEM_ERROR' },
+      },
+      config: {
+        url: 'https://sandbox.plaid.com/item/get',
+        data: JSON.stringify({ access_token: SENTINEL_ACCESS_TOKEN, client_id: SENTINEL_CLIENT_ID }),
+        headers: { Authorization: SENTINEL_AUTH_HEADER },
+      },
+      request: { path: '/item/get' },
+    };
+    setupFakeSupabase([encryptedRow(TARTAN_ID, SENTINEL_PLAINTEXT, { keyRing: V1_KEY_RING })]);
+    mockVerifyAccessTokenLive.mockRejectedValue(fakeAxiosError);
+    const { rawLines } = captureLogs();
+
+    await rotateTartan(TARTAN_ID, true).catch(() => {});
+
+    for (const line of rawLines) {
+      expect(line).not.toContain(SENTINEL_ACCESS_TOKEN);
+      expect(line).not.toContain(SENTINEL_CLIENT_ID);
+      expect(line).not.toContain(SENTINEL_AUTH_HEADER);
+      expect(line).not.toContain('sandbox.plaid.com');
     }
   });
 

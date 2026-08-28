@@ -452,6 +452,34 @@ export interface RotationOutcome {
 }
 
 async function verifyStoredV2(tartanId: string, row: TokenRow, expectedPlaintext: string): Promise<RotationOutcome> {
+  // The invariant boundary this function enforces on its own, independent of anything the caller
+  // already believed about `row`: it never decrypts or reports success against a row it hasn't
+  // itself just confirmed is a complete V2/version-1 dual-write representation. This matters
+  // because the caller's earlier classification can be stale by the time this runs (e.g. the
+  // fresh reread already-V2 resume path classifies once, then rereads again before calling this —
+  // if the row somehow changed in between, the *stale* classification must never be trusted).
+  // decryptAccessToken() only ever attests "these bytes decrypt for the key/version *given*,"
+  // never "this row is on the approved key/version" — that's this check's job, not decrypt's.
+  const state = classifyStorageState(row);
+  if (!isCleanState(state, NEW_KEY_ID)) {
+    let reason: string;
+    if (state.kind === 'partial' || state.kind === 'missing_both') {
+      reason = state.kind;
+    } else if (state.kind === 'plaintext_only') {
+      reason = 'unexpected_plaintext_only_state';
+    } else if (!state.plaintextAlsoPresent) {
+      reason = 'plaintext_missing_in_stored_state';
+    } else if (state.keyId === OLD_KEY_ID) {
+      reason = 'still_v1_in_stored_state';
+    } else if (state.keyId !== NEW_KEY_ID) {
+      reason = 'wrong_key_in_stored_state';
+    } else {
+      reason = 'wrong_version_in_stored_state';
+    }
+    logEntry({ id: tartanId, stage: 'verify_state_check', outcome: `failed:${reason}` });
+    throw new HaltError(tartanId, reason);
+  }
+
   if (row.access_token !== expectedPlaintext) {
     logEntry({ id: tartanId, stage: 'verify_compare', outcome: 'failed:plaintext_mismatch' });
     throw new HaltError(tartanId, 'plaintext_mismatch');
