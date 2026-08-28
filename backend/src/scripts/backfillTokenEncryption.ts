@@ -485,10 +485,19 @@ function isNetworkLikeError(err: unknown): boolean {
 }
 
 /** Only Plaid's `itemGet` call (network) can fail transiently — every other step in this script
- *  is pure local computation with no transient-failure category at all (§22 "Retry policy"). */
+ *  is pure local computation with no transient-failure category at all (§22 "Retry policy").
+ *
+ *  A structured HTTP status, once present, is authoritative and the *only* thing consulted —
+ *  the message-based network heuristic (`isNetworkLikeError`) is a fallback for when there's no
+ *  structured status at all, never a second opinion that can override one. Without this, a
+ *  genuine HTTP 4xx credential-rejection error whose message happened to also contain the word
+ *  "timeout" (e.g. embedded in a Plaid-provided error description) could be misclassified as
+ *  transient and retried, when the structured status already definitively says otherwise. */
 function classifyPlaidFailure(err: unknown): 'transient' | 'non_transient' {
   const status = (err as { response?: { status?: unknown } })?.response?.status;
-  if (typeof status === 'number' && (status === 429 || status >= 500)) return 'transient';
+  if (typeof status === 'number') {
+    return status === 429 || status >= 500 ? 'transient' : 'non_transient';
+  }
   if (isNetworkLikeError(err)) return 'transient';
   return 'non_transient';
 }
@@ -507,28 +516,58 @@ export class HaltError extends Error {
   }
 }
 
+/** Thrown the moment a SIGINT/SIGTERM is observed (§22 "Interruption behavior") — deliberately a
+ *  distinct type from `HaltError`, so every catch site can tell "the operator asked us to stop"
+ *  apart from "something about this target is wrong," and never logs an interrupt as a `halted:*`
+ *  failure reason. Carries `targetId` only when one was in scope at the point of interruption. */
+export class InterruptedError extends Error {
+  targetId?: string;
+  constructor(targetId?: string) {
+    super('Interrupted by SIGINT/SIGTERM');
+    this.targetId = targetId;
+  }
+}
+
+/** The single interruption checkpoint every other awaited operation and every success/logging
+ *  boundary in this script calls through — see the call sites throughout `verifyLiveWithRetry`,
+ *  `processTarget`, and `main` for exactly where. Centralizing this in one function (rather than
+ *  inlining `if (interruptRequested)` at each of those sites) is what keeps every checkpoint
+ *  behaving identically and keeps them auditable as one list, per §22's explicit request. */
+function throwIfInterrupted(id?: string): void {
+  if (interruptRequested) throw new InterruptedError(id);
+}
+
 /** Bounded retry, transient failures only (§22 "Retry policy"). Any non-transient failure, or a
  *  transient one that exhausts its retry budget, throws `HaltError` — never silently skipped,
  *  never allowed to fall through as a false "verified." `baseDelayMs` is a parameter (rather than
  *  always reading the module constant) specifically so tests can exercise real retry attempts
- *  without real waiting. */
+ *  without real waiting.
+ *
+ *  Interruption checkpoints: before every attempt (including the first), immediately after every
+ *  awaited Plaid call (success or failure), and immediately after every retry delay — an
+ *  `InterruptedError` thrown from any of these propagates straight up, uncaught here, and is
+ *  never reclassified as a Plaid failure or retried. */
 export async function verifyLiveWithRetry(id: string, accessToken: string, baseDelayMs = TRANSIENT_RETRY_BASE_DELAY_MS): Promise<void> {
   let attempt = 0;
   for (;;) {
+    throwIfInterrupted(id);
     try {
       await verifyAccessTokenLive(accessToken);
-      return;
     } catch (err) {
+      throwIfInterrupted(id);
       attempt++;
       const classification = classifyPlaidFailure(err);
       if (classification === 'transient' && attempt <= TRANSIENT_RETRY_LIMIT) {
         logEntry({ id, stage: 'verify_plaid_retry', outcome: `retrying_attempt_${attempt}` });
         await sleep(baseDelayMs * 2 ** (attempt - 1));
+        throwIfInterrupted(id);
         continue;
       }
       const reason = classification === 'transient' ? 'transient_retry_exhausted' : 'credential_rejected';
       throw new HaltError(id, reason);
     }
+    throwIfInterrupted(id);
+    return;
   }
 }
 
@@ -542,6 +581,7 @@ export interface TargetOutcome {
 export async function processTarget(id: string, apply: boolean): Promise<TargetOutcome> {
   logEntry({ id, stage: 'reread_initial', outcome: 'started' });
   const initialRow = await rereadRow(id);
+  throwIfInterrupted(id);
   if (!initialRow) throw new HaltError(id, 'target_not_found');
 
   const initialState = classifyStorageState(initialRow);
@@ -576,19 +616,30 @@ export async function processTarget(id: string, apply: boolean): Promise<TargetO
     // credential is caught before it's ever encrypted and stored, not only after.
     logEntry({ id, stage: 'verify_plaid_pre_write', outcome: 'started' });
     await verifyLiveWithRetry(id, plaintextForCompare);
+    throwIfInterrupted(id);
 
     if (!apply) {
+      throwIfInterrupted(id); // before any dry_run_verified log
       logEntry({ id, stage: 'done', outcome: 'dry_run_verified' });
       return { id, outcome: 'dry_run_verified' };
     }
 
+    throwIfInterrupted(id); // before guardedEncryptUpdate()
     logEntry({ id, stage: 'write', outcome: 'started' });
     const affected = await guardedEncryptUpdate(id, enc);
+    // If interrupted right here: the write may already have committed (it either did or lost the
+    // race to a concurrent writer — either way the row is left exactly as-is, never rolled back)
+    // and we stop immediately, before even logging this write's own outcome, before rereading it,
+    // and before anything downstream could log success. The next invocation's initial reread
+    // (top of this function) picks the row's real state back up and reverifies it from scratch —
+    // no special interrupt-resume logic is needed beyond that already-existing behavior.
+    throwIfInterrupted(id);
     logEntry({ id, stage: 'write', outcome: affected === 1 ? 'committed' : 'lost_race' });
 
     // Whether we won or lost the race, always reread the database's own current value — the
     // local `enc` object computed above is never itself the thing that gets verified next.
     const rereadAfterWrite = await rereadRow(id);
+    throwIfInterrupted(id);
     if (!rereadAfterWrite) throw new HaltError(id, 'target_not_found_after_write');
     verifyRow = rereadAfterWrite;
 
@@ -648,9 +699,10 @@ export async function processTarget(id: string, apply: boolean): Promise<TargetO
     if (err instanceof HaltError) {
       logEntry({ id, stage: 'verify_plaid', outcome: `failed:${err.reason}` });
     }
-    throw err;
+    throw err; // InterruptedError propagates through untouched — never logged as a halt reason
   }
 
+  throwIfInterrupted(id); // before the 'verified' log — the last checkpoint in this function
   logEntry({ id, stage: 'done', outcome: 'verified' });
   return { id, outcome: 'verified' };
 }
@@ -687,61 +739,66 @@ export async function main(argv: string[]): Promise<number> {
 
   installSignalHandlers();
 
-  logEntry({ stage: 'preflight', outcome: 'started' });
-  const preflight = await runPreflight(args);
-  for (const failure of preflight.failures) {
-    logEntry({ stage: 'preflight', outcome: `failed:${failure}` });
-  }
-  if (!preflight.ok) {
-    logEntry({ stage: 'preflight', outcome: 'failed' });
-    return 1;
-  }
-  logEntry({ stage: 'preflight', outcome: 'passed' });
-
-  // Every target is processed on every invocation, dry-run or apply — dry-run still fully
-  // rereads and reverifies any target that's already encrypted, and now also exercises the local
-  // crypto path + a read-only Plaid check for a still-plaintext target (§22 point 8).
-  for (const id of args.targetIds) {
-    if (interruptRequested) {
-      logEntry({ id, stage: 'run', outcome: 'interrupted' });
+  // Every checkpoint below (after preflight, before each target, before postflight, before final
+  // success) calls `throwIfInterrupted()`, and any `InterruptedError` — from here or from deep
+  // inside `processTarget`/`verifyLiveWithRetry` — is caught in exactly one place below, so
+  // interruption is handled identically no matter which stage it happens in.
+  try {
+    logEntry({ stage: 'preflight', outcome: 'started' });
+    const preflight = await runPreflight(args);
+    throwIfInterrupted();
+    for (const failure of preflight.failures) {
+      logEntry({ stage: 'preflight', outcome: `failed:${failure}` });
+    }
+    if (!preflight.ok) {
+      logEntry({ stage: 'preflight', outcome: 'failed' });
       return 1;
     }
-    try {
+    logEntry({ stage: 'preflight', outcome: 'passed' });
+
+    // Every target is processed on every invocation, dry-run or apply — dry-run still fully
+    // rereads and reverifies any target that's already encrypted, and now also exercises the
+    // local crypto path + a read-only Plaid check for a still-plaintext target (§22 point 8).
+    for (const id of args.targetIds) {
+      throwIfInterrupted(id); // before beginning another target
       await processTarget(id, args.apply);
-    } catch (err) {
-      if (err instanceof HaltError) {
-        logEntry({ id: err.targetId, stage: 'run', outcome: `halted:${err.reason}` });
-      } else {
-        logEntry({ id, stage: 'run', outcome: 'halted:unexpected_error' });
-      }
+    }
+
+    throwIfInterrupted(); // before deciding what "done" means below
+
+    if (!args.apply) {
+      logEntry({ stage: 'done', outcome: 'dry_run_complete' });
+      return 0;
+    }
+
+    // A successful apply exit means every supplied target verified *this* invocation AND the
+    // whole table's integrity holds afterward — not just the former (§22 point 7).
+    logEntry({ stage: 'postflight', outcome: 'started' });
+    const postflight = await runPostflight(args.expectedTotal);
+    throwIfInterrupted(); // before acting on postflight's result or logging final success
+    for (const failure of postflight.failures) {
+      logEntry({ stage: 'postflight', outcome: `failed:${failure}` });
+    }
+    if (!postflight.ok) {
+      logEntry({ stage: 'postflight', outcome: 'failed' });
       return 1;
     }
-  }
 
-  if (interruptRequested) {
-    logEntry({ stage: 'run', outcome: 'interrupted' });
-    return 1;
-  }
-
-  if (!args.apply) {
-    logEntry({ stage: 'done', outcome: 'dry_run_complete' });
+    throwIfInterrupted(); // the last checkpoint before the one line that claims overall success
+    logEntry({ stage: 'done', outcome: 'all_targets_verified_and_postflight_passed' });
     return 0;
-  }
-
-  // A successful apply exit means every supplied target verified *this* invocation AND the
-  // whole table's integrity holds afterward — not just the former (§22 point 7).
-  logEntry({ stage: 'postflight', outcome: 'started' });
-  const postflight = await runPostflight(args.expectedTotal);
-  for (const failure of postflight.failures) {
-    logEntry({ stage: 'postflight', outcome: `failed:${failure}` });
-  }
-  if (!postflight.ok) {
-    logEntry({ stage: 'postflight', outcome: 'failed' });
+  } catch (err) {
+    if (err instanceof InterruptedError) {
+      logEntry({ id: err.targetId, stage: 'run', outcome: 'interrupted' });
+      return 1;
+    }
+    if (err instanceof HaltError) {
+      logEntry({ id: err.targetId, stage: 'run', outcome: `halted:${err.reason}` });
+      return 1;
+    }
+    logEntry({ stage: 'run', outcome: 'halted:unexpected_error' });
     return 1;
   }
-
-  logEntry({ stage: 'done', outcome: 'all_targets_verified_and_postflight_passed' });
-  return 0;
 }
 
 /* istanbul ignore next -- exercised via processes spawned in manual/production use, not unit tests */

@@ -30,6 +30,7 @@ import {
   ArgError,
   classifyStorageState,
   HaltError,
+  InterruptedError,
   logEntry,
   main,
   parseArgs,
@@ -1006,5 +1007,149 @@ describe('logging — never leaks credential material or raw error/argument text
     logEntry({ id: TARGET_A, stage: 'test', outcome: 'ok' });
     const parsed = JSON.parse(rawLines[0]);
     expect(Object.keys(parsed).sort()).toEqual(['id', 'outcome', 'stage', 'ts']);
+  });
+});
+
+// ---- Mid-flight SIGINT/SIGTERM interruption (Codex re-audit finding) --------------------------
+//
+// A signal can't cancel an in-flight DB/Plaid call already awaited — these tests simulate it
+// landing *while* that call is in flight, observed the moment it settles, exactly matching how
+// `installSignalHandlers` actually behaves against a real OS signal.
+
+describe('mid-flight interruption — signal during pre-write Plaid verification', () => {
+  afterEach(() => {
+    __setInterruptedForTests(false);
+  });
+
+  it('makes zero writes, no second Plaid call, no success log, and throws InterruptedError', async () => {
+    const fake = setupFakeSupabase([plaintextRow(TARGET_A, 'secret-a')]);
+    const { entries } = captureLogs();
+    mockVerifyAccessTokenLive.mockImplementationOnce(async () => {
+      __setInterruptedForTests(true); // the signal "arrives" while this call is in flight
+      return undefined;
+    });
+
+    await expect(processTarget(TARGET_A, true)).rejects.toBeInstanceOf(InterruptedError);
+
+    expect(fake.getUpdateCallCount()).toBe(0);
+    expect(mockVerifyAccessTokenLive).toHaveBeenCalledTimes(1);
+    expect(entries.some((e) => e.outcome === 'verified' || e.outcome === 'dry_run_verified')).toBe(false);
+  });
+});
+
+describe('mid-flight interruption — signal immediately after a committed update', () => {
+  afterEach(() => {
+    __setInterruptedForTests(false);
+  });
+
+  it('leaves the encrypted representation stored, logs no success, exits via InterruptedError, and a rerun reverifies without writing again', async () => {
+    const fake = setupFakeSupabase([plaintextRow(TARGET_A, 'secret-a')], {
+      onBeforeUpdateFilter: () => {
+        // Fires as the guarded update's own DB call is resolving — the write itself still
+        // completes (this callback runs *before* the update is applied to the fake table, but
+        // the update proceeds normally either way), simulating the signal landing right as that
+        // awaited call settles.
+        __setInterruptedForTests(true);
+      },
+    });
+    const { entries } = captureLogs();
+
+    await expect(processTarget(TARGET_A, true)).rejects.toBeInstanceOf(InterruptedError);
+
+    // The write committed and is left intact.
+    expect(fake.getUpdateCallCount()).toBe(1);
+    const row = fake.getRows()[0];
+    expect(row.access_token_key_id).toBe('RAILWAY_PROD_V1');
+    expect(row.access_token).toBe('secret-a');
+    expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
+
+    // Rerun: not interrupted this time — must fully reverify the now-already-encrypted row
+    // without attempting a second encryption write.
+    __setInterruptedForTests(false);
+    mockVerifyAccessTokenLive.mockClear();
+    const result = await processTarget(TARGET_A, true);
+    expect(result.outcome).toBe('verified');
+    expect(fake.getUpdateCallCount()).toBe(1); // still just the one write from before
+    expect(mockVerifyAccessTokenLive).toHaveBeenCalledTimes(1); // the rerun's own reverification
+  });
+});
+
+describe('mid-flight interruption — signal during a retry sleep', () => {
+  afterEach(() => {
+    __setInterruptedForTests(false);
+  });
+
+  it('does not begin another retry attempt once interrupted during the delay, and never writes/succeeds afterward', async () => {
+    vi.useFakeTimers();
+    mockVerifyAccessTokenLive.mockRejectedValue({ response: { status: 429 } });
+    captureLogs();
+
+    const outcome = verifyLiveWithRetry(TARGET_A, 'token', 1000).catch((e) => e);
+    await vi.advanceTimersByTimeAsync(0); // let the first attempt's rejection register the retry sleep
+    expect(mockVerifyAccessTokenLive).toHaveBeenCalledTimes(1);
+    __setInterruptedForTests(true); // signal "arrives" during the sleep
+    await vi.advanceTimersByTimeAsync(2000); // exhaust the sleep
+
+    const result = await outcome;
+    expect(result).toBeInstanceOf(InterruptedError);
+    expect(mockVerifyAccessTokenLive).toHaveBeenCalledTimes(1); // no second attempt was ever begun
+  });
+});
+
+describe('mid-flight interruption — signal during an already-encrypted target\'s verification', () => {
+  afterEach(() => {
+    __setInterruptedForTests(false);
+  });
+
+  it('logs no success, performs no further processing, and exits via InterruptedError', async () => {
+    const fake = setupFakeSupabase([encryptedRow(TARGET_A, 'secret-a')]);
+    const { entries } = captureLogs();
+    mockVerifyAccessTokenLive.mockImplementationOnce(async () => {
+      __setInterruptedForTests(true);
+      return undefined;
+    });
+
+    await expect(processTarget(TARGET_A, true)).rejects.toBeInstanceOf(InterruptedError);
+
+    expect(fake.getUpdateCallCount()).toBe(0);
+    expect(entries.some((e) => e.outcome === 'verified')).toBe(false);
+  });
+});
+
+describe('mid-flight interruption — end to end through main()', () => {
+  afterEach(() => {
+    __setInterruptedForTests(false);
+  });
+
+  it('a signal during the first target halts before the second target ever begins, and reports interrupted, not success', async () => {
+    setupFakeSupabase(cohort());
+    const { entries } = captureLogs();
+    mockVerifyAccessTokenLive.mockImplementationOnce(async () => {
+      __setInterruptedForTests(true);
+      return undefined;
+    });
+
+    const code = await main(baseArgv(['--apply', '--confirm', CONFIRM]));
+
+    expect(code).toBe(1);
+    expect(mockVerifyAccessTokenLive).toHaveBeenCalledTimes(1); // never reached the second target
+    expect(entries.some((e) => e.outcome.includes('verified'))).toBe(false);
+    expect(entries.some((e) => e.outcome.includes('all_targets_verified'))).toBe(false);
+    expect(entries.some((e) => e.stage === 'run' && e.outcome === 'interrupted')).toBe(true);
+  });
+});
+
+// ---- Retry-classification hardening: a structured status is authoritative ---------------------
+
+describe('classifyPlaidFailure (via verifyLiveWithRetry) — structured status overrides message heuristics', () => {
+  it('a real HTTP 400 credential rejection is never retried, even if its message contains "timeout"', async () => {
+    mockVerifyAccessTokenLive.mockRejectedValue({
+      response: { status: 400, data: { error_code: 'ITEM_LOGIN_REQUIRED' } },
+      message: 'a timeout occurred while validating this credential',
+    });
+    captureLogs();
+
+    await expect(verifyLiveWithRetry(TARGET_A, 'token', 1)).rejects.toMatchObject({ reason: 'credential_rejected' });
+    expect(mockVerifyAccessTokenLive).toHaveBeenCalledTimes(1); // never retried
   });
 });
