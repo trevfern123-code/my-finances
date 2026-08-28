@@ -36,6 +36,17 @@ export async function exchangePublicToken(publicToken: string) {
   };
 }
 
+/** Confirms `accessToken` is still a live, Plaid-accepted credential by calling **only**
+ *  `itemGet` — deliberately does not call `institutionsGetById` or anything else. Used by the
+ *  Plaid token-encryption backfill (`backend/src/scripts/backfillTokenEncryption.ts`) to verify a
+ *  decrypted token without risking a false-positive credential failure from an unrelated Plaid
+ *  call (see PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §22 — the whole reason this exists separately
+ *  from `getItemInstitution` below, which *does* also call `institutionsGetById`). The response
+ *  body is deliberately discarded — success/failure of the call is the only signal this needs. */
+export async function verifyAccessTokenLive(accessToken: string): Promise<void> {
+  await plaidClient.itemGet({ access_token: accessToken });
+}
+
 export async function getItemInstitution(accessToken: string) {
   const itemResponse = await plaidClient.itemGet({ access_token: accessToken });
   const institutionId = itemResponse.data.item.institution_id;
