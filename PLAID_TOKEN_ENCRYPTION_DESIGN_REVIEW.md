@@ -323,10 +323,10 @@ Exactly §2's `alter table`, which now also **drops `access_token`'s `NOT NULL` 
 **Rollback guarantees, stated explicitly and asymmetrically, exactly as Trevor asked:**
 - **Rolling back any deploy up through and including Phase 2a is fully safe, with zero data loss.** Every row — old ones from before this migration and any new one linked during 2a — still has a valid plaintext `access_token` the pre-migration code can read directly, because 2a never stops writing it.
 - **Rolling back to pre-Phase-2 (pre-encryption-aware) code after Phase 2b has begun is *not* safe** for any row created (in 2b) or backfilled (Phase 3) since encrypted-only writing began. The reverted code has no idea the encrypted columns exist and would read that row's `access_token` as `NULL`, then fail — loudly, not silently: a plain-string operation on `null` (or the Plaid SDK rejecting a missing credential outright) breaks obviously for that specific item's syncs/refreshes rather than corrupting data quietly. **This is an accepted, deliberate tradeoff from Phase 2b onward**, not an oversight — it's the same category of tradeoff Phases 3–7 already accept (once you're far enough into the migration, going back to "plaintext is primary" stops being free), just moved earlier than the original document implied. The mitigation is procedural, not technical: don't roll back to pre-2b code once 2b is live; roll *forward* (fix and redeploy) instead, exactly as the Phase-2a verification gate is meant to make unnecessary in the first place by catching problems before 2b ever starts.
-- Rolling back during/after Phase 6 (dual-read removed) or Phase 7 (column dropped) is categorically unsafe, exactly as the original document already said, unchanged by this revision.
+- **Corrected 2026-08-30, see §22's "Rollback boundaries" for the full three-point analysis**: rolling back is not one cliff at Phase 2b. **Phase 2a remains a fully valid rollback target all the way through Phase 6** (dual-read removed from the *then-current* code) — Phase 6 changes application code, not the schema, and Phase 2a's own dual-read already knows how to handle an encrypted-only row. Only **Phase 7** (`access_token` column physically dropped) makes every earlier version of the code — including Phase 2a — unable to run against the schema at all. The earlier wording here ("Phase 6 ... or Phase 7 ... is categorically unsafe") incorrectly lumped Phase 6 in with Phase 7; it wasn't.
 
 ### Phase 3 — Backfill existing plaintext credentials
-A one-off script (not part of the request-serving code path), run against production data:
+**Superseded by §22's detailed, corrected design (revised 2026-08-30 after an independent Codex review of the original backfill plan) — read §22 before implementing anything, this section is kept only for original context.** High-level shape, still accurate:
 ```sql
 select id, access_token from public.plaid_items
 where access_token_key_id is null
@@ -347,8 +347,8 @@ where id = :id
 ```
 The trailing `and access_token_key_id is null` is what makes this safe to run concurrently with live traffic and safe to re-run after an interruption: if the live app (or a second, accidentally-overlapping backfill run) already encrypted this row between the `select` and this `update`, the `where` clause matches zero rows and this write silently no-ops instead of clobbering newer data with a redundant re-encryption. **Batching**: given this app's actual scale (a single-user personal-finance tool today, per the project's own status notes — not a multi-tenant production system with thousands of items), a batch size of 50–100 rows per iteration with a short pause between batches is more than sufficient; there is no evidence in this codebase of a `plaid_items` table anywhere near a size where batching performance is a real concern. Run it as a plain Node script invoked manually (`ts-node` or compiled + `node`), not as a scheduled job — this is a one-time operation. **Never modify or delete plaintext during this phase.** **Rollback**: simply stop running the script; already-backfilled rows are harmless to leave encrypted (Phase 2's dual-read already handles them), and any row it hasn't reached yet is untouched.
 
-### Phase 4 — Verification (corrected per point 3 of Trevor's follow-up)
-Before touching plaintext at all, confirm every path in §1 still works with encrypted rows: initial Link (new row, encrypted-only from Phase 2b onward), manual sync, manual balance refresh, webhook-triggered sync (**test this one specifically and separately** — it's the async path, §1.9), liabilities refresh, recurring-streams refresh, reconnect/Update Mode, both sandbox helpers, and a full server restart (to prove the key-ring loads correctly from environment on a cold start, not just that it happened to already be in memory from before the migration began).
+### Phase 4 — Verification (corrected per point 3 of Trevor's follow-up; superseded again by §22)
+**§22's "Verification model" section is now the authoritative per-row verification design** — it corrects a real gap in the per-row verification described just below (treating "encrypted" as proof of "verified" isn't safe across a crash/resume). Kept here for original context. Before touching plaintext at all, confirm every path in §1 still works with encrypted rows: initial Link (new row, encrypted-only from Phase 2b onward), manual sync, manual balance refresh, webhook-triggered sync (**test this one specifically and separately** — it's the async path, §1.9), liabilities refresh, recurring-streams refresh, reconnect/Update Mode, both sandbox helpers, and a full server restart (to prove the key-ring loads correctly from environment on a cold start, not just that it happened to already be in memory from before the migration began).
 
 **Per-row verification, corrected**: my original wording ("compare against a value fetched from Plaid") was imprecise in exactly the way Trevor flagged — Plaid never returns an access token back to us for comparison; it's an opaque, write-only-to-us credential from the moment `itemPublicTokenExchange` first issues it. The actual verification, for every row touched by Phase 3 (and, during Phase 2a, for the handful of rows created by the initial dual-write test): three steps, in order, none of which ever logs either the plaintext or the decrypted value —
 1. **Decrypt** the row's encrypted representation using the key ring.
@@ -473,6 +473,8 @@ For the eventual KMS move itself (explicitly not being done now): the Express ba
 ---
 
 ## 16. Required tests
+
+**The backfill script's own test plan is superseded by §22's "Required test plan"** (revised 2026-08-30 after Codex's review) — this section's cryptographic/migration/controller test coverage below is unaffected and still accurate for the already-shipped Phase 1/2a code.
 
 Mapped onto this app's actual test conventions (Vitest, `vi.mock`/`vi.hoisted` for mocking, a shared `createQueryBuilder` Supabase-chain mock in `backend/src/testUtils/supabaseMock.ts` already used across every `dataService.test.ts` suite):
 
@@ -605,82 +607,198 @@ This confirms every §7 Phase 4 check for the currently-live rows, matches the s
 
 Phase 2b, backfill, and everything after remain **not started** — no plaintext writes have stopped, no plaintext reads have stopped, no plaintext has been touched.
 
-## 22. Phase 2b / backfill proposal — revised 2026-08-29, for review, not yet approved or implemented
+## 22. Phase 2b / backfill proposal — revised 2026-08-30 (second revision, after Codex's design/execution review), for review, not yet approved or implemented
 
 This refines §7's Phases 3–7 with the concrete state confirmed in §21, rather than replacing it. Nothing in this section has been implemented; it is a plan to review.
 
-**Revision note**: the original version of this section recommended entering Phase 2b (stop writing plaintext for new items) *before* running the backfill, reasoning that otherwise the backfill's `select where access_token_key_id is null` could "chase a moving target." **That reasoning was wrong and Trevor caught it**: Phase 2a is already deployed and already dual-writes every newly linked item with both representations (§7 Phase 2a, §21) — under Phase 2a, a brand-new item can never be plaintext-only in the first place, so there is no moving target to chase and nothing forcing Phase 2b to happen first. The corrected sequence below runs the backfill entirely within the already-verified Phase 2a deployment, with no write-behavior change at all, and defers Phase 2b to its own later, separately-verified step. This is strictly safer: it keeps the one part of this rollout with the most production experience (Phase 2a) in place for longer, and it separates two independently-risky changes (backfilling existing data vs. changing what new writes do) instead of bundling them.
+**Revision history**: the 2026-08-29 revision fixed the sequencing (backfill before Phase 2b, not after) and the rollback-boundary analysis, per Trevor's own review. Trevor then had Codex independently review that revised design and Codex returned **NOT READY**, with real findings — not stylistic ones. This revision incorporates all of them, exactly, before anything is implemented:
+
+1. **The verification design conflated "encrypted" with "verified."** The original design treated a non-null `access_token_key_id` as proof a row had been through verification. It isn't — it only proves a write happened. A crash between the `update` committing and the three-step verification completing (process killed, `itemGet` times out, etc.) would leave a row encrypted but never actually confirmed, and a naive resume (`select where access_token_key_id is null`) would skip it forever, silently treating an unverified row as done.
+2. **The execution plan used `railway run`, which runs locally.** Codex confirmed `railway run` injects that service's environment variables into a *locally-spawned* process — exactly the local secret exposure Trevor explicitly ruled out, not an honest caveat to route around.
+3. **The reused Plaid verification helper (`getItemInstitution`) does more than verify the credential.** Checked directly against `backend/src/services/plaidService.ts:39-56`: it calls `itemGet` **and then** `institutionsGetById`. An institution-lookup failure (a real, distinct Plaid failure mode, unrelated to whether the credential itself is valid) would be indistinguishable from a genuine credential problem — exactly the false-positive Codex flagged.
+4. Several other gaps: no dry-run-by-default, no explicit confirmation gate on writes, no distinction between "transient, retry-safe" and "non-transient, must-halt" Plaid failures, no defined signal-handling behavior, and logging discipline wasn't pinned down as an explicit allow-list.
+
+None of these were cosmetic — each one is a real crash-safety, credential-exposure, or false-positive/false-negative risk. All are corrected below.
+
+### Three distinct concepts, kept separate throughout the design (point 2)
+
+Codex's core finding was really this one, underlying most of the others: this design must never collapse **"is this row encrypted"** into **"has this row been verified."** Concretely, three separate concepts, computed independently every run:
+
+- **Target identity** — the internal `plaid_items.id`. Fixed, supplied explicitly via `--target-ids`, never discovered by a broad query at apply time (point 4 below).
+- **Storage state** — read fresh from the database *this run*, never assumed or cached from a prior run or from this run's own in-memory copy of what it just wrote: `plaintext_only` (`access_token_key_id is null`), `encrypted` (`access_token_key_id is not null`, all 5 encrypted columns populated per the `plaid_items_encrypted_token_complete` constraint), or an anomaly (`partial` — shouldn't be possible given that constraint, but checked for explicitly rather than assumed impossible).
+- **Verification result** — computed fresh *every run*, for *every* target, regardless of storage state. A row already showing `encrypted` storage state is **not** treated as verified — it is re-decrypted from what's actually stored, re-compared, and re-checked against Plaid, exactly as if this were the first time. There is no "skip verification, it's already encrypted" branch anywhere in this design.
+
+### Verification model — resumable, always re-derived from the database (points 1, 6)
+
+Every target, on every invocation (dry-run or apply, first run or resumed), goes through the same sequence — nothing is inferred from a prior run's outcome:
+
+1. **Reread** the target row from the database right now (not a value held in memory from earlier in this process, and never a value held in memory from a *previous* process invocation).
+2. If storage state is `plaintext_only`: (apply mode only) perform the guarded update below, then **reread again** — the row that verification checks is always the one just confirmed present in the database, never the locally-built ciphertext object the script computed before the write.
+3. If the guarded update affected **zero rows** (another process's write won the race — see below): reread and verify **that** row, the actual database winner. The local ciphertext this run computed and lost the race with is discarded outright and never fed into verification.
+4. Regardless of how storage state became `encrypted` (this run's own write, a resumed run finding it already encrypted from a prior interrupted attempt, or the lost-race path above): **decrypt the ciphertext actually stored in the database right now**, compare it against the plaintext held in memory from this run's own initial reread (`===`), then call the dedicated `itemGet`-only verifier (below) with the decrypted value.
+5. Only a fully-passed three-step check is ever reported as `verified`. There is no partial-credit state.
+
+**Concurrency guard, restated precisely** (point 1's crash scenario, point 6):
+```sql
+update public.plaid_items
+set access_token_ciphertext = :ciphertext,
+    access_token_nonce = :nonce,
+    access_token_auth_tag = :auth_tag,
+    access_token_key_id = :key_id,
+    access_token_enc_version = 1,
+    updated_at = now()
+where id = :id
+  and access_token_key_id is null;
+```
+`access_token` never appears in the `set` list — the script is structurally incapable of writing or clearing plaintext, not merely instructed not to. A zero-row result means someone else's write already landed; the correct response is to reread and verify *their* result, never to treat zero-rows-affected as "nothing to do" or to fall back to verifying this run's own discarded computation.
+
+### Dedicated Plaid verifier (point 7)
+
+New, thin function — reused by the script, not reimplemented by it — that calls **only** `itemGet`:
+```ts
+// backend/src/services/plaidService.ts — new export, additive, no existing export changed
+export async function verifyAccessTokenLive(accessToken: string): Promise<void> {
+  await plaidClient.itemGet({ access_token: accessToken });
+  // Success = Plaid accepted the credential. We deliberately discard the response body —
+  // this function exists only to answer "is this credential still valid," never to fetch
+  // institution/account data, so a later, unrelated Plaid call can never be mistaken for a
+  // credential failure (see the getItemInstitution gap this replaces, §22 revision history).
+}
+```
+The existing `getItemInstitution` (`itemGet` + `institutionsGetById`) stays exactly as-is for its current callers — nothing about it changes; the backfill script simply never calls it.
+
+### Retry policy (point 8)
+
+Only the `itemGet` call in step 4 above can experience a transient failure — steps 1–3 (reread, local decrypt, `===` compare) are pure local computation with no network dependency and therefore no transient-failure category at all.
+
+- **Retried, bounded** (e.g. 3 attempts, short exponential backoff): request timeout / network-level transient error, HTTP 429, HTTP/Plaid 5xx.
+- **Never retried, always a hard failure**: GCM authentication failure, unknown key id, unexpected `access_token_enc_version`, malformed database state (e.g. a `partial` row — see "three concepts" above), a plaintext/decrypted mismatch, or Plaid legitimately rejecting the credential (e.g. `ITEM_LOGIN_REQUIRED`, `INVALID_ACCESS_TOKEN`) — none of these become correct by waiting and asking again.
+- **Any verification failure — retry-exhausted or immediately non-transient — halts the entire run**, consistent with the existing halt-on-first-failure principle: it doesn't skip to the next target, and it exits nonzero. The two cases are logged with a distinguishable reason (`transient_retry_exhausted` vs. e.g. `crypto_mismatch`) so Trevor knows whether "just try again later" or "stop and investigate" is the right next step — but both leave the encrypted representation exactly as committed, never rolled back, since undoing a write is itself a risk and a future rerun re-verifies it fresh regardless (per the resumable model above).
+
+### Interruption behavior (point 9)
+
+On SIGINT/SIGTERM: stop picking up any new target, let an already-issued single-statement database write finish naturally (Postgres commits it atomically; there is no safe way to "abort" it mid-flight that's worth the added complexity), then exit nonzero with an explicit message that the run was interrupted — **never** a success/completion message under any interrupt path. The design deliberately assumes the in-flight write may have already committed by the time the signal is handled; this requires no special interrupt-recovery logic of its own precisely because the verification model above already rereads and re-verifies every target from scratch on every run, interrupted or not.
+
+### Command-line interface (points 3, 4)
+
+Dry-run is the default — no flag needed to get it, only to leave it:
+```
+node dist/scripts/backfillTokenEncryption.js --target-ids <uuid-1>,<uuid-2> --expected-total 3 --expected-plaid-env sandbox
+```
+Confirms, all read-only, and prints a report: exact total `plaid_items` count matches `--expected-total`; the two supplied target ids currently exist and their storage state (should be `plaintext_only` for both, today); zero rows anywhere in the table are in a `partial` state; `PLAID_ENV` matches `--expected-plaid-env`; the key ring's current key id is `RAILWAY_PROD_V1` and would encrypt at `enc_version = 1`; plaintext is present on both targets; **no row in the whole table currently has `access_token_key_id is not null and access_token is null`** — this is the concrete, checkable proxy for "Phase 2a dual-write is still active, Phase 2b hasn't silently begun," since the script can't inspect the deployed server's source directly, only infer it from data; and both `plaid_items_token_present` and `plaid_items_encrypted_token_complete` (the exact Phase 1 constraint names, `supabase/migrations/20260826050000_plaid_token_encryption_phase1.sql`) still exist on the table. Any check failing exits nonzero with a specific reason; nothing is written in this mode, ever. Running with no `--target-ids` at all is also supported and stays read-only — it just lists current `plaintext_only` candidates, so Trevor can discover/confirm the two ids before ever writing anything.
+
+Apply requires every one of these together — any one missing or wrong refuses to run:
+```
+node dist/scripts/backfillTokenEncryption.js \
+  --apply \
+  --confirm BACKFILL_PLAID_TOKENS \
+  --target-ids <uuid-1>,<uuid-2> \
+  --expected-total 3 \
+  --expected-plaid-env sandbox
+```
+`--apply` and `--confirm BACKFILL_PLAID_TOKENS` (exact string, case-sensitive) are both required — either alone does nothing. `--target-ids` must name the exact rows to touch; there is no "encrypt everything matching a query" mode, in apply or anywhere else in this script. `--expected-total` and `--expected-plaid-env` are required and checked identically to dry-run, so apply mode runs the full dry-run check first, internally, before writing anything — apply is dry-run-plus-writes, not a separate, less-checked path.
+
+### Rollback boundaries — unchanged from the 2026-08-29 revision, restated for completeness (point 12)
+
+- **Point A** — rollback to pre-encryption code stops being universally safe the moment Phase 2b is deployed and creates its first encrypted-only new row. Not at the backfill: the backfill only ever adds encrypted columns alongside plaintext that's already there, so every row stays readable by pre-encryption code through the backfill, its verification, and the soak.
+- **Point B** — rollback to **Phase 2a** remains safe from Point A onward, through Phase 2b, Phase 5, and Phase 6, because Phase 2a's existing dual-read logic already handles an encrypted-only row correctly with zero further code change.
+- **Point C** — guarantees change again only at **Phase 7** (the `access_token` column physically dropped) — the first point even Phase 2a can't run against the schema at all.
+
+§7 Phase 2's rollback bullets and §22's own earlier point 7 both contained stale language implying Phase 6 was as unsafe as Phase 7 for rollback purposes — both corrected in place (see §7 Phase 2 and "When plaintext reads stop" below).
 
 ### Corrected end-to-end sequence
 
 1. **Now**: Phase 2a stays deployed, unchanged. No code change in this step.
-2. Write the backfill script and get it reviewed (§ "What Codex should independently review," below) — committed to a feature branch, not `main`, until approved.
+2. Write the backfill script on a **new branch cut from current `main`** (point 11 — not a reuse of the already-merged `feature/phase2a-encryption-reapply`), get it reviewed (see the Codex checklist below).
 3. Deploy it as an ordinary part of the next regular backend deploy. It is inert from the running server's perspective (see "Execution environment" below) — this step changes nothing about what the live service does.
-4. Trevor manually triggers one run against the 2 known plaintext-only rows, using the Railway-native invocation described below — no production credentials copied to his local machine.
-5. The script encrypts, concurrency-guards, and verifies each row per points 1–3 below, halting immediately on any verification failure.
-6. Trevor performs the live checks in point 5 below (integrity query, spot-check refresh/sync on the two newly-encrypted items, log check).
-7. **Soak/checkpoint period, still on Phase 2a** — length at Trevor's discretion (a few days is reasonable given this app's low traffic), watching the two newly-encrypted items go through real subsequent syncs/webhooks/refreshes under normal use, not just the one-time verification in step 5. Rollback to pre-encryption code remains fully safe throughout this entire window (see rollback boundaries below) — nothing here has removed or altered plaintext.
-8. **Only after that soak passes cleanly**: a separate, later Phase 2b deployment flips `insertPlaidItem` to stop writing plaintext for brand-new items. This is its own change, requiring its own approval — not bundled with the backfill.
-9. *(Future, separate, not part of this proposal)* Phase 5 (confirm zero plaintext-only rows remain) → Phase 6 (remove the dual-read fallback) → Phase 7 (drop the column, after a further multi-week soak). Each already described in §7.
+4. Trevor runs a **remote dry-run** (Execution environment, below) against the two known plaintext-only rows — read-only, confirms every invariant, writes nothing.
+5. Trevor runs a **remote apply** with `--apply --confirm BACKFILL_PLAID_TOKENS` against exactly those two target ids. The script encrypts, concurrency-guards, and re-verifies each target per the verification model above, halting immediately on any failure.
+6. Trevor performs the live checks below (integrity query, log check).
+7. Trevor manually tests balance refresh, transaction sync, and webhook processing on each of the two now-backfilled items specifically.
+8. **Soak/checkpoint period, still on Phase 2a** — length at Trevor's discretion (a few days is reasonable given this app's low traffic). Rollback to pre-encryption code remains fully safe throughout (Point A hasn't been reached yet).
+9. **Only after that soak passes cleanly**: a separate, later Phase 2b deployment flips `insertPlaidItem` to stop writing plaintext for brand-new items — its own change, its own approval, not bundled with the backfill.
+10. *(Future, separate, not part of this proposal)* Phase 5 → Phase 6 → Phase 7, each already described in §7, rollback guarantees shifting exactly per Points A/B/C above.
 
-**1. How the two existing plaintext-only items will be encrypted safely**
+**1. How the two existing plaintext-only items will be encrypted safely** — see "Verification model" and "Command-line interface" above; the underlying encryption call is unchanged, `encryptAccessToken(plaintext, getKeyRing(), row.id)`, the same function and key ring already proven correct in production.
 
-A one-off Node script (`backend/src/scripts/backfillTokenEncryption.ts` or similar — not part of the request-serving path, not a scheduled job), run manually by Trevor against production, following §7 Phase 3 exactly: select rows where `access_token_key_id is null`, and for each, call the existing `encryptAccessToken(plaintext, getKeyRing(), row.id)` — the same function and same key ring already proven correct in production — then write the 5 encrypted columns with the concurrency guard below. Given the current count (2 rows, confirmed static under Phase 2a per the corrected sequencing above — no new plaintext-only row can appear while it runs), this executes as a single small batch, not a multi-batch job; §7's batching guidance for a larger table isn't operationally relevant here but the script would still use it as written, for correctness under any future growth in item count.
+**2. Idempotent/concurrency-safe backfill behavior** — see "Verification model" above (the guarded `update`, and the explicit "reread the database winner, never verify discarded local state" rule).
 
-**2. Idempotent/concurrency-safe backfill behavior**
+**3. How each backfilled item will be verified before anything plaintext-related is retired** — see "Verification model," "Dedicated Plaid verifier," and "Retry policy" above.
 
-Exactly §7 Phase 3's guard, unchanged: every `update` carries `where id = :id and access_token_key_id is null`, and the `set` list never includes `access_token` — the script is structurally incapable of modifying or clearing plaintext, not just instructed not to. If a row was already encrypted between the script's `select` and its `update` — by a concurrent run of the same script, or (in principle, though ruled out under the corrected sequencing) by other traffic — the `where` clause matches zero rows and the write silently no-ops rather than overwriting a newer encrypted value with a stale re-encryption. Safe to interrupt and re-run from the start at any point: already-encrypted rows are simply skipped on the next pass (they no longer match `access_token_key_id is null`).
-
-**3. How each backfilled item will be verified before anything plaintext-related is retired**
-
-Exactly §7 Phase 4's three-step per-row verification, run immediately after that row's `update` commits, before the script moves to the next row: (1) decrypt the just-written encrypted representation using the key ring; (2) compare the decrypted string against that same row's still-present plaintext `access_token` column in memory (`===`), logging only `{ id, match: true/false }` — never either string; (3) call `plaidService.getItemInstitution` (wraps Plaid's `itemGet`) with the decrypted value to confirm it's still a live, Plaid-accepted credential, not just byte-identical to what was stored. Any row failing step 2 or step 3 is left as-is (not retried automatically, not silently skipped from the report) and the script halts rather than continuing past a first verification failure — a failure here means something is wrong with encryption itself, not with one unlucky row, and continuing to encrypt more rows under that condition would be unsafe.
-
-**4. Rollback boundaries — corrected, three explicit points**
-
-The original version of this document (§7 Phase 2) already stated the rollback guarantee asymmetrically but only identified one transition. Trevor asked for all three explicitly:
-
-- **Point A — rollback to pre-encryption code stops being universally safe: the moment Phase 2b is deployed and creates its first encrypted-only new row** (`access_token is null`, `access_token_key_id is not null`). Not at the backfill (step 4–7 above) — the backfill only ever *adds* encrypted columns alongside plaintext that's already there, so every row remains readable by pre-encryption code (which only ever looks at the `access_token` column) all the way through the soak in step 7. The boundary is specifically Phase 2b's write-behavior change, not the backfill.
-- **Point B — rollback to Phase 2a remains safe, from Point A onward, indefinitely (up to Point C).** This is the corrected part of the analysis: once Phase 2b begins producing encrypted-only rows, the safe rollback target isn't "nothing" — it's the immediately-prior, already-proven Phase 2a deployment, because Phase 2a's dual-read logic (`resolveAccessToken`, §6.1) already prefers the encrypted representation whenever `access_token_key_id is not null` and never requires plaintext to also be present to do so. Phase 2a was written to handle an encrypted-only row correctly without any further change — it just never previously encountered one in practice until Phase 2b starts creating them. This holds for every row (old, backfilled, or newly linked under either 2a or 2b), through the entire backfill, the soak, Phase 2b, Phase 5, and Phase 6 — Phase 2a's code never depends on the plaintext column continuing to exist or be populated.
-- **Point C — rollback guarantees change again at Phase 7 (column physically dropped).** Phase 6 (removing the dual-read *fallback* from the then-current code) doesn't change the schema, so Phase 2a remains a valid rollback target even after Phase 6 is deployed — the columns are all still there for Phase 2a to read. Only Phase 7's `drop column access_token` makes *every* earlier version of the code, including Phase 2a, unable to run against the schema at all (a plain SQL error on any query naming that column). From Phase 7 onward, "rollback" would require restoring the column first, not just redeploying older code — categorically different from Points A/B, exactly as §7 Phase 7 already says.
+**4. Rollback boundaries** — see the dedicated section above.
 
 **5. What Trevor must perform as live checks**
 
-Before running the script: confirm the integrity query still shows `plaintext_only_items = 2` (or whatever the current count is at that moment) and `partial_encrypted_items = 0`, so the starting state matches expectations. After the script completes: re-run the same integrity query and confirm `plaintext_only_items = 0`, `partial_encrypted_items = 0`, `unexpected_key_id_items = 0`, `unexpected_version_items = 0`, and `distinct_encrypted_nonces` equal to the new total encrypted-item count (proving no nonce reuse across the newly-encrypted rows); spot-check Refresh balances and Sync transactions on the two now-encrypted (previously plaintext-only) items specifically, since those are the only two rows this backfill actually changes the read path for; confirm production logs show no raw credential material during the run (same sanitized-error check as §21). During the soak (step 7 above): periodically confirm those same two items keep syncing/refreshing normally under ordinary use, not just the one-time check right after the backfill.
+Before applying: run the dry-run above and read its report. After applying: re-run the integrity query and confirm `plaintext_only_items = 0`, `partial_encrypted_items = 0`, `unexpected_key_id_items = 0`, `unexpected_version_items = 0`, and `distinct_encrypted_nonces` equal to the new total encrypted-item count; manually test Refresh balances, Sync transactions, and (via Plaid's sandbox webhook trigger) webhook processing on each of the two newly-encrypted items specifically (step 7 of the corrected sequence); confirm production logs from the run contain only allow-listed fields (Logging, below). During the soak: periodically confirm those same two items keep syncing/refreshing normally under ordinary use.
 
-**6. When plaintext writes stop**
+**6. When plaintext writes stop** — unchanged: only at the separate, later Phase 2b deployment (step 9 of the corrected sequence), never as part of the backfill itself.
 
-**Corrected**: not before or during the backfill — plaintext writes for new items stop only when the separate, later Phase 2b deployment happens (step 8 of the corrected sequence above), after the backfill, its verification, and the soak have all already passed cleanly. The backfill itself never writes plaintext for any row either (point 2 above) — it only adds encrypted columns alongside what's already there.
+**7. When plaintext reads stop — corrected**
 
-**7. When plaintext reads stop**
+Per §7 Phase 6, only after Phase 5 confirms zero remaining plaintext-only rows — this proposal does **not** include Phase 6. **Corrected**: removing the dual-read fallback at Phase 6 does *not* by itself make Phase 2a stop being a valid rollback target — that was the stale claim in the prior revision, and it's wrong for the same reason §7 Phase 2's bullet was wrong (Point C above is Phase 7, not Phase 6). Phase 6 is still its own separately-approved change; the reason it needs one is that it changes the currently-deployed code's own failure behavior (treating a stray plaintext-only row as a hard error), not because it collapses the rollback story.
 
-Unchanged: per §7 Phase 6, only after Phase 5 confirms zero remaining plaintext-only rows (this backfill is what gets that count to zero) — this proposal does **not** include Phase 6. Removing the dual-read fallback is a separate, later change requiring its own approval, since — per the corrected rollback analysis above — it's the point where Phase 2a itself stops being reachable as a rollback target for a schema-incompatible reason.
+**8. When the plaintext column could eventually be removed** — unchanged from §7 Phase 7: a further multi-week soak after Phase 6, zero `MissingEncryptedRepresentationError` occurrences, its own separate migration.
 
-**8. When the plaintext column could eventually be removed**
+### Execution environment — remote Railway execution, no local secret exposure (point 5)
 
-Unchanged from §7 Phase 7: only after a deliberate soak period following Phase 6 — on the order of a couple of weeks of clean production operation with zero `MissingEncryptedRepresentationError` occurrences, given this app's low traffic volume. Not part of this proposal; explicitly a future, separately-approved migration.
+Trevor confirmed via Codex that `railway run` executes **locally**, injecting that service's variables into the local process — exactly what he ruled out. Corrected to Railway's remote single-command execution instead:
 
-### Execution environment — running the backfill without copying production secrets locally
+- **Where the script lives, and how it deploys**: unchanged from the prior revision — `backend/src/scripts/backfillTokenEncryption.ts`, part of the normal backend source tree, compiled by the same `tsc -p tsconfig.build.json` build as every regular deploy, **never imported by `index.ts`** or anything in the request-serving module graph (inert on deploy), with its own entrypoint guard refusing to run unless launched directly. `railway.json`'s `deploy.startCommand` stays exactly `npm run start --workspace backend`, untouched; the backfill is a separate `npm` script the deployed service never runs on its own.
+- **How it's invoked — remote, inside Railway, not local**:
+  ```
+  railway ssh --project <PROJECT_ID> --service <BACKEND_SERVICE> --environment production --deployment-instance <INSTANCE_ID> -- \
+    node dist/scripts/backfillTokenEncryption.js --target-ids <uuid-1>,<uuid-2> --expected-total 3 --expected-plaid-env sandbox
+  ```
+  and, for apply, the same with `--apply --confirm BACKFILL_PLAID_TOKENS` appended. This runs the command inside the running production container over SSH, using the variables already injected into that container's own environment — nothing is copied to, or ever present in, Trevor's local process. **Honest caveat, flagged rather than glossed over**: I have not independently verified the exact current flag surface of `railway ssh` (project/service/environment/deployment-instance naming) against Railway's live CLI, the same kind of platform-specific fact I couldn't verify for Sealed Variables in §5.4 or for `railway run`'s behavior before Codex checked it. Trevor should confirm the exact flags via `railway ssh --help` (or the current docs) before first use — the property that matters for this design (execution happens inside the container, not locally) is what to insist on, not the exact spelling of the flags.
+- **Which credentials/variables it needs**: exactly what's already configured for the backend service today — `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`, `PLAID_TOKEN_KEY_RAILWAY_PROD_V1` / `PLAID_TOKEN_CURRENT_KEY_ID`, `PLAID_CLIENT_ID` / `PLAID_SECRET` / `PLAID_ENV`. Nothing new is created, copied, or displayed to Trevor at any point.
+- **How we avoid printing secrets**: see "Logging," below.
+- **How Trevor manually triggers it**: the one explicit `railway ssh ... -- node dist/scripts/backfillTokenEncryption.js ...` command (dry-run first, then apply) — never wired to a deploy hook, cron, or the server's own startup path.
+- **How to stop/abort it**: Ctrl+C on the local `railway ssh` session sends the interrupt through to the remote process (standard SSH behavior); the remote process's own SIGINT/SIGTERM handling (above) governs what happens next — no success message, safe to rerun.
+- **Whether deploying the script changes application behavior**: no — inert until invoked as its own process, exactly as the prior revision established.
+- **How we ensure it cannot run automatically on deploy/startup**: unchanged three-part guarantee — never imported by the server's module graph, `startCommand` never references it, and the script's own entrypoint guard refuses indirect invocation.
 
-Trevor asked for this to use the already-configured Railway production environment rather than his local machine, so the script never requires him to hand-copy the production encryption key, Supabase service-role key, or Plaid credentials anywhere new.
+### Logging (point 10)
 
-- **Where the script lives**: `backend/src/scripts/backfillTokenEncryption.ts`, inside the normal backend source tree, compiled by the exact same `tsc -p tsconfig.build.json` build already used for every regular deploy (§ "How it deploys" below). It is **never imported by `index.ts`** or anything else in the request-serving module graph — the running server's module graph has no path that reaches it, so its mere presence in a deploy is inert. As a second, redundant safety net (belt-and-suspenders, matching this codebase's existing fail-closed philosophy, §8), the script's own entrypoint only runs when invoked directly as the process's own entrypoint (the compiled-CommonJS equivalent of `require.main === module`), not if some future refactor accidentally imports it from elsewhere.
-- **How it deploys**: as part of the ordinary backend build/deploy — no new Railway service, no new environment, no new variables. `railway.json`'s `deploy.startCommand` stays exactly `npm run start --workspace backend`, untouched; the backfill is a second, separate `npm` script (e.g. `"backfill:token-encryption": "node dist/scripts/backfillTokenEncryption.js"`) that the deployed service never runs on its own.
-- **How it's invoked**: as a one-off command run *against the already-deployed backend service's own environment*, via Railway's mechanism for exactly this (Railway CLI's `railway run --service <backend-service> -- npm run backfill:token-encryption --workspace backend`, or the dashboard's equivalent one-off-command/shell control if Trevor's plan exposes one — worth him confirming which is available in his own dashboard, the same kind of one-time check he already did for Sealed Variables in §5.4/§19). This reuses the exact already-configured, already-sealed variables for that service — nothing new is created or copied. **Honest caveat**: depending on how the Railway CLI executes `railway run`, the command may run as a local process with that service's variables injected into local process memory for the single command's duration (never written to disk, never printed) rather than fully inside Railway's own infrastructure — if Trevor's dashboard offers a fully-remote one-off-execution control instead, that's the preferable option with zero local exposure of any kind; either way, no secret is ever hand-copied, pasted, or stored in a file.
-- **Which credentials/variables it needs**: exactly what's already configured for the backend service today — `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` (read/update `plaid_items`), `PLAID_TOKEN_KEY_RAILWAY_PROD_V1` / `PLAID_TOKEN_CURRENT_KEY_ID` (encrypt), `PLAID_CLIENT_ID` / `PLAID_SECRET` / `PLAID_ENV` (the `itemGet` verification call). No new key, no new service-role token, no new Plaid credential.
-- **How we avoid printing secrets**: the script only ever logs `{ id, match: boolean }` per row, exactly like point 3 above — never a plaintext token, decrypted value, ciphertext, nonce, auth tag, or key. Any caught error is passed through the existing `summarizeErrorSafely()` (§20) before logging, the same as every other Plaid-facing call site in this codebase. Nothing in the script logs `process.env` or a raw row object.
-- **How Trevor manually triggers it**: the single explicit `railway run ...` (or dashboard equivalent) command above — one deliberate action, never wired to a deploy hook, cron, or the server's startup path.
-- **How to stop/abort it**: it's a plain foreground process — Ctrl+C or closing the terminal ends it immediately. Because every row's encryption + verification is a single atomic update gated by the `access_token_key_id is null` guard (point 2), an interrupted run always leaves the database fully consistent — some rows encrypted, some not yet — and is safely resumed by simply running the same command again (point 2's idempotency).
-- **Whether deploying the script changes application behavior**: no. It ships with the regular deploy but is unreachable from the running server (see "Where the script lives" above) until explicitly invoked as its own process.
-- **How we ensure it cannot run automatically on deploy/startup**: three independent things all have to be true, not just one: (1) it's never imported by `index.ts`/anything the server's module graph reaches; (2) `railway.json`'s `startCommand` never references it; (3) the script's own entrypoint guard refuses to execute unless launched directly.
+Structured, allow-listed fields only — every log line is built from an explicit small set of safe fields, never from spreading/serializing a row or error object wholesale:
+- **Always allowed**: the internal `plaid_items.id`, the current stage (`storage_check` / `encrypt` / `verify_decrypt` / `verify_compare` / `verify_plaid` / `done`), and a safe outcome (`verified` / `failed:<reason>` / `skipped_dry_run` / `interrupted`).
+- **Never logged, under any code path in this script**: the plaintext token, the decrypted token, ciphertext, nonce, auth tag, any key material, the *external* Plaid `item_id` (stricter than this codebase's existing webhook logging, which does log it — a deliberate, narrower rule for this specific script, not a change to any other file), raw Axios/Plaid error objects (routed through the existing `summarizeErrorSafely()`, §20, same as every other Plaid-facing call site), or environment contents.
 
-**9. What Codex should independently review before execution**
+### Implementation branch (point 11)
 
-- The backfill script itself, read-only against the actual file once written: the concurrency guard (`and access_token_key_id is null` on every update, and that `access_token` never appears in any `set` list), and that per-row verification (point 3) halts the whole run on first failure rather than continuing or silently skipping.
-- That the script reuses the existing `encryptAccessToken`/`getKeyRing`/`plaidService.getItemInstitution` functions rather than reimplementing any crypto or Plaid-call logic.
-- That the corrected sequencing actually holds in the deployed code at execution time: Phase 2a's dual-write is still active (no accidental early Phase 2b) when the backfill runs, and the later Phase 2b deployment (step 8) is a separate, distinct change from the backfill itself, not bundled into the same deploy.
-- That nothing in the script or its invocation logs plaintext, decrypted values, or key material — the same sanitized-logging standard already enforced elsewhere in this codebase (§11, §20's error sanitizer).
-- That the script is genuinely unreachable from the running server's startup path (all three points under "How we ensure it cannot run automatically," above) — not just that it's not currently wired up, but that there's no accidental import path into it.
-- The rollback-safety boundary statement in point 4 above (Points A/B/C), checked against the actual state of `dataService.ts` at the time of execution, since code can drift between this proposal being written and being executed.
+When implementation is approved: a **new branch cut from current `main`**, not a reuse of `feature/phase2a-encryption-reapply` (already merged and gone as an active line of work).
+
+### What Codex should independently review before execution (expanded)
+
+- That storage state and verification result are genuinely never conflated anywhere in the script — specifically, that there is no code path that treats a non-null `access_token_key_id` as sufficient to skip the three-step verification.
+- The concurrency guard (`and access_token_key_id is null`, `access_token` absent from every `set` list) and that a zero-row update result triggers a reread-and-verify-the-winner path, never a verify-the-discarded-local-object path.
+- That `verifyAccessTokenLive` calls only `itemGet` — no institution lookup, no other Plaid call — and that the script never calls `getItemInstitution` instead.
+- The retry policy: exactly which failure categories are retried (transient network/429/5xx) vs. never retried (crypto/key/version/state/comparison/legitimate-rejection), and that any exhausted-retry or non-transient failure halts the whole run and exits nonzero.
+- SIGINT/SIGTERM handling: no success message on any interrupted path, and that the next run's behavior is correct without any special interrupt-recovery code (because it re-verifies everything unconditionally).
+- The CLI surface: dry-run is truly the default (no flags produce a write), `--apply` alone doesn't write without `--confirm BACKFILL_PLAID_TOKENS`, `--target-ids` is required and exact (no broad-match mode exists anywhere), and `--expected-total`/`--expected-plaid-env` are enforced, not merely logged.
+- Logging: every log call site against the allow-list above, including error paths (not just the happy path).
+- That the script is genuinely unreachable from the running server's startup path — not imported by `index.ts`'s module graph, `startCommand` unchanged, entrypoint guard present.
+- The rollback-boundary statement (Points A/B/C) checked against the actual state of `dataService.ts` at execution time, since code can drift between this proposal and its execution.
+- That the implementation branch was cut from current `main`, not reused from the old Phase 2a branch.
+
+### Required test plan (point 13)
+
+- Dry-run performs zero writes (assert no `update` is ever issued in dry-run mode, across every check outcome).
+- Apply refused with `--apply` missing.
+- Apply refused with `--confirm` missing or set to the wrong string.
+- Apply refused when `--expected-total` doesn't match the live count.
+- Apply refused when a supplied target id doesn't exist, or doesn't currently have `plaintext_only` storage state.
+- A target already `encrypted` (from a prior run) is still fully re-verified, not skipped — this is the core point-1 regression test.
+- Simulated crash: update commits, then the process is interrupted before verification runs; the *next* invocation re-verifies that target from a fresh reread rather than treating it as done.
+- A guarded update that affects zero rows (simulated concurrent winner) causes a reread of the actual stored row and verification of that reread value, never of the run's own discarded local ciphertext.
+- A row in a `partial` encrypted state (simulated, shouldn't occur given the constraint) is detected and refused rather than guessed at.
+- An unexpected `access_token_key_id` (not in the configured key ring) or unexpected `access_token_enc_version` fails verification as a non-transient, non-retried error.
+- A plaintext/decrypted mismatch fails verification as a non-transient, non-retried error.
+- Verification decrypts and compares the value actually reread from the database, not a value held from earlier in the same run (a regression test specifically for point 6 — e.g. simulate the database row changing between the write and the verification read, and assert the newer value is what's checked).
+- A transient Plaid failure (simulated timeout/429/5xx) is retried up to the bound and can still succeed within it.
+- A transient Plaid failure that exhausts all retries halts the run, exits nonzero, and is logged with a distinguishable `transient_retry_exhausted` reason.
+- A non-transient Plaid failure (e.g. simulated `ITEM_LOGIN_REQUIRED`) is never retried and halts immediately.
+- SIGINT/SIGTERM mid-run exits nonzero and never emits a success/completion message.
+- Logging sentinel tests (same pattern as `errorSanitizer.test.ts`, §20): construct fixtures containing sentinel plaintext/ciphertext/key/Plaid-item-id values and assert none ever appear in any logged output, across every code path including error paths.
 
 ---
 
