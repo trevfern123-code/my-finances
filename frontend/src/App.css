@@ -343,6 +343,11 @@ button:disabled {
   font-size: 0.85rem;
 }
 
+.credential-error-hint {
+  border-left: 3px solid var(--warn);
+  padding-left: 0.6rem;
+}
+
 /* ---- Dashboard shell ---- */
 
 .dashboard {

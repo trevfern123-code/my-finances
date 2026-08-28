@@ -267,6 +267,16 @@ export function LinkedAccounts({
                     onReconnected={onRefreshed}
                   />
                 )}
+                {item.status === 'credential_error' && (
+                  // Deliberately no reconnect button — the stored credential may be perfectly
+                  // valid to Plaid, this app simply failed to read it. A reconnect flow can't fix
+                  // that, and would misleadingly suggest the bank connection itself is the
+                  // problem (design doc §10).
+                  <p className="hint credential-error-hint">
+                    We&rsquo;re having trouble accessing this account&rsquo;s connection right now.
+                    This isn&rsquo;t something you need to fix — we&rsquo;ve been notified.
+                  </p>
+                )}
                 <ul>
                   {sorted.map((account, index) => (
                     <li

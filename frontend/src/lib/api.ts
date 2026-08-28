@@ -79,7 +79,10 @@ export interface LinkedItem {
   id: string;
   institution_id: string | null;
   institution_name: string | null;
-  status: 'active' | 'login_required';
+  /** 'credential_error' means this app failed to decrypt/read the stored Plaid credential — not
+   *  a bank-reconnect situation like 'login_required' (see PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md
+   *  §9/§10). Never show a reconnect prompt for it — reconnecting wouldn't fix anything. */
+  status: 'active' | 'login_required' | 'credential_error';
   accounts: LinkedAccount[];
 }
 
