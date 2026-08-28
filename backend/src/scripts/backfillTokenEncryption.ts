@@ -29,6 +29,12 @@
  *
  * Both names must come back. Only after confirming this by hand does `--constraints-confirmed
  * PLAID_PHASE1_CONSTRAINTS_VERIFIED` become an honest attestation rather than a rubber stamp.
+ *
+ * Retargeted to RAILWAY_PROD_V2 (from RAILWAY_PROD_V1) as part of the V1 → V2 key rotation —
+ * see `rotateTartanTokenKey.ts` and PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §22's rotation
+ * addendum. By the time this script is meant to run, the Tartan item (the one non-target row)
+ * must already be on V2 — that's `rotateTartanTokenKey.ts`'s job, not this script's; this script
+ * only ever encrypts the two still-plaintext rows, directly under V2.
  */
 
 import { supabaseAdmin } from '../config/supabase';
@@ -50,7 +56,7 @@ import { verifyAccessTokenLive } from '../services/plaidService';
 
 const CONFIRM_TOKEN = 'BACKFILL_PLAID_TOKENS';
 const CONSTRAINTS_ATTESTATION_TOKEN = 'PLAID_PHASE1_CONSTRAINTS_VERIFIED';
-const EXPECTED_CURRENT_KEY_ID = 'RAILWAY_PROD_V1';
+const EXPECTED_CURRENT_KEY_ID = 'RAILWAY_PROD_V2'; // retargeted for the V1 → V2 rotation
 const EXPECTED_ENC_VERSION = 1; // mirrors tokenEncryption.ts's own (unexported) ENC_VERSION
 const REQUIRED_EXPECTED_TOTAL = 3;
 const REQUIRED_EXPECTED_PLAID_ENV = 'sandbox';
