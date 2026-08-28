@@ -35,6 +35,19 @@ function flushMicrotasks() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+/** Matches the shape errorSanitizer.ts's summarizeErrorSafely produces for a plain Error with no
+ *  Plaid/Axios fields — every log-call assertion below checks against this, never a raw Error
+ *  instance or a bare string, since that's exactly the distinction these tests exist to lock in. */
+function safeSummaryFor(err: Error) {
+  return {
+    name: err.name,
+    message: err.message,
+    plaidErrorCode: undefined,
+    plaidErrorType: undefined,
+    httpStatus: undefined,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -42,8 +55,9 @@ beforeEach(() => {
 });
 
 describe('handlePlaidWebhook — credential-error handling on the async path (§7 Phase 4, §9)', () => {
-  it('logs a credential error resolving the item and does not throw an unhandled rejection', async () => {
-    mockGetPlaidItemByPlaidItemId.mockRejectedValue(new UnknownKeyIdError());
+  it('logs a sanitized summary (never the raw error) when the item cannot be resolved at all (no internal row id known)', async () => {
+    const err = new UnknownKeyIdError(); // no itemRowId — the row itself never resolved
+    mockGetPlaidItemByPlaidItemId.mockRejectedValue(err);
     const req = fakeReq({ webhook_type: 'TRANSACTIONS', webhook_code: 'SYNC_UPDATES_AVAILABLE', item_id: 'plaid-item-1' });
     const res = fakeRes();
 
@@ -54,15 +68,42 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
     expect(mockSyncItemTransactions).not.toHaveBeenCalled();
     expect(console.error).toHaveBeenCalledWith(
       expect.stringContaining('Plaid credential error resolving webhook item plaid-item-1'),
-      'UnknownKeyIdError'
+      safeSummaryFor(err)
     );
-    // No internal row id was ever available for this failure mode — confirms this case is
-    // deliberately just logged, not silently treated as a normal processing error either.
+    // No internal row id was available on this error, so there is genuinely nothing to mark —
+    // confirms this stays an honest "logged, not silently treated as success" case rather than
+    // guessing at a row id.
     expect(mockSetItemStatus).not.toHaveBeenCalled();
   });
 
-  it('rethrows (surfacing to the outer .catch as an unexpected error) a non-credential error resolving the item', async () => {
-    mockGetPlaidItemByPlaidItemId.mockRejectedValue(new Error('network blip'));
+  it('marks the correct item credential_error when the thrown error carries its itemRowId (Blocker 3)', async () => {
+    const err = new UnknownKeyIdError('internal-row-42');
+    mockGetPlaidItemByPlaidItemId.mockRejectedValue(err);
+    const req = fakeReq({ webhook_type: 'TRANSACTIONS', webhook_code: 'SYNC_UPDATES_AVAILABLE', item_id: 'plaid-item-1' });
+    const res = fakeRes();
+
+    await handlePlaidWebhook(req, res);
+    await flushMicrotasks();
+
+    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('internal-row-42', 'credential_error');
+  });
+
+  it('one item\'s credential failure does not affect another item\'s status', async () => {
+    const err = new UnknownKeyIdError('row-affected');
+    mockGetPlaidItemByPlaidItemId.mockRejectedValue(err);
+    const req = fakeReq({ webhook_type: 'TRANSACTIONS', webhook_code: 'SYNC_UPDATES_AVAILABLE', item_id: 'plaid-item-1' });
+    const res = fakeRes();
+
+    await handlePlaidWebhook(req, res);
+    await flushMicrotasks();
+
+    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-affected', 'credential_error');
+    expect(mockSetItemStatus).not.toHaveBeenCalledWith('row-unrelated', expect.anything());
+  });
+
+  it('rethrows (surfacing to the outer .catch, sanitized) a non-credential error resolving the item', async () => {
+    const err = new Error('network blip');
+    mockGetPlaidItemByPlaidItemId.mockRejectedValue(err);
     const req = fakeReq({ webhook_type: 'TRANSACTIONS', webhook_code: 'SYNC_UPDATES_AVAILABLE', item_id: 'plaid-item-1' });
     const res = fakeRes();
 
@@ -72,8 +113,9 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
     expect(console.error).toHaveBeenCalledWith(
       'Failed to process Plaid webhook:',
       'SYNC_UPDATES_AVAILABLE',
-      expect.any(Error)
+      safeSummaryFor(err)
     );
+    expect(mockSetItemStatus).not.toHaveBeenCalled();
   });
 
   it('processes a normal webhook exactly as before when nothing fails', async () => {
@@ -96,13 +138,36 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
     expect(console.error).not.toHaveBeenCalled();
   });
 
+  it('legitimate Plaid reauthentication (ITEM_LOGIN_REQUIRED) still sets login_required, distinct from credential_error', async () => {
+    mockGetPlaidItemByPlaidItemId.mockResolvedValue({
+      id: 'row-1',
+      user_id: 'user-1',
+      access_token: 'a-token',
+      transactions_cursor: 'cursor-1',
+    });
+    const req = fakeReq({
+      webhook_type: 'ITEM',
+      webhook_code: 'ERROR',
+      item_id: 'plaid-item-1',
+      error: { error_code: 'ITEM_LOGIN_REQUIRED' },
+    });
+    const res = fakeRes();
+
+    await handlePlaidWebhook(req, res);
+    await flushMicrotasks();
+
+    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'login_required');
+    expect(mockSetItemStatus).not.toHaveBeenCalledWith('row-1', 'credential_error');
+  });
+
   it('does not swallow a PlaidCredentialError instance differently than any of its subclasses (instanceof, not name-matching)', async () => {
     class SomeFutureSubclass extends PlaidCredentialError {
-      constructor() {
-        super('future subclass');
+      constructor(itemRowId?: string) {
+        super('future subclass', itemRowId);
       }
     }
-    mockGetPlaidItemByPlaidItemId.mockRejectedValue(new SomeFutureSubclass());
+    const err = new SomeFutureSubclass('row-99');
+    mockGetPlaidItemByPlaidItemId.mockRejectedValue(err);
     const req = fakeReq({ webhook_type: 'TRANSACTIONS', webhook_code: 'SYNC_UPDATES_AVAILABLE', item_id: 'plaid-item-1' });
     const res = fakeRes();
 
@@ -111,7 +176,8 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
 
     expect(console.error).toHaveBeenCalledWith(
       expect.stringContaining('Plaid credential error resolving webhook item plaid-item-1'),
-      'SomeFutureSubclass'
+      safeSummaryFor(err)
     );
+    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-99', 'credential_error');
   });
 });

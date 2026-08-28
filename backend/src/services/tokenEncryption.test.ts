@@ -190,6 +190,31 @@ describe('encryptAccessToken / decryptAccessToken round trip', () => {
     expect(a.nonceBase64).not.toBe(b.nonceBase64);
   });
 
+  it('decrypts correctly using a configured historical (non-current) key — the key-rotation scenario (§13)', () => {
+    const oldKeyB64 = randomBytes(32).toString('base64');
+    const ringWithOldCurrent = loadKeyRing(fixtureEnv({ PLAID_TOKEN_KEY_OLD_V1: oldKeyB64, PLAID_TOKEN_CURRENT_KEY_ID: 'OLD_V1' }));
+    // Encrypt while OLD_V1 is current — mirrors a row written before a rotation.
+    const enc = encryptAccessToken(PLAINTEXT, ringWithOldCurrent, ITEM_ID);
+    expect(enc.keyId).toBe('OLD_V1');
+
+    // Rotate: TEST_V1 becomes current, but OLD_V1 stays configured for decrypting old rows.
+    const ringAfterRotation = loadKeyRing(
+      fixtureEnv({ PLAID_TOKEN_KEY_OLD_V1: oldKeyB64, PLAID_TOKEN_CURRENT_KEY_ID: 'TEST_V1' })
+    );
+    const decrypted = decryptAccessToken(enc, ringAfterRotation, ITEM_ID);
+    expect(decrypted).toBe(PLAINTEXT);
+  });
+
+  it('fails GCM authentication if the encryption version is tampered with between encrypt and decrypt', () => {
+    // encVersion feeds the AAD (§4) — a tampered version changes the AAD, which GCM correctly
+    // treats the same as any other AAD mismatch: authentication failure, not a silent version
+    // upgrade/downgrade.
+    const ring = fixtureKeyRing();
+    const enc = encryptAccessToken(PLAINTEXT, ring, ITEM_ID);
+    const tampered = { ...enc, encVersion: enc.encVersion + 1 };
+    expect(() => decryptAccessToken(tampered, ring, ITEM_ID)).toThrow(GcmAuthenticationError);
+  });
+
   it('nonce is always exactly 12 bytes, across many repeated calls', () => {
     const ring = fixtureKeyRing();
     for (let i = 0; i < 50; i++) {

@@ -11,14 +11,17 @@ import { userPreferencesRouter } from './routes/userPreferences';
 import { webhooksRouter } from './routes/webhooks';
 import { errorHandler } from './middleware/errorHandler';
 import { validateKeyRingOrExit } from './services/tokenEncryption';
+import { summarizeErrorSafely } from './services/errorSanitizer';
 
 // Last-resort logging so a future unhandled rejection is visible in deploy logs before
-// the process exits, rather than the container just going silently unresponsive.
+// the process exits, rather than the container just going silently unresponsive. Never log the
+// raw reason/error — either could in principle be a real Plaid/Axios error that slipped past
+// every other catch site (see errorSanitizer.ts for why the raw object is unsafe).
 process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled promise rejection:', reason);
+  console.error('Unhandled promise rejection:', summarizeErrorSafely(reason));
 });
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
+  console.error('Uncaught exception:', summarizeErrorSafely(err));
   process.exit(1);
 });
 

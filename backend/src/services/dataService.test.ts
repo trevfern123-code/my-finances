@@ -189,6 +189,70 @@ describe('getPlaidItemsForUser / getPlaidItemByPlaidItemId / getPlaidItemForUser
     expect(() => result[0].access_token).toThrow(UnknownKeyIdError);
   });
 
+  it('getPlaidItemsForUser: an empty-string access_token_key_id enters the encrypted path (not truthiness) and fails closed, never falling back to plaintext', async () => {
+    // Blocker 2: `if (row.access_token_key_id)` would treat '' as falsy and silently return the
+    // plaintext column below — the DB check constraint permits '' (it only requires non-NULL),
+    // so this must be handled at the application layer, not assumed away by the schema.
+    const row = encryptedRow('irrelevant', {
+      access_token_key_id: '',
+      access_token: 'a-plaintext-value-that-must-never-be-returned',
+    });
+    const query = createQueryBuilder({ data: [row], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getPlaidItemsForUser('user-1');
+
+    // Entering the encrypted path with keyId '' resolves to UnknownKeyIdError (no real key is
+    // ever registered under an empty string) — a clean, fail-closed result, not a crash and
+    // absolutely not the plaintext value.
+    expect(() => result[0].access_token).toThrow(UnknownKeyIdError);
+  });
+
+  it('getPlaidItemsForUser: empty-string key ID with fully-populated encrypted fields still fails closed, not plaintext', async () => {
+    // Same as above but explicit that every other encrypted column is genuinely present and
+    // well-formed (mirrors exactly the row shape Codex described: "encrypted fields populated +
+    // empty key ID") — the failure is specifically about the key id, not incidentally about some
+    // other field being malformed too.
+    const validEncryption = encryptAccessToken('some-token', TEST_KEY_RING, ITEM_ROW_ID);
+    const row = encryptedRow('irrelevant', {
+      access_token_key_id: '',
+      access_token_ciphertext: validEncryption.ciphertextBase64,
+      access_token_nonce: validEncryption.nonceBase64,
+      access_token_auth_tag: validEncryption.authTagBase64,
+      access_token_enc_version: validEncryption.encVersion,
+      access_token: 'plaintext-must-never-be-returned',
+    });
+    const query = createQueryBuilder({ data: [row], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getPlaidItemsForUser('user-1');
+
+    let thrown: unknown;
+    try {
+      void result[0].access_token;
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(UnknownKeyIdError);
+    // Explicit, not just "it threw" — proves no code path returned the plaintext instead.
+    expect(thrown).not.toBe('plaintext-must-never-be-returned');
+  });
+
+  it('getPlaidItemForUser and getPlaidItemByPlaidItemId also fail closed on an empty-string key ID (shared resolveAccessToken)', async () => {
+    const row = encryptedRow('irrelevant', {
+      access_token_key_id: '',
+      access_token: 'plaintext-must-never-be-returned',
+    });
+
+    const query1 = createQueryBuilder({ data: row, error: null });
+    mockFrom.mockReturnValueOnce(query1);
+    await expect(getPlaidItemForUser(ITEM_ROW_ID, 'user-1')).rejects.toThrow(UnknownKeyIdError);
+
+    const query2 = createQueryBuilder({ data: row, error: null });
+    mockFrom.mockReturnValueOnce(query2);
+    await expect(getPlaidItemByPlaidItemId('plaid-item-1')).rejects.toThrow(UnknownKeyIdError);
+  });
+
   it('getPlaidItemsForUser resolves each item independently — a bad row does not prevent reading a good row in the same batch', async () => {
     const badRow = encryptedRow('bad', { id: 'row-bad', access_token_ciphertext: 'AAAAAAAAAAAAAAAAAAAAAA==' });
     const goodRow = { ...plaintextOnlyRow(), id: 'row-good', access_token: 'good-token' };

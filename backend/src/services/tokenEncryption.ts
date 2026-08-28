@@ -24,40 +24,50 @@ const AUTH_TAG_LENGTH_BYTES = 16; // AES-GCM's standard tag length
  * `middleware/errorHandler.ts` forwards `.message` to the client unchanged today.
  */
 export class PlaidCredentialError extends Error {
-  constructor(message: string) {
+  /** The internal `plaid_items.id` this failure is associated with, when known at the point the
+   *  error was constructed. Lets a catch site recover the row to act on (e.g. set its status)
+   *  even when the failure happened *while resolving that very row* — the webhook path's item
+   *  lookup and token decryption are one combined call, so without this, a decrypt failure there
+   *  would leave no internal id available at all to mark the item `credential_error`. Undefined
+   *  for failures that aren't tied to one specific row (e.g. `InvalidKeyConfigurationError`, a
+   *  whole-key-ring problem, not a per-item one). */
+  itemRowId?: string;
+
+  constructor(message: string, itemRowId?: string) {
     super(message);
     this.name = this.constructor.name;
+    this.itemRowId = itemRowId;
   }
 }
 
 /** Thrown at startup (not per-request) when the configured key-ring environment variables are
- *  missing, malformed, or internally inconsistent (§5.5, §9). */
+ *  missing, malformed, or internally inconsistent (§5.5, §9). Never tied to one row. */
 export class InvalidKeyConfigurationError extends PlaidCredentialError {}
 
 /** A row's `access_token_key_id` doesn't match any key currently configured in this app's key
  *  ring (§9) — e.g. an old key was removed from the environment before every row referencing it
  *  was rotated (§12). */
 export class UnknownKeyIdError extends PlaidCredentialError {
-  constructor() {
-    super('Stored credential references an unrecognized encryption key.');
+  constructor(itemRowId?: string) {
+    super('Stored credential references an unrecognized encryption key.', itemRowId);
   }
 }
 
 export class MalformedNonceError extends PlaidCredentialError {
-  constructor() {
-    super('Stored credential has a malformed nonce.');
+  constructor(itemRowId?: string) {
+    super('Stored credential has a malformed nonce.', itemRowId);
   }
 }
 
 export class MalformedAuthTagError extends PlaidCredentialError {
-  constructor() {
-    super('Stored credential has a malformed authentication tag.');
+  constructor(itemRowId?: string) {
+    super('Stored credential has a malformed authentication tag.', itemRowId);
   }
 }
 
 export class MalformedCiphertextError extends PlaidCredentialError {
-  constructor() {
-    super('Stored credential has malformed ciphertext.');
+  constructor(itemRowId?: string) {
+    super('Stored credential has malformed ciphertext.', itemRowId);
   }
 }
 
@@ -65,8 +75,8 @@ export class MalformedCiphertextError extends PlaidCredentialError {
  *  mismatched AAD are indistinguishable from the ciphertext alone, by GCM's design (§9). This is
  *  the exact error the fail-closed rule (§8) forbids falling back to plaintext from. */
 export class GcmAuthenticationError extends PlaidCredentialError {
-  constructor() {
-    super('Unable to verify stored credential.');
+  constructor(itemRowId?: string) {
+    super('Unable to verify stored credential.', itemRowId);
   }
 }
 
@@ -75,8 +85,8 @@ export class GcmAuthenticationError extends PlaidCredentialError {
  *  (§2) makes this unreachable before then. Exported here because it's part of the same
  *  `PlaidCredentialError` family (§9), even though dataService.ts is what throws it. */
 export class MissingEncryptedRepresentationError extends PlaidCredentialError {
-  constructor() {
-    super('Stored credential has no usable representation.');
+  constructor(itemRowId?: string) {
+    super('Stored credential has no usable representation.', itemRowId);
   }
 }
 
@@ -238,12 +248,12 @@ export function decryptAccessToken(
   const authTag = Buffer.from(enc.authTagBase64, 'base64');
   const ciphertext = Buffer.from(enc.ciphertextBase64, 'base64');
 
-  if (nonce.length !== NONCE_LENGTH_BYTES) throw new MalformedNonceError();
-  if (authTag.length !== AUTH_TAG_LENGTH_BYTES) throw new MalformedAuthTagError();
-  if (ciphertext.length === 0) throw new MalformedCiphertextError();
+  if (nonce.length !== NONCE_LENGTH_BYTES) throw new MalformedNonceError(plaidItemId);
+  if (authTag.length !== AUTH_TAG_LENGTH_BYTES) throw new MalformedAuthTagError(plaidItemId);
+  if (ciphertext.length === 0) throw new MalformedCiphertextError(plaidItemId);
 
   const key = keyRing.keys.get(enc.keyId);
-  if (!key) throw new UnknownKeyIdError();
+  if (!key) throw new UnknownKeyIdError(plaidItemId);
 
   const decipher = createDecipheriv('aes-256-gcm', key, nonce);
   decipher.setAAD(buildAad(plaidItemId, enc.encVersion));
@@ -254,6 +264,6 @@ export function decryptAccessToken(
     // Deliberately swallow crypto's own thrown error rather than rethrow/wrap it — it could in
     // principle carry buffer contents, and GcmAuthenticationError's fixed message is all that
     // should ever reach a log line or an HTTP response (§11).
-    throw new GcmAuthenticationError();
+    throw new GcmAuthenticationError(plaidItemId);
   }
 }

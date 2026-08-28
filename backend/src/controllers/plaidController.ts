@@ -10,6 +10,7 @@ import { groupAccountsForAssetsSummary, type AssetAccount } from '../services/as
 import { getCurrentMonthRange } from '../services/budgetPeriod';
 import { isReportingRangeId, resolveReportingRange, type ResolvedRange } from '../services/reportingRange';
 import { PlaidCredentialError } from '../services/tokenEncryption';
+import { summarizeErrorSafely } from '../services/errorSanitizer';
 import { env } from '../config/env';
 
 /** Date-Range Customization v1: `range_id` (one of the 5 reporting-range presets) takes
@@ -287,7 +288,9 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
         // Best-effort: backfills the webhook URL onto items linked before webhooks were
         // configured. Not critical, so a failure here shouldn't fail the whole refresh.
         await plaidService.updateItemWebhook(item.access_token).catch((err) => {
-          console.error(`Failed to backfill webhook for item ${item.id}:`, err);
+          // Never log the raw error — a real Plaid/Axios rejection here carries the outgoing
+          // request (access_token included) in its .config (see errorSanitizer.ts).
+          console.error(`Failed to backfill webhook for item ${item.id}:`, summarizeErrorSafely(err));
         });
 
         // Also best-effort (see refreshLoansForItem) — only produces data once the

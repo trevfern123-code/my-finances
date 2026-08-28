@@ -3,6 +3,7 @@ import * as dataService from '../services/dataService';
 import * as syncService from '../services/syncService';
 import { verifyPlaidWebhook } from '../services/webhookVerification';
 import { PlaidCredentialError } from '../services/tokenEncryption';
+import { summarizeErrorSafely } from '../services/errorSanitizer';
 
 interface PlaidWebhookPayload {
   webhook_type: string;
@@ -32,7 +33,11 @@ export async function handlePlaidWebhook(req: Request, res: Response) {
   res.status(200).json({ acknowledged: true });
 
   processWebhook(payload).catch((err) => {
-    console.error('Failed to process Plaid webhook:', payload.webhook_code, err);
+    // Never log the raw error — this is the fire-and-forget catch-all for the entire webhook
+    // processing chain, including real Plaid/Axios errors from syncItemTransactions (whose
+    // `.config` would carry the full outgoing request, access_token included). See
+    // errorSanitizer.ts for why the raw object is unsafe.
+    console.error('Failed to process Plaid webhook:', payload.webhook_code, summarizeErrorSafely(err));
   });
 }
 
@@ -42,12 +47,19 @@ async function processWebhook(payload: PlaidWebhookPayload) {
     item = await dataService.getPlaidItemByPlaidItemId(payload.item_id);
   } catch (err) {
     if (err instanceof PlaidCredentialError) {
-      // Only Plaid's own item_id is known here — the row lookup itself is what failed, so
-      // (unlike completeReauth, which already has its internal row id from the route param)
-      // there's no internal id available to set a 'credential_error' status on. This is logged
-      // clearly enough for a human to find the row directly (§12 treats this as an investigation
-      // trigger, not something to auto-recover from anyway).
-      console.error(`Plaid credential error resolving webhook item ${payload.item_id}:`, err.name);
+      // The combined item-lookup-and-decrypt call is what failed, so unlike completeReauth
+      // (which already has its internal row id from the route param before any decrypt is
+      // attempted), there'd otherwise be no internal id available here at all — resolveAccessToken
+      // attaches it to the thrown error itself (itemRowId, tokenEncryption.ts) specifically so
+      // this case can still mark the correct row, rather than only being able to log Plaid's own
+      // item_id and leave the row's status stale at 'active'.
+      console.error(
+        `Plaid credential error resolving webhook item ${payload.item_id}:`,
+        summarizeErrorSafely(err)
+      );
+      if (err.itemRowId) {
+        await dataService.setItemStatus(err.itemRowId, 'credential_error');
+      }
       return;
     }
     throw err;

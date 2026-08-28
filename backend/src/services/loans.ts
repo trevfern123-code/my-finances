@@ -1,6 +1,7 @@
 import type { CreditCardLiability, MortgageLiability, StudentLoan } from 'plaid';
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
+import { summarizeErrorSafely } from './errorSanitizer';
 import type { InsertedTransaction } from '../types';
 
 export type LoanType = 'student' | 'mortgage' | 'credit';
@@ -192,6 +193,9 @@ export async function refreshLoansForItem(
     const normalized = normalizeLiabilities(liabilities);
     await dataService.upsertLoans(itemRowId, normalized, accountIdByPlaidId);
   } catch (err) {
-    console.error(`Failed to refresh loans for item ${itemRowId}:`, err);
+    // Never log the raw error — plaidService.getLiabilities is a real Plaid API call, and a
+    // rejected request's .config carries the outgoing request body (access_token included; see
+    // errorSanitizer.ts).
+    console.error(`Failed to refresh loans for item ${itemRowId}:`, summarizeErrorSafely(err));
   }
 }

@@ -62,7 +62,15 @@ interface EncryptedTokenRow {
  *  straight up, uncaught — there is deliberately no `catch` here that would fall back to the
  *  plaintext column once an encrypted representation exists, which is the one thing §8 forbids. */
 function resolveAccessToken(itemRowId: string, row: EncryptedTokenRow): string {
-  if (row.access_token_key_id) {
+  // Presence/non-NULL, not JavaScript truthiness: the plaid_items_encrypted_token_complete check
+  // constraint (§2) guarantees this column is NULL or non-NULL together with the other four
+  // encrypted fields, but does not (and a check constraint reasonably can't) forbid it being the
+  // empty string. `if (row.access_token_key_id)` would treat '' as "no encrypted representation"
+  // and silently fall through to the plaintext branch below — exactly the kind of accidental
+  // plaintext fallback §8's fail-closed rule exists to prevent. An empty (or any non-null,
+  // non-matching) key id now always enters the encrypted path and fails closed via
+  // UnknownKeyIdError, never plaintext.
+  if (row.access_token_key_id !== null) {
     const enc: EncryptedAccessToken = {
       ciphertextBase64: row.access_token_ciphertext!,
       nonceBase64: row.access_token_nonce!,
@@ -77,7 +85,7 @@ function resolveAccessToken(itemRowId: string, row: EncryptedTokenRow): string {
     // least one representation always exists. Reachable only after a future Phase 6 change
     // removes this plaintext-fallback branch entirely and treats a missing key_id as a hard
     // error in every case, not just this already-impossible one.
-    throw new MissingEncryptedRepresentationError();
+    throw new MissingEncryptedRepresentationError(itemRowId);
   }
   return row.access_token;
 }
