@@ -10,16 +10,28 @@ import { manualLoansRouter } from './routes/manualLoans';
 import { userPreferencesRouter } from './routes/userPreferences';
 import { webhooksRouter } from './routes/webhooks';
 import { errorHandler } from './middleware/errorHandler';
+import { validateKeyRingOrExit } from './services/tokenEncryption';
+import { summarizeErrorSafely } from './services/errorSanitizer';
 
 // Last-resort logging so a future unhandled rejection is visible in deploy logs before
-// the process exits, rather than the container just going silently unresponsive.
+// the process exits, rather than the container just going silently unresponsive. Never log the
+// raw reason/error — either could in principle be a real Plaid/Axios error that slipped past
+// every other catch site (see errorSanitizer.ts for why the raw object is unsafe).
 process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled promise rejection:', reason);
+  console.error('Unhandled promise rejection:', summarizeErrorSafely(reason));
 });
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
+  console.error('Uncaught exception:', summarizeErrorSafely(err));
   process.exit(1);
 });
+
+// Fail closed *before* the app ever binds a port or serves traffic if Plaid access-token
+// encryption is misconfigured (PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §5.5) — the alternative
+// (validating lazily, on first use) would let /health return 200 while every real Plaid request
+// silently breaks the moment it's tried. Also populates getKeyRing()'s cache here, so every
+// request handler that calls it afterward reuses this same validated, in-memory key ring rather
+// than re-reading the environment.
+validateKeyRingOrExit();
 
 const app = express();
 

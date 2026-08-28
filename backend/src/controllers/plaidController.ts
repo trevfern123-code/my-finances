@@ -9,6 +9,8 @@ import { computePayoffProgressPct, refreshLoansForItem } from '../services/loans
 import { groupAccountsForAssetsSummary, type AssetAccount } from '../services/assetsSummary';
 import { getCurrentMonthRange } from '../services/budgetPeriod';
 import { isReportingRangeId, resolveReportingRange, type ResolvedRange } from '../services/reportingRange';
+import { PlaidCredentialError } from '../services/tokenEncryption';
+import { summarizeErrorSafely } from '../services/errorSanitizer';
 import { env } from '../config/env';
 
 /** Date-Range Customization v1: `range_id` (one of the 5 reporting-range presets) takes
@@ -286,7 +288,9 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
         // Best-effort: backfills the webhook URL onto items linked before webhooks were
         // configured. Not critical, so a failure here shouldn't fail the whole refresh.
         await plaidService.updateItemWebhook(item.access_token).catch((err) => {
-          console.error(`Failed to backfill webhook for item ${item.id}:`, err);
+          // Never log the raw error — a real Plaid/Axios rejection here carries the outgoing
+          // request (access_token included) in its .config (see errorSanitizer.ts).
+          console.error(`Failed to backfill webhook for item ${item.id}:`, summarizeErrorSafely(err));
         });
 
         // Also best-effort (see refreshLoansForItem) — only produces data once the
@@ -294,9 +298,16 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
         const accountIdByPlaidId = new Map(updatedAccounts.map((a) => [a.plaid_account_id, a.id]));
         await refreshLoansForItem(item.id, item.access_token, accountIdByPlaidId);
       } catch (err) {
-        // An item needing re-auth shouldn't break refreshing everyone else's accounts —
-        // flag it and let the frontend prompt the user to reconnect that one institution.
-        if (plaidService.isReauthRequiredError(err)) {
+        if (err instanceof PlaidCredentialError) {
+          // Not a bank-reconnect situation (§10 of the design doc) — the stored token may be
+          // perfectly valid to Plaid, this app simply failed to read it. Never set
+          // login_required for this; that would send the user through a reconnect flow that
+          // can't fix anything and would misleadingly suggest their bank is the problem.
+          console.error(`Plaid credential error refreshing item ${item.id}:`, err.name);
+          await dataService.setItemStatus(item.id, 'credential_error');
+        } else if (plaidService.isReauthRequiredError(err)) {
+          // An item needing re-auth shouldn't break refreshing everyone else's accounts —
+          // flag it and let the frontend prompt the user to reconnect that one institution.
           await dataService.setItemStatus(item.id, 'login_required');
         } else {
           throw err;
@@ -427,7 +438,10 @@ export async function syncTransactions(req: Request, res: Response, next: NextFu
         modifiedCount += result.modified;
         removedCount += result.removed;
       } catch (err) {
-        if (plaidService.isReauthRequiredError(err)) {
+        if (err instanceof PlaidCredentialError) {
+          console.error(`Plaid credential error syncing item ${item.id}:`, err.name);
+          await dataService.setItemStatus(item.id, 'credential_error');
+        } else if (plaidService.isReauthRequiredError(err)) {
           await dataService.setItemStatus(item.id, 'login_required');
         } else {
           throw err;
@@ -513,7 +527,21 @@ export async function completeReauth(req: Request, res: Response, next: NextFunc
     const userId = req.user!.id;
     const { itemId } = req.params;
 
-    const item = await dataService.getPlaidItemForUser(itemId, userId);
+    let item;
+    try {
+      item = await dataService.getPlaidItemForUser(itemId, userId);
+    } catch (err) {
+      if (err instanceof PlaidCredentialError) {
+        // itemId (the route param) is already this row's own id, so unlike the webhook path
+        // (§7 Phase 4, where only Plaid's own item_id is known until the row resolves) this
+        // status update doesn't need the row object at all.
+        console.error(`Plaid credential error completing reauth for item ${itemId}:`, err.name);
+        await dataService.setItemStatus(itemId, 'credential_error');
+        res.status(409).json({ error: 'This connection needs attention before it can be used again.' });
+        return;
+      }
+      throw err;
+    }
     if (!item) {
       res.status(404).json({ error: 'Item not found' });
       return;

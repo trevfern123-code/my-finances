@@ -1,5 +1,13 @@
+import { randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
 import { roundToCents } from './money';
+import {
+  decryptAccessToken,
+  encryptAccessToken,
+  getKeyRing,
+  MissingEncryptedRepresentationError,
+  type EncryptedAccessToken,
+} from './tokenEncryption';
 import type {
   AccountRow,
   BudgetCategoryRow,
@@ -24,6 +32,64 @@ import type { NormalizedLoan } from './loans';
 
 // ---- Plaid items -----------------------------------------------------------
 
+/** `PlaidItemRow.access_token` is `string | null` at the schema level (a row can be
+ *  encrypted-only), but every function below always resolves it to a real string before
+ *  returning (`resolveAccessToken` never returns null) — this narrows just the one field back to
+ *  non-nullable for callers, none of which should ever need to null-check it (§6.1: callers stay
+ *  exactly as unaware of encryption as they were before this migration). */
+type ResolvedPlaidItem<K extends keyof PlaidItemRow> = Omit<Pick<PlaidItemRow, K>, 'access_token'> & {
+  access_token: string;
+};
+
+/** Columns needed to resolve a row's effective access token — every Plaid-item read function
+ *  below selects at least these, in addition to whatever else it needs. */
+const ENCRYPTED_TOKEN_COLUMNS =
+  'access_token, access_token_ciphertext, access_token_nonce, access_token_auth_tag, access_token_key_id, access_token_enc_version';
+
+interface EncryptedTokenRow {
+  access_token: string | null;
+  access_token_ciphertext: string | null;
+  access_token_nonce: string | null;
+  access_token_auth_tag: string | null;
+  access_token_key_id: string | null;
+  access_token_enc_version: number | null;
+}
+
+/** Dual-read (PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §7 Phases 2-5, §8's fail-closed rule): the
+ *  encrypted representation is preferred whenever present, decrypted here so every caller keeps
+ *  receiving a plain string exactly as before (§6.1) — none of them need to become
+ *  "encryption-aware." A decryption failure (any `PlaidCredentialError` subclass) propagates
+ *  straight up, uncaught — there is deliberately no `catch` here that would fall back to the
+ *  plaintext column once an encrypted representation exists, which is the one thing §8 forbids. */
+function resolveAccessToken(itemRowId: string, row: EncryptedTokenRow): string {
+  // Presence/non-NULL, not JavaScript truthiness: the plaid_items_encrypted_token_complete check
+  // constraint (§2) guarantees this column is NULL or non-NULL together with the other four
+  // encrypted fields, but does not (and a check constraint reasonably can't) forbid it being the
+  // empty string. `if (row.access_token_key_id)` would treat '' as "no encrypted representation"
+  // and silently fall through to the plaintext branch below — exactly the kind of accidental
+  // plaintext fallback §8's fail-closed rule exists to prevent. An empty (or any non-null,
+  // non-matching) key id now always enters the encrypted path and fails closed via
+  // UnknownKeyIdError, never plaintext.
+  if (row.access_token_key_id !== null) {
+    const enc: EncryptedAccessToken = {
+      ciphertextBase64: row.access_token_ciphertext!,
+      nonceBase64: row.access_token_nonce!,
+      authTagBase64: row.access_token_auth_tag!,
+      keyId: row.access_token_key_id,
+      encVersion: row.access_token_enc_version ?? 1,
+    };
+    return decryptAccessToken(enc, getKeyRing(), itemRowId);
+  }
+  if (row.access_token === null) {
+    // Unreachable today — the plaid_items_token_present check constraint (§2) guarantees at
+    // least one representation always exists. Reachable only after a future Phase 6 change
+    // removes this plaintext-fallback branch entirely and treats a missing key_id as a hard
+    // error in every case, not just this already-impossible one.
+    throw new MissingEncryptedRepresentationError(itemRowId);
+  }
+  return row.access_token;
+}
+
 export async function insertPlaidItem(params: {
   userId: string;
   itemId: string;
@@ -31,12 +97,30 @@ export async function insertPlaidItem(params: {
   institutionId: string | null;
   institutionName: string | null;
 }): Promise<PlaidItemRow> {
+  // The AAD binds ciphertext to this row's own id (design doc §4), but `id` is normally generated
+  // by the database's own `gen_random_uuid()` default at insert time, so it isn't known yet when
+  // encryption needs to happen. Generating it here instead and passing it explicitly lets
+  // encryption and row creation happen atomically in one insert, rather than needing a separate
+  // encrypt-then-update step after the row already exists.
+  const id = randomUUID();
+  const enc = encryptAccessToken(params.accessToken, getKeyRing(), id);
+
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
     .insert({
+      id,
       user_id: params.userId,
       plaid_item_id: params.itemId,
+      // Phase 2a (dual-write, design doc §7): both representations are written together, so this
+      // deploy can be rolled back cleanly if needed. Flipping to Phase 2b (encrypted-only,
+      // access_token left null) is a small, separate follow-up once this has been verified
+      // against a real deployment — see the design doc §7/§19.
       access_token: params.accessToken,
+      access_token_ciphertext: enc.ciphertextBase64,
+      access_token_nonce: enc.nonceBase64,
+      access_token_auth_tag: enc.authTagBase64,
+      access_token_key_id: enc.keyId,
+      access_token_enc_version: enc.encVersion,
       institution_id: params.institutionId,
       institution_name: params.institutionName,
     })
@@ -49,14 +133,37 @@ export async function insertPlaidItem(params: {
 
 export async function getPlaidItemsForUser(
   userId: string
-): Promise<Pick<PlaidItemRow, 'id' | 'user_id' | 'access_token' | 'transactions_cursor'>[]> {
+): Promise<ResolvedPlaidItem<'id' | 'user_id' | 'transactions_cursor'>[]> {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
-    .select('id, user_id, access_token, transactions_cursor')
+    .select(`id, user_id, ${ENCRYPTED_TOKEN_COLUMNS}, transactions_cursor`)
     .eq('user_id', userId);
 
   if (error) throw new Error(`Failed to load Plaid items: ${error.message}`);
-  return data;
+
+  // access_token is a *lazy*, memoized getter here rather than resolved eagerly — this function
+  // returns every one of a user's items in a single batch call, and both of its callers
+  // (refreshAccounts, syncTransactions) loop over the result with a per-item try/catch that's
+  // meant to isolate one item's failure from the rest (the same way an existing re-auth error on
+  // one item today doesn't abort refreshing everyone else's). Resolving every token eagerly, up
+  // front, would mean one undecryptable row throws before that per-item loop even starts,
+  // silently defeating that isolation for every item in the batch. Deferring the decrypt to the
+  // first read of `.access_token` keeps a bad item's failure scoped to whichever loop iteration
+  // actually touches it — exactly where the existing per-item catch already lives.
+  return (data as (EncryptedTokenRow & { id: string; user_id: string; transactions_cursor: string | null })[]).map(
+    (row) => {
+      let cached: string | undefined;
+      return {
+        id: row.id,
+        user_id: row.user_id,
+        get access_token(): string {
+          if (cached === undefined) cached = resolveAccessToken(row.id, row);
+          return cached;
+        },
+        transactions_cursor: row.transactions_cursor,
+      };
+    }
+  );
 }
 
 export async function updateItemCursor(itemRowId: string, cursor: string) {
@@ -68,7 +175,10 @@ export async function updateItemCursor(itemRowId: string, cursor: string) {
   if (error) throw new Error(`Failed to update sync cursor: ${error.message}`);
 }
 
-export async function setItemStatus(itemRowId: string, status: 'active' | 'login_required') {
+export async function setItemStatus(
+  itemRowId: string,
+  status: 'active' | 'login_required' | 'credential_error'
+) {
   const { error } = await supabaseAdmin.from('plaid_items').update({ status }).eq('id', itemRowId);
   if (error) throw new Error(`Failed to update item status: ${error.message}`);
 }
@@ -76,30 +186,43 @@ export async function setItemStatus(itemRowId: string, status: 'active' | 'login
 /** Looks up an item by Plaid's own item_id, which is what webhook payloads identify items by. */
 export async function getPlaidItemByPlaidItemId(
   plaidItemId: string
-): Promise<Pick<PlaidItemRow, 'id' | 'user_id' | 'access_token' | 'transactions_cursor'> | null> {
+): Promise<ResolvedPlaidItem<'id' | 'user_id' | 'transactions_cursor'> | null> {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
-    .select('id, user_id, access_token, transactions_cursor')
+    .select(`id, user_id, ${ENCRYPTED_TOKEN_COLUMNS}, transactions_cursor`)
     .eq('plaid_item_id', plaidItemId)
     .maybeSingle();
 
   if (error) throw new Error(`Failed to load Plaid item: ${error.message}`);
-  return data;
+  if (!data) return null;
+  const row = data as EncryptedTokenRow & { id: string; user_id: string; transactions_cursor: string | null };
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    access_token: resolveAccessToken(row.id, row),
+    transactions_cursor: row.transactions_cursor,
+  };
 }
 
 export async function getPlaidItemForUser(
   itemId: string,
   userId: string
-): Promise<Pick<PlaidItemRow, 'id' | 'access_token' | 'status'> | null> {
+): Promise<ResolvedPlaidItem<'id' | 'status'> | null> {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
-    .select('id, access_token, status')
+    .select(`id, ${ENCRYPTED_TOKEN_COLUMNS}, status`)
     .eq('id', itemId)
     .eq('user_id', userId)
     .maybeSingle();
 
   if (error) throw new Error(`Failed to load Plaid item: ${error.message}`);
-  return data;
+  if (!data) return null;
+  const row = data as EncryptedTokenRow & { id: string; status: string };
+  return {
+    id: row.id,
+    access_token: resolveAccessToken(row.id, row),
+    status: row.status,
+  };
 }
 
 export async function getLinkedItemsForUser(userId: string) {

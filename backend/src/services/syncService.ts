@@ -1,6 +1,7 @@
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
 import * as loansService from './loans';
+import { summarizeErrorSafely } from './errorSanitizer';
 
 /**
  * Syncs one Plaid item's transactions and advances its cursor. Shared by the authenticated
@@ -42,7 +43,10 @@ export async function syncItemTransactions(item: {
     ];
     await dataService.upsertRecurringStreams(item.id, streams, accountIdByPlaidId);
   } catch (err) {
-    console.error(`Failed to refresh recurring streams for item ${item.id}:`, err);
+    // Never log the raw error — plaidService.getRecurringStreams is a real Plaid API call, and a
+    // rejected request's .config carries the outgoing request body (access_token included; see
+    // errorSanitizer.ts).
+    console.error(`Failed to refresh recurring streams for item ${item.id}:`, summarizeErrorSafely(err));
   }
 
   return { added: added.length, modified: modified.length, removed: removed.length };
