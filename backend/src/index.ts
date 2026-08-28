@@ -10,6 +10,7 @@ import { manualLoansRouter } from './routes/manualLoans';
 import { userPreferencesRouter } from './routes/userPreferences';
 import { webhooksRouter } from './routes/webhooks';
 import { errorHandler } from './middleware/errorHandler';
+import { validateKeyRingOrExit } from './services/tokenEncryption';
 
 // Last-resort logging so a future unhandled rejection is visible in deploy logs before
 // the process exits, rather than the container just going silently unresponsive.
@@ -20,6 +21,14 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
   process.exit(1);
 });
+
+// Fail closed *before* the app ever binds a port or serves traffic if Plaid access-token
+// encryption is misconfigured (PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §5.5) — the alternative
+// (validating lazily, on first use) would let /health return 200 while every real Plaid request
+// silently breaks the moment it's tried. Also populates getKeyRing()'s cache here, so every
+// request handler that calls it afterward reuses this same validated, in-memory key ring rather
+// than re-reading the environment.
+validateKeyRingOrExit();
 
 const app = express();
 

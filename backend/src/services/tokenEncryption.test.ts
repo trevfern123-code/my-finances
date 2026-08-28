@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { isReauthRequiredError } from './plaidErrors';
 import {
@@ -12,6 +12,7 @@ import {
   MalformedNonceError,
   PlaidCredentialError,
   UnknownKeyIdError,
+  validateKeyRingOrExit,
   type EncryptedAccessToken,
   type KeyRing,
 } from './tokenEncryption';
@@ -246,6 +247,71 @@ describe('error message hygiene (§11)', () => {
           expect(message).not.toContain(secret);
         }
       }
+    }
+  });
+});
+
+describe('validateKeyRingOrExit — fail-closed at startup, before the server binds a port', () => {
+  const ENV_KEYS = ['PLAID_TOKEN_CURRENT_KEY_ID', 'PLAID_TOKEN_KEY_STARTUP_TEST_V1'];
+  const originalValues: Record<string, string | undefined> = {};
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    for (const key of ENV_KEYS) {
+      originalValues[key] = process.env[key];
+      delete process.env[key];
+    }
+    // process.exit throws instead of actually terminating the test process — lets execution stop
+    // at the same point it would in production (nothing after process.exit() in the real function
+    // runs), without killing the test runner.
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('process.exit called');
+    });
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      if (originalValues[key] === undefined) delete process.env[key];
+      else process.env[key] = originalValues[key];
+    }
+    exitSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it('exits with code 1 when PLAID_TOKEN_CURRENT_KEY_ID is missing entirely', () => {
+    expect(() => validateKeyRingOrExit()).toThrow('process.exit called');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('exits with code 1 when the current key id does not match any configured key', () => {
+    process.env.PLAID_TOKEN_KEY_STARTUP_TEST_V1 = randomBytes(32).toString('base64');
+    process.env.PLAID_TOKEN_CURRENT_KEY_ID = 'SOME_OTHER_ID';
+
+    expect(() => validateKeyRingOrExit()).toThrow('process.exit called');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('exits with code 1 when the configured key is not 32 bytes once decoded', () => {
+    process.env.PLAID_TOKEN_KEY_STARTUP_TEST_V1 = Buffer.from('too-short').toString('base64');
+    process.env.PLAID_TOKEN_CURRENT_KEY_ID = 'STARTUP_TEST_V1';
+
+    expect(() => validateKeyRingOrExit()).toThrow('process.exit called');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('never logs the raw key value or the caught error object on failure — only a fixed, safe message', () => {
+    process.env.PLAID_TOKEN_CURRENT_KEY_ID = 'MISSING';
+
+    expect(() => validateKeyRingOrExit()).toThrow('process.exit called');
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const loggedArgs = errorSpy.mock.calls[0];
+    for (const arg of loggedArgs) {
+      // Nothing logged should ever be the raw Error object itself (which could, in principle,
+      // carry a stack trace or other detail beyond the safe fixed message) — only strings.
+      expect(typeof arg).toBe('string');
     }
   });
 });

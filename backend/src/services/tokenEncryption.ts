@@ -152,6 +152,27 @@ export function getKeyRing(): KeyRing {
   return cachedKeyRing;
 }
 
+/** Validates the key ring or terminates the process — meant to be called exactly once,
+ *  synchronously, at application startup (before the server binds a port), so a misconfigured key
+ *  ring fails closed before any traffic is served rather than surfacing lazily on the first real
+ *  Plaid request (§5.5). Also populates `getKeyRing()`'s cache as a side effect, on success.
+ *  Deliberately its own small function (rather than inlined in `index.ts`, which nothing imports)
+ *  so this behavior is independently testable — `index.ts` itself is never exercised by the test
+ *  suite. Never logs the caught error object itself, only its already-safe, fixed `.message`
+ *  (every `PlaidCredentialError` subclass's message is a hand-written, non-sensitive string by
+ *  construction, §11). */
+export function validateKeyRingOrExit(): void {
+  try {
+    getKeyRing();
+  } catch (err) {
+    console.error(
+      'Refusing to start: Plaid access-token encryption key configuration is invalid.',
+      err instanceof Error ? err.message : 'Unknown error.'
+    );
+    process.exit(1);
+  }
+}
+
 // ---- AAD (§4) -----------------------------------------------------------
 
 function buildAad(plaidItemId: string, encVersion: number): Buffer {
