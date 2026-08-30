@@ -802,7 +802,7 @@ When implementation is approved: a **new branch cut from current `main`**, not a
 
 ---
 
-## 23. V1 → V2 key rotation and backfill — completed and verified in production (2026-08-31, soak period)
+## 23. V1 → V2 key rotation and backfill — fully complete, V1 removed from production
 
 **Trigger**: the production `RAILWAY_PROD_V1` encryption key was accidentally visible in a screenshot during earlier setup. Treated as compromised the moment this was discovered — not because of any observed misuse, but because "accidentally exposed" and "still safe to rely on" are mutually exclusive for a symmetric key by design.
 
@@ -820,7 +820,7 @@ When implementation is approved: a **new branch cut from current `main`**, not a
 - Zero crypto/decryption/key-configuration errors observed in production logs.
 - A pre-existing `ADDITIONAL_CONSENT_REQUIRED` error on one loan is confirmed **unrelated** to encryption — a separate, already-known Plaid consent-scope condition, noted here explicitly so it is never mistaken for a rotation regression in a future review.
 
-**Why V1 is still configured right now**: this is the deliberate, temporary soak window described in the rotation design (§22's rotation addendum, "when V1 can finally be removed"). Production data no longer has any row that needs V1 to decrypt — V1's presence in Railway is now pure safety margin (in case some undiscovered edge case still needed it), not an active dependency. §25 below is the exact checklist for retiring it once the soak concludes.
+**§25's post-soak checklist has now been completed — V1 fully removed.** Final confirmed production state: `PLAID_TOKEN_CURRENT_KEY_ID=RAILWAY_PROD_V2`; `PLAID_TOKEN_KEY_RAILWAY_PROD_V1` removed from Railway entirely; `PLAID_TOKEN_KEY_RAILWAY_PROD_V2` remains configured; the backend redeployed successfully running on V2 only (`validateKeyRingOrExit()` passed with no V1 present, proving nothing live still depended on it); all 3 items refresh/sync successfully; Sandbox webhook tests succeeded for all 3; zero `UnknownKeyIdError`, decrypt failures, or `credential_error` observed; the pre-existing `ADDITIONAL_CONSENT_REQUIRED` loan error remains confirmed unrelated. Final Supabase integrity: `total_items = 3`, `encrypted_items = 3`, `plaintext_only_items = 0`, `plaintext_missing_items = 0`, `partial_encrypted_items = 0`, `v1_items = 0`, `v2_items = 3`, `unexpected_version_items = 0`, `distinct_encrypted_nonces = 3` — every metric clean. The V1 → V2 rotation is complete end to end: no code, schema, or application behavior remains dependent on the exposed key, and the key itself no longer exists anywhere this application can reach.
 
 ## 24. Phase 2b proposal (revised for the post-rotation state) — design only, not yet approved or implemented
 
@@ -842,6 +842,8 @@ Phase 2b is the one piece of the original 7-phase design (§7 Phase 2, §6.2) st
 One rotation-specific dependency worth naming explicitly: "rollback to Phase 2a" as a safe target has always implicitly assumed *whichever key(s) an existing row's `access_token_key_id` references are still configured in Railway*. Today that's moot for production data (the rotation already eliminated every V1-encrypted row), but it's the reason §25's post-removal verification matters before, not after, treating V1 as gone for good.
 
 ## 25. Post-soak checklist — removing `PLAID_TOKEN_KEY_RAILWAY_PROD_V1`
+
+**✅ COMPLETE — all 6 steps executed and confirmed.** Final results recorded in §23 above. Kept here verbatim as the record of what was actually checked, not just planned.
 
 **1. Final DB integrity verification** (immediately before touching Railway): re-run the standard integrity query and confirm zero rows reference V1 — gate on *zero V1-keyed rows*, not a hardcoded total count (the total may have grown past 3 if a new item was linked during the soak; since Phase 2b hasn't shipped, any such item already dual-writes under V2 today, so it shouldn't show up as V1 either way, but the query should check for that explicitly rather than assume it). Confirm: `unexpected_key_id_items` (anything not `RAILWAY_PROD_V2`) `= 0`, `partial_encrypted_items = 0`, `plaintext_missing_items = 0`, `unexpected_version_items = 0`, `distinct_encrypted_nonces` equal to the total encrypted-item count.
 
@@ -866,6 +868,61 @@ One rotation-specific dependency worth naming explicitly: "rollback to Phase 2a"
 - Re-derive the Points A/B/C rollback-boundary claims above against the actual code at implementation time.
 - Confirm the verification plan (one new Sandbox item, integrity query, functional checks) is actually followed and its results documented before Phase 2b is considered complete — matching how every earlier phase in this project was verified live, not just tested.
 - Confirm whichever sequencing is actually used (this proposal recommends waiting until after §25's V1 removal) — flag it if Phase 2b is requested before that, rather than silently assuming it's fine.
+
+## 27. Phase 2b — finalized implementation plan, ready for approval (not yet implemented)
+
+§24's sequencing recommendation ("don't implement Phase 2b until after V1 removal") is now satisfied — §25 is complete. This section is the exact, execution-ready plan Trevor asked for: implementation scope, files affected, required tests, deployment sequence, rollback boundary, and production verification. Nothing below has been implemented.
+
+### Implementation scope
+
+One line removed from `backend/src/services/dataService.ts`'s `insertPlaidItem` (currently lines 93-132) — the `access_token: params.accessToken,` entry (line 118) in the `.insert({...})` payload. The surrounding comment (lines 114-117, currently describing Phase 2a dual-write and noting "Flipping to Phase 2b ... is a small, separate follow-up") gets updated to describe Phase 2b instead. Everything else in the function is untouched: `id` is still generated client-side via `randomUUID()` before the insert (still needed for the AAD), and the 5 encrypted columns are still always populated via `encryptAccessToken(params.accessToken, getKeyRing(), id)` exactly as today, using whichever key is current — `RAILWAY_PROD_V2`, the only key that exists now.
+
+No schema or migration change: Phase 1 already made `access_token` nullable and already added the `plaid_items_token_present` check constraint that permits an encrypted-only row (`access_token is not null or access_token_ciphertext is not null`). No type change: `PlaidItemRow.access_token` is already typed `string | null`. No Railway/Supabase change is required for this step — V2 is already the only configured, current key.
+
+### Files affected
+
+- `backend/src/services/dataService.ts` — the one-line change plus comment update.
+- `backend/src/services/dataService.test.ts` — the required test changes below.
+- `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` and `README.md` — a post-merge status update, same as every prior phase in this project.
+
+No other application file changes. `resolveAccessToken` and the other three Plaid-item read functions in `dataService.ts` are confirmed unchanged (§24). No controller, `plaidService.ts`, `syncService.ts`, or `loans.ts` change — none of them read `access_token` directly; they all go through `dataService.ts`'s functions, which already resolve it correctly regardless of representation.
+
+### Tests required
+
+- **Update the existing test** `dataService.test.ts`'s `describe('insertPlaidItem', ...)` → `it('writes both the plaintext and the full encrypted representation together (Phase 2a dual-write)', ...)` (line 63) — this test currently asserts `expect(inserted.access_token).toBe('access-sandbox-1')`, which becomes false under Phase 2b. Rename it to describe Phase 2b encrypted-only writes and change the assertion to confirm `access_token` is absent/`undefined` from the insert payload (not merely present-but-null — confirm during implementation whether the `plaid_items.access_token` column has any DB-level default; if none, an absent key and an explicit `null` behave identically at the database level, but the test should assert what the code actually sends, not assume).
+- **Add a new test** confirming the row a Phase-2b insert produces has no plaintext but a fully-populated, correctly-decryptable encrypted representation under the current key — the same round-trip-through-`decryptAccessToken` proof the existing test already does for the ciphertext, minus the plaintext-column assertion.
+- **Confirm, don't assume**, that existing tests for the four read functions (`getPlaidItemsForUser`, `getPlaidItemByPlaidItemId`, `getPlaidItemForUser`, and `resolveAccessToken` indirectly) already include an encrypted-only-row fixture (`access_token: null`) — several already do, from the Codex-blocker-2 round; implementation should verify this by name against current test file contents, not trust this document's memory of it.
+- No changes needed to `webhookController.test.ts` or `plaidController.test.ts` — neither inserts new items, only reads.
+
+### Deployment sequence
+
+1. New branch off current `main` (this project's established convention — one branch per phase/tool).
+2. Implement the one-line change + test updates above.
+3. Full local verification: backend + frontend test suites, both typechecks, both builds, `git diff --check` — same rigor as every prior round in this project.
+4. Codex review (§26, restated below) before merge.
+5. Merge to `main` and push — this repository auto-deploys `main` to Railway on every push, so the merge *is* the deploy; no separate manual deploy step.
+6. Immediately after the deploy goes Active: run the production verification plan below, before considering Phase 2b live.
+
+### Rollback boundary
+
+Restating §24's Points A/B/C, now with V1 fully gone from the picture — nothing about V1's removal changes this analysis, since every row (the 3 existing ones and every new one Phase 2b creates) is on `RAILWAY_PROD_V2`, which remains configured throughout:
+- **Point A** — rollback to pre-encryption code stops being universally safe the moment the *first* Phase-2b row is created — i.e., the moment someone links a new item after this deploys. Not before: the deploy itself, before any new item is linked, changes nothing about any existing row.
+- **Point B** — rollback to Phase 2a (the immediately-prior commit/deploy) remains safe indefinitely from that point onward — Phase 2a's dual-read already handles an encrypted-only V2 row correctly, with zero further code change, and V2 remains configured.
+- **Point C** — unchanged: only Phase 7 (the `access_token` column physically dropped — not proposed here or anywhere near-term) breaks even Phase 2a as a rollback target.
+- **Operationally**: because this is a single-line change with no schema or environment dependency, "roll back" in practice just means reverting the one commit (or redeploying the prior image) — trivial, and safe per Point B, for as long as this deploy is live.
+
+### Production verification plan
+
+1. Link one new Plaid Sandbox test item after the deploy goes Active.
+2. Direct integrity query on that new row specifically: `access_token IS NULL`, all 5 encrypted columns populated, `access_token_key_id = 'RAILWAY_PROD_V2'`, `access_token_enc_version = 1`.
+3. Refresh balances on the new item — succeeds.
+4. Sync transactions on the new item — succeeds.
+5. Trigger the Sandbox webhook test for the new item — succeeds.
+6. Re-run the same full-table integrity query used throughout this project. **Read this result carefully**: `plaintext_missing_items` will now correctly read `1` (the new item) instead of `0` — this is the expected, correct signal that Phase 2b is working, not a regression. The 3 pre-existing items should show completely unchanged: still `access_token_key_id = RAILWAY_PROD_V2`, still with plaintext present (Phase 2b never touches existing rows, only future inserts).
+
+### What Codex should review
+
+Exactly the list in §26, restated as still current now that sequencing is satisfied: the `insertPlaidItem` diff (confirms it removes only `access_token`, nothing else); a fresh re-verification that `resolveAccessToken` truly needs no change, checked against actual current code; the new/updated tests above; a full-repo grep confirming no code path outside `resolveAccessToken`'s abstraction reads `.access_token` directly assuming non-null; the Points A/B/C claims re-derived against actual code at implementation time; and confirmation that the production verification plan above is actually followed and its results documented — including that a nonzero `plaintext_missing_items` after this deploy is correctly recognized as success, not investigated as an anomaly.
 
 ---
 
