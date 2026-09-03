@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { randomBytes } from 'node:crypto';
+import { createCipheriv, randomBytes } from 'node:crypto';
 import { isReauthRequiredError } from './plaidErrors';
 import {
   decryptAccessToken,
@@ -12,6 +12,7 @@ import {
   MalformedNonceError,
   PlaidCredentialError,
   UnknownKeyIdError,
+  UnsupportedEncryptionVersionError,
   validateKeyRingOrExit,
   type EncryptedAccessToken,
   type KeyRing,
@@ -205,14 +206,17 @@ describe('encryptAccessToken / decryptAccessToken round trip', () => {
     expect(decrypted).toBe(PLAINTEXT);
   });
 
-  it('fails GCM authentication if the encryption version is tampered with between encrypt and decrypt', () => {
-    // encVersion feeds the AAD (§4) — a tampered version changes the AAD, which GCM correctly
-    // treats the same as any other AAD mismatch: authentication failure, not a silent version
-    // upgrade/downgrade.
+  it('rejects a tampered-to-unsupported encryption version by explicit policy, not GCM authentication failure (§27)', () => {
+    // encVersion feeds the AAD (§4), so a genuinely-tampered version *would* also change the AAD
+    // and fail GCM authentication — but the supported-version check now runs first, before any
+    // crypto call, so a version this app doesn't support is rejected by policy before it ever
+    // gets the chance to fail authentication instead. These are deliberately distinguishable
+    // failure modes (§27's Phase 2b revision), not the same thing observed two ways.
     const ring = fixtureKeyRing();
     const enc = encryptAccessToken(PLAINTEXT, ring, ITEM_ID);
     const tampered = { ...enc, encVersion: enc.encVersion + 1 };
-    expect(() => decryptAccessToken(tampered, ring, ITEM_ID)).toThrow(GcmAuthenticationError);
+    expect(() => decryptAccessToken(tampered, ring, ITEM_ID)).toThrow(UnsupportedEncryptionVersionError);
+    expect(() => decryptAccessToken(tampered, ring, ITEM_ID)).not.toThrow(GcmAuthenticationError);
   });
 
   it('nonce is always exactly 12 bytes, across many repeated calls', () => {
@@ -296,6 +300,57 @@ describe('decryptAccessToken — tamper and mismatch detection', () => {
   });
 });
 
+describe('decryptAccessToken — unsupported encryption version (§27, Phase 2b revision)', () => {
+  it('rejects encVersion 2 even when the ciphertext/tag/AAD are completely self-consistent for version 2', () => {
+    // Bypasses encryptAccessToken (which always hardcodes version 1) to build a genuinely valid,
+    // decryptable version-2 representation — proving this is rejected by explicit policy, not
+    // because it happens to fail GCM authentication. Same technique already used by
+    // rotateTartanTokenKey.test.ts's rowWithVersion helper for the same purpose.
+    const ring = fixtureKeyRing();
+    const key = ring.keys.get('TEST_V1')!;
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', key, nonce);
+    cipher.setAAD(Buffer.from(`my-finances:plaid-access-token:v2:${ITEM_ID}`, 'utf8'));
+    const ciphertext = Buffer.concat([cipher.update(PLAINTEXT, 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const selfConsistentV2: EncryptedAccessToken = {
+      ciphertextBase64: ciphertext.toString('base64'),
+      nonceBase64: nonce.toString('base64'),
+      authTagBase64: authTag.toString('base64'),
+      keyId: 'TEST_V1',
+      encVersion: 2,
+    };
+    expect(() => decryptAccessToken(selfConsistentV2, ring, ITEM_ID)).toThrow(UnsupportedEncryptionVersionError);
+  });
+
+  it('rejects a null-turned-2 version before any other malformed-input check runs', () => {
+    // A version-2 payload that is *also* malformed in another way (wrong-length nonce here) must
+    // still surface as UnsupportedEncryptionVersionError, not MalformedNonceError — proving the
+    // version check runs strictly first, before Base64 decoding or any of the length checks.
+    const ring = fixtureKeyRing();
+    const enc = encryptAccessToken(PLAINTEXT, ring, ITEM_ID);
+    const malformedAndUnsupported: EncryptedAccessToken = {
+      ...enc,
+      encVersion: 2,
+      nonceBase64: Buffer.from([1, 2, 3]).toString('base64'), // also wrong-length
+    };
+    expect(() => decryptAccessToken(malformedAndUnsupported, ring, ITEM_ID)).toThrow(UnsupportedEncryptionVersionError);
+  });
+
+  it('carries the itemRowId through, same as every other PlaidCredentialError subclass', () => {
+    const ring = fixtureKeyRing();
+    const enc = encryptAccessToken(PLAINTEXT, ring, ITEM_ID);
+    try {
+      decryptAccessToken({ ...enc, encVersion: 2 }, ring, ITEM_ID);
+      throw new Error('expected decryptAccessToken to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(UnsupportedEncryptionVersionError);
+      expect(err).toBeInstanceOf(PlaidCredentialError);
+      expect((err as UnsupportedEncryptionVersionError).itemRowId).toBe(ITEM_ID);
+    }
+  });
+});
+
 describe('PlaidCredentialError stays distinct from Plaid\'s own errors (§9)', () => {
   it('isReauthRequiredError returns false for every PlaidCredentialError subclass', () => {
     const ring = fixtureKeyRing();
@@ -305,9 +360,17 @@ describe('PlaidCredentialError stays distinct from Plaid\'s own errors (§9)', (
       new MalformedAuthTagError(),
       new MalformedCiphertextError(),
       new InvalidKeyConfigurationError('test'),
+      new UnsupportedEncryptionVersionError(),
       (() => {
         try {
           decryptAccessToken({ ...encryptAccessToken(PLAINTEXT, ring, ITEM_ID), ciphertextBase64: 'AA==' }, ring, ITEM_ID);
+        } catch (e) {
+          return e;
+        }
+      })(),
+      (() => {
+        try {
+          decryptAccessToken({ ...encryptAccessToken(PLAINTEXT, ring, ITEM_ID), encVersion: 2 }, ring, ITEM_ID);
         } catch (e) {
           return e;
         }
@@ -341,6 +404,7 @@ describe('error message hygiene (§11)', () => {
       },
       () => decryptAccessToken({ ...enc, ciphertextBase64: 'AAAAAAAAAAAAAAAAAAAAAA==' }, ring, ITEM_ID),
       () => loadKeyRing({ PLAID_TOKEN_CURRENT_KEY_ID: 'TEST_V1', PLAID_TOKEN_KEY_TEST_V1: 'not-32-bytes' }),
+      () => decryptAccessToken({ ...enc, encVersion: 2 }, ring, ITEM_ID),
     ];
 
     for (const attempt of attempts) {

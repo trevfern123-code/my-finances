@@ -869,7 +869,9 @@ One rotation-specific dependency worth naming explicitly: "rollback to Phase 2a"
 - Confirm the verification plan (one new Sandbox item, integrity query, functional checks) is actually followed and its results documented before Phase 2b is considered complete — matching how every earlier phase in this project was verified live, not just tested.
 - Confirm whichever sequencing is actually used (this proposal recommends waiting until after §25's V1 removal) — flag it if Phase 2b is requested before that, rather than silently assuming it's fine.
 
-## 27. Phase 2b — revised design, incorporating Codex's 3 blockers (not yet approved or implemented)
+## 27. Phase 2b — revised design, incorporating Codex's 3 blockers (implemented on a feature branch, not yet merged or deployed)
+
+**Implementation status**: Codex's re-review returned READY on this revised design; implementation proceeded on `feature/phase2b-stop-plaintext-writes` (cut from `main` at `a85066e`) exactly as specified below — `resolveAccessToken`'s explicit `classifyEncryptedFields` state machine, the `?? 1` coercion removed, `decryptAccessToken`'s version-support check, both new error classes, and the exhaustive 30-partial-subset test coverage all match this design as written. Not merged, not deployed, no production/Railway/Supabase change, no migration, no existing row touched. See the implementation commit for exact file-by-file detail. The one open item from "Remaining risks" below that got resolved during implementation: the `plaid_items.access_token` column has no DB-level default, confirmed by the insert code now omitting the key entirely rather than sending an explicit `null`.
 
 **Revision history**: the first version of this section (design-only, superseded below) proposed a one-line change trusting the existing single-field (`access_token_key_id !== null`) classification and the existing `?? 1` version coercion as already-correct. Codex's independent design review returned **NOT READY**, confirming the overall architecture but finding three real gaps — all confirmed against actual current code before being incorporated, not taken on faith:
 

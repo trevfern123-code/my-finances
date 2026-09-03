@@ -35,6 +35,8 @@ import {
   encryptAccessToken,
   GcmAuthenticationError,
   loadKeyRing,
+  MissingEncryptedRepresentationError,
+  PartialEncryptedRepresentationError,
   UnknownKeyIdError,
   type KeyRing,
 } from './tokenEncryption';
@@ -59,10 +61,12 @@ const TEST_KEY_RING: KeyRing = loadKeyRing({
   PLAID_TOKEN_CURRENT_KEY_ID: 'TEST_V1',
 });
 
-describe('insertPlaidItem', () => {
-  it('writes both the plaintext and the full encrypted representation together (Phase 2a dual-write)', async () => {
+describe('insertPlaidItem — Phase 2b encrypted-only writes (§27)', () => {
+  const PLAINTEXT = 'access-sandbox-1';
+
+  it('the insert payload has no access_token property at all — not present, not null', async () => {
     const query = createQueryBuilder({
-      data: { id: 'row-1', user_id: 'user-1', plaid_item_id: 'item-1', access_token: 'access-sandbox-1' },
+      data: { id: 'row-1', user_id: 'user-1', plaid_item_id: 'item-1', access_token: null },
       error: null,
     });
     mockFrom.mockReturnValueOnce(query);
@@ -70,24 +74,79 @@ describe('insertPlaidItem', () => {
     await insertPlaidItem({
       userId: 'user-1',
       itemId: 'item-1',
-      accessToken: 'access-sandbox-1',
+      accessToken: PLAINTEXT,
       institutionId: 'ins_1',
       institutionName: 'Sandbox Bank',
     });
 
-    expect(query.insert).toHaveBeenCalledTimes(1);
     const inserted = (query.insert as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    expect(inserted.access_token).toBe('access-sandbox-1');
+    expect('access_token' in inserted).toBe(false);
+  });
+
+  it('the plaintext value never appears anywhere in the serialized insert payload', async () => {
+    const query = createQueryBuilder({
+      data: { id: 'row-1', user_id: 'user-1', plaid_item_id: 'item-1', access_token: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    await insertPlaidItem({
+      userId: 'user-1',
+      itemId: 'item-1',
+      accessToken: PLAINTEXT,
+      institutionId: 'ins_1',
+      institutionName: 'Sandbox Bank',
+    });
+
+    const inserted = (query.insert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(JSON.stringify(inserted)).not.toContain(PLAINTEXT);
+  });
+
+  it('exactly five encrypted fields are populated, and the returned row may have access_token: null', async () => {
+    const query = createQueryBuilder({
+      data: { id: 'row-1', user_id: 'user-1', plaid_item_id: 'item-1', access_token: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await insertPlaidItem({
+      userId: 'user-1',
+      itemId: 'item-1',
+      accessToken: PLAINTEXT,
+      institutionId: 'ins_1',
+      institutionName: 'Sandbox Bank',
+    });
+
+    const inserted = (query.insert as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(typeof inserted.id).toBe('string');
     expect(inserted.access_token_key_id).toBe('TEST_V1');
     expect(inserted.access_token_enc_version).toBe(1);
     expect(typeof inserted.access_token_ciphertext).toBe('string');
     expect(typeof inserted.access_token_nonce).toBe('string');
     expect(typeof inserted.access_token_auth_tag).toBe('string');
+    // What the DB actually returns for the now-nullable column — distinct from what was sent.
+    expect(result.access_token).toBeNull();
+  });
 
-    // The written ciphertext genuinely represents the plaintext, bound to the generated row id —
-    // not just present-but-arbitrary. Proves the round trip actually works at this layer, not
-    // only inside tokenEncryption.test.ts in isolation.
+  it('the written ciphertext genuinely round-trips using the generated row UUID as AAD', async () => {
+    const query = createQueryBuilder({
+      data: { id: 'row-1', user_id: 'user-1', plaid_item_id: 'item-1', access_token: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    await insertPlaidItem({
+      userId: 'user-1',
+      itemId: 'item-1',
+      accessToken: PLAINTEXT,
+      institutionId: 'ins_1',
+      institutionName: 'Sandbox Bank',
+    });
+
+    const inserted = (query.insert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    // Proves the round trip actually works at this layer, not only inside
+    // tokenEncryption.test.ts in isolation — the ciphertext genuinely represents the plaintext,
+    // bound to the generated row id, not just present-but-arbitrary.
     const decrypted = decryptAccessToken(
       {
         ciphertextBase64: inserted.access_token_ciphertext,
@@ -99,7 +158,7 @@ describe('insertPlaidItem', () => {
       TEST_KEY_RING,
       inserted.id
     );
-    expect(decrypted).toBe('access-sandbox-1');
+    expect(decrypted).toBe(PLAINTEXT);
   });
 });
 
@@ -300,6 +359,153 @@ describe('getPlaidItemsForUser / getPlaidItemByPlaidItemId / getPlaidItemForUser
     const result = await getPlaidItemForUser(ITEM_ROW_ID, 'user-1');
 
     expect(result).toEqual({ id: ITEM_ROW_ID, access_token: 'plaintext-access-token', status: 'active' });
+  });
+
+  it('getPlaidItemForUser resolves an encrypted-only row correctly', async () => {
+    // getPlaidItemsForUser and getPlaidItemByPlaidItemId both already have this coverage
+    // (encryptedRow() defaults access_token to null); this one was the actual gap.
+    const query = createQueryBuilder({ data: encryptedRow('reconnect-path-token'), error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getPlaidItemForUser(ITEM_ROW_ID, 'user-1');
+
+    expect(result?.access_token).toBe('reconnect-path-token');
+  });
+});
+
+describe('resolveAccessToken — explicit 5-field state machine (§27, Phase 2b revision)', () => {
+  const ITEM_ROW_ID = 'row-1';
+  const ENCRYPTED_FIELD_NAMES = [
+    'access_token_ciphertext',
+    'access_token_nonce',
+    'access_token_auth_tag',
+    'access_token_key_id',
+    'access_token_enc_version',
+  ] as const;
+
+  function fullyEncryptedFields(plaintext: string, rowId: string = ITEM_ROW_ID) {
+    const enc = encryptAccessToken(plaintext, TEST_KEY_RING, rowId);
+    return {
+      access_token_ciphertext: enc.ciphertextBase64,
+      access_token_nonce: enc.nonceBase64,
+      access_token_auth_tag: enc.authTagBase64,
+      access_token_key_id: enc.keyId,
+      access_token_enc_version: enc.encVersion,
+    };
+  }
+
+  it('zero encrypted fields + null plaintext throws MissingEncryptedRepresentationError', async () => {
+    const row = {
+      id: ITEM_ROW_ID,
+      user_id: 'user-1',
+      access_token: null,
+      access_token_ciphertext: null,
+      access_token_nonce: null,
+      access_token_auth_tag: null,
+      access_token_key_id: null,
+      access_token_enc_version: null,
+      status: 'active',
+    };
+    const query = createQueryBuilder({ data: row, error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await expect(getPlaidItemForUser(ITEM_ROW_ID, 'user-1')).rejects.toThrow(MissingEncryptedRepresentationError);
+  });
+
+  // Every non-empty, incomplete subset of the 5 encrypted fields — 2^5 - 2 = 30 subsets (excludes
+  // the empty subset, "legacy plaintext-only", and the full subset, "complete encrypted"). Every
+  // one of these must fail closed via PartialEncryptedRepresentationError and must never return
+  // plaintext, regardless of which specific fields happen to be present.
+  const allFullFields = fullyEncryptedFields('sentinel-for-subset-generation');
+  const PARTIAL_SUBSETS: (typeof ENCRYPTED_FIELD_NAMES[number])[][] = [];
+  for (let mask = 1; mask < 31; mask++) {
+    const subset = ENCRYPTED_FIELD_NAMES.filter((_, i) => (mask & (1 << i)) !== 0);
+    PARTIAL_SUBSETS.push(subset);
+  }
+
+  it('generates exactly 30 partial subsets', () => {
+    expect(PARTIAL_SUBSETS).toHaveLength(30);
+  });
+
+  for (const presentFields of PARTIAL_SUBSETS) {
+    const label = presentFields.length > 0 ? presentFields.join('+') : '(none)';
+    it(`partial state [${label}] fails closed with PartialEncryptedRepresentationError, never returns plaintext`, async () => {
+      const plaintext = 'plaintext-must-never-be-returned';
+      const enc = fullyEncryptedFields(plaintext);
+      const row: Record<string, unknown> = {
+        id: ITEM_ROW_ID,
+        user_id: 'user-1',
+        access_token: plaintext, // deliberately retained — must never be fallen back to
+        status: 'active',
+      };
+      for (const field of ENCRYPTED_FIELD_NAMES) {
+        row[field] = presentFields.includes(field) ? enc[field] : null;
+      }
+      const query = createQueryBuilder({ data: row, error: null });
+      mockFrom.mockReturnValueOnce(query);
+
+      let thrown: unknown;
+      try {
+        await getPlaidItemForUser(ITEM_ROW_ID, 'user-1');
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(PartialEncryptedRepresentationError);
+      expect(thrown).not.toBe(plaintext);
+    });
+  }
+
+  it('a null encryption version specifically (four fields present) fails closed the same way — the named regression for the removed `?? 1` coercion', async () => {
+    const plaintext = 'plaintext-must-never-be-returned';
+    const enc = fullyEncryptedFields(plaintext);
+    const row = {
+      id: ITEM_ROW_ID,
+      user_id: 'user-1',
+      access_token: plaintext,
+      access_token_ciphertext: enc.access_token_ciphertext,
+      access_token_nonce: enc.access_token_nonce,
+      access_token_auth_tag: enc.access_token_auth_tag,
+      access_token_key_id: enc.access_token_key_id,
+      access_token_enc_version: null, // no more `?? 1` — this must fail, not silently default
+      status: 'active',
+    };
+    const query = createQueryBuilder({ data: row, error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await expect(getPlaidItemForUser(ITEM_ROW_ID, 'user-1')).rejects.toThrow(PartialEncryptedRepresentationError);
+  });
+
+  it('batch isolation holds for a partial row too — one partial item fails lazily without preventing a good item in the same batch from resolving', async () => {
+    const plaintext = 'good-token';
+    const goodRow = {
+      id: 'row-good',
+      user_id: 'user-1',
+      access_token: null,
+      ...fullyEncryptedFields(plaintext, 'row-good'),
+      transactions_cursor: null,
+      status: 'active',
+    };
+    const badPlaintext = 'partial-row-plaintext-must-never-be-returned';
+    const badEnc = fullyEncryptedFields(badPlaintext, 'row-partial');
+    const badRow = {
+      id: 'row-partial',
+      user_id: 'user-1',
+      access_token: badPlaintext,
+      access_token_ciphertext: badEnc.access_token_ciphertext,
+      access_token_nonce: badEnc.access_token_nonce,
+      access_token_auth_tag: null, // partial
+      access_token_key_id: badEnc.access_token_key_id,
+      access_token_enc_version: badEnc.access_token_enc_version,
+      transactions_cursor: null,
+      status: 'active',
+    };
+    const query = createQueryBuilder({ data: [badRow, goodRow], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await getPlaidItemsForUser('user-1');
+
+    expect(() => result[0].access_token).toThrow(PartialEncryptedRepresentationError);
+    expect(result[1].access_token).toBe(plaintext);
   });
 });
 

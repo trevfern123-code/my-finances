@@ -6,6 +6,7 @@ import {
   encryptAccessToken,
   getKeyRing,
   MissingEncryptedRepresentationError,
+  PartialEncryptedRepresentationError,
   type EncryptedAccessToken,
 } from './tokenEncryption';
 import type {
@@ -55,36 +56,63 @@ interface EncryptedTokenRow {
   access_token_enc_version: number | null;
 }
 
-/** Dual-read (PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §7 Phases 2-5, §8's fail-closed rule): the
- *  encrypted representation is preferred whenever present, decrypted here so every caller keeps
- *  receiving a plain string exactly as before (§6.1) — none of them need to become
- *  "encryption-aware." A decryption failure (any `PlaidCredentialError` subclass) propagates
- *  straight up, uncaught — there is deliberately no `catch` here that would fall back to the
- *  plaintext column once an encrypted representation exists, which is the one thing §8 forbids. */
+/** Exactly one of `access_token_ciphertext`/`_nonce`/`_auth_tag`/`_key_id`/`_enc_version` — never
+ *  inferred from any single one of them (§27, Phase 2b revision). The Phase 1
+ *  `plaid_items_encrypted_token_complete` check constraint already guarantees these five columns
+ *  are NULL or non-NULL *together* at the database level, but `resolveAccessToken` below checks
+ *  all five explicitly anyway rather than trusting that constraint alone — a schema constraint
+ *  guaranteeing a shape is not the same thing as application code proving it before acting on it,
+ *  and this is the one place in the codebase that decides whether a stored credential is safe to
+ *  decrypt. */
+type EncryptedFieldsState = 'none' | 'partial' | 'complete';
+
+function classifyEncryptedFields(row: EncryptedTokenRow): EncryptedFieldsState {
+  const fields = [
+    row.access_token_ciphertext,
+    row.access_token_nonce,
+    row.access_token_auth_tag,
+    row.access_token_key_id,
+    row.access_token_enc_version,
+  ];
+  const present = fields.filter((f) => f !== null).length;
+  if (present === 5) return 'complete';
+  if (present === 0) return 'none';
+  return 'partial';
+}
+
+/** Dual-read (PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §7 Phases 2-5, §8's fail-closed rule, §27's
+ *  Phase 2b revision): the encrypted representation is preferred whenever fully present,
+ *  decrypted here so every caller keeps receiving a plain string exactly as before (§6.1) — none
+ *  of them need to become "encryption-aware." A decryption failure (any `PlaidCredentialError`
+ *  subclass) propagates straight up, uncaught — there is deliberately no `catch` here that would
+ *  fall back to the plaintext column once a complete encrypted representation exists, which is
+ *  the one thing §8 forbids. A *partial* representation (1-4 of the 5 fields — should be
+ *  unreachable given the Phase 1 constraint, but never assumed impossible) fails closed the same
+ *  way, and also never falls back to plaintext, regardless of whether plaintext happens to still
+ *  be present. */
 function resolveAccessToken(itemRowId: string, row: EncryptedTokenRow): string {
-  // Presence/non-NULL, not JavaScript truthiness: the plaid_items_encrypted_token_complete check
-  // constraint (§2) guarantees this column is NULL or non-NULL together with the other four
-  // encrypted fields, but does not (and a check constraint reasonably can't) forbid it being the
-  // empty string. `if (row.access_token_key_id)` would treat '' as "no encrypted representation"
-  // and silently fall through to the plaintext branch below — exactly the kind of accidental
-  // plaintext fallback §8's fail-closed rule exists to prevent. An empty (or any non-null,
-  // non-matching) key id now always enters the encrypted path and fails closed via
-  // UnknownKeyIdError, never plaintext.
-  if (row.access_token_key_id !== null) {
+  const state = classifyEncryptedFields(row);
+
+  if (state === 'partial') {
+    throw new PartialEncryptedRepresentationError(itemRowId);
+  }
+
+  if (state === 'complete') {
     const enc: EncryptedAccessToken = {
       ciphertextBase64: row.access_token_ciphertext!,
       nonceBase64: row.access_token_nonce!,
       authTagBase64: row.access_token_auth_tag!,
-      keyId: row.access_token_key_id,
-      encVersion: row.access_token_enc_version ?? 1,
+      keyId: row.access_token_key_id!,
+      // Non-null is guaranteed by `state === 'complete'` — no `?? 1` coercion. A null version
+      // alongside four populated fields is a `partial` state, caught above, before this line.
+      encVersion: row.access_token_enc_version!,
     };
     return decryptAccessToken(enc, getKeyRing(), itemRowId);
   }
+
+  // state === 'none': legacy plaintext-only fallback, explicit and intentional (§27) — this is
+  // the *only* branch that ever returns plaintext, and only when zero encrypted fields exist.
   if (row.access_token === null) {
-    // Unreachable today — the plaid_items_token_present check constraint (§2) guarantees at
-    // least one representation always exists. Reachable only after a future Phase 6 change
-    // removes this plaintext-fallback branch entirely and treats a missing key_id as a hard
-    // error in every case, not just this already-impossible one.
     throw new MissingEncryptedRepresentationError(itemRowId);
   }
   return row.access_token;
@@ -111,11 +139,12 @@ export async function insertPlaidItem(params: {
       id,
       user_id: params.userId,
       plaid_item_id: params.itemId,
-      // Phase 2a (dual-write, design doc §7): both representations are written together, so this
-      // deploy can be rolled back cleanly if needed. Flipping to Phase 2b (encrypted-only,
-      // access_token left null) is a small, separate follow-up once this has been verified
-      // against a real deployment — see the design doc §7/§19.
-      access_token: params.accessToken,
+      // Phase 2b (encrypted-only writes, design doc §27): plaintext is deliberately never sent
+      // for a new row — the `access_token` key is omitted here entirely, not set to `null`, so
+      // there is no plaintext value anywhere in this insert payload to leak, log, or serialize.
+      // The database's own default for the now-nullable column (Phase 1) is what actually leaves
+      // it null; this insert simply never supplies a value for it. Existing rows created under
+      // the earlier Phase 2a dual-write are untouched — this only changes what *new* rows get.
       access_token_ciphertext: enc.ciphertextBase64,
       access_token_nonce: enc.nonceBase64,
       access_token_auth_tag: enc.authTagBase64,
