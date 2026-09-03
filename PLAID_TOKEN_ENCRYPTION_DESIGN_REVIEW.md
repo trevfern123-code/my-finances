@@ -869,60 +869,233 @@ One rotation-specific dependency worth naming explicitly: "rollback to Phase 2a"
 - Confirm the verification plan (one new Sandbox item, integrity query, functional checks) is actually followed and its results documented before Phase 2b is considered complete — matching how every earlier phase in this project was verified live, not just tested.
 - Confirm whichever sequencing is actually used (this proposal recommends waiting until after §25's V1 removal) — flag it if Phase 2b is requested before that, rather than silently assuming it's fine.
 
-## 27. Phase 2b — finalized implementation plan, ready for approval (not yet implemented)
+## 27. Phase 2b — revised design, incorporating Codex's 3 blockers (not yet approved or implemented)
 
-§24's sequencing recommendation ("don't implement Phase 2b until after V1 removal") is now satisfied — §25 is complete. This section is the exact, execution-ready plan Trevor asked for: implementation scope, files affected, required tests, deployment sequence, rollback boundary, and production verification. Nothing below has been implemented.
+**Revision history**: the first version of this section (design-only, superseded below) proposed a one-line change trusting the existing single-field (`access_token_key_id !== null`) classification and the existing `?? 1` version coercion as already-correct. Codex's independent design review returned **NOT READY**, confirming the overall architecture but finding three real gaps — all confirmed against actual current code before being incorporated, not taken on faith:
 
-### Implementation scope
+1. **`resolveAccessToken()` infers "encrypted" from one field** (`row.access_token_key_id !== null`, `dataService.ts:73`), relying entirely on the Phase 1 DB constraint to guarantee the other four fields follow. Correct today, but a code-level classification shouldn't depend solely on a schema constraint holding — this codebase's own established discipline elsewhere (every backfill/rotation script's row classification) already treats "check all five fields explicitly" as the standard, and `resolveAccessToken` should meet the same bar.
+2. **`encVersion: row.access_token_enc_version ?? 1`** (`dataService.ts:79`) silently coerces a null version to 1 rather than treating a null version (alongside four non-null fields) as the partial/malformed state it actually is.
+3. **`decryptAccessToken()` has no explicit supported-version check** (`tokenEncryption.ts:242-269`) — it builds the AAD from whatever `enc.encVersion` says and never asks "is this version even one we support." A genuinely self-consistent version-2 ciphertext (matching AAD, matching key) would decrypt successfully today, which is wrong: this app has only ever generated version 1, and accepting anything else is an unreviewed format change slipping in silently.
 
-One line removed from `backend/src/services/dataService.ts`'s `insertPlaidItem` (currently lines 93-132) — the `access_token: params.accessToken,` entry (line 118) in the `.insert({...})` payload. The surrounding comment (lines 114-117, currently describing Phase 2a dual-write and noting "Flipping to Phase 2b ... is a small, separate follow-up") gets updated to describe Phase 2b instead. Everything else in the function is untouched: `id` is still generated client-side via `randomUUID()` before the insert (still needed for the AAD), and the 5 encrypted columns are still always populated via `encryptAccessToken(params.accessToken, getKeyRing(), id)` exactly as today, using whichever key is current — `RAILWAY_PROD_V2`, the only key that exists now.
+All confirmed points from §24 that remain valid, reconfirmed against current code (`main` at `e1f6f04`) rather than re-derived from memory: `insertPlaidItem()` is the only request-serving credential write path; removing `access_token: params.accessToken` stops normal plaintext persistence; `exchangePublicToken` (`plaidController.ts:210-264`) uses the in-memory `accessToken` local variable for `getAccounts`/`syncItemTransactions`/`refreshLoansForItem` and never reads `itemRow.access_token` — confirmed by direct inspection, not assumed; Update Mode/reconnect (`completeReauth`) never writes a new token; refresh/sync/webhook/loans/recurring all resolve through `dataService.ts`'s four functions; no frontend file references an access token; Phase 1's schema already permits and requires no further migration for an encrypted-only row.
 
-No schema or migration change: Phase 1 already made `access_token` nullable and already added the `plaid_items_token_present` check constraint that permits an encrypted-only row (`access_token is not null or access_token_ciphertext is not null`). No type change: `PlaidItemRow.access_token` is already typed `string | null`. No Railway/Supabase change is required for this step — V2 is already the only configured, current key.
+### Exact fail-closed state machine (Blocker 1)
+
+`resolveAccessToken` is redesigned around an explicit classification of all five encrypted columns together, never inferred from any single one:
+
+```ts
+type EncryptedFieldsState = 'none' | 'partial' | 'complete';
+
+function classifyEncryptedFields(row: EncryptedTokenRow): EncryptedFieldsState {
+  const fields = [
+    row.access_token_ciphertext,
+    row.access_token_nonce,
+    row.access_token_auth_tag,
+    row.access_token_key_id,
+    row.access_token_enc_version,
+  ];
+  const present = fields.filter((f) => f !== null).length;
+  if (present === 5) return 'complete';
+  if (present === 0) return 'none';
+  return 'partial';
+}
+```
+
+Then the state machine, exactly as Codex specified:
+
+| Encrypted fields | Plaintext | Behavior |
+|---|---|---|
+| 0 (`none`) | present | **Legacy plaintext-only fallback** — explicitly supported for backward compatibility with any row that predates encryption entirely. Returns the plaintext column directly. |
+| 0 (`none`) | absent | `MissingEncryptedRepresentationError` — no usable representation at all. |
+| 5 (`complete`) | either | **Resolve through the encrypted representation.** Never falls back to plaintext if decryption fails, regardless of whether plaintext happens to still be present (legacy dual-write) or is null (Phase 2b). This is the one branch where plaintext's presence is irrelevant to the *read* path — it only ever matters for backward-compat fallback in the `none` case above. |
+| 1–4 (`partial`) | either | **Always fails closed** with a new, fixed, non-sensitive error — `PartialEncryptedRepresentationError` — regardless of which fields are present or which are missing, and regardless of plaintext. Never returns plaintext. This explicitly covers the case Codex named specifically: ciphertext/nonce/tag/version present but key id null (or any other 1-of-5-missing permutation) — the *count* is what's checked, not any individual field's presence. |
+
+```ts
+function resolveAccessToken(itemRowId: string, row: EncryptedTokenRow): string {
+  const state = classifyEncryptedFields(row);
+
+  if (state === 'partial') {
+    throw new PartialEncryptedRepresentationError(itemRowId);
+  }
+
+  if (state === 'complete') {
+    const enc: EncryptedAccessToken = {
+      ciphertextBase64: row.access_token_ciphertext!,
+      nonceBase64: row.access_token_nonce!,
+      authTagBase64: row.access_token_auth_tag!,
+      keyId: row.access_token_key_id!,
+      encVersion: row.access_token_enc_version!, // non-null guaranteed by state === 'complete' — no coercion
+    };
+    return decryptAccessToken(enc, getKeyRing(), itemRowId); // no catch — never falls back to plaintext
+  }
+
+  // state === 'none'
+  if (row.access_token === null) {
+    throw new MissingEncryptedRepresentationError(itemRowId);
+  }
+  return row.access_token; // legacy plaintext-only fallback, explicit and intentional
+}
+```
+
+Note what this closes automatically: because the `complete` branch reads `access_token_enc_version!` directly (never `?? 1`), a row with a null version and four other non-null fields is *structurally* a `partial` state (4 of 5 present) and fails closed via `PartialEncryptedRepresentationError` before ever reaching `decryptAccessToken` — Blocker 1's fix already eliminates the coercion Blocker 2 flagged for the *null*-version case. Blocker 2's own fix (below) is what's still needed for the *non-null-but-unsupported* version case (e.g. a hypothetical, structurally-complete version-2 row), which this state machine alone can't catch since "2" is a valid non-null value.
+
+### Encryption-version policy (Blocker 2)
+
+`decryptAccessToken` gains an explicit, first check — before the nonce/tag/ciphertext length checks, since "is this version supported at all" is a more fundamental question than "is this specific representation well-formed":
+
+```ts
+const SUPPORTED_ENC_VERSION = 1; // this app has only ever generated version 1
+
+export function decryptAccessToken(enc: EncryptedAccessToken, keyRing: KeyRing, plaidItemId: string): string {
+  if (enc.encVersion !== SUPPORTED_ENC_VERSION) {
+    throw new UnsupportedEncryptionVersionError(plaidItemId);
+  }
+  // ... existing nonce/tag/ciphertext/key checks, unchanged ...
+}
+```
+
+New error class, same family, same fixed-message discipline as every existing one in §9 — never includes the actual version number or any other dynamic value: `UnsupportedEncryptionVersionError extends PlaidCredentialError`, message `'Stored credential uses an unsupported encryption version.'`.
+
+This is deliberately a **policy** check, distinct from and prior to GCM's own tamper detection: a version-2 ciphertext built with genuinely matching version-2 AAD and the correct key would authenticate successfully at the crypto layer — `GcmAuthenticationError` is specifically for *authentication failure* (tampering, wrong key, mismatched AAD), never for "this is a well-formed representation we've simply decided not to support." Confirmed behavior for every case Codex asked about:
+- **Null version** → caught by Blocker 1's `partial` state, before `decryptAccessToken` is ever called.
+- **Version 2, cryptographically self-consistent** → caught by this new check, `UnsupportedEncryptionVersionError`, *before* any `crypto` call — never reaches `decipher.final()`, so it's never at risk of being misclassified as a `GcmAuthenticationError`.
+- **Unknown key id** → unchanged, existing `UnknownKeyIdError`.
+- **Partial representation** → Blocker 1's `PartialEncryptedRepresentationError`.
+- **Tampered ciphertext/tag/nonce, or wrong key** → unchanged, existing `GcmAuthenticationError` / `Malformed*Error` family.
+
+None of these fall back to retained plaintext when any encrypted field is present — that remains true structurally, not by convention: the `complete` and `partial` branches above have no `catch` that reaches the plaintext column at all.
+
+### Phase 2b monitoring semantics (Blocker 3)
+
+`plaintext_missing_items` (as used throughout §21/§23/§25 for the rotation/backfill era, where every row *should* have retained plaintext) is retired as a Phase 2b health signal — a Phase-2b-created encrypted-only row is a **valid success state**, not an anomaly, and the old metric would flag every one of them. Replaced with explicit state classification via `num_nonnulls()` across the five encrypted columns, adopted from Codex's supplied query:
+
+```sql
+with item_state as (
+  select *,
+    num_nonnulls(
+      access_token_ciphertext,
+      access_token_nonce,
+      access_token_auth_tag,
+      access_token_key_id,
+      access_token_enc_version
+    ) as encrypted_parts
+  from public.plaid_items
+)
+select
+  count(*) as total_items,
+  count(*) filter (where encrypted_parts = 5) as encrypted_complete_items,
+  count(*) filter (where access_token is not null and encrypted_parts = 5) as legacy_dual_write_items,
+  count(*) filter (where access_token is null and encrypted_parts = 5) as phase2b_encrypted_only_items,
+  count(*) filter (where access_token is not null and encrypted_parts = 0) as plaintext_only_items,
+  count(*) filter (where encrypted_parts between 1 and 4) as partial_encrypted_items,
+  count(*) filter (where access_token is null and encrypted_parts = 0) as missing_both_items,
+  count(*) filter (where encrypted_parts = 5 and access_token_key_id <> 'RAILWAY_PROD_V2') as unexpected_key_items,
+  count(*) filter (where encrypted_parts = 5 and access_token_enc_version <> 1) as unexpected_version_items,
+  count(*) filter (where access_token_key_id = 'RAILWAY_PROD_V1') as v1_items,
+  count(distinct access_token_nonce) filter (where encrypted_parts = 5) as distinct_encrypted_nonces
+from item_state;
+```
+
+**Valid production states, documented explicitly**:
+- **Expected legacy state**: plaintext present + all 5 fields complete, `RAILWAY_PROD_V2`/version 1 — every pre-Phase-2b row.
+- **Expected Phase 2b state**: plaintext `NULL` + all 5 fields complete, `RAILWAY_PROD_V2`/version 1 — every item linked after Phase 2b deploys.
+- **Operationally unexpected but schema-allowed**: plaintext-only (0 encrypted fields, plaintext present) — the Phase-1-era shape; shouldn't occur post-backfill but the schema permits it.
+- **Invalid / fail-closed**: partial encrypted representation (1-4 fields); missing both plaintext and encrypted representation; wrong key id; unsupported encryption version. **Wrong key/version are schema-allowed but operationally invalid** — the Phase 1 `plaid_items_encrypted_token_complete` constraint only enforces the null/non-null *pattern* across the five columns, never the *values* of `access_token_key_id` or `access_token_enc_version` — the database has no way to know which key ids or versions this application currently considers valid. That enforcement is exactly what Blocker 1's `resolveAccessToken` classification and Blocker 2's `decryptAccessToken` version check exist to provide at the application layer, and what `unexpected_key_items`/`unexpected_version_items` exist to surface at the monitoring layer.
+
+**Expected result after linking exactly one new Phase 2b Sandbox item**, from the current confirmed 3-row baseline (all 3 legacy dual-write, V2, version 1, zero anomalies): `total_items = 4`, `encrypted_complete_items = 4`, `legacy_dual_write_items = 3`, `phase2b_encrypted_only_items = 1`, `plaintext_only_items = 0`, `partial_encrypted_items = 0`, `missing_both_items = 0`, `unexpected_key_items = 0`, `unexpected_version_items = 0`, `v1_items = 0`, `distinct_encrypted_nonces = 4`.
+
+**This query proves structural integrity only** — that the right columns are populated in the right pattern. It does not prove the ciphertext actually decrypts, that the key ring can reach it, or that Plaid still accepts the credential. The row-specific boolean check and the live functional checks in the production verification plan below remain required; this query is necessary, not sufficient.
+
+**Retired tooling, explicitly**: `backend/src/scripts/backfillTokenEncryption.ts`'s own postflight (`runPostflight`, §22) is **not valid for Phase 2b health monitoring** — it asserts `plaintext_only_items = 0` *and* that every encrypted row still has plaintext (`plaintext_missing_after_backfill` is a failure condition there), which is exactly backwards for a world where Phase 2b is deliberately creating encrypted-only rows. Both `backfillTokenEncryption.ts` and `rotateTartanTokenKey.ts` are kept in the repository for audit history and are not modified as part of this phase — but are documented here as **retired: do not run after Phase 2b** ships, since their own preflight/postflight invariants (fixed 3-row cohort, fixed expected-total, "every row already encrypted must have plaintext") no longer describe a healthy post-Phase-2b table and would refuse to run correctly (or worse, misreport) against one.
+
+### Revised implementation scope
+
+**`backend/src/services/dataService.ts`**:
+- Remove `access_token: params.accessToken,` from `insertPlaidItem`'s insert payload (unchanged from the original proposal).
+- Replace the single-field `resolveAccessToken` check with the explicit `classifyEncryptedFields` + 3-branch state machine above.
+- Remove the `?? 1` version coercion entirely — the `complete` branch reads `access_token_enc_version!` directly, non-null by construction of the state check.
+
+**`backend/src/services/tokenEncryption.ts`**:
+- Add `UnsupportedEncryptionVersionError` and `PartialEncryptedRepresentationError` to the existing `PlaidCredentialError` family (§9), same fixed-message, `itemRowId`-carrying pattern as every other error class in this file.
+- Add the explicit `enc.encVersion !== SUPPORTED_ENC_VERSION` check as the first thing `decryptAccessToken` does.
+
+No schema/migration change (unchanged from the original proposal — Phase 1 already covers this). No type change beyond whatever the new error classes need (none — `PlaidItemRow` stays as-is).
 
 ### Files affected
 
-- `backend/src/services/dataService.ts` — the one-line change plus comment update.
-- `backend/src/services/dataService.test.ts` — the required test changes below.
-- `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` and `README.md` — a post-merge status update, same as every prior phase in this project.
+- `backend/src/services/dataService.ts` — the insert-payload line, `resolveAccessToken`'s rewrite.
+- `backend/src/services/dataService.test.ts` — updated + new tests, below.
+- `backend/src/services/tokenEncryption.ts` — two new error classes, the version check.
+- `backend/src/services/tokenEncryption.test.ts` — updated + new tests, below.
+- `backend/src/controllers/plaidController.test.ts` — one new, narrowly-scoped test (see "resolver-boundary coverage" below); the mock factory needs `insertPlaidItem`/`upsertAccountsForItem` added to it, which it currently omits entirely (confirmed by inspection — `exchangePublicToken` has no existing test coverage in this file at all today).
+- `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` and `README.md` — post-merge status update.
 
-No other application file changes. `resolveAccessToken` and the other three Plaid-item read functions in `dataService.ts` are confirmed unchanged (§24). No controller, `plaidService.ts`, `syncService.ts`, or `loans.ts` change — none of them read `access_token` directly; they all go through `dataService.ts`'s functions, which already resolve it correctly regardless of representation.
+No change to `webhookController.ts`, `plaidService.ts`, `syncService.ts`, `loans.ts`, or their test files — confirmed unchanged; see "resolver-boundary coverage" below for why their *test* files don't need new mocking infrastructure either, despite the new test requirements Codex listed.
 
 ### Tests required
 
-- **Update the existing test** `dataService.test.ts`'s `describe('insertPlaidItem', ...)` → `it('writes both the plaintext and the full encrypted representation together (Phase 2a dual-write)', ...)` (line 63) — this test currently asserts `expect(inserted.access_token).toBe('access-sandbox-1')`, which becomes false under Phase 2b. Rename it to describe Phase 2b encrypted-only writes and change the assertion to confirm `access_token` is absent/`undefined` from the insert payload (not merely present-but-null — confirm during implementation whether the `plaid_items.access_token` column has any DB-level default; if none, an absent key and an explicit `null` behave identically at the database level, but the test should assert what the code actually sends, not assume).
-- **Add a new test** confirming the row a Phase-2b insert produces has no plaintext but a fully-populated, correctly-decryptable encrypted representation under the current key — the same round-trip-through-`decryptAccessToken` proof the existing test already does for the ciphertext, minus the plaintext-column assertion.
-- **Confirm, don't assume**, that existing tests for the four read functions (`getPlaidItemsForUser`, `getPlaidItemByPlaidItemId`, `getPlaidItemForUser`, and `resolveAccessToken` indirectly) already include an encrypted-only-row fixture (`access_token: null`) — several already do, from the Codex-blocker-2 round; implementation should verify this by name against current test file contents, not trust this document's memory of it.
-- No changes needed to `webhookController.test.ts` or `plaidController.test.ts` — neither inserts new items, only reads.
+Grouped by where each requirement is actually satisfied, since several of Codex's items land in the same test:
+
+**`dataService.test.ts` — insert behavior**:
+- Rename/rewrite the existing test at line 63 (`'writes both the plaintext and the full encrypted representation together (Phase 2a dual-write)'`) — its `expect(inserted.access_token).toBe('access-sandbox-1')` assertion becomes false under Phase 2b. New assertions: `'access_token' in inserted` is `false` (the insert payload has no such key at all, not merely `null` — confirms the *code's* actual behavior, not an assumption about how Supabase treats an absent vs. explicit-null key); the plaintext value itself never appears anywhere in the serialized insert payload (a direct `JSON.stringify(inserted)` sentinel check); the row **returned** from the insert may have `access_token: null` (that's the DB's own default for the now-nullable column, distinct from what the *code sends*); exactly five encrypted fields written, all non-null; the ciphertext round-trips through `decryptAccessToken` using the generated row UUID as AAD (same proof pattern the existing test already does).
+
+**`dataService.test.ts` — `resolveAccessToken`'s new state machine, exercised through all three read functions**:
+- Every 1-of-5 through 4-of-5 partial permutation fails closed with `PartialEncryptedRepresentationError`, never returns plaintext — including specifically the case Codex named (ciphertext/nonce/tag/version present, key id null).
+- Null version alongside four populated fields fails closed the same way (a specific instance of the above, worth its own named test given it's the literal Blocker 2 scenario).
+- Unknown key id, wrong key id, and tampered representation all still fail as before (regression, not new).
+- **Self-consistent unsupported version 2** fails explicitly with `UnsupportedEncryptionVersionError` — built the same way `rotateTartanTokenKey.test.ts`'s `rowWithVersion` helper already does (bypass `encryptAccessToken`, hand-build a genuinely matching version-2 AAD), proving this is rejected by policy, not because decryption happens to fail.
+- Legacy dual-write (plaintext + complete encrypted fields) still prefers the decrypted value over stale plaintext — regression.
+- **`getPlaidItemForUser()` specifically gets a new normal-success encrypted-only-row test** — confirmed by direct inspection that this is a real, existing gap: `getPlaidItemsForUser` and `getPlaidItemByPlaidItemId` both already have a "resolves an encrypted row correctly" test, `getPlaidItemForUser` currently does not (only a plaintext-only success test and a shared failure-path test exist for it).
+
+**`tokenEncryption.test.ts`**:
+- `UnsupportedEncryptionVersionError` thrown for version 2 (and any version other than 1), checked before any `crypto` call is attempted (spy/assert on `createDecipheriv` never being reached, same technique already used for the existing malformed-input checks).
+- `PartialEncryptedRepresentationError`'s message is fixed and non-sensitive, same no-secret-in-message test pattern already applied to every other error class here.
+- Logging-sentinel suites (already-existing pattern) re-run and stay green — nothing about these two new error classes changes what's safe to log.
+
+**`plaidController.test.ts` — resolver-boundary coverage for the exchange flow**:
+- New test proving `exchangePublicToken` uses the in-memory token, not the inserted row's plaintext: mock `insertPlaidItem` to return a row with `access_token: null` (the Phase 2b shape) and assert `getAccounts`/`syncItemTransactions`/`refreshLoansForItem` are all still called with the original in-memory access-token string. Confirmed by direct inspection that this is accurate to current code — `exchangePublicToken` (`plaidController.ts:210-264`) never reads `itemRow.access_token` anywhere in its body.
+- `credential_error` vs. `login_required` behavior — already covered by the existing `completeReauth` tests in this file (from the earlier Codex-blocker rounds); reconfirm they still pass unchanged, no new coverage needed here specifically.
+
+**Resolver-boundary coverage for refresh/sync/webhook — identified gap and narrow resolution**: `plaidController.test.ts` and `webhookController.test.ts` both mock `../services/dataService` wholesale (confirmed by inspection of both files' `vi.mock` calls) — neither currently exercises the real `resolveAccessToken` at all; both hand back pre-resolved fixture strings. Un-mocking `dataService.ts` in either large, established file to add "real resolver boundary" coverage there would be a much bigger, riskier change than Phase 2b's actual scope calls for. The narrower, already-architecturally-correct answer: `dataService.ts`'s four Plaid-item functions **are** the resolver boundary (§6.1 — the only encryption-aware layer in the codebase), and `refreshAccounts`/`syncTransactions`/webhook processing all call exactly those functions with no logic of their own in between. The `dataService.test.ts` coverage above (which does exercise the real functions against real crypto, per its established pattern) is both the correct and the sufficient place for this requirement — controller-level tests correctly continue to treat `dataService.ts` as an already-independently-verified dependency, exactly as they do today for every other encryption concern.
 
 ### Deployment sequence
 
-1. New branch off current `main` (this project's established convention — one branch per phase/tool).
-2. Implement the one-line change + test updates above.
-3. Full local verification: backend + frontend test suites, both typechecks, both builds, `git diff --check` — same rigor as every prior round in this project.
-4. Codex review (§26, restated below) before merge.
-5. Merge to `main` and push — this repository auto-deploys `main` to Railway on every push, so the merge *is* the deploy; no separate manual deploy step.
-6. Immediately after the deploy goes Active: run the production verification plan below, before considering Phase 2b live.
+1. Design approval (this document) — **then** a new branch off current `main`.
+2. Implement the scope above.
+3. Full local verification: backend + frontend test suites, both typechecks, both builds, `git diff --check`.
+4. Codex implementation audit.
+5. **Preserve/document the exact rollback artifact** (below) before merging — not after.
+6. Merge to `main` and push — this repository auto-deploys `main` to Railway on every push, so the merge *is* the deploy.
+7. Verify startup/health (`/health` 200, no `Refusing to start` in deploy logs).
+8. Link exactly one fresh Sandbox item.
+9. Run a row-specific boolean check on that new row: plaintext `NULL`, all 5 encrypted fields complete, key id `RAILWAY_PROD_V2`, version 1.
+10. Run the aggregate state-classification query above — confirm it matches the expected post-link numbers.
+11. Refresh balances / sync transactions on the new item.
+12. Fire the Sandbox webhook test for the new item.
+13. Exercise Update Mode/reconnect on the new item (confirms the already-confirmed "Update Mode never persists a new token" claim holds against a live encrypted-only row, not just by code inspection).
+14. Inspect Railway logs across the verification window for any crypto/key/credential error code, and for any leakage (same discipline as every prior round — search for safe identifiers like error/reason codes, never anything that could be a secret).
+15. Re-run the integrity query one more time.
+16. Soak before any consideration of legacy plaintext cleanup (a future, separate, far-off phase — not part of this proposal or anywhere near it).
 
-### Rollback boundary
+### Rollback boundary and artifact
 
-Restating §24's Points A/B/C, now with V1 fully gone from the picture — nothing about V1's removal changes this analysis, since every row (the 3 existing ones and every new one Phase 2b creates) is on `RAILWAY_PROD_V2`, which remains configured throughout:
-- **Point A** — rollback to pre-encryption code stops being universally safe the moment the *first* Phase-2b row is created — i.e., the moment someone links a new item after this deploys. Not before: the deploy itself, before any new item is linked, changes nothing about any existing row.
-- **Point B** — rollback to Phase 2a (the immediately-prior commit/deploy) remains safe indefinitely from that point onward — Phase 2a's dual-read already handles an encrypted-only V2 row correctly, with zero further code change, and V2 remains configured.
-- **Point C** — unchanged: only Phase 7 (the `access_token` column physically dropped — not proposed here or anywhere near-term) breaks even Phase 2a as a rollback target.
-- **Operationally**: because this is a single-line change with no schema or environment dependency, "roll back" in practice just means reverting the one commit (or redeploying the prior image) — trivial, and safe per Point B, for as long as this deploy is live.
-
-### Production verification plan
-
-1. Link one new Plaid Sandbox test item after the deploy goes Active.
-2. Direct integrity query on that new row specifically: `access_token IS NULL`, all 5 encrypted columns populated, `access_token_key_id = 'RAILWAY_PROD_V2'`, `access_token_enc_version = 1`.
-3. Refresh balances on the new item — succeeds.
-4. Sync transactions on the new item — succeeds.
-5. Trigger the Sandbox webhook test for the new item — succeeds.
-6. Re-run the same full-table integrity query used throughout this project. **Read this result carefully**: `plaintext_missing_items` will now correctly read `1` (the new item) instead of `0` — this is the expected, correct signal that Phase 2b is working, not a regression. The 3 pre-existing items should show completely unchanged: still `access_token_key_id = RAILWAY_PROD_V2`, still with plaintext present (Phase 2b never touches existing rows, only future inserts).
+Preserved and tightened, per Codex's request:
+- **Until the first encrypted-only row is created**, older pre-encryption code remains technically able to read every row, because all existing rows still contain plaintext.
+- **After the first encrypted-only row exists**, rolling back to pre-encryption code is unsafe for that row (and any created after it) — it would read `access_token` as `NULL` and fail loudly, not silently.
+- **The safe rollback target is the last known-V2-capable Phase 2a commit** — concretely, the exact commit `main` is at immediately before the Phase 2b merge lands. As of this design (baseline confirmed by Codex: `main = e1f6f04517f15ab51c4cbe9dc3f687f5c4c97090`), that would be `e1f6f04` itself, **provided no other commit lands on `main` between now and the Phase 2b merge** — this must be re-confirmed at actual merge time, not assumed from this document. **Recommendation**: as step 5 of the deployment sequence above, create an annotated git tag (e.g. `pre-phase2b-v2-capable`) pointing at that exact pre-merge commit, so the rollback target is a durable, nameable artifact rather than something to be reconstructed from `git log` later.
+- **Reverting Phase 2b** means redeploying that tagged commit — this simply resumes dual-write for future items; every encrypted-only row Phase 2b already created remains completely valid and continues to be read correctly by Phase 2a's dual-read (§6.1's `resolveAccessToken`, which has never required plaintext to be present for the `complete` branch, in either the original or this revised design).
+- **No schema rollback, no restoration of `access_token NOT NULL`, no Phase 7 behavior** — none of those are part of this proposal, and reverting Phase 2b touches none of them.
+- `RAILWAY_PROD_V2` must remain configured throughout — it already will be, since nothing in this proposal or its rollback touches Railway.
 
 ### What Codex should review
 
-Exactly the list in §26, restated as still current now that sequencing is satisfied: the `insertPlaidItem` diff (confirms it removes only `access_token`, nothing else); a fresh re-verification that `resolveAccessToken` truly needs no change, checked against actual current code; the new/updated tests above; a full-repo grep confirming no code path outside `resolveAccessToken`'s abstraction reads `.access_token` directly assuming non-null; the Points A/B/C claims re-derived against actual code at implementation time; and confirmation that the production verification plan above is actually followed and its results documented — including that a nonzero `plaintext_missing_items` after this deploy is correctly recognized as success, not investigated as an anomaly.
+Everything in §26 remains current (the `insertPlaidItem` diff, the read-path re-verification, the full-repo grep for other direct `.access_token` reads, the rollback-boundary re-derivation, the production verification plan actually being followed) — **plus, specific to this revision**: the exact `classifyEncryptedFields`/state-machine implementation in `resolveAccessToken` (confirm all five fields are genuinely checked, not a subset); that `decryptAccessToken`'s version check runs before any `crypto` call, with a test proving `createDecipheriv` is never reached for an unsupported version; that neither new error class's message ever includes the actual version number, key id, or any other dynamic value; the new monitoring query's numbers against a real post-link production check, not just the arithmetic in this document; that the retired-tooling documentation is accurate and neither script was modified; and the specific new `plaidController.test.ts` test proving the exchange flow's in-memory-token behavior.
+
+### Remaining risks / open questions
+
+- The exact rollback-artifact commit can only be finalized at actual merge time — this document names `e1f6f04` as the current baseline, but implementation must re-confirm (and tag) whatever `main` actually is immediately before merging, not reuse this hash blindly if other work has landed in between.
+- Whether the `plaid_items.access_token` column has any DB-level default value matters for one test assertion's precision (absent-key vs. explicit-null in the insert payload) — flagged as something to confirm during implementation, not assumed here.
+- This proposal does not address a future, much later question: once enough time has passed and Phase 2b is fully soaked, should the *legacy* rows (still dual-write, still holding plaintext) eventually be re-encrypted-only too, closing the loop entirely? That's explicitly out of scope here — raised only so it isn't lost, not to be actioned now.
 
 ---
 
