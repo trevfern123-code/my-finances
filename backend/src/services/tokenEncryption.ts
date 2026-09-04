@@ -5,6 +5,10 @@ import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 // management), §6 (key ring), §8 (fail-closed rule), §9 (error classes).
 
 const AAD_CONTEXT = 'my-finances:plaid-access-token';
+// Single source of truth for both "the version new encryptions are written under" and "the only
+// version reads currently accept" (PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §27, Phase 2b
+// revision) — one constant, so a writer/reader version drifting apart from each other is not a
+// mistake that can even be expressed in code.
 const ENC_VERSION = 1;
 const KEY_ENV_PREFIX = 'PLAID_TOKEN_KEY_';
 const CURRENT_KEY_ID_ENV = 'PLAID_TOKEN_CURRENT_KEY_ID';
@@ -87,6 +91,34 @@ export class GcmAuthenticationError extends PlaidCredentialError {
 export class MissingEncryptedRepresentationError extends PlaidCredentialError {
   constructor(itemRowId?: string) {
     super('Stored credential has no usable representation.', itemRowId);
+  }
+}
+
+/** 1-4 (of the 5) encrypted columns are populated — never reachable if the Phase 1
+ *  `plaid_items_encrypted_token_complete` check constraint holds, but `resolveAccessToken`
+ *  (dataService.ts, §27) classifies all five explicitly rather than trusting that constraint
+ *  alone, exactly so this state has a specific, fail-closed outcome instead of being silently
+ *  reachable through a coercion (e.g. treating a null `access_token_enc_version` as `1`).
+ *  Exported here because it's part of the same `PlaidCredentialError` family, even though
+ *  dataService.ts is what throws it — mirrors `MissingEncryptedRepresentationError` above. */
+export class PartialEncryptedRepresentationError extends PlaidCredentialError {
+  constructor(itemRowId?: string) {
+    super('Stored credential has an incomplete encrypted representation.', itemRowId);
+  }
+}
+
+/** `enc.encVersion` is present but not one this app currently knows how to read (§27, Phase 2b
+ *  revision) — checked before any Base64 decoding or `crypto` call, so a version this app
+ *  doesn't support is rejected by explicit policy, not by however `crypto` happens to react to
+ *  bytes it wasn't asked to interpret. Deliberately distinct from `GcmAuthenticationError`: a
+ *  version-2 representation with genuinely matching version-2 AAD and the correct key would
+ *  authenticate successfully at the crypto layer — this rejects it anyway, because this app has
+ *  only ever generated version 1 and accepting anything else would be an unreviewed format
+ *  change slipping in silently. The message never includes the actual version number (or
+ *  anything else dynamic) — same fixed, non-sensitive discipline as every other error here. */
+export class UnsupportedEncryptionVersionError extends PlaidCredentialError {
+  constructor(itemRowId?: string) {
+    super('Stored credential uses an unsupported encryption version.', itemRowId);
   }
 }
 
@@ -233,17 +265,23 @@ export function encryptAccessToken(
 }
 
 /** Decrypts an `EncryptedAccessToken`, verifying it was encrypted for `plaidItemId` specifically
- *  (the AAD, §4) under a key still present in `keyRing`. Every malformed-input check (§3) runs
- *  before any `crypto` call is attempted; a GCM authentication failure — tampered ciphertext,
- *  tampered tag, wrong key, or mismatched AAD, indistinguishable from each other by design — is
- *  the only case that reaches `decipher.final()` before throwing. Callers must never catch the
- *  resulting error and fall back to a plaintext column (§8) — this function has no such
- *  fallback itself, by design. */
+ *  (the AAD, §4) under a key still present in `keyRing`. The supported-version check runs first,
+ *  before any Base64 decoding or `crypto` call — an unsupported version is a policy rejection,
+ *  not something left for the malformed-input checks or GCM's own tamper detection to
+ *  incidentally catch (§27). Every malformed-input check (§3) then runs before any `crypto` call
+ *  is attempted; a GCM authentication failure — tampered ciphertext, tampered tag, wrong key, or
+ *  mismatched AAD, indistinguishable from each other by design — is the only case that reaches
+ *  `decipher.final()` before throwing. Callers must never catch the resulting error and fall
+ *  back to a plaintext column (§8) — this function has no such fallback itself, by design. */
 export function decryptAccessToken(
   enc: EncryptedAccessToken,
   keyRing: KeyRing,
   plaidItemId: string
 ): string {
+  if (enc.encVersion !== ENC_VERSION) {
+    throw new UnsupportedEncryptionVersionError(plaidItemId);
+  }
+
   const nonce = Buffer.from(enc.nonceBase64, 'base64');
   const authTag = Buffer.from(enc.authTagBase64, 'base64');
   const ciphertext = Buffer.from(enc.ciphertextBase64, 'base64');
