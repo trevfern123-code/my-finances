@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabaseClient';
 import {
@@ -133,8 +133,24 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // The authenticated identity Navigation Customization is scoped to — not just a derived display
+  // value here. `userIdRef` mirrors it for refreshAll's async staleness guard below (a plain
+  // closure variable captured when refreshAll was defined would itself go stale the moment the
+  // user changes; a ref read at resolution time never does). `navLayoutOwnerRef` is compared
+  // synchronously, during render, precisely so a since-superseded user's raw preference data is
+  // cleared before useNavLayout is ever called with it in the same render — a useEffect-based
+  // clear would run one commit too late to prevent a single-frame hydration from stale data.
+  const userId = session?.user.id ?? null;
+  const userIdRef = useRef(userId);
+  userIdRef.current = userId;
+  const navLayoutOwnerRef = useRef<string | null | undefined>(undefined);
+  if (navLayoutOwnerRef.current !== userId) {
+    navLayoutOwnerRef.current = userId;
+    setNavLayoutRaw(undefined);
+  }
+
   const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
-  const navLayout = useNavLayout(navLayoutRaw);
+  const navLayout = useNavLayout(userId, navLayoutRaw);
   const appearance = useAppearance(appearanceRaw);
   const financialPreferences = useFinancialPreferences(financialPreferencesRaw);
   const reportingRange = useReportingRange(reportingRangeRaw);
@@ -156,6 +172,11 @@ export default function App() {
   }, []);
 
   const refreshAll = useCallback(async () => {
+    // Captured up front so the nav_layout write-back below can detect a fetch that's still in
+    // flight when the authenticated user changes (e.g. sign-out immediately followed by a
+    // different account signing in) — without this, a slow, superseded fetch resolving late would
+    // overwrite the *new* user's already-hydrated navigation state with the *previous* user's data.
+    const requestedForUserId = userIdRef.current;
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
     // blank the entire dashboard when the other calls succeeded fine.
@@ -217,7 +238,13 @@ export default function App() {
     if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
     if (userPreferencesRes.status === 'fulfilled') {
       setDashboardLayoutRaw(userPreferencesRes.value.dashboard_layout?.cards ?? null);
-      setNavLayoutRaw(userPreferencesRes.value.nav_layout?.tabs ?? null);
+      // Guarded: a response fetched for a user who has since signed out or been replaced by a
+      // different account must never write into navLayoutRaw — see the comment on
+      // requestedForUserId above, and useNavLayout's own independent ownerId check for a second
+      // layer of the same protection.
+      if (userIdRef.current === requestedForUserId) {
+        setNavLayoutRaw(userPreferencesRes.value.nav_layout?.tabs ?? null);
+      }
       setAppearanceRaw({
         theme: userPreferencesRes.value.theme,
         accent_color: userPreferencesRes.value.accent_color,

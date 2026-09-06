@@ -213,4 +213,211 @@ describe('NavLayoutSync — dispose', () => {
     expect(statuses.at(-1)).toBe('saved'); // never reached 'idle' — timer was cancelled
     vi.useRealTimers();
   });
+
+  it('discards a queued, not-yet-sent layout — it can never be dispatched', () => {
+    const a = deferred<void>();
+    const save = vi.fn(() => a.promise);
+    const { sync } = makeSync(save);
+
+    sync.submit(LAYOUT_A); // dispatched immediately, still in flight
+    sync.submit(LAYOUT_B); // queued, never sent yet
+
+    sync.dispose();
+
+    // Even if the in-flight A request later settles, there is nothing queued left to dispatch —
+    // B (the unsent layout) was discarded the instant dispose() ran, not merely left pending.
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(save).toHaveBeenCalledWith(LAYOUT_A);
+  });
+
+  it('an in-flight request settling after dispose cannot trigger another dispatch or status callback', async () => {
+    const a = deferred<void>();
+    const save = vi.fn(() => a.promise);
+    const { sync, statuses } = makeSync(save);
+
+    sync.submit(LAYOUT_A); // dispatched, in flight
+    sync.submit(LAYOUT_B); // queued behind it
+
+    sync.dispose(); // discards the queued B; leaves A's in-flight request to finish on its own
+    const statusesAtDispose = [...statuses];
+
+    a.resolve(); // A's request — dispatched legitimately before dispose — finishes normally
+    await a.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(save).toHaveBeenCalledTimes(1); // B was never dispatched
+    expect(statuses).toEqual(statusesAtDispose); // no further status callback fired after dispose
+  });
+
+  it('an in-flight request rejecting after dispose cannot emit an error status or retry state', async () => {
+    const a = deferred<void>();
+    const save = vi.fn(() => a.promise);
+    const { sync, statuses } = makeSync(save);
+
+    sync.submit(LAYOUT_A);
+    sync.dispose();
+    const statusesAtDispose = [...statuses];
+
+    a.reject(new Error('finishes after dispose'));
+    await a.promise.catch(() => {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(statuses).toEqual(statusesAtDispose); // never reaches 'error' after disposal
+  });
+
+  it('rejects new submissions after disposal', () => {
+    const save = vi.fn(() => new Promise(() => {}));
+    const { sync } = makeSync(save);
+
+    sync.dispose();
+    sync.submit(LAYOUT_A);
+
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('rejects retry() after disposal', async () => {
+    const save = vi
+      .fn()
+      .mockReturnValueOnce(Promise.reject(new Error('fail once')));
+    const { sync, statuses } = makeSync(save);
+
+    sync.submit(LAYOUT_A);
+    await Promise.resolve().catch(() => {});
+    await Promise.resolve();
+    expect(statuses.at(-1)).toBe('error');
+
+    sync.dispose();
+    sync.retry();
+
+    expect(save).toHaveBeenCalledTimes(1); // retry() after dispose never re-invokes save
+  });
+});
+
+describe('NavLayoutSync — simulated account switch (A disposed mid-flight, B gets a fresh instance)', () => {
+  it('6. A has one request in flight and another A layout pending, then "logs out" before the first settles — the pending A layout is discarded and never sent', () => {
+    const aInFlight = deferred<void>();
+    const saveA = vi.fn(() => aInFlight.promise);
+    const { sync: syncA } = makeSync(saveA);
+
+    syncA.submit(LAYOUT_A); // dispatched, in flight
+    syncA.submit(LAYOUT_B); // queued — represents a second A edit made just before logout
+
+    syncA.dispose(); // "A logs out" — happens before aInFlight ever settles
+
+    expect(saveA).toHaveBeenCalledTimes(1); // only the in-flight A request was ever sent
+    expect(saveA).toHaveBeenCalledWith(LAYOUT_A); // LAYOUT_B (queued) was discarded, never dispatched
+  });
+
+  it('7. following logout and a B login, no A-derived write is ever dispatched under B\'s own sync instance', async () => {
+    const aInFlight = deferred<void>();
+    const saveA = vi.fn(() => aInFlight.promise);
+    const { sync: syncA } = makeSync(saveA);
+
+    syncA.submit(LAYOUT_A);
+    syncA.submit(LAYOUT_B);
+    syncA.dispose(); // A logs out — B's own useNavLayout render would construct a brand-new instance
+
+    const saveB = vi.fn(() => Promise.resolve());
+    const { sync: syncB, statuses: statusesB } = makeSync(saveB);
+    syncB.submit(LAYOUT_C); // B's own, unrelated edit
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // B's own save() only ever receives B's own layout — never anything A queued or attempted.
+    expect(saveB).toHaveBeenCalledTimes(1);
+    expect(saveB).toHaveBeenCalledWith(LAYOUT_C);
+    expect(statusesB).toEqual(['saving', 'saved']);
+
+    // Completing A's stale in-flight request afterward changes nothing about B's instance.
+    aInFlight.resolve();
+    await aInFlight.promise;
+    await Promise.resolve();
+    expect(saveB).toHaveBeenCalledTimes(1);
+  });
+
+  it('8. completion of A\'s already-in-flight request after disposal cannot update B\'s save status or trigger another dispatch', async () => {
+    const aInFlight = deferred<void>();
+    const saveA = vi.fn(() => aInFlight.promise);
+    const { sync: syncA, statuses: statusesA } = makeSync(saveA);
+
+    syncA.submit(LAYOUT_A);
+    syncA.dispose();
+    const statusesAAtDispose = [...statusesA];
+
+    const saveB = vi.fn(() => new Promise(() => {}));
+    const { sync: syncB, statuses: statusesB } = makeSync(saveB);
+    syncB.submit(LAYOUT_C);
+    const statusesBBeforeASettles = [...statusesB];
+
+    aInFlight.resolve(); // A's stale request finally settles
+    await aInFlight.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // A's own (disposed) instance emitted nothing further...
+    expect(statusesA).toEqual(statusesAAtDispose);
+    // ...and, since A and B are entirely separate instances/closures, B's status and save() calls
+    // are completely unaffected by A's settlement.
+    expect(statusesB).toEqual(statusesBBeforeASettles);
+    expect(saveB).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('NavLayoutSync — synchronous save() throw', () => {
+  it('is treated the same as a rejected promise — status becomes error, not stuck on saving', async () => {
+    const save = vi.fn(() => {
+      throw new Error('synchronous failure');
+    });
+    const { sync, statuses } = makeSync(save);
+
+    sync.submit(LAYOUT_A);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(statuses).toEqual(['saving', 'error']);
+  });
+
+  it('does not wedge the queue — a subsequent submit still dispatches normally', async () => {
+    const save = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('synchronous failure');
+      })
+      .mockReturnValueOnce(Promise.resolve());
+    const { sync, statuses } = makeSync(save);
+
+    sync.submit(LAYOUT_A);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(statuses.at(-1)).toBe('error');
+
+    sync.submit(LAYOUT_B);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(save).toHaveBeenNthCalledWith(2, LAYOUT_B);
+    expect(statuses.at(-1)).toBe('saved');
+  });
+
+  it('a synchronous throw superseded by a newer pending submit is swallowed, same as a rejected promise', async () => {
+    const save = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('synchronous failure');
+      })
+      .mockReturnValueOnce(new Promise(() => {}));
+    const { sync, statuses } = makeSync(save);
+
+    sync.submit(LAYOUT_A);
+    sync.submit(LAYOUT_B); // queued before A's synchronous throw is even processed
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(statuses).toEqual(['saving', 'saving']); // never visits 'error'
+    expect(save).toHaveBeenNthCalledWith(2, LAYOUT_B);
+  });
 });
