@@ -1396,6 +1396,91 @@ button:disabled {
   min-width: 0;
 }
 
+/* ---- Settings shell ---- */
+/* Desktop: sidebar + content pane, both visible together — .settings-mobile-* only matters below
+ * the Responsive section's settings breakpoint, where exactly one pane shows at a time. */
+
+.settings-shell {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.settings-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.4rem;
+  position: sticky;
+  top: 1rem;
+}
+
+.settings-sidebar-item {
+  text-align: left;
+  font-size: 0.9rem;
+  font-weight: 500;
+  padding: 0.6rem 0.75rem;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.settings-sidebar-item:hover:not(.active) {
+  color: var(--text);
+  background: rgba(var(--accent-rgb), 0.08);
+}
+
+.settings-sidebar-item.active {
+  background: rgba(var(--accent-rgb), 0.15);
+  color: var(--accent);
+}
+
+.settings-content {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  min-width: 0;
+}
+
+/* Only rendered/visible at the mobile drill-down breakpoint (see Responsive) — hidden at desktop
+ * widths regardless of settings-mobile-* state. */
+.settings-back-link {
+  display: none;
+}
+
+/* ---- Save status ---- */
+
+.save-status {
+  font-size: 0.8rem;
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.save-status-saving {
+  color: var(--text-muted);
+}
+
+.save-status-saved {
+  color: var(--positive);
+}
+
+.save-status-error {
+  color: var(--danger);
+}
+
+.save-status-error .link-button {
+  font-size: inherit;
+  font-weight: inherit;
+  color: inherit;
+}
+
 /* ---- Appearance settings ---- */
 
 .appearance-section {
@@ -1512,14 +1597,6 @@ button:disabled {
 .financial-prefs-desc {
   color: var(--text-muted);
   font-size: 0.8rem;
-}
-
-.financial-prefs-subheading {
-  font-size: 0.85rem;
-  font-weight: 600;
-  margin: 0.4rem 0 0.9rem;
-  padding-top: 0.9rem;
-  border-top: 1px solid var(--border);
 }
 
 .financial-prefs-toggle-header {
@@ -2251,6 +2328,26 @@ button:disabled {
 
   .grid-span-2 {
     grid-column: span 1;
+  }
+
+  /* Settings drill-down: exactly one pane shows at a time below this width, toggled by
+   * Settings.tsx's mobileView state — the section list, or the selected section plus a way back
+   * to the list. Above this width both panes render together regardless of that state. */
+  .settings-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-mobile-list .settings-content {
+    display: none;
+  }
+
+  .settings-mobile-section .settings-sidebar {
+    display: none;
+  }
+
+  .settings-mobile-section .settings-back-link {
+    display: inline-block;
+    margin-bottom: 0.25rem;
   }
 }
 

@@ -8,6 +8,7 @@ import {
   DEFAULT_FINANCIAL_PREFERENCES,
   type FinancialPreferences,
 } from '../lib/financialPreferences';
+import { useSaveStatus } from './useSaveStatus';
 
 /**
  * Owns Financial Preferences v1 (minimum cash buffer, upcoming-bills window, recent-average
@@ -40,6 +41,7 @@ export function useFinancialPreferences(
 ) {
   const [prefs, setPrefs] = useState<FinancialPreferences>(DEFAULT_FINANCIAL_PREFERENCES);
   const hydrated = useRef(false);
+  const { status: saveStatus, track, retry } = useSaveStatus();
 
   useEffect(() => {
     if (hydrated.current || saved === undefined) return;
@@ -57,17 +59,18 @@ export function useFinancialPreferences(
   }, [saved]);
 
   function persist(next: FinancialPreferences) {
-    updateFinancialPreferences({
-      minimum_cash_buffer: next.minimumCashBuffer,
-      upcoming_bills_days: next.upcomingBillsDays,
-      recent_avg_months: next.recentAvgMonths,
-      savings_rate_target: next.savingsRateTarget,
-      safe_to_spend_include_upcoming_bills: next.includeUpcomingBills,
-      safe_to_spend_include_remaining_budget: next.includeRemainingBudget,
-    }).catch(() => {
-      // Best-effort — stays applied locally this session even if the save failed, same as
-      // useAppearance/useDashboardLayout.
-    });
+    // Stays applied locally this session even if the save fails — track() surfaces the real
+    // outcome via saveStatus instead of silently swallowing it.
+    track(() =>
+      updateFinancialPreferences({
+        minimum_cash_buffer: next.minimumCashBuffer,
+        upcoming_bills_days: next.upcomingBillsDays,
+        recent_avg_months: next.recentAvgMonths,
+        savings_rate_target: next.savingsRateTarget,
+        safe_to_spend_include_upcoming_bills: next.includeUpcomingBills,
+        safe_to_spend_include_remaining_budget: next.includeRemainingBudget,
+      })
+    );
   }
 
   function update(partial: Partial<FinancialPreferences>) {
@@ -86,5 +89,7 @@ export function useFinancialPreferences(
     setSavingsRateTarget: (value: number) => update({ savingsRateTarget: clampSavingsRateTarget(value) }),
     setIncludeUpcomingBills: (value: boolean) => update({ includeUpcomingBills: value }),
     setIncludeRemainingBudget: (value: boolean) => update({ includeRemainingBudget: value }),
+    saveStatus,
+    retry,
   };
 }
