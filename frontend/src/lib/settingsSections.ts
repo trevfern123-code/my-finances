@@ -1,8 +1,8 @@
 // Every section Settings could ever show, including ones not built yet — a stable, append-only
 // id registry. `available: false` is how a section gets a permanent home in this list before its
 // content exists, without ever being rendered or selectable until it does — Phase 2 (Navigation)
-// and Phase 3 (Dashboard, Connections) will each flip one entry to `available: true` and add its
-// content, not restructure this list.
+// has shipped; Phase 3 (Dashboard, Connections) will flip its remaining entries to
+// `available: true` and add their content, not restructure this list.
 export type SettingsSectionId =
   | 'appearance'
   | 'financial'
@@ -21,7 +21,7 @@ export interface SettingsSectionMeta {
 export const ALL_SECTIONS: SettingsSectionMeta[] = [
   { id: 'appearance', label: 'Appearance', available: true },
   { id: 'dashboard', label: 'Dashboard', available: false },
-  { id: 'navigation', label: 'Navigation', available: false },
+  { id: 'navigation', label: 'Navigation', available: true },
   { id: 'financial', label: 'Financial Preferences', available: true },
   { id: 'safe_to_spend', label: 'Safe to Spend', available: true },
   { id: 'categories', label: 'Categories', available: true },

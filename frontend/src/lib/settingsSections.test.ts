@@ -10,16 +10,15 @@ import {
 } from './settingsSections';
 
 describe('getAvailableSections', () => {
-  it('only returns sections marked available — Phase 2/3 placeholders are excluded', () => {
+  it('only returns sections marked available — Phase 3 placeholders are excluded', () => {
     const available = getAvailableSections();
     const ids = available.map((s) => s.id);
-    expect(ids).toEqual(['appearance', 'financial', 'safe_to_spend', 'categories']);
+    expect(ids).toEqual(['appearance', 'navigation', 'financial', 'safe_to_spend', 'categories']);
   });
 
-  it('excludes every registered-but-unbuilt section by name, explicitly', () => {
+  it('excludes every registered-but-unbuilt Phase 3 section by name, explicitly', () => {
     const ids = getAvailableSections().map((s) => s.id);
     expect(ids).not.toContain('dashboard');
-    expect(ids).not.toContain('navigation');
     expect(ids).not.toContain('connections');
   });
 
@@ -35,14 +34,14 @@ describe('getAvailableSections', () => {
 describe('isSectionAvailable', () => {
   it('is true for each currently-available section', () => {
     expect(isSectionAvailable('appearance')).toBe(true);
+    expect(isSectionAvailable('navigation')).toBe(true);
     expect(isSectionAvailable('financial')).toBe(true);
     expect(isSectionAvailable('safe_to_spend')).toBe(true);
     expect(isSectionAvailable('categories')).toBe(true);
   });
 
-  it('is false for each Phase 2/3 placeholder', () => {
+  it('is false for each Phase 3 placeholder', () => {
     expect(isSectionAvailable('dashboard')).toBe(false);
-    expect(isSectionAvailable('navigation')).toBe(false);
     expect(isSectionAvailable('connections')).toBe(false);
   });
 });

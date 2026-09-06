@@ -145,6 +145,11 @@ export interface UserPreferencesRow {
   /** Null until the user customizes their dashboard at least once — the frontend falls back to
    *  its own built-in default layout in that case, not an empty/broken one. */
   dashboard_layout: { cards: { id: string; visible: boolean }[] } | null;
+  /** Navigation Customization v1 — null until the user customizes their main-tab navigation at
+   *  least once, same fallback-to-built-in-default reasoning as dashboard_layout. Only ever holds
+   *  the customizable middle tabs (frontend lib/tabRegistry.ts) — Overview and Settings are
+   *  structural anchors and are never persisted here. */
+  nav_layout: { tabs: { id: string; visible: boolean }[] } | null;
   /** 'system' | 'light' | 'dark' — validated/defaulted at the controller layer, stored as plain
    *  text here since a check constraint plus app-layer validation is enough for a 3-value enum. */
   theme: string;

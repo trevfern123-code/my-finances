@@ -10,6 +10,7 @@ export async function getUserPreferences(req: Request, res: Response, next: Next
     const prefs = await dataService.getUserPreferences(req.user!.id);
     res.json({
       dashboard_layout: prefs?.dashboard_layout ?? null,
+      nav_layout: prefs?.nav_layout ?? null,
       theme: prefs?.theme ?? 'system',
       accent_color: prefs?.accent_color ?? 'green',
       minimum_cash_buffer: prefs?.minimum_cash_buffer ?? 0,
@@ -41,6 +42,27 @@ export async function updateDashboardLayout(req: Request, res: Response, next: N
     const dashboardLayout = { cards: cards as { id: string; visible: boolean }[] };
     const prefs = await dataService.upsertDashboardLayout(req.user!.id, dashboardLayout);
     res.json({ dashboard_layout: prefs.dashboard_layout });
+  } catch (err) {
+    next(err);
+  }
+}
+
+interface NavLayoutBody {
+  tabs?: { id?: string; visible?: boolean }[];
+}
+
+export async function updateNavLayout(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { tabs } = req.body as NavLayoutBody;
+
+    if (!Array.isArray(tabs) || tabs.some((t) => typeof t.id !== 'string' || typeof t.visible !== 'boolean')) {
+      res.status(400).json({ error: 'tabs must be an array of { id: string, visible: boolean }' });
+      return;
+    }
+
+    const navLayout = { tabs: tabs as { id: string; visible: boolean }[] };
+    const prefs = await dataService.upsertNavLayout(req.user!.id, navLayout);
+    res.json({ nav_layout: prefs.nav_layout });
   } catch (err) {
     next(err);
   }

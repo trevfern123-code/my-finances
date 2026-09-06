@@ -576,10 +576,26 @@ export interface DashboardLayout {
   cards: DashboardCardEntry[];
 }
 
+/** One customizable tab's saved state in a user's navigation layout. `id` is a plain string on the
+ *  wire, same reasoning as DashboardCardEntry.id above — lib/navLayout.ts's mergeNavLayout owns
+ *  reconciling it against the known customizable-tab set (lib/tabRegistry.ts), not this file. */
+export interface NavLayoutEntry {
+  id: string;
+  visible: boolean;
+}
+
+export interface NavLayout {
+  tabs: NavLayoutEntry[];
+}
+
 export interface UserPreferences {
   /** Null means the user has never customized anything — the caller falls back to the built-in
    *  default layout, not an empty one. */
   dashboard_layout: DashboardLayout | null;
+  /** Null means the user has never customized navigation — same fallback reasoning as
+   *  dashboard_layout. Only ever contains customizable tabs; Overview and Settings are structural
+   *  anchors and are never represented here (see lib/tabRegistry.ts). */
+  nav_layout: NavLayout | null;
   /** Raw strings on the wire, same reasoning as DashboardCardEntry.id above — lib/theme.ts's
    *  normalizeTheme/normalizeAccent own turning these into real, known-good ids. */
   theme: string;
@@ -606,6 +622,13 @@ export function getUserPreferences(): Promise<UserPreferences> {
 
 export function updateDashboardLayout(layout: DashboardLayout): Promise<{ dashboard_layout: DashboardLayout }> {
   return authedFetch('/api/user-preferences/dashboard-layout', {
+    method: 'PUT',
+    body: JSON.stringify(layout),
+  });
+}
+
+export function updateNavLayout(layout: NavLayout): Promise<{ nav_layout: NavLayout }> {
+  return authedFetch('/api/user-preferences/nav-layout', {
     method: 'PUT',
     body: JSON.stringify(layout),
   });

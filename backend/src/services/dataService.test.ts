@@ -24,6 +24,7 @@ import {
   getTransactionsSince,
   getRecentTransactionsForUser,
   upsertFinancialPreferences,
+  upsertNavLayout,
   upsertReportingRange,
   insertPlaidItem,
   getPlaidItemsForUser,
@@ -1354,6 +1355,25 @@ describe('upsertFinancialPreferences', () => {
     );
     expect(result.minimum_cash_buffer).toBe(500);
     expect(result.savings_rate_target).toBe(20);
+  });
+});
+
+describe('upsertNavLayout', () => {
+  it('upserts nav_layout keyed by user_id', async () => {
+    const navLayout = { tabs: [{ id: 'loans', visible: false }] };
+    const query = createQueryBuilder({
+      data: { user_id: 'user-1', nav_layout: navLayout },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await upsertNavLayout('user-1', navLayout);
+
+    expect(query.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: 'user-1', nav_layout: navLayout }),
+      { onConflict: 'user_id' }
+    );
+    expect(result.nav_layout).toEqual(navLayout);
   });
 });
 

@@ -47,15 +47,19 @@ import {
   type ManualLoanInput,
   type ManualPaymentInput,
   type MonthBreakdown,
+  type NavLayoutEntry,
   type NetWorthPoint,
   type RecurringStream,
   type SpendingSummary,
   type TransactionItem,
 } from './lib/api';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
+import { getVisibleOrderedTabIds } from './lib/navLayout';
+import { buildWebTabList } from './lib/webTabNav';
 import { useDashboardLayout } from './hooks/useDashboardLayout';
 import { useAppearance } from './hooks/useAppearance';
 import { useFinancialPreferences } from './hooks/useFinancialPreferences';
+import { useNavLayout } from './hooks/useNavLayout';
 import { useReportingRange } from './hooks/useReportingRange';
 import { Auth } from './components/Auth';
 import { PlaidLink } from './components/PlaidLink';
@@ -77,19 +81,8 @@ import { IncomeSavings } from './components/IncomeSavings';
 import { Settings } from './components/Settings';
 import { DashboardCustomizer } from './components/DashboardCustomizer';
 import { ReportingRangeSelector } from './components/ReportingRangeSelector';
-import { TabNav, type Tab } from './components/TabNav';
+import { TabNav } from './components/TabNav';
 import './App.css';
-
-const TABS: Tab[] = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'monthly', label: 'Monthly Breakdown' },
-  { id: 'budget', label: 'Budget' },
-  { id: 'recurring', label: 'Subscriptions & Recurring' },
-  { id: 'loans', label: 'Loans' },
-  { id: 'income', label: 'Income & Savings' },
-  { id: 'accounts', label: 'Accounts' },
-  { id: 'settings', label: 'Settings' },
-];
 
 // The backend caps /api/plaid/transactions at 200 regardless of what's requested — fetching the
 // max lets the Monthly Breakdown and Budget tab drill-downs (both filtered client-side from this
@@ -120,6 +113,7 @@ export default function App() {
   // undefined = not fetched yet, null = fetched but the user has never customized anything —
   // useDashboardLayout treats both as "use the default layout," it only matters for hydration timing.
   const [dashboardLayoutRaw, setDashboardLayoutRaw] = useState<DashboardCardEntry[] | null | undefined>(undefined);
+  const [navLayoutRaw, setNavLayoutRaw] = useState<NavLayoutEntry[] | null | undefined>(undefined);
   const [appearanceRaw, setAppearanceRaw] = useState<
     { theme: string; accent_color: string } | null | undefined
   >(undefined);
@@ -140,9 +134,14 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
+  const navLayout = useNavLayout(navLayoutRaw);
   const appearance = useAppearance(appearanceRaw);
   const financialPreferences = useFinancialPreferences(financialPreferencesRaw);
   const reportingRange = useReportingRange(reportingRangeRaw);
+  // The current web/PWA's own decision about primary-tab-bar order (Overview first, Settings
+  // last) — see lib/webTabNav.ts. Recomputed from nav_layout on every render; cheap, and avoids a
+  // second piece of state that could drift from navLayout.layout.
+  const TABS = buildWebTabList(getVisibleOrderedTabIds(navLayout.layout));
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -218,6 +217,7 @@ export default function App() {
     if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
     if (userPreferencesRes.status === 'fulfilled') {
       setDashboardLayoutRaw(userPreferencesRes.value.dashboard_layout?.cards ?? null);
+      setNavLayoutRaw(userPreferencesRes.value.nav_layout?.tabs ?? null);
       setAppearanceRaw({
         theme: userPreferencesRes.value.theme,
         accent_color: userPreferencesRes.value.accent_color,
@@ -917,6 +917,7 @@ export default function App() {
             <Settings
               appearance={appearance}
               financialPreferences={financialPreferences}
+              navLayout={navLayout}
               categoryMappings={{
                 plaidCategories,
                 mappings: categoryMappings,

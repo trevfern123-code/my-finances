@@ -1506,6 +1506,28 @@ export async function upsertDashboardLayout(
   return data as UserPreferencesRow;
 }
 
+/** Upserts just the nav_layout column — same narrow-update reasoning as upsertDashboardLayout.
+ *  Validation (array shape, id/visible types) happens at the controller layer; this just persists
+ *  whatever it's given. The frontend's NavLayoutSync (lib/navLayoutSync.ts) is what guarantees at
+ *  most one call to this function is ever in flight per user session — this function itself has no
+ *  ordering guarantee of its own, same as every other narrow-update function here. */
+export async function upsertNavLayout(
+  userId: string,
+  navLayout: { tabs: { id: string; visible: boolean }[] }
+): Promise<UserPreferencesRow> {
+  const { data, error } = await supabaseAdmin
+    .from('user_preferences')
+    .upsert(
+      { user_id: userId, nav_layout: navLayout, updated_at: new Date().toISOString() },
+      { onConflict: 'user_id' }
+    )
+    .select()
+    .single();
+
+  if (error) throw new Error(`Failed to save navigation layout: ${error.message}`);
+  return data as UserPreferencesRow;
+}
+
 /** Upserts just theme/accent_color — same narrow-update reasoning as upsertDashboardLayout. */
 export async function upsertAppearance(
   userId: string,

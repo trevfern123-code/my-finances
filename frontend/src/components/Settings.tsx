@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { BudgetCategory, CategoryMapping } from '../lib/api';
 import type { useAppearance } from '../hooks/useAppearance';
 import type { useFinancialPreferences } from '../hooks/useFinancialPreferences';
+import type { useNavLayout } from '../hooks/useNavLayout';
 import {
   getAvailableSections,
   goBackToList,
@@ -12,6 +13,7 @@ import {
 import { AppearanceSettings } from './AppearanceSettings';
 import { FinancialPreferencesSettings } from './FinancialPreferencesSettings';
 import { SafeToSpendSettings } from './SafeToSpendSettings';
+import { NavigationSettings } from './NavigationSettings';
 import { CategoryMappings } from './CategoryMappings';
 
 const AVAILABLE_SECTIONS = getAvailableSections();
@@ -19,10 +21,12 @@ const AVAILABLE_SECTIONS = getAvailableSections();
 export function Settings({
   appearance,
   financialPreferences,
+  navLayout,
   categoryMappings,
 }: {
   appearance: ReturnType<typeof useAppearance>;
   financialPreferences: ReturnType<typeof useFinancialPreferences>;
+  navLayout: ReturnType<typeof useNavLayout>;
   categoryMappings: {
     plaidCategories: string[];
     mappings: CategoryMapping[];
@@ -96,6 +100,17 @@ export function Settings({
             onSetIncludeRemainingBudget={financialPreferences.setIncludeRemainingBudget}
             saveStatus={financialPreferences.saveStatus}
             onRetry={financialPreferences.retry}
+          />
+        )}
+
+        {activeSection === 'navigation' && (
+          <NavigationSettings
+            layout={navLayout.layout}
+            onToggleVisibility={navLayout.toggleVisibility}
+            onMove={navLayout.move}
+            onReset={navLayout.resetToDefault}
+            saveStatus={navLayout.status}
+            onRetry={navLayout.retry}
           />
         )}
 
