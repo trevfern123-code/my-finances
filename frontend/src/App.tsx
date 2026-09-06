@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabaseClient';
 import {
@@ -53,6 +53,7 @@ import {
   type SpendingSummary,
   type TransactionItem,
 } from './lib/api';
+import { currentGenerationValue, nextAuthGeneration } from './lib/authGeneration';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
 import { buildWebTabList } from './lib/webTabNav';
@@ -89,6 +90,51 @@ import './App.css';
 // same in-memory list) cover as much history as the API allows, rather than the default 50.
 const TRANSACTIONS_FETCH_LIMIT = 200;
 
+/**
+ * Scopes useNavLayout's entire lifecycle — its layout/status state, its hydration flag, and its
+ * NavLayoutSync instance — to exactly one authenticated generation. App.tsx renders this keyed by
+ * `authGeneration` (`<NavLayoutScope key={authGeneration} ...>`), so whenever that number changes,
+ * React unmounts the previous instance (running useNavLayout's real `useEffect` cleanup — a
+ * disposal that happens at a committed, irreversible point, never during a render that might be
+ * abandoned) and mounts a brand-new one with fresh initial state. A fresh mount never has the
+ * previous identity's data to begin with, so there is no window — not even a single frame — where
+ * one identity's layout could render under a different one, and nothing here ever needs to compare
+ * against a previous owner or dispose-and-replace anything in place.
+ *
+ * Only this hook's own state is scoped this way — every other piece of App's state (items,
+ * transactions, appearance, financial preferences, etc.) intentionally keeps living in the outer,
+ * unkeyed App component, exactly as it did before. A render-prop (`children`) is used instead of
+ * threading the rest of App's local state through as a long, separate prop list — the function
+ * passed as `children` is defined inline inside App's own render body, so it already has ordinary
+ * closure access to everything else App owns (activeTab, items, handlers, ...) without this
+ * component needing to know about any of it.
+ */
+function NavLayoutScope({
+  userId,
+  authGeneration,
+  isGenerationCurrent,
+  saved,
+  children,
+}: {
+  userId: string | null;
+  authGeneration: number;
+  isGenerationCurrent: (generation: number) => boolean;
+  saved: NavLayoutEntry[] | null | undefined;
+  children: (navLayout: ReturnType<typeof useNavLayout>) => ReactNode;
+}) {
+  // Reconstructed every render, but every version is functionally identical: `userId` and
+  // `authGeneration` are fixed for this mount's entire lifetime (a change to either would remount
+  // this component via its key), and isGenerationCurrent reads a live ref fresh at call time
+  // regardless of which render's closure is calling it — so it's safe that useNavLayout's
+  // NavLayoutSync only ever captures the first one. Checked by lib/api.ts's authedFetch at the
+  // moment a save is actually about to be sent, including its clock-skew retry — not merely once,
+  // up front, when the save was created — which is what actually closes the "session changed
+  // mid-flight" window Codex identified.
+  const verifyOwnership = (session: Session) => session.user.id === userId && isGenerationCurrent(authGeneration);
+  const navLayout = useNavLayout(userId, saved, verifyOwnership);
+  return <>{children(navLayout)}</>;
+}
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [activeTab, setActiveTab] = useState('overview');
@@ -114,6 +160,10 @@ export default function App() {
   // useDashboardLayout treats both as "use the default layout," it only matters for hydration timing.
   const [dashboardLayoutRaw, setDashboardLayoutRaw] = useState<DashboardCardEntry[] | null | undefined>(undefined);
   const [navLayoutRaw, setNavLayoutRaw] = useState<NavLayoutEntry[] | null | undefined>(undefined);
+  // Tags navLayoutRaw with the auth generation it was fetched under — see the derivation below
+  // and lib/authGeneration.ts's currentGenerationValue. This is what lets a fetch response prove
+  // it belongs to the *current* authenticated lifecycle, not merely the current user id.
+  const [navLayoutRawGeneration, setNavLayoutRawGeneration] = useState<number | undefined>(undefined);
   const [appearanceRaw, setAppearanceRaw] = useState<
     { theme: string; accent_color: string } | null | undefined
   >(undefined);
@@ -133,31 +183,38 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  // The authenticated identity Navigation Customization is scoped to — not just a derived display
-  // value here. `userIdRef` mirrors it for refreshAll's async staleness guard below (a plain
-  // closure variable captured when refreshAll was defined would itself go stale the moment the
-  // user changes; a ref read at resolution time never does). `navLayoutOwnerRef` is compared
-  // synchronously, during render, precisely so a since-superseded user's raw preference data is
-  // cleared before useNavLayout is ever called with it in the same render — a useEffect-based
-  // clear would run one commit too late to prevent a single-frame hydration from stale data.
   const userId = session?.user.id ?? null;
-  const userIdRef = useRef(userId);
-  userIdRef.current = userId;
-  const navLayoutOwnerRef = useRef<string | null | undefined>(undefined);
-  if (navLayoutOwnerRef.current !== userId) {
-    navLayoutOwnerRef.current = userId;
-    setNavLayoutRaw(undefined);
-  }
+
+  // One clear identity for "which authenticated lifecycle is current" — see lib/authGeneration.ts.
+  // Bumped (via an effect, never during render — see NavLayoutScope below for why) on every
+  // sign-in/sign-out transition, including a user signing back in as themselves: two login
+  // sessions by the same person are never treated as the same generation. `previousUserIdRef`
+  // starts at `userId`'s own initial value so the very first render (before getSession() even
+  // resolves) doesn't spuriously bump.
+  const [authGeneration, setAuthGeneration] = useState(0);
+  const previousUserIdForGenerationRef = useRef(userId);
+  useEffect(() => {
+    setAuthGeneration((g) => nextAuthGeneration(g, previousUserIdForGenerationRef.current, userId));
+    previousUserIdForGenerationRef.current = userId;
+  }, [userId]);
+  // Mirrors authGeneration for reads from inside async closures (refreshAll's own capture below,
+  // and NavLayoutScope's isGenerationCurrent) that must see the *latest* value at the moment they
+  // actually run, not whatever was current when they were defined.
+  const authGenerationRef = useRef(authGeneration);
+  authGenerationRef.current = authGeneration;
+  const isGenerationCurrent = (generation: number) => authGenerationRef.current === generation;
+
+  // Only usable if it was actually fetched under the generation that's current *right now* — a
+  // pure, per-render derivation (no mutation, no effect-ordering dependency) rather than a
+  // separate "clear the old value" step, which would need to run before NavLayoutScope's own
+  // first render for the new generation to avoid a stale hydration, and effect ordering (children
+  // fire before parents) can't guarantee that. See lib/authGeneration.ts's currentGenerationValue.
+  const navLayoutRawForCurrentGeneration = currentGenerationValue(navLayoutRaw, navLayoutRawGeneration, authGeneration);
 
   const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
-  const navLayout = useNavLayout(userId, navLayoutRaw);
   const appearance = useAppearance(appearanceRaw);
   const financialPreferences = useFinancialPreferences(financialPreferencesRaw);
   const reportingRange = useReportingRange(reportingRangeRaw);
-  // The current web/PWA's own decision about primary-tab-bar order (Overview first, Settings
-  // last) — see lib/webTabNav.ts. Recomputed from nav_layout on every render; cheap, and avoids a
-  // second piece of state that could drift from navLayout.layout.
-  const TABS = buildWebTabList(getVisibleOrderedTabIds(navLayout.layout));
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -172,11 +229,12 @@ export default function App() {
   }, []);
 
   const refreshAll = useCallback(async () => {
-    // Captured up front so the nav_layout write-back below can detect a fetch that's still in
-    // flight when the authenticated user changes (e.g. sign-out immediately followed by a
-    // different account signing in) — without this, a slow, superseded fetch resolving late would
-    // overwrite the *new* user's already-hydrated navigation state with the *previous* user's data.
-    const requestedForUserId = userIdRef.current;
+    // Tags this fetch with the generation it was made under — see the setNavLayoutRawGeneration
+    // call below and lib/authGeneration.ts's currentGenerationValue, which is what actually decides
+    // whether the result is ever usable. Comparing bare user ids here would not be enough: "A
+    // generation 1 -> logout -> A generation 3" must still reject generation 1's late response,
+    // even though its user id matches generation 3's just as well.
+    const requestedForGeneration = authGenerationRef.current;
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
     // blank the entire dashboard when the other calls succeeded fine.
@@ -238,13 +296,12 @@ export default function App() {
     if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
     if (userPreferencesRes.status === 'fulfilled') {
       setDashboardLayoutRaw(userPreferencesRes.value.dashboard_layout?.cards ?? null);
-      // Guarded: a response fetched for a user who has since signed out or been replaced by a
-      // different account must never write into navLayoutRaw — see the comment on
-      // requestedForUserId above, and useNavLayout's own independent ownerId check for a second
-      // layer of the same protection.
-      if (userIdRef.current === requestedForUserId) {
-        setNavLayoutRaw(userPreferencesRes.value.nav_layout?.tabs ?? null);
-      }
+      // Tagged, not gated: writing this unconditionally is safe because nothing ever *reads*
+      // navLayoutRaw directly — only navLayoutRawForCurrentGeneration's derivation does, and it
+      // already refuses any value whose tagged generation doesn't match whatever is current by
+      // the time it's read, regardless of how this write is timed relative to that.
+      setNavLayoutRaw(userPreferencesRes.value.nav_layout?.tabs ?? null);
+      setNavLayoutRawGeneration(requestedForGeneration);
       setAppearanceRaw({
         theme: userPreferencesRes.value.theme,
         accent_color: userPreferencesRes.value.accent_color,
@@ -814,147 +871,163 @@ export default function App() {
       {loading ? (
         <p className="hint">Loading...</p>
       ) : (
-        <>
-          <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
+        <NavLayoutScope
+          key={authGeneration}
+          userId={userId}
+          authGeneration={authGeneration}
+          isGenerationCurrent={isGenerationCurrent}
+          saved={navLayoutRawForCurrentGeneration}
+        >
+          {(navLayout) => {
+            // The current web/PWA's own decision about primary-tab-bar order (Overview first,
+            // Settings last) — see lib/webTabNav.ts. Recomputed on every render of this render-prop;
+            // cheap, and avoids a second piece of state that could drift from navLayout.layout.
+            const TABS = buildWebTabList(getVisibleOrderedTabIds(navLayout.layout));
+            return (
+              <>
+                <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
 
-          {activeTab === 'overview' && (
-            <div className="tab-panel">
-              <div className="section-header overview-header">
-                <span className="hint">Overview</span>
-                <button type="button" className="link-button" onClick={() => dashboardLayout.setCustomizing(true)}>
-                  Customize dashboard
-                </button>
-              </div>
-
-              {!dashboardLayout.customizing &&
-                dashboardLayout.layout.some(
-                  (c) => c.visible && (c.id === 'monthly_spending_chart' || c.id === 'net_worth_chart')
-                ) && <ReportingRangeSelector range={reportingRange.range} onChange={reportingRange.setRange} />}
-
-              {dashboardLayout.customizing ? (
-                <DashboardCustomizer
-                  layout={dashboardLayout.layout}
-                  onToggleVisibility={dashboardLayout.toggleVisibility}
-                  onMove={dashboardLayout.move}
-                  onApplyPreset={dashboardLayout.applyPreset}
-                  onDone={() => dashboardLayout.setCustomizing(false)}
-                />
-              ) : (
-                groupCardsIntoRows(
-                  dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id)
-                ).map((row) =>
-                  row.length === 2 ? (
-                    <div className="dashboard-grid" key={row.join('+')}>
-                      <div>{renderOverviewCard(row[0])}</div>
-                      <div>{renderOverviewCard(row[1])}</div>
+                {activeTab === 'overview' && (
+                  <div className="tab-panel">
+                    <div className="section-header overview-header">
+                      <span className="hint">Overview</span>
+                      <button type="button" className="link-button" onClick={() => dashboardLayout.setCustomizing(true)}>
+                        Customize dashboard
+                      </button>
                     </div>
-                  ) : (
-                    <div key={row[0]}>{renderOverviewCard(row[0])}</div>
-                  )
-                )
-              )}
-            </div>
-          )}
 
-          {activeTab === 'monthly' && (
-            <MonthlyBreakdown
-              months={monthlyBreakdown}
-              transactions={transactions}
-              reportingRange={reportingRange.range}
-              onSetReportingRange={reportingRange.setRange}
-            />
-          )}
+                    {!dashboardLayout.customizing &&
+                      dashboardLayout.layout.some(
+                        (c) => c.visible && (c.id === 'monthly_spending_chart' || c.id === 'net_worth_chart')
+                      ) && <ReportingRangeSelector range={reportingRange.range} onChange={reportingRange.setRange} />}
 
-          {activeTab === 'budget' && (
-            <BudgetCategories
-              categories={budgetCategories}
-              transactions={transactions}
-              recentAvgMonths={financialPreferences.recentAvgMonths}
-              onCreate={handleCreateCategory}
-              onUpdate={handleUpdateCategory}
-              onUpdateEmoji={handleUpdateCategoryEmoji}
-              onUpdateColor={handleUpdateCategoryColor}
-              onReorder={handleReorderCategory}
-              onArchive={handleArchiveCategory}
-              onUnarchive={handleUnarchiveCategory}
-            />
-          )}
+                    {dashboardLayout.customizing ? (
+                      <DashboardCustomizer
+                        layout={dashboardLayout.layout}
+                        onToggleVisibility={dashboardLayout.toggleVisibility}
+                        onMove={dashboardLayout.move}
+                        onApplyPreset={dashboardLayout.applyPreset}
+                        onDone={() => dashboardLayout.setCustomizing(false)}
+                      />
+                    ) : (
+                      groupCardsIntoRows(
+                        dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id)
+                      ).map((row) =>
+                        row.length === 2 ? (
+                          <div className="dashboard-grid" key={row.join('+')}>
+                            <div>{renderOverviewCard(row[0])}</div>
+                            <div>{renderOverviewCard(row[1])}</div>
+                          </div>
+                        ) : (
+                          <div key={row[0]}>{renderOverviewCard(row[0])}</div>
+                        )
+                      )
+                    )}
+                  </div>
+                )}
 
-          {activeTab === 'recurring' && (
-            <SubscriptionsRecurring
-              streams={recurringStreams}
-              totalMonthlyOutflow={totalMonthlyOutflow}
-              totalMonthlyInflow={totalMonthlyInflow}
-            />
-          )}
+                {activeTab === 'monthly' && (
+                  <MonthlyBreakdown
+                    months={monthlyBreakdown}
+                    transactions={transactions}
+                    reportingRange={reportingRange.range}
+                    onSetReportingRange={reportingRange.setRange}
+                  />
+                )}
 
-          {activeTab === 'loans' && (
-            <LoanProgress
-              loans={loans}
-              manualLoans={manualLoans}
-              totalDebt={totalDebt}
-              totalMinimumPayment={totalMinimumPayment}
-              onCreateManualLoan={handleCreateManualLoan}
-              onUpdateManualLoan={handleUpdateManualLoan}
-              onDeleteManualLoan={handleDeleteManualLoan}
-              onFetchPayments={handleFetchPayments}
-              onUpdateLinkedPayment={handleUpdateLinkedPayment}
-              onUnlinkPayment={handleUnlinkPayment}
-              onCreateManualPayment={handleCreateManualPayment}
-              onUpdateManualPayment={handleUpdateManualPayment}
-              onDeleteManualPayment={handleDeleteManualPayment}
-            />
-          )}
+                {activeTab === 'budget' && (
+                  <BudgetCategories
+                    categories={budgetCategories}
+                    transactions={transactions}
+                    recentAvgMonths={financialPreferences.recentAvgMonths}
+                    onCreate={handleCreateCategory}
+                    onUpdate={handleUpdateCategory}
+                    onUpdateEmoji={handleUpdateCategoryEmoji}
+                    onUpdateColor={handleUpdateCategoryColor}
+                    onReorder={handleReorderCategory}
+                    onArchive={handleArchiveCategory}
+                    onUnarchive={handleUnarchiveCategory}
+                  />
+                )}
 
-          {activeTab === 'income' && (
-            <IncomeSavings
-              groups={assetGroups}
-              totalAssets={totalAssets}
-              recurringStreams={recurringStreams}
-              currentMonthIncome={summary?.current_month.income ?? 0}
-              currentMonthSpent={summary?.current_month.spent ?? 0}
-              savingsRateTarget={financialPreferences.savingsRateTarget}
-              onUpdateSavingsGoal={handleUpdateSavingsGoal}
-            />
-          )}
+                {activeTab === 'recurring' && (
+                  <SubscriptionsRecurring
+                    streams={recurringStreams}
+                    totalMonthlyOutflow={totalMonthlyOutflow}
+                    totalMonthlyInflow={totalMonthlyInflow}
+                  />
+                )}
 
-          {activeTab === 'accounts' && (
-            <div className="tab-panel">
-              <LinkedAccounts
-                items={items}
-                isSandbox={isSandbox}
-                onRefreshed={handleAccountsRefreshed}
-                onUpdateCreditLimit={handleUpdateCreditLimit}
-                onUpdateCustomization={handleUpdateAccountCustomization}
-              />
-              <TransactionsFeed
-                transactions={transactions}
-                budgetCategories={budgetCategories}
-                syncing={syncing}
-                onSync={handleSyncTransactions}
-                onCategorize={handleCategorize}
-                onApprove={handleApproveTransaction}
-                onSaveSplits={handleSaveTransactionSplits}
-                onClearSplits={handleClearTransactionSplits}
-              />
-            </div>
-          )}
+                {activeTab === 'loans' && (
+                  <LoanProgress
+                    loans={loans}
+                    manualLoans={manualLoans}
+                    totalDebt={totalDebt}
+                    totalMinimumPayment={totalMinimumPayment}
+                    onCreateManualLoan={handleCreateManualLoan}
+                    onUpdateManualLoan={handleUpdateManualLoan}
+                    onDeleteManualLoan={handleDeleteManualLoan}
+                    onFetchPayments={handleFetchPayments}
+                    onUpdateLinkedPayment={handleUpdateLinkedPayment}
+                    onUnlinkPayment={handleUnlinkPayment}
+                    onCreateManualPayment={handleCreateManualPayment}
+                    onUpdateManualPayment={handleUpdateManualPayment}
+                    onDeleteManualPayment={handleDeleteManualPayment}
+                  />
+                )}
 
-          {activeTab === 'settings' && (
-            <Settings
-              appearance={appearance}
-              financialPreferences={financialPreferences}
-              navLayout={navLayout}
-              categoryMappings={{
-                plaidCategories,
-                mappings: categoryMappings,
-                budgetCategories: activeBudgetCategories,
-                onSave: handleSaveCategoryMapping,
-                onDelete: handleDeleteCategoryMapping,
-              }}
-            />
-          )}
-        </>
+                {activeTab === 'income' && (
+                  <IncomeSavings
+                    groups={assetGroups}
+                    totalAssets={totalAssets}
+                    recurringStreams={recurringStreams}
+                    currentMonthIncome={summary?.current_month.income ?? 0}
+                    currentMonthSpent={summary?.current_month.spent ?? 0}
+                    savingsRateTarget={financialPreferences.savingsRateTarget}
+                    onUpdateSavingsGoal={handleUpdateSavingsGoal}
+                  />
+                )}
+
+                {activeTab === 'accounts' && (
+                  <div className="tab-panel">
+                    <LinkedAccounts
+                      items={items}
+                      isSandbox={isSandbox}
+                      onRefreshed={handleAccountsRefreshed}
+                      onUpdateCreditLimit={handleUpdateCreditLimit}
+                      onUpdateCustomization={handleUpdateAccountCustomization}
+                    />
+                    <TransactionsFeed
+                      transactions={transactions}
+                      budgetCategories={budgetCategories}
+                      syncing={syncing}
+                      onSync={handleSyncTransactions}
+                      onCategorize={handleCategorize}
+                      onApprove={handleApproveTransaction}
+                      onSaveSplits={handleSaveTransactionSplits}
+                      onClearSplits={handleClearTransactionSplits}
+                    />
+                  </div>
+                )}
+
+                {activeTab === 'settings' && (
+                  <Settings
+                    appearance={appearance}
+                    financialPreferences={financialPreferences}
+                    navLayout={navLayout}
+                    categoryMappings={{
+                      plaidCategories,
+                      mappings: categoryMappings,
+                      budgetCategories: activeBudgetCategories,
+                      onSave: handleSaveCategoryMapping,
+                      onDelete: handleDeleteCategoryMapping,
+                    }}
+                  />
+                )}
+              </>
+            );
+          }}
+        </NavLayoutScope>
       )}
     </div>
   );

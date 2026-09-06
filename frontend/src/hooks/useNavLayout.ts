@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
+import type { Session } from '@supabase/supabase-js';
 import { updateNavLayout, type NavLayoutEntry } from '../lib/api';
-import { DEFAULT_NAV_LAYOUT, moveTab as moveTabInLayout, toggleTabVisibility as toggleTabVisibilityInLayout } from '../lib/navLayout';
 import {
-  hydrateIfNeeded,
-  resetForOwnerChange,
-  INITIAL_NAV_LAYOUT_OWNER_STATE,
-  type NavLayoutOwnerState,
-} from '../lib/navLayoutOwner';
+  DEFAULT_NAV_LAYOUT,
+  mergeNavLayout,
+  moveTab as moveTabInLayout,
+  toggleTabVisibility as toggleTabVisibilityInLayout,
+  type NavTabEntry,
+} from '../lib/navLayout';
 import { NavLayoutSync } from '../lib/navLayoutSync';
 import type { SaveStatus } from '../lib/saveStatus';
 import type { CustomizableTabId } from '../lib/tabRegistry';
@@ -14,86 +15,113 @@ import type { CustomizableTabId } from '../lib/tabRegistry';
 export type { SaveStatus };
 
 /**
- * Owns the main-navigation tab layout — visibility, order, and persistence — scoped to the
- * currently authenticated user, identified by `userId` (not a one-time hydration flag: see
- * lib/navLayoutOwner.ts's `resetForOwnerChange`). Whenever `userId` changes — first sign-in,
- * switching to a different account, or signing out (`userId` becoming `null`) — every piece of
- * this hook's state is reset synchronously during render, before this render is ever committed, so
- * a previous user's layout, save status, or in-flight/queued write can never become visible under —
- * or dispatch on behalf of — a different identity. The previous identity's NavLayoutSync instance
- * is disposed in that same synchronous step (see its own dispose() for the matching guarantee on
- * the network/queue side): any of that identity's not-yet-sent layout is discarded immediately, and
- * an already-in-flight request is left to finish normally but can no longer affect anything.
+ * Owns the main-navigation tab layout for exactly one authenticated identity's mounted lifetime.
+ * This hook is meant to be used inside a component that itself remounts (via a changed `key`)
+ * whenever the authenticated user changes — see App.tsx's `NavLayoutScope`, keyed by an auth
+ * generation number that advances across every sign-in/sign-out transition, including a user
+ * signing back in as themselves. Because of that, `userId` is fixed for this hook's entire mounted
+ * lifetime: there is no identity-change detection or in-place reset logic here at all.
  *
- * `saved` is `undefined` while the caller's own fetch (alongside the rest of the dashboard's data)
- * is still in flight, and `null` once fetched if the current user has never customized navigation.
- * The caller (App.tsx) is responsible for not handing this hook a *stale* `saved` value fetched for
- * a since-superseded identity — see App.tsx's own guard around setting it — but `hydrateIfNeeded`
- * also independently refuses to hydrate from a `saved` value unless it's paired with the `userId`
- * that matches the state's own current owner, as a second, cheaper line of defense.
+ * The `NavLayoutSync` instance is constructed inside a `useEffect`, not lazily during render.
+ * That's deliberate, not just stylistic: React 18 StrictMode deliberately mounts every effect
+ * twice in development (setup, simulated cleanup, setup again) to catch exactly this class of
+ * bug. A render-phase lazy-init (`if (!ref.current) ref.current = new X()`, guarded only by "does
+ * anything already exist") survives that fine when the effect has no cleanup, but here the
+ * cleanup calls `dispose()`, which is a real, permanent, one-way transition — StrictMode's
+ * simulated cleanup would dispose the freshly-built instance immediately, and the render-phase
+ * guard would then never rebuild it (something already exists in the ref, it's just inert),
+ * silently no-opping every future submit() for the rest of the mount. Constructing inside the
+ * effect instead means StrictMode's second "setup" call builds a *replacement* instance after the
+ * simulated disposal, so the mount ends up with a live, working one — matching React's own
+ * documented pattern for a resource whose lifecycle must survive this simulation. This was found
+ * by live-browser testing, not by the test suite — vitest's environment doesn't run under
+ * StrictMode, so this class of bug is invisible to it (same lesson as SaveStatusTracker's
+ * detached-setTimeout bug from Phase 1).
+ *
+ * `verifyOwnership` is threaded through to lib/api.ts's updateNavLayout, which passes it to
+ * authedFetch — checked there at the moment a request is actually about to be sent (including on
+ * a clock-skew retry), which is what actually closes the "session changed mid-flight" window. It's
+ * mirrored into a ref (`verifyOwnershipRef`) rather than being a dependency of the construction
+ * effect: every render's version is functionally identical for this mount (`userId` is fixed, and
+ * the live-generation check reads a ref fresh at call time), so the effect only needs to depend on
+ * `userId` — including it as a dependency would tear down and rebuild the sync instance on every
+ * unrelated render for no benefit.
+ *
+ * `saved` must already be `undefined` unless it genuinely belongs to this identity's current
+ * fetch — App.tsx's own generation-tagged derivation (lib/authGeneration.ts's
+ * currentGenerationValue) is what guarantees that; this hook does not need its own check for it.
  */
-export function useNavLayout(userId: string | null, saved: NavLayoutEntry[] | null | undefined) {
-  const [state, setState] = useState<NavLayoutOwnerState>(INITIAL_NAV_LAYOUT_OWNER_STATE);
+export function useNavLayout(
+  userId: string | null,
+  saved: NavLayoutEntry[] | null | undefined,
+  verifyOwnership: (session: Session) => boolean
+) {
+  const [layout, setLayout] = useState<NavTabEntry[]>(() => mergeNavLayout(undefined));
+  const [status, setStatus] = useState<SaveStatus>('idle');
+  const hydratedRef = useRef(false);
+  // Mirrors `layout` synchronously (not just "as of the last commit") so the action functions below
+  // can compute against the truly-latest layout even across multiple calls within the same tick —
+  // the same guarantee a functional setState updater used to provide, without putting the submit()
+  // side effect inside a setState updater itself (see toggleVisibility/move/resetToDefault: each
+  // updates this ref and calls setState with a plain value, then submits once, outside any updater —
+  // so React, including under StrictMode, can never cause a single user action to persist twice).
+  const layoutRef = useRef(layout);
+  layoutRef.current = layout;
+  const verifyOwnershipRef = useRef(verifyOwnership);
+  verifyOwnershipRef.current = verifyOwnership;
+
   const syncRef = useRef<NavLayoutSync | null>(null);
-  // Mirrors `state` synchronously — not just "as of the last commit" — so the action functions
-  // below can compute against the truly-latest layout even across multiple calls within the same
-  // tick, matching the guarantee the old functional-setState-updater form used to provide, without
-  // putting the persist() side effect inside a setState updater itself (see toggleVisibility/move/
-  // resetToDefault: each updates this ref and calls setState with a plain value, then calls
-  // persist() once, outside of any updater — so React (including under StrictMode, which may
-  // invoke an updater function twice) can never cause a single user action to persist twice).
-  const stateRef = useRef(state);
-  stateRef.current = state;
-
-  const resetState = resetForOwnerChange(stateRef.current, userId);
-  if (resetState !== stateRef.current) {
-    stateRef.current = resetState;
-    syncRef.current?.dispose();
-    syncRef.current = userId
-      ? new NavLayoutSync({
-          save: (next) => updateNavLayout({ tabs: next }),
-          onStatusChange: (status) => setState((prev) => ({ ...prev, status })),
-        })
-      : null; // logged out — nothing to submit to; toggle/move/reset simply won't be reachable
-    setState(resetState);
-  }
-
-  useEffect(() => () => syncRef.current?.dispose(), []);
+  useEffect(() => {
+    if (!userId) return;
+    const sync = new NavLayoutSync({
+      save: (next) => updateNavLayout({ tabs: next }, (session) => verifyOwnershipRef.current(session)),
+      onStatusChange: setStatus,
+    });
+    syncRef.current = sync;
+    return () => {
+      sync.dispose();
+      // Guards against a *later* effect run's instance being wiped out by an *earlier* run's
+      // cleanup firing out of order — not expected given how React sequences these, but cheap
+      // insurance: only null out the ref if it still points at the exact instance this cleanup
+      // belongs to.
+      if (syncRef.current === sync) syncRef.current = null;
+    };
+  }, [userId]);
 
   useEffect(() => {
-    const hydrated = hydrateIfNeeded(stateRef.current, userId, saved);
-    if (hydrated !== stateRef.current) {
-      stateRef.current = hydrated;
-      setState(hydrated);
-    }
+    if (hydratedRef.current || saved === undefined || !userId) return;
+    hydratedRef.current = true;
+    const hydrated = mergeNavLayout(saved);
+    layoutRef.current = hydrated;
+    setLayout(hydrated);
   }, [saved, userId]);
 
   function toggleVisibility(id: CustomizableTabId) {
-    const next = toggleTabVisibilityInLayout(stateRef.current.layout, id);
-    stateRef.current = { ...stateRef.current, layout: next };
-    setState(stateRef.current);
+    const next = toggleTabVisibilityInLayout(layoutRef.current, id);
+    layoutRef.current = next;
+    setLayout(next);
     syncRef.current?.submit(next);
   }
 
   function move(id: CustomizableTabId, direction: 'up' | 'down') {
-    const next = moveTabInLayout(stateRef.current.layout, id, direction);
-    stateRef.current = { ...stateRef.current, layout: next };
-    setState(stateRef.current);
+    const next = moveTabInLayout(layoutRef.current, id, direction);
+    layoutRef.current = next;
+    setLayout(next);
     syncRef.current?.submit(next);
   }
 
   function resetToDefault() {
-    stateRef.current = { ...stateRef.current, layout: DEFAULT_NAV_LAYOUT };
-    setState(stateRef.current);
+    layoutRef.current = DEFAULT_NAV_LAYOUT;
+    setLayout(DEFAULT_NAV_LAYOUT);
     syncRef.current?.submit(DEFAULT_NAV_LAYOUT);
   }
 
   return {
-    layout: state.layout,
+    layout,
     toggleVisibility,
     move,
     resetToDefault,
-    status: state.status,
+    status,
     retry: () => syncRef.current?.retry(),
   };
 }

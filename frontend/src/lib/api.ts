@@ -1,3 +1,4 @@
+import type { Session } from '@supabase/supabase-js';
 import { supabase } from './supabaseClient';
 import type { ReportingRangeId } from './reportingRange';
 
@@ -14,13 +15,35 @@ function isClockSkewError(message: string): boolean {
   return normalized.includes('issued at future') || normalized.includes('issued in the future');
 }
 
-async function authedFetch(path: string, init: RequestInit = {}, isRetry = false): Promise<any> {
+/**
+ * `verifyOwnership`, when given, is called with whatever session Supabase just handed back — on
+ * both the first attempt and the clock-skew retry below, not just once up front — and must return
+ * true for the request to actually be sent. This exists for callers whose request was *created*
+ * under one specific authenticated identity and must never be sent under a *different* one that
+ * happens to be current by the time an async session lookup (or its retry, after a real delay)
+ * finally resolves — checking ownership once before calling authedFetch is not enough, because the
+ * session this function looks up is whatever is current at the moment it actually looks, which can
+ * change during either await above. Most callers don't need this at all (only Navigation
+ * persistence currently does — see lib/api.ts's updateNavLayout) and simply omit it, leaving every
+ * other existing call's behavior completely unchanged.
+ */
+async function authedFetch(
+  path: string,
+  init: RequestInit = {},
+  isRetry = false,
+  verifyOwnership?: (session: Session) => boolean
+): Promise<any> {
   const {
     data: { session },
   } = await supabase.auth.getSession();
 
   if (!session) {
     throw new Error('Not signed in');
+  }
+  if (verifyOwnership && !verifyOwnership(session)) {
+    // The session just looked up no longer belongs to whoever this specific request was created
+    // for. Refuse rather than send it anyway under whatever happens to be current now.
+    throw new Error('Session no longer matches the expected authenticated owner');
   }
 
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -38,7 +61,10 @@ async function authedFetch(path: string, init: RequestInit = {}, isRetry = false
 
     if (!isRetry && isClockSkewError(message)) {
       await new Promise((resolve) => setTimeout(resolve, CLOCK_SKEW_RETRY_DELAY_MS));
-      return authedFetch(path, init, true);
+      // Re-verify on the retry too — the delay here is exactly the window a since-superseded
+      // request could otherwise slip through under a different session that became current while
+      // it waited.
+      return authedFetch(path, init, true, verifyOwnership);
     }
 
     throw new Error(message);
@@ -627,11 +653,22 @@ export function updateDashboardLayout(layout: DashboardLayout): Promise<{ dashbo
   });
 }
 
-export function updateNavLayout(layout: NavLayout): Promise<{ nav_layout: NavLayout }> {
-  return authedFetch('/api/user-preferences/nav-layout', {
-    method: 'PUT',
-    body: JSON.stringify(layout),
-  });
+/**
+ * `verifyOwnership` is required (not optional) here, deliberately: every Navigation save must be
+ * bound to the authenticated identity it was created for, checked at the moment this request is
+ * actually about to be sent — including on a clock-skew retry — never merely at the moment the
+ * caller decided to save. See authedFetch's own doc comment for exactly what this closes.
+ */
+export function updateNavLayout(
+  layout: NavLayout,
+  verifyOwnership: (session: Session) => boolean
+): Promise<{ nav_layout: NavLayout }> {
+  return authedFetch(
+    '/api/user-preferences/nav-layout',
+    { method: 'PUT', body: JSON.stringify(layout) },
+    false,
+    verifyOwnership
+  );
 }
 
 export function updateAppearance(appearance: {
