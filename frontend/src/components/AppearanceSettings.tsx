@@ -1,3 +1,5 @@
+import type { SaveStatus } from '../hooks/useSaveStatus';
+import { SaveStatusIndicator } from './SaveStatusIndicator';
 import { ACCENT_LABELS, ACCENT_SWATCHES, THEME_LABELS, type AccentId, type ThemeId } from '../lib/theme';
 
 const THEME_IDS: ThemeId[] = ['system', 'light', 'dark'];
@@ -8,16 +10,21 @@ export function AppearanceSettings({
   accent,
   onSetTheme,
   onSetAccent,
+  saveStatus,
+  onRetry,
 }: {
   theme: ThemeId;
   accent: AccentId;
   onSetTheme: (theme: ThemeId) => void;
   onSetAccent: (accent: AccentId) => void;
+  saveStatus: SaveStatus;
+  onRetry: () => void;
 }) {
   return (
     <div className="card">
       <div className="section-header">
         <h2>Appearance</h2>
+        <SaveStatusIndicator status={saveStatus} onRetry={onRetry} />
       </div>
 
       <div className="appearance-section">

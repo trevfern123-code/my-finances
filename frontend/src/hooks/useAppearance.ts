@@ -7,6 +7,7 @@ import {
   type AccentId,
   type ThemeId,
 } from '../lib/theme';
+import { useSaveStatus } from './useSaveStatus';
 
 const STORAGE_KEY = 'my-finances-appearance';
 
@@ -51,6 +52,7 @@ function writeCachedAppearance(appearance: StoredAppearance) {
 export function useAppearance(saved: { theme: string; accent_color: string } | null | undefined) {
   const [appearance, setAppearance] = useState<StoredAppearance>(() => readCachedAppearance());
   const hydrated = useRef(false);
+  const { status: saveStatus, track, retry } = useSaveStatus();
 
   // Re-applies on every change, including the initial cached value on mount — the inline script
   // in index.html already applied that same cached value before paint, so this is a no-op DOM
@@ -71,9 +73,9 @@ export function useAppearance(saved: { theme: string; accent_color: string } | n
 
   function persist(next: StoredAppearance) {
     writeCachedAppearance(next);
-    updateAppearance({ theme: next.theme, accent_color: next.accent }).catch(() => {
-      // Best-effort — stays applied locally (and cached) this session even if the save failed.
-    });
+    // Stays applied locally (and cached) this session even if the save fails — track() surfaces
+    // the real outcome via saveStatus instead of silently swallowing it.
+    track(() => updateAppearance({ theme: next.theme, accent_color: next.accent }));
   }
 
   function setTheme(theme: ThemeId) {
@@ -92,5 +94,5 @@ export function useAppearance(saved: { theme: string; accent_color: string } | n
     });
   }
 
-  return { theme: appearance.theme, accent: appearance.accent, setTheme, setAccent };
+  return { theme: appearance.theme, accent: appearance.accent, setTheme, setAccent, saveStatus, retry };
 }

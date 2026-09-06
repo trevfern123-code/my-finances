@@ -74,10 +74,8 @@ import { MonthlyBreakdown } from './components/MonthlyBreakdown';
 import { SubscriptionsRecurring } from './components/SubscriptionsRecurring';
 import { LoanProgress } from './components/LoanProgress';
 import { IncomeSavings } from './components/IncomeSavings';
-import { CategoryMappings } from './components/CategoryMappings';
+import { Settings } from './components/Settings';
 import { DashboardCustomizer } from './components/DashboardCustomizer';
-import { AppearanceSettings } from './components/AppearanceSettings';
-import { FinancialPreferencesSettings } from './components/FinancialPreferencesSettings';
 import { ReportingRangeSelector } from './components/ReportingRangeSelector';
 import { TabNav, type Tab } from './components/TabNav';
 import './App.css';
@@ -916,35 +914,17 @@ export default function App() {
           )}
 
           {activeTab === 'settings' && (
-            <div className="tab-panel">
-              <AppearanceSettings
-                theme={appearance.theme}
-                accent={appearance.accent}
-                onSetTheme={appearance.setTheme}
-                onSetAccent={appearance.setAccent}
-              />
-              <FinancialPreferencesSettings
-                minimumCashBuffer={financialPreferences.minimumCashBuffer}
-                upcomingBillsDays={financialPreferences.upcomingBillsDays}
-                recentAvgMonths={financialPreferences.recentAvgMonths}
-                savingsRateTarget={financialPreferences.savingsRateTarget}
-                includeUpcomingBills={financialPreferences.includeUpcomingBills}
-                includeRemainingBudget={financialPreferences.includeRemainingBudget}
-                onSetMinimumCashBuffer={financialPreferences.setMinimumCashBuffer}
-                onSetUpcomingBillsDays={financialPreferences.setUpcomingBillsDays}
-                onSetRecentAvgMonths={financialPreferences.setRecentAvgMonths}
-                onSetSavingsRateTarget={financialPreferences.setSavingsRateTarget}
-                onSetIncludeUpcomingBills={financialPreferences.setIncludeUpcomingBills}
-                onSetIncludeRemainingBudget={financialPreferences.setIncludeRemainingBudget}
-              />
-              <CategoryMappings
-                plaidCategories={plaidCategories}
-                mappings={categoryMappings}
-                budgetCategories={activeBudgetCategories}
-                onSave={handleSaveCategoryMapping}
-                onDelete={handleDeleteCategoryMapping}
-              />
-            </div>
+            <Settings
+              appearance={appearance}
+              financialPreferences={financialPreferences}
+              categoryMappings={{
+                plaidCategories,
+                mappings: categoryMappings,
+                budgetCategories: activeBudgetCategories,
+                onSave: handleSaveCategoryMapping,
+                onDelete: handleDeleteCategoryMapping,
+              }}
+            />
           )}
         </>
       )}
