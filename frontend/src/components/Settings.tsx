@@ -2,36 +2,19 @@ import { useState } from 'react';
 import type { BudgetCategory, CategoryMapping } from '../lib/api';
 import type { useAppearance } from '../hooks/useAppearance';
 import type { useFinancialPreferences } from '../hooks/useFinancialPreferences';
+import {
+  getAvailableSections,
+  goBackToList,
+  INITIAL_SETTINGS_VIEW_STATE,
+  selectSection,
+  type SettingsSectionId,
+} from '../lib/settingsSections';
 import { AppearanceSettings } from './AppearanceSettings';
 import { FinancialPreferencesSettings } from './FinancialPreferencesSettings';
 import { SafeToSpendSettings } from './SafeToSpendSettings';
 import { CategoryMappings } from './CategoryMappings';
 
-// Every section Settings could ever show, including ones not built yet — a stable, append-only
-// id registry (§ "Navigation preference architecture" reasoning applies here too, ahead of
-// Phase 2 actually needing it for nav_layout). `available: false` is how a section gets a
-// permanent home in this list before its content exists, without ever being rendered or
-// selectable until it does — Phase 2 (Navigation) and Phase 3 (Dashboard, Connections) will each
-// flip one entry to `available: true` and add its content, not restructure this list.
-type SettingsSectionId = 'appearance' | 'financial' | 'safe_to_spend' | 'categories' | 'dashboard' | 'navigation' | 'connections';
-
-interface SettingsSectionMeta {
-  id: SettingsSectionId;
-  label: string;
-  available: boolean;
-}
-
-const ALL_SECTIONS: SettingsSectionMeta[] = [
-  { id: 'appearance', label: 'Appearance', available: true },
-  { id: 'dashboard', label: 'Dashboard', available: false },
-  { id: 'navigation', label: 'Navigation', available: false },
-  { id: 'financial', label: 'Financial Preferences', available: true },
-  { id: 'safe_to_spend', label: 'Safe to Spend', available: true },
-  { id: 'categories', label: 'Categories', available: true },
-  { id: 'connections', label: 'Connections', available: false },
-];
-
-const AVAILABLE_SECTIONS = ALL_SECTIONS.filter((s) => s.available);
+const AVAILABLE_SECTIONS = getAvailableSections();
 
 export function Settings({
   appearance,
@@ -48,16 +31,11 @@ export function Settings({
     onDelete: (mappingId: string) => void;
   };
 }) {
-  const [activeSection, setActiveSection] = useState<SettingsSectionId>('appearance');
-  // Mobile-only drill-down state: which pane the (narrow-viewport) view currently shows. Has no
-  // effect at desktop widths, where CSS keeps both panes visible side by side regardless of this
-  // value — see the `.settings-shell` rules in App.css.
-  const [mobileView, setMobileView] = useState<'list' | 'section'>('list');
-
-  function selectSection(id: SettingsSectionId) {
-    setActiveSection(id);
-    setMobileView('section');
-  }
+  // The mobile drill-down state lives alongside activeSection (lib/settingsSections.ts owns the
+  // transition logic — see selectSection/goBackToList and their tests) — has no effect at desktop
+  // widths, where CSS keeps both panes visible side by side regardless of this value.
+  const [viewState, setViewState] = useState(INITIAL_SETTINGS_VIEW_STATE);
+  const { activeSection, mobileView } = viewState;
 
   return (
     <div className={`settings-shell settings-mobile-${mobileView}`}>
@@ -68,7 +46,7 @@ export function Settings({
             type="button"
             className={section.id === activeSection ? 'settings-sidebar-item active' : 'settings-sidebar-item'}
             aria-current={section.id === activeSection}
-            onClick={() => selectSection(section.id)}
+            onClick={() => setViewState((prev) => selectSection(prev, section.id as SettingsSectionId))}
           >
             {section.label}
           </button>
@@ -76,7 +54,11 @@ export function Settings({
       </nav>
 
       <div className="settings-content">
-        <button type="button" className="link-button settings-back-link" onClick={() => setMobileView('list')}>
+        <button
+          type="button"
+          className="link-button settings-back-link"
+          onClick={() => setViewState((prev) => goBackToList(prev))}
+        >
           ← Settings
         </button>
 

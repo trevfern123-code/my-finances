@@ -2329,7 +2329,14 @@ button:disabled {
   .grid-span-2 {
     grid-column: span 1;
   }
+}
 
+/* Settings gets its own, narrower breakpoint rather than reusing the 840px dashboard-grid one
+ * above: its sidebar is only 220px wide, so a moderately narrow window (a modest laptop, a split-
+ * screen pane — anything down to ~700px) still comfortably fits both panes side by side and looks
+ * sparse as a single column; the 840px dashboard threshold exists for a 2-across card grid that
+ * genuinely needs more room, which doesn't apply here. */
+@media (max-width: 700px) {
   /* Settings drill-down: exactly one pane shows at a time below this width, toggled by
    * Settings.tsx's mobileView state — the section list, or the selected section plus a way back
    * to the list. Above this width both panes render together regardless of that state. */
@@ -2347,6 +2354,13 @@ button:disabled {
 
   .settings-mobile-section .settings-back-link {
     display: inline-block;
+    /* .settings-content is a column flex without align-items set, so it defaults to `stretch` —
+     * without this, the button (an inline-block flex item) stretches to the pane's full width and
+     * a <button>'s own UA-default text-align: center then visually centers the label. flex-start
+     * keeps it sized to its content and left-aligned, clearly reading as a "back" affordance at
+     * the top of the section rather than a floating, centered control. */
+    align-self: flex-start;
+    text-align: left;
     margin-bottom: 0.25rem;
   }
 }
