@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
-import { updateNavLayout, type NavLayoutEntry } from '../lib/api';
+import type { NavLayoutEntry } from '../lib/api';
 import {
   DEFAULT_NAV_LAYOUT,
   mergeNavLayout,
@@ -8,52 +8,53 @@ import {
   toggleTabVisibility as toggleTabVisibilityInLayout,
   type NavTabEntry,
 } from '../lib/navLayout';
-import { NavLayoutSync } from '../lib/navLayoutSync';
+import type { NavigationWriteCoordinator } from '../lib/navigationWriteCoordinator';
 import type { SaveStatus } from '../lib/saveStatus';
 import type { CustomizableTabId } from '../lib/tabRegistry';
 
 export type { SaveStatus };
 
 /**
- * Owns the main-navigation tab layout for exactly one authenticated identity's mounted lifetime.
- * This hook is meant to be used inside a component that itself remounts (via a changed `key`)
- * whenever the authenticated user changes — see App.tsx's `NavLayoutScope`, keyed by an auth
- * generation number that advances across every sign-in/sign-out transition, including a user
- * signing back in as themselves. Because of that, `userId` and `expectedGeneration` are both fixed
- * for this hook's entire mounted lifetime: there is no identity-change detection or in-place reset
+ * Owns the main-navigation tab layout for exactly one authenticated login lifecycle's mounted
+ * lifetime. This hook is meant to be used inside a component that itself remounts (via a changed
+ * `key`) whenever the authenticated lifecycle changes — see App.tsx's `NavLayoutScope`, keyed by
+ * Supabase's own `session_id` JWT claim (see lib/jwt.ts), which advances on every genuine sign-in/
+ * sign-out transition, including a user signing back in as themselves, and stays stable across that
+ * login's own token refreshes. Because of that, `userId` and `expectedSessionId` are both fixed for
+ * this hook's entire mounted lifetime: there is no identity-change detection or in-place reset
  * logic here at all.
  *
- * `expectedGeneration` and `userId` are plain function parameters, captured directly by the
- * closure built below — never stored in, or read back out of, a mutable ref. That's deliberate:
- * they are the *expected owner* a save was created for, and must never be reassignable once
- * captured. `isGenerationCurrent` is different in kind — it's how the *ambient, live* "what
- * generation is actually current right now" question gets answered at verification time, and is
- * expected to change over time; App.tsx gives it a stable identity (`useCallback(fn, [])`) so
- * including it in this hook's effect dependency arrays never causes spurious re-construction.
+ * Persistence is delegated to a `NavigationWriteCoordinator` shared across every mount (constructed
+ * once in App.tsx, which never remounts) rather than a coordinator/queue constructed fresh per
+ * mount — see that class's own doc comment for why this is what actually closes the cross-
+ * lifecycle write-ordering gap a mount-scoped queue could not. This hook only `attach()`es to it on
+ * mount and `detach()`s on unmount; it never constructs or disposes the coordinator itself.
  *
- * Construction and disposal of the `NavLayoutSync` instance happen in `useLayoutEffect`, not
- * passive `useEffect`. Two independent reasons:
- *  1. React 18 StrictMode deliberately mounts every effect twice in development (setup, simulated
- *     cleanup, setup again) to catch exactly this class of bug. A render-phase lazy-init survives
- *     that fine when there's no cleanup, but `dispose()` is a real, permanent, one-way transition —
- *     StrictMode's simulated cleanup would dispose a render-phase-constructed instance immediately,
- *     and a render-phase guard would then never rebuild it. Effect-owned construction means
- *     StrictMode's second "setup" call builds a genuine replacement after the simulated disposal.
- *     `useLayoutEffect` gets this exact same self-healing property `useEffect` already had.
- *  2. `useLayoutEffect` runs synchronously after DOM mutation but strictly before the browser
- *     paints — so `syncRef.current` is guaranteed non-null by the time this component's UI is ever
- *     visible, closing the "user could interact before the sync exists" question by construction
- *     rather than by an argument about event-loop timing. Construction itself performs no network
- *     call (just object/closure creation), so doing it synchronously before paint costs nothing.
+ * `attach`/`detach` happen inside `useLayoutEffect`, not passive `useEffect` — same two reasons as
+ * before: (1) React 18 StrictMode's dev-mode setup/cleanup/setup double-invoke needs `attach()`'s
+ * second call to leave the coordinator in a correctly-attached state, which it does (idempotent —
+ * attaching twice with the same sessionId is harmless); (2) doing it synchronously before paint
+ * means this scope is guaranteed attached before the browser ever shows it, closing the "could the
+ * user interact before it's ready" question by construction.
  *
- * `saved` must already be `undefined` unless it genuinely belongs to this identity's current
- * fetch — App.tsx's own generation-tagged derivation (lib/authGeneration.ts's
+ * `verifyOwnership`, built fresh on every render by the caller (NavLayoutScope) but only ever
+ * captured once per submission (not once per mount), checks three things in order: the returned
+ * session's `user.id`, the returned session's own decoded `session_id` (compared directly against
+ * this hook's immutable `expectedSessionId` — not against any ambient/committed React state), and
+ * — as an additional, independently-sourced check that can only make the verification stricter,
+ * never more permissive — whether the ambient committed lifecycle is still current. See
+ * lib/api.ts's authedFetch for exactly when this runs (every attempt, including the clock-skew
+ * retry) and App.tsx's NavLayoutScope for how it's assembled.
+ *
+ * `saved` must already be `undefined` unless it genuinely belongs to this lifecycle's current
+ * fetch — App.tsx's own session-id-tagged derivation (lib/authGeneration.ts's
  * currentGenerationValue) is what guarantees that; this hook does not need its own check for it.
  */
 export function useNavLayout(
   userId: string | null,
-  expectedGeneration: number,
-  isGenerationCurrent: (generation: number) => boolean,
+  expectedSessionId: string,
+  coordinator: NavigationWriteCoordinator,
+  verifyOwnership: (session: Session) => boolean,
   saved: NavLayoutEntry[] | null | undefined
 ) {
   const [layout, setLayout] = useState<NavTabEntry[]>(() => mergeNavLayout(undefined));
@@ -62,37 +63,18 @@ export function useNavLayout(
   // Mirrors `layout` synchronously (not just "as of the last commit") so the action functions below
   // can compute against the truly-latest layout even across multiple calls within the same tick —
   // the same guarantee a functional setState updater used to provide, without putting the submit()
-  // side effect inside a setState updater itself (see toggleVisibility/move/resetToDefault: each
-  // updates this ref and calls setState with a plain value, then submits once, outside any updater —
-  // so React, including under StrictMode, can never cause a single user action to persist twice).
+  // side effect inside a setState updater itself (so React, including under StrictMode, can never
+  // cause a single user action to persist twice).
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
+  const verifyOwnershipRef = useRef(verifyOwnership);
+  verifyOwnershipRef.current = verifyOwnership;
 
-  const syncRef = useRef<NavLayoutSync | null>(null);
   useLayoutEffect(() => {
     if (!userId) return;
-    const sync = new NavLayoutSync({
-      save: (next) =>
-        updateNavLayout(
-          { tabs: next },
-          (session: Session) => session.user.id === userId && isGenerationCurrent(expectedGeneration)
-        ),
-      onStatusChange: setStatus,
-    });
-    syncRef.current = sync;
-    return () => {
-      sync.dispose();
-      // Guards against a *later* effect run's instance being wiped out by an *earlier* run's
-      // cleanup firing out of order — not expected given how React sequences these, but cheap
-      // insurance: only null out the ref if it still points at the exact instance this cleanup
-      // belongs to.
-      if (syncRef.current === sync) syncRef.current = null;
-    };
-  }, [userId, expectedGeneration, isGenerationCurrent]); // honestly exhaustive — none of these
-  // three actually change value across this mount's lifetime (userId/expectedGeneration are fixed
-  // by the keyed remount; isGenerationCurrent's identity is fixed by its own useCallback), so this
-  // still only truly runs once per real mount — but there is no ref reassignment anywhere carrying
-  // "who this belongs to."
+    coordinator.attach(expectedSessionId, setStatus);
+    return () => coordinator.detach(expectedSessionId);
+  }, [userId, expectedSessionId, coordinator]);
 
   useEffect(() => {
     if (hydratedRef.current || saved === undefined || !userId) return;
@@ -102,24 +84,28 @@ export function useNavLayout(
     setLayout(hydrated);
   }, [saved, userId]);
 
+  function submit(next: NavTabEntry[]) {
+    coordinator.submit(next, expectedSessionId, (session) => verifyOwnershipRef.current(session));
+  }
+
   function toggleVisibility(id: CustomizableTabId) {
     const next = toggleTabVisibilityInLayout(layoutRef.current, id);
     layoutRef.current = next;
     setLayout(next);
-    syncRef.current?.submit(next);
+    submit(next);
   }
 
   function move(id: CustomizableTabId, direction: 'up' | 'down') {
     const next = moveTabInLayout(layoutRef.current, id, direction);
     layoutRef.current = next;
     setLayout(next);
-    syncRef.current?.submit(next);
+    submit(next);
   }
 
   function resetToDefault() {
     layoutRef.current = DEFAULT_NAV_LAYOUT;
     setLayout(DEFAULT_NAV_LAYOUT);
-    syncRef.current?.submit(DEFAULT_NAV_LAYOUT);
+    submit(DEFAULT_NAV_LAYOUT);
   }
 
   return {
@@ -128,6 +114,6 @@ export function useNavLayout(
     move,
     resetToDefault,
     status,
-    retry: () => syncRef.current?.retry(),
+    retry: () => coordinator.retry(expectedSessionId),
   };
 }

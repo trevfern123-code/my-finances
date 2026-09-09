@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type ReactNode } from 'react';
+import type { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabaseClient';
 import {
   createBudgetCategory,
@@ -35,6 +36,7 @@ import {
   updateLinkedLoanPayment,
   updateManualLoan,
   updateManualPayment,
+  updateNavLayout,
   type AssetGroup,
   type BudgetCategory,
   type CategoryMapping,
@@ -52,9 +54,11 @@ import {
   type SpendingSummary,
   type TransactionItem,
 } from './lib/api';
-import { authReducer, currentGenerationValue, initialAuthState } from './lib/authGeneration';
+import { authReducer, currentGenerationValue, initialAuthState, shouldApplyAuthEvent } from './lib/authGeneration';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
+import { decodeSessionId } from './lib/jwt';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
+import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
 import { buildWebTabList } from './lib/webTabNav';
 import { useDashboardLayout } from './hooks/useDashboardLayout';
 import { useAppearance } from './hooks/useAppearance';
@@ -90,15 +94,14 @@ import './App.css';
 const TRANSACTIONS_FETCH_LIMIT = 200;
 
 /**
- * Scopes useNavLayout's entire lifecycle — its layout/status state, its hydration flag, and its
- * NavLayoutSync instance — to exactly one authenticated generation. App.tsx renders this keyed by
- * `authGeneration` (`<NavLayoutScope key={authGeneration} ...>`), so whenever that number changes,
- * React unmounts the previous instance (running useNavLayout's real `useEffect` cleanup — a
- * disposal that happens at a committed, irreversible point, never during a render that might be
- * abandoned) and mounts a brand-new one with fresh initial state. A fresh mount never has the
- * previous identity's data to begin with, so there is no window — not even a single frame — where
- * one identity's layout could render under a different one, and nothing here ever needs to compare
- * against a previous owner or dispose-and-replace anything in place.
+ * Scopes useNavLayout's layout/status state and its attachment to the shared
+ * `NavigationWriteCoordinator` to exactly one authenticated login lifecycle. App.tsx renders this
+ * keyed by Supabase's own `session_id` JWT claim (`<NavLayoutScope key={sessionId} ...>`), so
+ * whenever that changes, React unmounts the previous instance (running useNavLayout's real
+ * `useLayoutEffect` cleanup — a disposal that happens at a committed, irreversible point, never
+ * during a render that might be abandoned) and mounts a brand-new one with fresh initial state. A
+ * fresh mount never has the previous lifecycle's data to begin with, so there is no window — not
+ * even a single frame — where one lifecycle's layout could render under a different one.
  *
  * Only this hook's own state is scoped this way — every other piece of App's state (items,
  * transactions, appearance, financial preferences, etc.) intentionally keeps living in the outer,
@@ -110,37 +113,49 @@ const TRANSACTIONS_FETCH_LIMIT = 200;
  */
 export function NavLayoutScope({
   userId,
-  authGeneration,
-  isGenerationCurrent,
+  sessionId,
+  isSessionCurrent,
+  coordinator,
   saved,
   children,
 }: {
   userId: string | null;
-  authGeneration: number;
-  isGenerationCurrent: (generation: number) => boolean;
+  sessionId: string;
+  isSessionCurrent: (sessionId: string) => boolean;
+  coordinator: NavigationWriteCoordinator;
   saved: NavLayoutEntry[] | null | undefined;
   children: (navLayout: ReturnType<typeof useNavLayout>) => ReactNode;
 }) {
-  // `userId`/`authGeneration` are fixed for this mount's entire lifetime (a change to either would
-  // remount this component via its key) — useNavLayout captures them directly as immutable
-  // parameters and builds its own ownership predicate internally; nothing here threads a
-  // pre-built verifier through a mutable ref. `isGenerationCurrent` reads the ambient, live
-  // "what's actually current" value fresh at verification time (checked by lib/api.ts's
-  // authedFetch at the moment a save is actually about to be sent, including its clock-skew retry
-  // — not merely once, up front, when the save was created).
-  const navLayout = useNavLayout(userId, authGeneration, isGenerationCurrent, saved);
+  // `userId`/`sessionId` are fixed for this mount's entire lifetime (a change to either would
+  // remount this component via its key). `verifyOwnership` is reconstructed every render but every
+  // version is functionally identical — see useNavLayout's own doc comment for why that's safe —
+  // and checks three things in order: the *returned* session's user id, the *returned* session's
+  // own decoded session_id compared directly against this mount's immutable `sessionId` (not
+  // against any ambient/committed React state — this is what closes the pre-React-commit hole:
+  // even if React hasn't yet processed a newer sign-in, a session object Supabase actually hands
+  // back for a superseded lifecycle will decode to a different session_id and fail here
+  // regardless), and finally the ambient `isSessionCurrent` check as additional, independently-
+  // sourced defense-in-depth (see lib/authGeneration.ts's shouldApplyAuthEvent comment for why
+  // this can only make the check stricter, never more permissive). Checked by lib/api.ts's
+  // authedFetch at the moment a save is actually about to be sent, including its clock-skew retry.
+  const verifyOwnership = (session: Session) =>
+    session.user.id === userId && decodeSessionId(session.access_token) === sessionId && isSessionCurrent(sessionId);
+  const navLayout = useNavLayout(userId, sessionId, coordinator, verifyOwnership, saved);
   return <>{children(navLayout)}</>;
 }
 
 export default function App() {
-  // `{ session, generation }` as one atomic unit — see lib/authGeneration.ts's authReducer. Every
-  // AUTH_EVENT is reduced against the true previous state, so session and generation can never be
-  // observed out of step with each other in a committed render, even when two events (e.g. a
-  // same-user sign-out immediately followed by a re-login) are dispatched back-to-back before
-  // React has a chance to paint an intermediate frame — React still applies a useReducer's queued
-  // actions sequentially against the real prior state before rendering the batched result.
+  // `{ session, sessionId }` as one atomic unit — see lib/authGeneration.ts's authReducer.
+  // `sessionId` is Supabase's own `session_id` JWT claim, the authoritative identity for one
+  // continuous login lifecycle (stable across that login's own token refreshes, distinct for every
+  // actual sign-in) — not a client-side reconstruction. Every AUTH_EVENT is reduced against the
+  // true previous state, so session and sessionId can never be observed out of step with each
+  // other in a committed render, even when two events (e.g. a same-user sign-out immediately
+  // followed by a re-login) are dispatched back-to-back before React has a chance to paint an
+  // intermediate frame — React still applies a useReducer's queued actions sequentially against
+  // the real prior state before rendering the batched result.
   const [auth, dispatchAuth] = useReducer(authReducer, initialAuthState);
-  const { session, generation: authGeneration } = auth;
+  const { session, sessionId } = auth;
   const [activeTab, setActiveTab] = useState('overview');
   const [items, setItems] = useState<LinkedItem[]>([]);
   const [isSandbox, setIsSandbox] = useState(false);
@@ -164,10 +179,10 @@ export default function App() {
   // useDashboardLayout treats both as "use the default layout," it only matters for hydration timing.
   const [dashboardLayoutRaw, setDashboardLayoutRaw] = useState<DashboardCardEntry[] | null | undefined>(undefined);
   const [navLayoutRaw, setNavLayoutRaw] = useState<NavLayoutEntry[] | null | undefined>(undefined);
-  // Tags navLayoutRaw with the auth generation it was fetched under — see the derivation below
-  // and lib/authGeneration.ts's currentGenerationValue. This is what lets a fetch response prove
-  // it belongs to the *current* authenticated lifecycle, not merely the current user id.
-  const [navLayoutRawGeneration, setNavLayoutRawGeneration] = useState<number | undefined>(undefined);
+  // Tags navLayoutRaw with the sessionId it was fetched under — see the derivation below and
+  // lib/authGeneration.ts's currentGenerationValue. This is what lets a fetch response prove it
+  // belongs to the *current* authenticated lifecycle, not merely the current user id.
+  const [navLayoutRawSessionId, setNavLayoutRawSessionId] = useState<string | undefined>(undefined);
   const [appearanceRaw, setAppearanceRaw] = useState<
     { theme: string; accent_color: string } | null | undefined
   >(undefined);
@@ -189,29 +204,42 @@ export default function App() {
   const [actionError, setActionError] = useState<string | null>(null);
   const userId = session?.user.id ?? null;
 
-  // Mirrors authGeneration for reads from inside async closures (refreshAll's own capture below,
-  // and NavLayoutScope's isGenerationCurrent) that must see the *latest* value at the moment they
+  // Mirrors sessionId for reads from inside async closures (refreshAll's own capture below, and
+  // NavLayoutScope's isSessionCurrent) that must see the *latest* value at the moment they
   // actually run, not whatever was current when they were defined. Updated in useLayoutEffect, not
   // during render: a render-phase write here would be a mutation an abandoned/superseded
   // concurrent render could leave behind even though React never committed it, letting the ref
-  // represent a generation nothing on screen actually reflects. useLayoutEffect only ever runs for
+  // represent a lifecycle nothing on screen actually reflects. useLayoutEffect only ever runs for
   // a render React actually committed, and — because it runs synchronously, before the browser can
   // paint or any pending microtask (like an in-flight authedFetch's session-lookup continuation)
   // can resume — this write always completes before anything async could possibly read a stale
-  // value past the commit that produced it. See NavLayoutScope below for the ownership predicate
-  // this ref backs.
-  const authGenerationRef = useRef(authGeneration);
+  // value past the commit that produced it. This is deliberately kept as an *additional* check
+  // alongside NavLayoutScope's direct, returned-session comparison (see its own doc comment) —
+  // never the only one.
+  const sessionIdRef = useRef(sessionId);
   useLayoutEffect(() => {
-    authGenerationRef.current = authGeneration;
-  }, [authGeneration]);
-  const isGenerationCurrent = useCallback((generation: number) => authGenerationRef.current === generation, []);
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
+  const isSessionCurrent = useCallback((id: string) => sessionIdRef.current === id, []);
 
-  // Only usable if it was actually fetched under the generation that's current *right now* — a
+  // Constructed once, lazily, and never disposed — App itself never remounts within a session, so
+  // there's no paired cleanup the way NavLayoutScope's own useLayoutEffect has one. Passed down so
+  // every NavLayoutScope mount attaches to the *same* coordinator instead of constructing its own
+  // — see lib/navigationWriteCoordinator.ts's own doc comment for why this (not a fresh queue per
+  // mount) is what actually closes the cross-lifecycle write-ordering gap.
+  const coordinatorRef = useRef<NavigationWriteCoordinator | null>(null);
+  if (!coordinatorRef.current) {
+    coordinatorRef.current = new NavigationWriteCoordinator({
+      save: (layout, verify) => updateNavLayout({ tabs: layout }, verify),
+    });
+  }
+
+  // Only usable if it was actually fetched under the sessionId that's current *right now* — a
   // pure, per-render derivation (no mutation, no effect-ordering dependency) rather than a
   // separate "clear the old value" step, which would need to run before NavLayoutScope's own
-  // first render for the new generation to avoid a stale hydration, and effect ordering (children
+  // first render for the new lifecycle to avoid a stale hydration, and effect ordering (children
   // fire before parents) can't guarantee that. See lib/authGeneration.ts's currentGenerationValue.
-  const navLayoutRawForCurrentGeneration = currentGenerationValue(navLayoutRaw, navLayoutRawGeneration, authGeneration);
+  const navLayoutRawForCurrentSession = currentGenerationValue(navLayoutRaw, navLayoutRawSessionId, sessionId);
 
   const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
   const appearance = useAppearance(appearanceRaw);
@@ -219,26 +247,44 @@ export default function App() {
   const reportingRange = useReportingRange(reportingRangeRaw);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => dispatchAuth({ type: 'AUTH_EVENT', session: data.session }));
-    // Supabase re-emits SIGNED_IN (with a fresh session object each time) on things like tab
-    // focus/visibility changes, not just actual sign-in — every event is dispatched unconditionally
-    // here; authReducer itself is what decides whether it's a genuine identity transition (bumping
-    // generation) or a same-user refresh/duplicate (updating session only). The effect below that
-    // triggers refreshAll keys off `userId`, not `session` object identity, so a duplicate
-    // re-emission still doesn't cause a spurious refetch even though `session` itself changes here.
+    // sawLiveEvent guards a real ordering hazard: the bootstrap getSession() call and a live
+    // onAuthStateChange event are two independent async sources, and a live event can fire *and
+    // resolve* before the slower bootstrap snapshot does, even though the bootstrap represents
+    // strictly older information (whatever was true at page load). Once any live event has been
+    // observed, a later-resolving bootstrap result must never be allowed to overwrite it, no
+    // matter which one's own promise/callback happens to settle later. See
+    // lib/authGeneration.ts's shouldApplyAuthEvent.
+    let sawLiveEvent = false;
+
+    function applyEvent(newSession: Session | null, isBootstrap: boolean) {
+      if (!shouldApplyAuthEvent(isBootstrap, sawLiveEvent)) return;
+      if (!isBootstrap) sawLiveEvent = true;
+      // Decoded synchronously (see lib/jwt.ts) — no async gap between observing an event and
+      // including its session_id in the same atomic dispatch. A decode failure (should not happen
+      // — session_id is a required Supabase claim — but never assumed impossible) falls back to a
+      // freshly generated id, guaranteeing this is still always treated as a new lifecycle rather
+      // than silently trusting a guess that it's a continuation of the previous one.
+      const newSessionId = newSession ? (decodeSessionId(newSession.access_token) ?? crypto.randomUUID()) : null;
+      dispatchAuth({ type: 'AUTH_EVENT', session: newSession, sessionId: newSessionId });
+    }
+
+    // Registered before initiating the bootstrap call, so a live event that fires before
+    // getSession() even resolves is never missed.
     const { data: subscription } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      dispatchAuth({ type: 'AUTH_EVENT', session: newSession });
+      applyEvent(newSession, false);
     });
+    supabase.auth.getSession().then(({ data }) => applyEvent(data.session, true));
+
     return () => subscription.subscription.unsubscribe();
   }, []);
 
   const refreshAll = useCallback(async () => {
-    // Tags this fetch with the generation it was made under — see the setNavLayoutRawGeneration
-    // call below and lib/authGeneration.ts's currentGenerationValue, which is what actually decides
-    // whether the result is ever usable. Comparing bare user ids here would not be enough: "A
-    // generation 1 -> logout -> A generation 3" must still reject generation 1's late response,
-    // even though its user id matches generation 3's just as well.
-    const requestedForGeneration = authGenerationRef.current;
+    // Tags this fetch with the sessionId it was made under — see the setNavLayoutRawSessionId call
+    // below and lib/authGeneration.ts's currentGenerationValue, which is what actually decides
+    // whether the result is ever usable. Comparing bare user ids here would not be enough: "A1 ->
+    // logout -> A3" must still reject A1's late response, even though its user id matches A3's
+    // just as well.
+    const requestedForSessionId = sessionIdRef.current;
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
     // blank the entire dashboard when the other calls succeeded fine.
@@ -301,11 +347,11 @@ export default function App() {
     if (userPreferencesRes.status === 'fulfilled') {
       setDashboardLayoutRaw(userPreferencesRes.value.dashboard_layout?.cards ?? null);
       // Tagged, not gated: writing this unconditionally is safe because nothing ever *reads*
-      // navLayoutRaw directly — only navLayoutRawForCurrentGeneration's derivation does, and it
-      // already refuses any value whose tagged generation doesn't match whatever is current by
+      // navLayoutRaw directly — only navLayoutRawForCurrentSession's derivation does, and it
+      // already refuses any value whose tagged sessionId doesn't match whatever is current by
       // the time it's read, regardless of how this write is timed relative to that.
       setNavLayoutRaw(userPreferencesRes.value.nav_layout?.tabs ?? null);
-      setNavLayoutRawGeneration(requestedForGeneration);
+      if (requestedForSessionId) setNavLayoutRawSessionId(requestedForSessionId);
       setAppearanceRaw({
         theme: userPreferencesRes.value.theme,
         accent_color: userPreferencesRes.value.accent_color,
@@ -345,12 +391,16 @@ export default function App() {
   }, [reportingRange.range]);
 
   useEffect(() => {
-    // Keyed on `userId`, not `session` — `session` gets a new object reference on every auth
-    // event, including a duplicate re-emission of the same signed-in user (e.g. on tab focus), but
-    // `userId` (a plain string) is unchanged by those, so this only actually re-fires on a genuine
-    // identity transition, exactly matching when authGeneration itself changes.
-    if (userId) refreshAll();
-  }, [userId, refreshAll]);
+    // Keyed on `sessionId`, not `userId` and not `session` object identity. `session` gets a new
+    // object reference on every auth event, including a duplicate re-emission of the same signed-
+    // in user (e.g. on tab focus) or a routine token refresh — `sessionId` is unchanged by either,
+    // so this doesn't spuriously re-fire for them. Keying on `userId` alone would miss a batched
+    // same-user logout/login (A1 -> SIGNED_OUT -> SIGNED_IN A3): the *final* committed userId is
+    // unchanged (still A), so a userId-keyed effect would never re-fire and Navigation would stay
+    // hydrated from A1's stale preferences — sessionId genuinely changes across that exact
+    // transition, so this effect correctly re-fires and refetches for A3's own data.
+    if (sessionId) refreshAll();
+  }, [sessionId, refreshAll]);
 
   // Best-effort — account/transaction refresh already succeeded by the time this runs,
   // so a failure here shouldn't surface as an error for an action the user didn't take.
@@ -880,13 +930,17 @@ export default function App() {
           "some data fetch is in flight" flag (set by every refreshAll() call, including ones with
           nothing to do with authentication, e.g. PlaidLink's onLinked) — it must only ever affect
           what's rendered *inside* Navigation's authenticated scope, never whether that scope
-          exists. Only `key={authGeneration}` controls that. */}
+          exists. Only `key={sessionId}` controls that. sessionId! below: this JSX only renders
+          once the earlier `!session` early return has already confirmed we're authenticated, and
+          `session`/`sessionId` are always set together, atomically, by the same reducer action —
+          TypeScript just can't see that correlation across two destructured fields. */}
       <NavLayoutScope
-        key={authGeneration}
+        key={sessionId!}
         userId={userId}
-        authGeneration={authGeneration}
-        isGenerationCurrent={isGenerationCurrent}
-        saved={navLayoutRawForCurrentGeneration}
+        sessionId={sessionId!}
+        isSessionCurrent={isSessionCurrent}
+        coordinator={coordinatorRef.current}
+        saved={navLayoutRawForCurrentSession}
       >
         {(navLayout) => {
           if (loading) return <p className="hint">Loading...</p>;

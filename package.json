@@ -8,6 +8,9 @@
     "backend",
     "frontend"
   ],
+  "devDependencies": {
+    "jsdom": "27.0.1"
+  },
   "scripts": {
     "dev:backend": "npm run dev --workspace backend",
     "dev:frontend": "npm run dev --workspace frontend",
