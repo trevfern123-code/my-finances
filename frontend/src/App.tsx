@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import type { Session } from '@supabase/supabase-js';
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type ReactNode } from 'react';
 import { supabase } from './lib/supabaseClient';
 import {
   createBudgetCategory,
@@ -53,7 +52,7 @@ import {
   type SpendingSummary,
   type TransactionItem,
 } from './lib/api';
-import { currentGenerationValue, nextAuthGeneration } from './lib/authGeneration';
+import { authReducer, currentGenerationValue, initialAuthState } from './lib/authGeneration';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
 import { buildWebTabList } from './lib/webTabNav';
@@ -109,7 +108,7 @@ const TRANSACTIONS_FETCH_LIMIT = 200;
  * closure access to everything else App owns (activeTab, items, handlers, ...) without this
  * component needing to know about any of it.
  */
-function NavLayoutScope({
+export function NavLayoutScope({
   userId,
   authGeneration,
   isGenerationCurrent,
@@ -122,21 +121,26 @@ function NavLayoutScope({
   saved: NavLayoutEntry[] | null | undefined;
   children: (navLayout: ReturnType<typeof useNavLayout>) => ReactNode;
 }) {
-  // Reconstructed every render, but every version is functionally identical: `userId` and
-  // `authGeneration` are fixed for this mount's entire lifetime (a change to either would remount
-  // this component via its key), and isGenerationCurrent reads a live ref fresh at call time
-  // regardless of which render's closure is calling it — so it's safe that useNavLayout's
-  // NavLayoutSync only ever captures the first one. Checked by lib/api.ts's authedFetch at the
-  // moment a save is actually about to be sent, including its clock-skew retry — not merely once,
-  // up front, when the save was created — which is what actually closes the "session changed
-  // mid-flight" window Codex identified.
-  const verifyOwnership = (session: Session) => session.user.id === userId && isGenerationCurrent(authGeneration);
-  const navLayout = useNavLayout(userId, saved, verifyOwnership);
+  // `userId`/`authGeneration` are fixed for this mount's entire lifetime (a change to either would
+  // remount this component via its key) — useNavLayout captures them directly as immutable
+  // parameters and builds its own ownership predicate internally; nothing here threads a
+  // pre-built verifier through a mutable ref. `isGenerationCurrent` reads the ambient, live
+  // "what's actually current" value fresh at verification time (checked by lib/api.ts's
+  // authedFetch at the moment a save is actually about to be sent, including its clock-skew retry
+  // — not merely once, up front, when the save was created).
+  const navLayout = useNavLayout(userId, authGeneration, isGenerationCurrent, saved);
   return <>{children(navLayout)}</>;
 }
 
 export default function App() {
-  const [session, setSession] = useState<Session | null>(null);
+  // `{ session, generation }` as one atomic unit — see lib/authGeneration.ts's authReducer. Every
+  // AUTH_EVENT is reduced against the true previous state, so session and generation can never be
+  // observed out of step with each other in a committed render, even when two events (e.g. a
+  // same-user sign-out immediately followed by a re-login) are dispatched back-to-back before
+  // React has a chance to paint an intermediate frame — React still applies a useReducer's queued
+  // actions sequentially against the real prior state before rendering the batched result.
+  const [auth, dispatchAuth] = useReducer(authReducer, initialAuthState);
+  const { session, generation: authGeneration } = auth;
   const [activeTab, setActiveTab] = useState('overview');
   const [items, setItems] = useState<LinkedItem[]>([]);
   const [isSandbox, setIsSandbox] = useState(false);
@@ -185,24 +189,22 @@ export default function App() {
   const [actionError, setActionError] = useState<string | null>(null);
   const userId = session?.user.id ?? null;
 
-  // One clear identity for "which authenticated lifecycle is current" — see lib/authGeneration.ts.
-  // Bumped (via an effect, never during render — see NavLayoutScope below for why) on every
-  // sign-in/sign-out transition, including a user signing back in as themselves: two login
-  // sessions by the same person are never treated as the same generation. `previousUserIdRef`
-  // starts at `userId`'s own initial value so the very first render (before getSession() even
-  // resolves) doesn't spuriously bump.
-  const [authGeneration, setAuthGeneration] = useState(0);
-  const previousUserIdForGenerationRef = useRef(userId);
-  useEffect(() => {
-    setAuthGeneration((g) => nextAuthGeneration(g, previousUserIdForGenerationRef.current, userId));
-    previousUserIdForGenerationRef.current = userId;
-  }, [userId]);
   // Mirrors authGeneration for reads from inside async closures (refreshAll's own capture below,
   // and NavLayoutScope's isGenerationCurrent) that must see the *latest* value at the moment they
-  // actually run, not whatever was current when they were defined.
+  // actually run, not whatever was current when they were defined. Updated in useLayoutEffect, not
+  // during render: a render-phase write here would be a mutation an abandoned/superseded
+  // concurrent render could leave behind even though React never committed it, letting the ref
+  // represent a generation nothing on screen actually reflects. useLayoutEffect only ever runs for
+  // a render React actually committed, and — because it runs synchronously, before the browser can
+  // paint or any pending microtask (like an in-flight authedFetch's session-lookup continuation)
+  // can resume — this write always completes before anything async could possibly read a stale
+  // value past the commit that produced it. See NavLayoutScope below for the ownership predicate
+  // this ref backs.
   const authGenerationRef = useRef(authGeneration);
-  authGenerationRef.current = authGeneration;
-  const isGenerationCurrent = (generation: number) => authGenerationRef.current === generation;
+  useLayoutEffect(() => {
+    authGenerationRef.current = authGeneration;
+  }, [authGeneration]);
+  const isGenerationCurrent = useCallback((generation: number) => authGenerationRef.current === generation, []);
 
   // Only usable if it was actually fetched under the generation that's current *right now* — a
   // pure, per-render derivation (no mutation, no effect-ordering dependency) rather than a
@@ -217,13 +219,15 @@ export default function App() {
   const reportingRange = useReportingRange(reportingRangeRaw);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    supabase.auth.getSession().then(({ data }) => dispatchAuth({ type: 'AUTH_EVENT', session: data.session }));
     // Supabase re-emits SIGNED_IN (with a fresh session object each time) on things like tab
-    // focus/visibility changes, not just actual sign-in — bail out via the functional updater
-    // when the token hasn't actually changed, so this doesn't retrigger the refreshAll effect
-    // below on every tab switch.
+    // focus/visibility changes, not just actual sign-in — every event is dispatched unconditionally
+    // here; authReducer itself is what decides whether it's a genuine identity transition (bumping
+    // generation) or a same-user refresh/duplicate (updating session only). The effect below that
+    // triggers refreshAll keys off `userId`, not `session` object identity, so a duplicate
+    // re-emission still doesn't cause a spurious refetch even though `session` itself changes here.
     const { data: subscription } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      setSession((prev) => (prev?.access_token === newSession?.access_token ? prev : newSession));
+      dispatchAuth({ type: 'AUTH_EVENT', session: newSession });
     });
     return () => subscription.subscription.unsubscribe();
   }, []);
@@ -341,8 +345,12 @@ export default function App() {
   }, [reportingRange.range]);
 
   useEffect(() => {
-    if (session) refreshAll();
-  }, [session, refreshAll]);
+    // Keyed on `userId`, not `session` — `session` gets a new object reference on every auth
+    // event, including a duplicate re-emission of the same signed-in user (e.g. on tab focus), but
+    // `userId` (a plain string) is unchanged by those, so this only actually re-fires on a genuine
+    // identity transition, exactly matching when authGeneration itself changes.
+    if (userId) refreshAll();
+  }, [userId, refreshAll]);
 
   // Best-effort — account/transaction refresh already succeeded by the time this runs,
   // so a failure here shouldn't surface as an error for an action the user didn't take.
@@ -868,167 +876,169 @@ export default function App() {
 
       {actionError && <p className="error">{actionError}</p>}
 
-      {loading ? (
-        <p className="hint">Loading...</p>
-      ) : (
-        <NavLayoutScope
-          key={authGeneration}
-          userId={userId}
-          authGeneration={authGeneration}
-          isGenerationCurrent={isGenerationCurrent}
-          saved={navLayoutRawForCurrentGeneration}
-        >
-          {(navLayout) => {
-            // The current web/PWA's own decision about primary-tab-bar order (Overview first,
-            // Settings last) — see lib/webTabNav.ts. Recomputed on every render of this render-prop;
-            // cheap, and avoids a second piece of state that could drift from navLayout.layout.
-            const TABS = buildWebTabList(getVisibleOrderedTabIds(navLayout.layout));
-            return (
-              <>
-                <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
+      {/* NavLayoutScope sits outside the loading check deliberately: loading is a general
+          "some data fetch is in flight" flag (set by every refreshAll() call, including ones with
+          nothing to do with authentication, e.g. PlaidLink's onLinked) — it must only ever affect
+          what's rendered *inside* Navigation's authenticated scope, never whether that scope
+          exists. Only `key={authGeneration}` controls that. */}
+      <NavLayoutScope
+        key={authGeneration}
+        userId={userId}
+        authGeneration={authGeneration}
+        isGenerationCurrent={isGenerationCurrent}
+        saved={navLayoutRawForCurrentGeneration}
+      >
+        {(navLayout) => {
+          if (loading) return <p className="hint">Loading...</p>;
+          // The current web/PWA's own decision about primary-tab-bar order (Overview first,
+          // Settings last) — see lib/webTabNav.ts. Recomputed on every render of this render-prop;
+          // cheap, and avoids a second piece of state that could drift from navLayout.layout.
+          const TABS = buildWebTabList(getVisibleOrderedTabIds(navLayout.layout));
+          return (
+            <>
+              <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
 
-                {activeTab === 'overview' && (
-                  <div className="tab-panel">
-                    <div className="section-header overview-header">
-                      <span className="hint">Overview</span>
-                      <button type="button" className="link-button" onClick={() => dashboardLayout.setCustomizing(true)}>
-                        Customize dashboard
-                      </button>
-                    </div>
+              {activeTab === 'overview' && (
+                <div className="tab-panel">
+                  <div className="section-header overview-header">
+                    <span className="hint">Overview</span>
+                    <button type="button" className="link-button" onClick={() => dashboardLayout.setCustomizing(true)}>
+                      Customize dashboard
+                    </button>
+                  </div>
 
-                    {!dashboardLayout.customizing &&
-                      dashboardLayout.layout.some(
-                        (c) => c.visible && (c.id === 'monthly_spending_chart' || c.id === 'net_worth_chart')
-                      ) && <ReportingRangeSelector range={reportingRange.range} onChange={reportingRange.setRange} />}
+                  {!dashboardLayout.customizing &&
+                    dashboardLayout.layout.some(
+                      (c) => c.visible && (c.id === 'monthly_spending_chart' || c.id === 'net_worth_chart')
+                    ) && <ReportingRangeSelector range={reportingRange.range} onChange={reportingRange.setRange} />}
 
-                    {dashboardLayout.customizing ? (
-                      <DashboardCustomizer
-                        layout={dashboardLayout.layout}
-                        onToggleVisibility={dashboardLayout.toggleVisibility}
-                        onMove={dashboardLayout.move}
-                        onApplyPreset={dashboardLayout.applyPreset}
-                        onDone={() => dashboardLayout.setCustomizing(false)}
-                      />
-                    ) : (
-                      groupCardsIntoRows(
-                        dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id)
-                      ).map((row) =>
-                        row.length === 2 ? (
-                          <div className="dashboard-grid" key={row.join('+')}>
-                            <div>{renderOverviewCard(row[0])}</div>
-                            <div>{renderOverviewCard(row[1])}</div>
-                          </div>
-                        ) : (
-                          <div key={row[0]}>{renderOverviewCard(row[0])}</div>
-                        )
+                  {dashboardLayout.customizing ? (
+                    <DashboardCustomizer
+                      layout={dashboardLayout.layout}
+                      onToggleVisibility={dashboardLayout.toggleVisibility}
+                      onMove={dashboardLayout.move}
+                      onApplyPreset={dashboardLayout.applyPreset}
+                      onDone={() => dashboardLayout.setCustomizing(false)}
+                    />
+                  ) : (
+                    groupCardsIntoRows(
+                      dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id)
+                    ).map((row) =>
+                      row.length === 2 ? (
+                        <div className="dashboard-grid" key={row.join('+')}>
+                          <div>{renderOverviewCard(row[0])}</div>
+                          <div>{renderOverviewCard(row[1])}</div>
+                        </div>
+                      ) : (
+                        <div key={row[0]}>{renderOverviewCard(row[0])}</div>
                       )
-                    )}
-                  </div>
-                )}
+                    )
+                  )}
+                </div>
+              )}
 
-                {activeTab === 'monthly' && (
-                  <MonthlyBreakdown
-                    months={monthlyBreakdown}
+              {activeTab === 'monthly' && (
+                <MonthlyBreakdown
+                  months={monthlyBreakdown}
+                  transactions={transactions}
+                  reportingRange={reportingRange.range}
+                  onSetReportingRange={reportingRange.setRange}
+                />
+              )}
+
+              {activeTab === 'budget' && (
+                <BudgetCategories
+                  categories={budgetCategories}
+                  transactions={transactions}
+                  recentAvgMonths={financialPreferences.recentAvgMonths}
+                  onCreate={handleCreateCategory}
+                  onUpdate={handleUpdateCategory}
+                  onUpdateEmoji={handleUpdateCategoryEmoji}
+                  onUpdateColor={handleUpdateCategoryColor}
+                  onReorder={handleReorderCategory}
+                  onArchive={handleArchiveCategory}
+                  onUnarchive={handleUnarchiveCategory}
+                />
+              )}
+
+              {activeTab === 'recurring' && (
+                <SubscriptionsRecurring
+                  streams={recurringStreams}
+                  totalMonthlyOutflow={totalMonthlyOutflow}
+                  totalMonthlyInflow={totalMonthlyInflow}
+                />
+              )}
+
+              {activeTab === 'loans' && (
+                <LoanProgress
+                  loans={loans}
+                  manualLoans={manualLoans}
+                  totalDebt={totalDebt}
+                  totalMinimumPayment={totalMinimumPayment}
+                  onCreateManualLoan={handleCreateManualLoan}
+                  onUpdateManualLoan={handleUpdateManualLoan}
+                  onDeleteManualLoan={handleDeleteManualLoan}
+                  onFetchPayments={handleFetchPayments}
+                  onUpdateLinkedPayment={handleUpdateLinkedPayment}
+                  onUnlinkPayment={handleUnlinkPayment}
+                  onCreateManualPayment={handleCreateManualPayment}
+                  onUpdateManualPayment={handleUpdateManualPayment}
+                  onDeleteManualPayment={handleDeleteManualPayment}
+                />
+              )}
+
+              {activeTab === 'income' && (
+                <IncomeSavings
+                  groups={assetGroups}
+                  totalAssets={totalAssets}
+                  recurringStreams={recurringStreams}
+                  currentMonthIncome={summary?.current_month.income ?? 0}
+                  currentMonthSpent={summary?.current_month.spent ?? 0}
+                  savingsRateTarget={financialPreferences.savingsRateTarget}
+                  onUpdateSavingsGoal={handleUpdateSavingsGoal}
+                />
+              )}
+
+              {activeTab === 'accounts' && (
+                <div className="tab-panel">
+                  <LinkedAccounts
+                    items={items}
+                    isSandbox={isSandbox}
+                    onRefreshed={handleAccountsRefreshed}
+                    onUpdateCreditLimit={handleUpdateCreditLimit}
+                    onUpdateCustomization={handleUpdateAccountCustomization}
+                  />
+                  <TransactionsFeed
                     transactions={transactions}
-                    reportingRange={reportingRange.range}
-                    onSetReportingRange={reportingRange.setRange}
+                    budgetCategories={budgetCategories}
+                    syncing={syncing}
+                    onSync={handleSyncTransactions}
+                    onCategorize={handleCategorize}
+                    onApprove={handleApproveTransaction}
+                    onSaveSplits={handleSaveTransactionSplits}
+                    onClearSplits={handleClearTransactionSplits}
                   />
-                )}
+                </div>
+              )}
 
-                {activeTab === 'budget' && (
-                  <BudgetCategories
-                    categories={budgetCategories}
-                    transactions={transactions}
-                    recentAvgMonths={financialPreferences.recentAvgMonths}
-                    onCreate={handleCreateCategory}
-                    onUpdate={handleUpdateCategory}
-                    onUpdateEmoji={handleUpdateCategoryEmoji}
-                    onUpdateColor={handleUpdateCategoryColor}
-                    onReorder={handleReorderCategory}
-                    onArchive={handleArchiveCategory}
-                    onUnarchive={handleUnarchiveCategory}
-                  />
-                )}
-
-                {activeTab === 'recurring' && (
-                  <SubscriptionsRecurring
-                    streams={recurringStreams}
-                    totalMonthlyOutflow={totalMonthlyOutflow}
-                    totalMonthlyInflow={totalMonthlyInflow}
-                  />
-                )}
-
-                {activeTab === 'loans' && (
-                  <LoanProgress
-                    loans={loans}
-                    manualLoans={manualLoans}
-                    totalDebt={totalDebt}
-                    totalMinimumPayment={totalMinimumPayment}
-                    onCreateManualLoan={handleCreateManualLoan}
-                    onUpdateManualLoan={handleUpdateManualLoan}
-                    onDeleteManualLoan={handleDeleteManualLoan}
-                    onFetchPayments={handleFetchPayments}
-                    onUpdateLinkedPayment={handleUpdateLinkedPayment}
-                    onUnlinkPayment={handleUnlinkPayment}
-                    onCreateManualPayment={handleCreateManualPayment}
-                    onUpdateManualPayment={handleUpdateManualPayment}
-                    onDeleteManualPayment={handleDeleteManualPayment}
-                  />
-                )}
-
-                {activeTab === 'income' && (
-                  <IncomeSavings
-                    groups={assetGroups}
-                    totalAssets={totalAssets}
-                    recurringStreams={recurringStreams}
-                    currentMonthIncome={summary?.current_month.income ?? 0}
-                    currentMonthSpent={summary?.current_month.spent ?? 0}
-                    savingsRateTarget={financialPreferences.savingsRateTarget}
-                    onUpdateSavingsGoal={handleUpdateSavingsGoal}
-                  />
-                )}
-
-                {activeTab === 'accounts' && (
-                  <div className="tab-panel">
-                    <LinkedAccounts
-                      items={items}
-                      isSandbox={isSandbox}
-                      onRefreshed={handleAccountsRefreshed}
-                      onUpdateCreditLimit={handleUpdateCreditLimit}
-                      onUpdateCustomization={handleUpdateAccountCustomization}
-                    />
-                    <TransactionsFeed
-                      transactions={transactions}
-                      budgetCategories={budgetCategories}
-                      syncing={syncing}
-                      onSync={handleSyncTransactions}
-                      onCategorize={handleCategorize}
-                      onApprove={handleApproveTransaction}
-                      onSaveSplits={handleSaveTransactionSplits}
-                      onClearSplits={handleClearTransactionSplits}
-                    />
-                  </div>
-                )}
-
-                {activeTab === 'settings' && (
-                  <Settings
-                    appearance={appearance}
-                    financialPreferences={financialPreferences}
-                    navLayout={navLayout}
-                    categoryMappings={{
-                      plaidCategories,
-                      mappings: categoryMappings,
-                      budgetCategories: activeBudgetCategories,
-                      onSave: handleSaveCategoryMapping,
-                      onDelete: handleDeleteCategoryMapping,
-                    }}
-                  />
-                )}
-              </>
-            );
-          }}
-        </NavLayoutScope>
-      )}
+              {activeTab === 'settings' && (
+                <Settings
+                  appearance={appearance}
+                  financialPreferences={financialPreferences}
+                  navLayout={navLayout}
+                  categoryMappings={{
+                    plaidCategories,
+                    mappings: categoryMappings,
+                    budgetCategories: activeBudgetCategories,
+                    onSave: handleSaveCategoryMapping,
+                    onDelete: handleDeleteCategoryMapping,
+                  }}
+                />
+              )}
+            </>
+          );
+        }}
+      </NavLayoutScope>
     </div>
   );
 }

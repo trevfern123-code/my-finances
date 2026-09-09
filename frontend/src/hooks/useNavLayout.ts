@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { updateNavLayout, type NavLayoutEntry } from '../lib/api';
 import {
@@ -19,33 +19,32 @@ export type { SaveStatus };
  * This hook is meant to be used inside a component that itself remounts (via a changed `key`)
  * whenever the authenticated user changes — see App.tsx's `NavLayoutScope`, keyed by an auth
  * generation number that advances across every sign-in/sign-out transition, including a user
- * signing back in as themselves. Because of that, `userId` is fixed for this hook's entire mounted
- * lifetime: there is no identity-change detection or in-place reset logic here at all.
+ * signing back in as themselves. Because of that, `userId` and `expectedGeneration` are both fixed
+ * for this hook's entire mounted lifetime: there is no identity-change detection or in-place reset
+ * logic here at all.
  *
- * The `NavLayoutSync` instance is constructed inside a `useEffect`, not lazily during render.
- * That's deliberate, not just stylistic: React 18 StrictMode deliberately mounts every effect
- * twice in development (setup, simulated cleanup, setup again) to catch exactly this class of
- * bug. A render-phase lazy-init (`if (!ref.current) ref.current = new X()`, guarded only by "does
- * anything already exist") survives that fine when the effect has no cleanup, but here the
- * cleanup calls `dispose()`, which is a real, permanent, one-way transition — StrictMode's
- * simulated cleanup would dispose the freshly-built instance immediately, and the render-phase
- * guard would then never rebuild it (something already exists in the ref, it's just inert),
- * silently no-opping every future submit() for the rest of the mount. Constructing inside the
- * effect instead means StrictMode's second "setup" call builds a *replacement* instance after the
- * simulated disposal, so the mount ends up with a live, working one — matching React's own
- * documented pattern for a resource whose lifecycle must survive this simulation. This was found
- * by live-browser testing, not by the test suite — vitest's environment doesn't run under
- * StrictMode, so this class of bug is invisible to it (same lesson as SaveStatusTracker's
- * detached-setTimeout bug from Phase 1).
+ * `expectedGeneration` and `userId` are plain function parameters, captured directly by the
+ * closure built below — never stored in, or read back out of, a mutable ref. That's deliberate:
+ * they are the *expected owner* a save was created for, and must never be reassignable once
+ * captured. `isGenerationCurrent` is different in kind — it's how the *ambient, live* "what
+ * generation is actually current right now" question gets answered at verification time, and is
+ * expected to change over time; App.tsx gives it a stable identity (`useCallback(fn, [])`) so
+ * including it in this hook's effect dependency arrays never causes spurious re-construction.
  *
- * `verifyOwnership` is threaded through to lib/api.ts's updateNavLayout, which passes it to
- * authedFetch — checked there at the moment a request is actually about to be sent (including on
- * a clock-skew retry), which is what actually closes the "session changed mid-flight" window. It's
- * mirrored into a ref (`verifyOwnershipRef`) rather than being a dependency of the construction
- * effect: every render's version is functionally identical for this mount (`userId` is fixed, and
- * the live-generation check reads a ref fresh at call time), so the effect only needs to depend on
- * `userId` — including it as a dependency would tear down and rebuild the sync instance on every
- * unrelated render for no benefit.
+ * Construction and disposal of the `NavLayoutSync` instance happen in `useLayoutEffect`, not
+ * passive `useEffect`. Two independent reasons:
+ *  1. React 18 StrictMode deliberately mounts every effect twice in development (setup, simulated
+ *     cleanup, setup again) to catch exactly this class of bug. A render-phase lazy-init survives
+ *     that fine when there's no cleanup, but `dispose()` is a real, permanent, one-way transition —
+ *     StrictMode's simulated cleanup would dispose a render-phase-constructed instance immediately,
+ *     and a render-phase guard would then never rebuild it. Effect-owned construction means
+ *     StrictMode's second "setup" call builds a genuine replacement after the simulated disposal.
+ *     `useLayoutEffect` gets this exact same self-healing property `useEffect` already had.
+ *  2. `useLayoutEffect` runs synchronously after DOM mutation but strictly before the browser
+ *     paints — so `syncRef.current` is guaranteed non-null by the time this component's UI is ever
+ *     visible, closing the "user could interact before the sync exists" question by construction
+ *     rather than by an argument about event-loop timing. Construction itself performs no network
+ *     call (just object/closure creation), so doing it synchronously before paint costs nothing.
  *
  * `saved` must already be `undefined` unless it genuinely belongs to this identity's current
  * fetch — App.tsx's own generation-tagged derivation (lib/authGeneration.ts's
@@ -53,8 +52,9 @@ export type { SaveStatus };
  */
 export function useNavLayout(
   userId: string | null,
-  saved: NavLayoutEntry[] | null | undefined,
-  verifyOwnership: (session: Session) => boolean
+  expectedGeneration: number,
+  isGenerationCurrent: (generation: number) => boolean,
+  saved: NavLayoutEntry[] | null | undefined
 ) {
   const [layout, setLayout] = useState<NavTabEntry[]>(() => mergeNavLayout(undefined));
   const [status, setStatus] = useState<SaveStatus>('idle');
@@ -67,14 +67,16 @@ export function useNavLayout(
   // so React, including under StrictMode, can never cause a single user action to persist twice).
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
-  const verifyOwnershipRef = useRef(verifyOwnership);
-  verifyOwnershipRef.current = verifyOwnership;
 
   const syncRef = useRef<NavLayoutSync | null>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!userId) return;
     const sync = new NavLayoutSync({
-      save: (next) => updateNavLayout({ tabs: next }, (session) => verifyOwnershipRef.current(session)),
+      save: (next) =>
+        updateNavLayout(
+          { tabs: next },
+          (session: Session) => session.user.id === userId && isGenerationCurrent(expectedGeneration)
+        ),
       onStatusChange: setStatus,
     });
     syncRef.current = sync;
@@ -86,7 +88,11 @@ export function useNavLayout(
       // belongs to.
       if (syncRef.current === sync) syncRef.current = null;
     };
-  }, [userId]);
+  }, [userId, expectedGeneration, isGenerationCurrent]); // honestly exhaustive — none of these
+  // three actually change value across this mount's lifetime (userId/expectedGeneration are fixed
+  // by the keyed remount; isGenerationCurrent's identity is fixed by its own useCallback), so this
+  // still only truly runs once per real mount — but there is no ref reassignment anywhere carrying
+  // "who this belongs to."
 
   useEffect(() => {
     if (hydratedRef.current || saved === undefined || !userId) return;

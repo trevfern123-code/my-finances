@@ -1,3 +1,5 @@
+import type { Session } from '@supabase/supabase-js';
+
 /**
  * One clear identity for "which authenticated lifecycle is currently active" — an integer that
  * changes across every relevant auth ownership transition: signed-out -> a user, a user -> signed-
@@ -46,4 +48,43 @@ export function currentGenerationValue<T>(
   currentGeneration: number
 ): T | undefined {
   return valueGeneration === currentGeneration ? value : undefined;
+}
+
+/**
+ * `{ session, generation }` as one atomic unit, updated by a single reducer — the whole point
+ * being that a genuine identity transition can never be observed as a committed render where one
+ * has updated and the other hasn't. Previously `session` (a useState, set synchronously inside the
+ * Supabase auth callback) and `generation` (bumped afterward, in a separate effect reacting to the
+ * derived user id) were two independent pieces of state; there necessarily existed one committed
+ * render where `userId` already reflected a new sign-in while `generation` — and therefore
+ * NavLayoutScope's key — still reflected the old one. A `useReducer` makes both fields the output
+ * of one state transition, which React can never apply partially.
+ */
+export interface AuthState {
+  session: Session | null;
+  generation: number;
+}
+
+export const initialAuthState: AuthState = { session: null, generation: 0 };
+
+/** The only action this reducer handles: "here is whatever Supabase just told us the session is,"
+ *  whether from the initial `getSession()` call or a later `onAuthStateChange` event (SIGNED_IN,
+ *  SIGNED_OUT, TOKEN_REFRESHED, or a benign re-emission of the currently active session). The
+ *  reducer — not the caller — decides whether this represents a new generation. */
+export type AuthAction = { type: 'AUTH_EVENT'; session: Session | null };
+
+/** Pure reducer. Each call processes exactly one AUTH_EVENT against whatever state came before it
+ *  — including when two events are dispatched back-to-back before React has a chance to render in
+ *  between (e.g. a same-user logout immediately followed by a re-login): React still applies
+ *  reducer actions to a `useReducer` sequentially, each computed from the true previous state, even
+ *  when their resulting renders are batched into one — so a `SIGNED_OUT` action processed between
+ *  two `SIGNED_IN` actions for the same user still produces two distinct generation bumps, never
+ *  one, regardless of whether an intermediate render for the signed-out state ever paints. */
+export function authReducer(state: AuthState, action: AuthAction): AuthState {
+  const previousUserId = state.session?.user.id ?? null;
+  const userId = action.session?.user.id ?? null;
+  return {
+    session: action.session,
+    generation: nextAuthGeneration(state.generation, previousUserId, userId),
+  };
 }

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { currentGenerationValue, isNewAuthGeneration, nextAuthGeneration } from './authGeneration';
+import type { Session } from '@supabase/supabase-js';
+import { authReducer, currentGenerationValue, initialAuthState, isNewAuthGeneration, nextAuthGeneration } from './authGeneration';
+
+function fakeSession(userId: string): Session {
+  return { user: { id: userId } } as Session;
+}
 
 describe('isNewAuthGeneration', () => {
   it('is true for signed-out -> a user', () => {
@@ -103,5 +108,75 @@ describe('currentGenerationValue — stale-fetch generation guard', () => {
 
   it('a legitimate null (fetched successfully, nothing saved) still passes through when tagged with the current generation', () => {
     expect(currentGenerationValue(null, 5, 5)).toBeNull();
+  });
+});
+
+describe('authReducer', () => {
+  it('initial state is signed out at generation 0', () => {
+    expect(initialAuthState).toEqual({ session: null, generation: 0 });
+  });
+
+  it('bumps to generation 1 on the first sign-in', () => {
+    const state = authReducer(initialAuthState, { type: 'AUTH_EVENT', session: fakeSession('user-a') });
+    expect(state.generation).toBe(1);
+    expect(state.session?.user.id).toBe('user-a');
+  });
+
+  it('does not bump on a same-user token refresh or benign re-emission — session updates, generation does not', () => {
+    const signedIn = authReducer(initialAuthState, { type: 'AUTH_EVENT', session: fakeSession('user-a') });
+    const refreshedSession = { user: { id: 'user-a' }, access_token: 'new-token' } as Session;
+    const refreshed = authReducer(signedIn, { type: 'AUTH_EVENT', session: refreshedSession });
+    expect(refreshed.generation).toBe(signedIn.generation);
+    expect(refreshed.session).toBe(refreshedSession); // the fresh session object is still adopted
+  });
+
+  it('bumps on sign-out and again on a subsequent sign-in as the same user — never the same generation twice', () => {
+    let state = authReducer(initialAuthState, { type: 'AUTH_EVENT', session: fakeSession('user-a') });
+    expect(state.generation).toBe(1);
+
+    state = authReducer(state, { type: 'AUTH_EVENT', session: null });
+    expect(state.generation).toBe(2);
+
+    state = authReducer(state, { type: 'AUTH_EVENT', session: fakeSession('user-a') });
+    expect(state.generation).toBe(3); // not 1 — a genuinely new lifecycle for the same person
+  });
+
+  it('a same-user logout immediately followed by a re-login (A1 -> SIGNED_OUT -> SIGNED_IN as A again), applied as two sequential actions before either is necessarily rendered, ends at a new generation — never generation 1', () => {
+    // Models the exact scenario Codex raised: two actions dispatched back-to-back, faster than
+    // React could paint an intermediate frame. React still reduces a useReducer's queued actions
+    // sequentially against the true prior state even when their renders are batched into one — this
+    // proves the *reducer's own logic* preserves that sequencing; see the React-level test in the
+    // integration suite for proof React's actual dispatch queue does too.
+    const gen1 = authReducer(initialAuthState, { type: 'AUTH_EVENT', session: fakeSession('user-a') });
+    expect(gen1.generation).toBe(1);
+
+    const signedOut = authReducer(gen1, { type: 'AUTH_EVENT', session: null });
+    const gen3 = authReducer(signedOut, { type: 'AUTH_EVENT', session: fakeSession('user-a') });
+
+    expect(signedOut.generation).toBe(2); // the intermediate signed-out lifecycle is never skipped
+    expect(gen3.generation).toBe(3);
+    expect(gen3.generation).not.toBe(gen1.generation);
+  });
+
+  it('bootstrap ordering — getSession(A) then the auth callback for A — never creates two generations for one continuous session', () => {
+    let state = authReducer(initialAuthState, { type: 'AUTH_EVENT', session: fakeSession('user-a') }); // getSession() resolves first
+    expect(state.generation).toBe(1);
+    state = authReducer(state, { type: 'AUTH_EVENT', session: fakeSession('user-a') }); // onAuthStateChange fires for the same session
+    expect(state.generation).toBe(1); // still 1 — the redundant event for the same user is a no-op on generation
+  });
+
+  it('bootstrap ordering — the auth callback for A then getSession(A) — never creates two generations for one continuous session', () => {
+    let state = authReducer(initialAuthState, { type: 'AUTH_EVENT', session: fakeSession('user-a') }); // onAuthStateChange fires first
+    expect(state.generation).toBe(1);
+    state = authReducer(state, { type: 'AUTH_EVENT', session: fakeSession('user-a') }); // getSession() resolves for the same session
+    expect(state.generation).toBe(1); // still 1, regardless of which of the two arrived first
+  });
+
+  it('A -> B -> A produces three distinct generations, never reusing the first A session\'s number', () => {
+    let state = authReducer(initialAuthState, { type: 'AUTH_EVENT', session: fakeSession('user-a') });
+    const firstAGeneration = state.generation;
+    state = authReducer(state, { type: 'AUTH_EVENT', session: fakeSession('user-b') });
+    state = authReducer(state, { type: 'AUTH_EVENT', session: fakeSession('user-a') });
+    expect(state.generation).not.toBe(firstAGeneration);
   });
 });
