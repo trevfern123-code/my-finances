@@ -23,19 +23,31 @@ interface Submission {
 }
 
 /**
- * The one Navigation write queue for this running browser tab, constructed once (in App.tsx, which
- * never remounts) and shared across every `NavLayoutScope` mount, rather than a fresh instance per
- * mount. This is what closes the cross-lifecycle ordering gap a mount-scoped queue could not: an
- * already-issued write from an *older* authenticated lifecycle can now be guaranteed to settle
- * before a *newer* lifecycle's write is ever sent, because "at most one write in flight" is now a
- * guarantee for the whole tab, not just for whichever scope happens to be currently mounted.
+ * The one Navigation write queue for this running browser tab/JS module realm, shared across every
+ * `NavLayoutScope` mount, rather than a fresh instance per mount. This is what closes the
+ * cross-lifecycle ordering gap a mount-scoped queue could not: an already-issued write from an
+ * *older* authenticated lifecycle can now be guaranteed to settle before a *newer* lifecycle's
+ * write is ever sent, because "at most one write in flight" is now a guarantee for the whole tab,
+ * not just for whichever scope happens to be currently mounted.
  *
- * Guarantee, stated precisely: within one running browser tab, at most one Navigation write is on
- * the wire at a time, and a newer authenticated lifecycle's save can never be overtaken on the
- * server by an older lifecycle's still-outstanding save. This makes no claim about, and provides no
- * protection against, a different browser tab or a different device — the last write from any such
- * source still simply wins at the database layer, exactly as it already does for every other
- * preference in this app.
+ * App.tsx constructs exactly one instance of this class as a *module-level* constant (evaluated
+ * once, the first time that module is loaded into this realm — not inside the `App` component
+ * function), and exports it so every `NavLayoutScope` mount, across the entire page's lifetime,
+ * attaches to that same instance. A `useRef`-scoped instance living inside `App` would not
+ * actually deliver the guarantee below: if `App` itself were ever unmounted and a new `App`
+ * instance mounted within the same page (a full top-level remount — not something this app
+ * currently does, but not something this class should depend on it never doing either), a fresh
+ * `useRef` would construct a second, competing coordinator with no memory of the first's in-flight
+ * or queued work. A module-level constant has no such gap: this module is only ever evaluated once
+ * per realm, so importing it from anywhere — including a brand-new `App` instance — always yields
+ * the identical object.
+ *
+ * Guarantee, stated precisely: within one running browser tab/JS realm, at most one Navigation
+ * write is on the wire at a time, and a newer authenticated lifecycle's save can never be overtaken
+ * on the server by an older lifecycle's still-outstanding save. This makes no claim about, and
+ * provides no protection against, a different browser tab or a different device — the last write
+ * from any such source still simply wins at the database layer, exactly as it already does for
+ * every other preference in this app.
  *
  * Each mounted `NavLayoutScope` "attaches" on mount and "detaches" on unmount (see
  * hooks/useNavLayout.ts) rather than constructing/disposing its own instance. Ownership of any
@@ -83,11 +95,23 @@ export class NavigationWriteCoordinator {
   }
 
   /** Called on unmount. Only clears the attachment if it still belongs to `sessionId` — guards
-   *  against an out-of-order cleanup/setup pair wiping out a *newer* scope's attachment. */
+   *  against an out-of-order cleanup/setup pair wiping out a *newer* scope's attachment. Also
+   *  drops this scope's own not-yet-sent `pending` layout and its `lastAttempted` (Retry target):
+   *  a scope that's going away can make no more edits, so any queued-but-unsent work it left behind
+   *  belongs to a lifecycle that no longer exists client-side — dropped here rather than left to
+   *  linger indefinitely if nothing ever attaches again (e.g. a final sign-out), or dispatched onto
+   *  the wire under a since-detached scope's binding once some unrelated in-flight request settles.
+   *  This can never discard a *subsequent* scope's work: React always fully unmounts an old keyed
+   *  instance (running this) before mounting a new one (running attach()), so nothing has had a
+   *  chance to submit() under a new sessionId yet at the moment this runs. An already-in-flight
+   *  request is untouched either way — it was legitimately dispatched while this scope owned the
+   *  attachment and is left to finish per the documented guarantee (Case B/C). */
   detach(sessionId: string): void {
     if (this.attachedSessionId === sessionId) {
       this.attachedSessionId = null;
       this.onStatusChange = null;
+      this.pending = null;
+      this.lastAttempted = null;
     }
   }
 
@@ -113,6 +137,15 @@ export class NavigationWriteCoordinator {
 
   private dispatchNext(): void {
     if (this.pending === null) return;
+    // Cancel any Saved -> Idle timer still pending from an *earlier* attempt in this same
+    // attachment before starting a new one. Without this, a second save beginning (and possibly
+    // failing) before the first save's 2-second idle-reset fires would let that stale timer flip
+    // status back to 'idle' later — silently erasing a genuine 'error' (or a since-changed 'saved')
+    // that has nothing to do with the attempt the timer was originally scheduled for. attach()
+    // already clears this across a scope change; this closes the gap for a second attempt within
+    // the *same* still-attached scope, which attach() alone never runs for.
+    this.clearTimeoutFn(this.resetTimer);
+    this.resetTimer = undefined;
     const submission = this.pending;
     this.pending = null;
     this.lastAttempted = submission;

@@ -1508,9 +1508,10 @@ export async function upsertDashboardLayout(
 
 /** Upserts just the nav_layout column — same narrow-update reasoning as upsertDashboardLayout.
  *  Validation (array shape, id/visible types) happens at the controller layer; this just persists
- *  whatever it's given. The frontend's NavLayoutSync (lib/navLayoutSync.ts) is what guarantees at
- *  most one call to this function is ever in flight per user session — this function itself has no
- *  ordering guarantee of its own, same as every other narrow-update function here. */
+ *  whatever it's given. The frontend's NavigationWriteCoordinator (lib/navigationWriteCoordinator.ts)
+ *  is what guarantees at most one call to this function is ever in flight per browser tab — this
+ *  function itself has no ordering guarantee of its own, same as every other narrow-update function
+ *  here. */
 export async function upsertNavLayout(
   userId: string,
   navLayout: { tabs: { id: string; visible: boolean }[] }

@@ -299,6 +299,138 @@ describe('NavigationWriteCoordinator — Cases A/B/C (cross-lifecycle ordering)'
   });
 });
 
+describe('NavigationWriteCoordinator — Saved -> Idle timer does not outlive its own attempt (Blocker 2)', () => {
+  it('a later failure is not clobbered back to idle by an earlier success\'s stale timer, and Retry still works', async () => {
+    vi.useFakeTimers();
+    const save = vi
+      .fn()
+      .mockImplementationOnce(() => Promise.resolve()) // Save #1 succeeds
+      .mockImplementationOnce(() => Promise.reject(new Error('Save #2 failed'))) // Save #2 fails
+      .mockImplementationOnce(() => Promise.resolve()); // the eventual Retry succeeds
+    const coordinator = makeCoordinator(save, 2000);
+    const statuses = attachRecorder(coordinator, 'sid-1');
+
+    coordinator.submit(LAYOUT_A, 'sid-1', ALWAYS_VALID); // Save #1
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses).toEqual(['saving', 'saved']); // Save #1's own idle-reset timer is now pending
+
+    await vi.advanceTimersByTimeAsync(500); // well before Save #1's 2000ms deadline
+    coordinator.submit(LAYOUT_B, 'sid-1', ALWAYS_VALID); // Save #2 begins — reports 'saving' synchronously
+    expect(statuses.at(-1)).toBe('saving');
+    await vi.advanceTimersByTimeAsync(0); // let Save #2's rejection settle
+    expect(statuses.at(-1)).toBe('error');
+
+    // Advance past where Save #1's original timer would have fired (500 + 1500 = 2000ms from Save #1).
+    await vi.advanceTimersByTimeAsync(1500);
+    // The stale timer must never fire — status must still read 'error', not be clobbered to 'idle'.
+    expect(statuses.at(-1)).toBe('error');
+
+    // Retry is still available and functional.
+    coordinator.retry('sid-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses.at(-1)).toBe('saved');
+
+    vi.useRealTimers();
+  });
+
+  it('Save #2 succeeding schedules its own idle-reset timer; nothing fires before its own deadline', async () => {
+    vi.useFakeTimers();
+    const save = vi.fn().mockReturnValueOnce(Promise.resolve()).mockReturnValueOnce(Promise.resolve());
+    const coordinator = makeCoordinator(save, 2000);
+    const statuses = attachRecorder(coordinator, 'sid-1');
+
+    coordinator.submit(LAYOUT_A, 'sid-1', ALWAYS_VALID); // Save #1 succeeds
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses).toEqual(['saving', 'saved']);
+
+    await vi.advanceTimersByTimeAsync(1000); // halfway to Save #1's own idle deadline
+    coordinator.submit(LAYOUT_B, 'sid-1', ALWAYS_VALID); // Save #2 begins — cancels Save #1's timer
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses.at(-1)).toBe('saved'); // Save #2 also succeeded, scheduling its OWN new timer
+
+    // Advance to where Save #1's ORIGINAL timer would have fired (1000ms elapsed + 1000ms more) —
+    // it must not, since dispatchNext() cancelled it the instant Save #2 began.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(statuses.at(-1)).toBe('saved'); // still 'saved' — Save #2's own timer isn't due yet either
+
+    // Advance to Save #2's own 2000ms deadline (started at t=1000, due at t=3000; we're at t=2000 now).
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(statuses.at(-1)).toBe('idle'); // only Save #2's own timer ever produces idle
+    expect(statuses).toEqual(['saving', 'saved', 'saving', 'saved', 'idle']);
+
+    vi.useRealTimers();
+  });
+
+  it('a Retry begun while an earlier Saved timer would otherwise still be pending is not clobbered', async () => {
+    vi.useFakeTimers();
+    const save = vi
+      .fn()
+      .mockImplementationOnce(() => Promise.resolve()) // Save #1 succeeds
+      .mockImplementationOnce(() => Promise.reject(new Error('fails once'))) // Save #2 fails
+      .mockImplementationOnce(() => Promise.resolve()); // Retry succeeds
+    const coordinator = makeCoordinator(save, 2000);
+    const statuses = attachRecorder(coordinator, 'sid-1');
+
+    coordinator.submit(LAYOUT_A, 'sid-1', ALWAYS_VALID);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses).toEqual(['saving', 'saved']);
+
+    coordinator.submit(LAYOUT_B, 'sid-1', ALWAYS_VALID); // Save #2, immediately after Save #1's success
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses.at(-1)).toBe('error');
+
+    coordinator.retry('sid-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statuses.at(-1)).toBe('saved');
+
+    // Advance well past where Save #1's original timer would have fired — only Retry's own success
+    // and its own idle-reset are in play now, nothing stale from Save #1.
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(statuses.at(-1)).toBe('idle');
+
+    vi.useRealTimers();
+  });
+});
+
+describe('NavigationWriteCoordinator — detach() drops this scope\'s own unsent work (Blocker 3)', () => {
+  it('a pending-but-unsent layout is dropped immediately on detach, even if nothing attaches afterward', async () => {
+    const inFlight = deferred<void>();
+    const save = vi.fn(() => inFlight.promise);
+    const coordinator = makeCoordinator(save);
+    attachRecorder(coordinator, 'sid-1');
+
+    coordinator.submit(LAYOUT_A, 'sid-1', ALWAYS_VALID); // dispatched, in flight
+    coordinator.submit(LAYOUT_B, 'sid-1', ALWAYS_VALID); // queued, never sent
+
+    coordinator.detach('sid-1'); // sid-1 signs out — nothing else attaches afterward
+
+    inFlight.resolve(); // the already-issued A1 request settles normally
+    await inFlight.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // LAYOUT_B was dropped at detach — it must never be dispatched, even after the in-flight
+    // request that was ahead of it in the queue settles.
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(save).toHaveBeenCalledWith(LAYOUT_A, ALWAYS_VALID);
+  });
+
+  it('Retry is unavailable immediately after detach — nothing can retry a detached scope\'s failure', async () => {
+    const save = vi.fn().mockReturnValueOnce(Promise.reject(new Error('fails')));
+    const coordinator = makeCoordinator(save);
+    attachRecorder(coordinator, 'sid-1');
+
+    coordinator.submit(LAYOUT_A, 'sid-1', ALWAYS_VALID);
+    await Promise.resolve().catch(() => {});
+    await Promise.resolve();
+
+    coordinator.detach('sid-1');
+    coordinator.retry('sid-1'); // sid-1 is no longer attached — retry is a no-op
+
+    expect(save).toHaveBeenCalledTimes(1); // no resubmission
+  });
+});
+
 describe('NavigationWriteCoordinator — user isolation', () => {
   it('User A\'s in-flight settlement never leaks into User B\'s attached status', async () => {
     const aInFlight = deferred<void>();

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabaseClient';
 import {
@@ -54,12 +54,13 @@ import {
   type SpendingSummary,
   type TransactionItem,
 } from './lib/api';
-import { authReducer, currentGenerationValue, initialAuthState, shouldApplyAuthEvent } from './lib/authGeneration';
+import { currentGenerationValue } from './lib/authGeneration';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { decodeSessionId } from './lib/jwt';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
 import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
 import { buildWebTabList } from './lib/webTabNav';
+import { useAuthSession } from './hooks/useAuthSession';
 import { useDashboardLayout } from './hooks/useDashboardLayout';
 import { useAppearance } from './hooks/useAppearance';
 import { useFinancialPreferences } from './hooks/useFinancialPreferences';
@@ -92,6 +93,22 @@ import './App.css';
 // max lets the Monthly Breakdown and Budget tab drill-downs (both filtered client-side from this
 // same in-memory list) cover as much history as the API allows, rather than the default 50.
 const TRANSACTIONS_FETCH_LIMIT = 200;
+
+// The one Navigation write coordinator for this browser tab — a genuine module-level singleton,
+// constructed exactly once when this module is first evaluated, not inside the `App` component
+// function. This is deliberate, not merely a style choice: a `useRef`-scoped instance living
+// inside `App` would only actually survive for as long as one `App` component *instance* does — if
+// `App` were ever unmounted and a new one mounted within the same page, a fresh `useRef` would
+// silently construct a second, competing coordinator with no memory of the first one's in-flight or
+// queued work, quietly breaking the documented "at most one write on the wire per tab" guarantee.
+// A module-level constant has no such gap: this module is only ever evaluated once per realm (ES
+// module semantics), so every `NavLayoutScope` mount — across every `App` instance this page ever
+// creates — attaches to the exact same object. Exported so App.integration.test.tsx can exercise
+// this exact instance directly for the coordinator-lifetime regression tests, rather than a
+// same-shaped copy. See lib/navigationWriteCoordinator.ts's own doc comment for the full guarantee.
+export const navigationWriteCoordinator = new NavigationWriteCoordinator({
+  save: (layout, verify) => updateNavLayout({ tabs: layout }, verify),
+});
 
 /**
  * Scopes useNavLayout's layout/status state and its attachment to the shared
@@ -145,17 +162,12 @@ export function NavLayoutScope({
 }
 
 export default function App() {
-  // `{ session, sessionId }` as one atomic unit — see lib/authGeneration.ts's authReducer.
-  // `sessionId` is Supabase's own `session_id` JWT claim, the authoritative identity for one
-  // continuous login lifecycle (stable across that login's own token refreshes, distinct for every
-  // actual sign-in) — not a client-side reconstruction. Every AUTH_EVENT is reduced against the
-  // true previous state, so session and sessionId can never be observed out of step with each
-  // other in a committed render, even when two events (e.g. a same-user sign-out immediately
-  // followed by a re-login) are dispatched back-to-back before React has a chance to paint an
-  // intermediate frame — React still applies a useReducer's queued actions sequentially against
-  // the real prior state before rendering the batched result.
-  const [auth, dispatchAuth] = useReducer(authReducer, initialAuthState);
-  const { session, sessionId } = auth;
+  // `{ session, sessionId }` as one atomic unit, and the bootstrap/live-event wiring that produces
+  // it (including the StrictMode/unmount-safe invalidation guard) — see hooks/useAuthSession.ts's
+  // own doc comment. `sessionId` is Supabase's own `session_id` JWT claim, the authoritative
+  // identity for one continuous login lifecycle (stable across that login's own token refreshes,
+  // distinct for every actual sign-in) — not a client-side reconstruction.
+  const { session, sessionId } = useAuthSession();
   const [activeTab, setActiveTab] = useState('overview');
   const [items, setItems] = useState<LinkedItem[]>([]);
   const [isSandbox, setIsSandbox] = useState(false);
@@ -222,18 +234,6 @@ export default function App() {
   }, [sessionId]);
   const isSessionCurrent = useCallback((id: string) => sessionIdRef.current === id, []);
 
-  // Constructed once, lazily, and never disposed — App itself never remounts within a session, so
-  // there's no paired cleanup the way NavLayoutScope's own useLayoutEffect has one. Passed down so
-  // every NavLayoutScope mount attaches to the *same* coordinator instead of constructing its own
-  // — see lib/navigationWriteCoordinator.ts's own doc comment for why this (not a fresh queue per
-  // mount) is what actually closes the cross-lifecycle write-ordering gap.
-  const coordinatorRef = useRef<NavigationWriteCoordinator | null>(null);
-  if (!coordinatorRef.current) {
-    coordinatorRef.current = new NavigationWriteCoordinator({
-      save: (layout, verify) => updateNavLayout({ tabs: layout }, verify),
-    });
-  }
-
   // Only usable if it was actually fetched under the sessionId that's current *right now* — a
   // pure, per-render derivation (no mutation, no effect-ordering dependency) rather than a
   // separate "clear the old value" step, which would need to run before NavLayoutScope's own
@@ -245,38 +245,6 @@ export default function App() {
   const appearance = useAppearance(appearanceRaw);
   const financialPreferences = useFinancialPreferences(financialPreferencesRaw);
   const reportingRange = useReportingRange(reportingRangeRaw);
-
-  useEffect(() => {
-    // sawLiveEvent guards a real ordering hazard: the bootstrap getSession() call and a live
-    // onAuthStateChange event are two independent async sources, and a live event can fire *and
-    // resolve* before the slower bootstrap snapshot does, even though the bootstrap represents
-    // strictly older information (whatever was true at page load). Once any live event has been
-    // observed, a later-resolving bootstrap result must never be allowed to overwrite it, no
-    // matter which one's own promise/callback happens to settle later. See
-    // lib/authGeneration.ts's shouldApplyAuthEvent.
-    let sawLiveEvent = false;
-
-    function applyEvent(newSession: Session | null, isBootstrap: boolean) {
-      if (!shouldApplyAuthEvent(isBootstrap, sawLiveEvent)) return;
-      if (!isBootstrap) sawLiveEvent = true;
-      // Decoded synchronously (see lib/jwt.ts) — no async gap between observing an event and
-      // including its session_id in the same atomic dispatch. A decode failure (should not happen
-      // — session_id is a required Supabase claim — but never assumed impossible) falls back to a
-      // freshly generated id, guaranteeing this is still always treated as a new lifecycle rather
-      // than silently trusting a guess that it's a continuation of the previous one.
-      const newSessionId = newSession ? (decodeSessionId(newSession.access_token) ?? crypto.randomUUID()) : null;
-      dispatchAuth({ type: 'AUTH_EVENT', session: newSession, sessionId: newSessionId });
-    }
-
-    // Registered before initiating the bootstrap call, so a live event that fires before
-    // getSession() even resolves is never missed.
-    const { data: subscription } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      applyEvent(newSession, false);
-    });
-    supabase.auth.getSession().then(({ data }) => applyEvent(data.session, true));
-
-    return () => subscription.subscription.unsubscribe();
-  }, []);
 
   const refreshAll = useCallback(async () => {
     // Tags this fetch with the sessionId it was made under — see the setNavLayoutRawSessionId call
@@ -939,7 +907,7 @@ export default function App() {
         userId={userId}
         sessionId={sessionId!}
         isSessionCurrent={isSessionCurrent}
-        coordinator={coordinatorRef.current}
+        coordinator={navigationWriteCoordinator}
         saved={navLayoutRawForCurrentSession}
       >
         {(navLayout) => {
