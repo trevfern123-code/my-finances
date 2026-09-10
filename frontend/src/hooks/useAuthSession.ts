@@ -58,7 +58,16 @@ export function useAuthSession(): AuthState {
     const { data: subscription } = supabase.auth.onAuthStateChange((_event, newSession) => {
       applyEvent(newSession, false);
     });
-    supabase.auth.getSession().then(({ data }) => applyEvent(data.session, true));
+    supabase.auth.getSession().then(
+      ({ data }) => applyEvent(data.session, true),
+      // A rejected bootstrap (e.g. a transient network failure) tells us nothing about the actual
+      // session — never dispatch on it. In particular, it must never be treated as "signed out":
+      // that would overwrite whatever a live onAuthStateChange event may have already committed
+      // (or silently discard state before one ever arrives). Left uncaught, this would otherwise be
+      // an unhandled promise rejection; caught, it's simply a no-op — the live event stream is
+      // unaffected and will still deliver the real state once Supabase is reachable again.
+      () => {}
+    );
 
     return () => {
       active = false;

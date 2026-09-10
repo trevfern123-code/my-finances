@@ -579,6 +579,32 @@ describe('10. StrictMode / real-unmount bootstrap invalidation (Blocker 1)', () 
     // commit that includes a state change.
     expect(states.length).toBe(stateCountBeforeUnmount);
   });
+
+  it('a rejected bootstrap getSession() never dispatches and never becomes an unhandled rejection', async () => {
+    mockGetSession.mockRejectedValue(new Error('network unreachable'));
+
+    const states: AuthState[] = [];
+    render(<AuthSessionProbe onState={(s) => states.push(s)} />);
+    const stateCountAfterMount = states.length; // the probe's own effect reports the initial state once
+
+    // Let the rejection actually settle (awaited here, so if the hook left it uncaught this test
+    // itself would surface it as an unhandled rejection — the real regression this guards against).
+    await act(async () => {
+      await Promise.resolve().catch(() => {});
+      await Promise.resolve();
+    });
+
+    // A failed bootstrap must never be treated as "signed out" or dispatch anything at all — no
+    // *new* state report happened beyond the initial mount, and the initial state is untouched.
+    expect(states.length).toBe(stateCountAfterMount);
+    expect(states.at(-1)).toEqual({ session: null, sessionId: null });
+
+    // A live event afterward still works normally — the rejected bootstrap didn't wedge anything.
+    await act(async () => {
+      emitAuthEvent(fakeSession('user-a', 'sid-1'));
+    });
+    expect(states.at(-1)?.sessionId).toBe('sid-1');
+  });
 });
 
 describe('11. NavigationWriteCoordinator lifetime — survives a full harness (App-level) remount (Blocker 3)', () => {
@@ -655,5 +681,114 @@ describe('11. NavigationWriteCoordinator lifetime — survives a full harness (A
     // A3's own status must be completely unaffected by A1's stale completion.
     expect(mountA3.getByTestId('status').textContent).toBe(statusBeforeA1Settles);
     mountA3.unmount();
+  });
+
+  // The two tests above both remount under a genuinely different sessionId (sid-1 -> sid-3) —
+  // Codex specifically flagged that as an incomplete regression: a full harness/App-level remount
+  // can happen while the very same Supabase session stays active (its sessionId unchanged), and
+  // that case needs its own coverage, since sessionId alone is exactly what the previous round's
+  // coordinator used to gate status/detach/retry ownership on.
+  it('a full remount under the SAME session_id still gets a distinct attachment: the old attachment\'s success never reports into the new one, and wire order stays old -> new', async () => {
+    const fetchCall1 = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    const fetchCall2 = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    vi.mocked(fetch)
+      .mockImplementationOnce(() => fetchCall1.promise as never)
+      .mockImplementationOnce(() => fetchCall2.promise as never);
+
+    const framesOld: Frame[] = [];
+    const mountOld = render(<AuthHarness frames={framesOld} coordinator={navigationWriteCoordinator} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-1')));
+    await waitFor(() => expect(mountOld.getByTestId('content')).toBeTruthy());
+
+    act(() => {
+      mountOld.getByTestId('hide-loans').click(); // old attachment's write dispatched — held open
+    });
+    await waitFor(() => expect(mountOld.getByTestId('status').textContent).toBe('saving'));
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    mountOld.unmount(); // a genuine, complete teardown — the underlying sid-1 session stays active
+
+    // A new harness mounts under the exact SAME session_id — a distinct attachment.
+    const framesNew: Frame[] = [];
+    const mountNew = render(<AuthHarness frames={framesNew} coordinator={navigationWriteCoordinator} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-1'))); // same session_id as before
+    await waitFor(() => expect(mountNew.getByTestId('content')).toBeTruthy());
+
+    act(() => {
+      mountNew.getByTestId('hide-loans').click(); // new attachment's own edit — merely queued for now:
+      // the old attachment's request is still in flight, so the coordinator can't dispatch this one
+      // yet (Case B) — status stays whatever it was (the hook's initial 'idle', since this
+      // attachment has made no request of its own yet), not a premature 'saving'.
+    });
+    expect(fetch).toHaveBeenCalledTimes(1); // not sent yet — the old attachment's write is still on the wire
+
+    // The old attachment's already-issued request finally settles successfully. This is what
+    // actually lets the coordinator chase the new attachment's queued edit — which is also the
+    // moment the previous, buggy coordinator would have (incorrectly) reported the OLD attachment's
+    // own 'saved' into the NEW attachment, since both share the same sessionId.
+    await act(async () => {
+      fetchCall1.resolve(okResponse({ nav_layout: { tabs: [] } }));
+      await fetchCall1.promise;
+    });
+
+    // Critical assertion — this is exactly the false-positive Codex reproduced: the OLD
+    // attachment's success must not have been reported into the NEW attachment as a premature
+    // 'saved'. Instead, the new attachment now (and only now) has its OWN request dispatched and
+    // correctly shows ITS OWN 'saving' state — never the old attachment's completion status.
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    expect(mountNew.getByTestId('status').textContent).toBe('saving');
+
+    // Now the new attachment's own request settles.
+    await act(async () => {
+      fetchCall2.resolve(okResponse({ nav_layout: { tabs: [] } }));
+      await fetchCall2.promise;
+    });
+
+    await waitFor(() => expect(mountNew.getByTestId('status').textContent).toBe('saved'));
+    // Wire order: the old attachment's write first, the new attachment's second — never
+    // concurrently, and exactly two calls total.
+    expect(fetch).toHaveBeenCalledTimes(2);
+    mountNew.unmount();
+  });
+
+  it('an old attachment\'s failure under the SAME session_id cannot surface a false Error (with a nonfunctional Retry) in the new attachment', async () => {
+    const fetchCall1 = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    vi.mocked(fetch).mockImplementationOnce(() => fetchCall1.promise as never);
+
+    const framesOld: Frame[] = [];
+    const mountOld = render(<AuthHarness frames={framesOld} coordinator={navigationWriteCoordinator} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-1')));
+    await waitFor(() => expect(mountOld.getByTestId('content')).toBeTruthy());
+    act(() => mountOld.getByTestId('hide-loans').click());
+    await waitFor(() => expect(mountOld.getByTestId('status').textContent).toBe('saving'));
+
+    mountOld.unmount();
+
+    const framesNew: Frame[] = [];
+    const mountNew = render(<AuthHarness frames={framesNew} coordinator={navigationWriteCoordinator} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-1'))); // same session_id — a distinct attachment
+    await waitFor(() => expect(mountNew.getByTestId('content')).toBeTruthy());
+    const statusBeforeOldSettles = mountNew.getByTestId('status').textContent; // fresh attachment's starting status
+
+    // The old attachment's already-issued request finally fails — a real authedFetch-shaped
+    // failure (a non-ok response), not a mocked coordinator-level rejection, so this exercises the
+    // exact production failure path.
+    await act(async () => {
+      fetchCall1.resolve({ ok: false, status: 500, json: () => Promise.resolve({ error: 'stale failure' }) });
+      await fetchCall1.promise.catch(() => {});
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The new attachment must be completely unaffected — no false 'error', status unchanged.
+    expect(mountNew.getByTestId('status').textContent).toBe(statusBeforeOldSettles);
+
+    // And since nothing was ever incorrectly surfaced to it, Retry has nothing of its own to do —
+    // clicking it sends no new request at all. There is no "false Error with a nonfunctional
+    // Retry," because there is no false Error to begin with.
+    act(() => mountNew.getByTestId('retry').click());
+    expect(fetch).toHaveBeenCalledTimes(1); // still just the old attachment's own (now-settled) call
+
+    mountNew.unmount();
   });
 });

@@ -8,7 +8,7 @@ import {
   toggleTabVisibility as toggleTabVisibilityInLayout,
   type NavTabEntry,
 } from '../lib/navLayout';
-import type { NavigationWriteCoordinator } from '../lib/navigationWriteCoordinator';
+import type { AttachmentId, NavigationWriteCoordinator } from '../lib/navigationWriteCoordinator';
 import type { SaveStatus } from '../lib/saveStatus';
 import type { CustomizableTabId } from '../lib/tabRegistry';
 
@@ -32,10 +32,18 @@ export type { SaveStatus };
  *
  * `attach`/`detach` happen inside `useLayoutEffect`, not passive `useEffect` — same two reasons as
  * before: (1) React 18 StrictMode's dev-mode setup/cleanup/setup double-invoke needs `attach()`'s
- * second call to leave the coordinator in a correctly-attached state, which it does (idempotent —
- * attaching twice with the same sessionId is harmless); (2) doing it synchronously before paint
+ * second call to leave the coordinator in a correctly-attached state, which it does (each call
+ * simply gets its own fresh `AttachmentId` — see below); (2) doing it synchronously before paint
  * means this scope is guaranteed attached before the browser ever shows it, closing the "could the
  * user interact before it's ready" question by construction.
+ *
+ * `attach()` returns an `AttachmentId` — an identity distinct from `expectedSessionId`, minted
+ * fresh on every call even when `expectedSessionId` is unchanged (see
+ * lib/navigationWriteCoordinator.ts's own doc comment for exactly why `sessionId` alone isn't
+ * enough: a full remount can happen under the very same still-active session). Captured in
+ * `attachmentIdRef` so `submit`/`retry` — defined in the render body but only ever actually called
+ * later, from a user interaction — always use whichever attachment is *currently* live, never a
+ * stale one closed over at define time.
  *
  * `verifyOwnership`, built fresh on every render by the caller (NavLayoutScope) but only ever
  * captured once per submission (not once per mount), checks three things in order: the returned
@@ -69,11 +77,17 @@ export function useNavLayout(
   layoutRef.current = layout;
   const verifyOwnershipRef = useRef(verifyOwnership);
   verifyOwnershipRef.current = verifyOwnership;
+  // Set synchronously inside the layout effect below, before this mount is ever shown or
+  // interactable — see that effect's own comment. `submit`/`retry` always read `.current` at call
+  // time (never close over a value from an earlier render), so they use whichever attachment this
+  // mount's *latest* attach() call produced, even across a StrictMode setup/cleanup/setup pair.
+  const attachmentIdRef = useRef<AttachmentId | null>(null);
 
   useLayoutEffect(() => {
     if (!userId) return;
-    coordinator.attach(expectedSessionId, setStatus);
-    return () => coordinator.detach(expectedSessionId);
+    const attachmentId = coordinator.attach(expectedSessionId, setStatus);
+    attachmentIdRef.current = attachmentId;
+    return () => coordinator.detach(expectedSessionId, attachmentId);
   }, [userId, expectedSessionId, coordinator]);
 
   useEffect(() => {
@@ -85,7 +99,13 @@ export function useNavLayout(
   }, [saved, userId]);
 
   function submit(next: NavTabEntry[]) {
-    coordinator.submit(next, expectedSessionId, (session) => verifyOwnershipRef.current(session));
+    const attachmentId = attachmentIdRef.current;
+    // Not yet attached (shouldn't normally happen — submit is only ever reachable from a user
+    // interaction with the already-rendered UI, which implies the mount effect has already run).
+    // Failing silently here, rather than throwing or attaching implicitly, keeps this a true no-op
+    // exactly like an ordinary detached-scope submit() already is.
+    if (attachmentId === null) return;
+    coordinator.submit(next, expectedSessionId, attachmentId, (session) => verifyOwnershipRef.current(session));
   }
 
   function toggleVisibility(id: CustomizableTabId) {
@@ -114,6 +134,10 @@ export function useNavLayout(
     move,
     resetToDefault,
     status,
-    retry: () => coordinator.retry(expectedSessionId),
+    retry: () => {
+      const attachmentId = attachmentIdRef.current;
+      if (attachmentId === null) return;
+      coordinator.retry(expectedSessionId, attachmentId);
+    },
   };
 }
