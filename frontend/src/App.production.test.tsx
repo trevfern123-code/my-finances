@@ -44,6 +44,14 @@ const mockGetAssetsSummary = vi.hoisted(() => vi.fn());
 // Controlled so the Navigation ownership regression test can inspect exactly what layout a save
 // actually persists.
 const mockUpdateNavLayout = vi.hoisted(() => vi.fn());
+// Controlled so Round 6's ad-hoc-ownership regression tests can hold each of these single-resource
+// refreshes open/reject them on demand and distinguish "whose" data landed.
+const mockGetRecurringStreams = vi.hoisted(() => vi.fn());
+const mockGetLoans = vi.hoisted(() => vi.fn());
+const mockGetBudgetCategories = vi.hoisted(() => vi.fn());
+const mockGetTransactions = vi.hoisted(() => vi.fn());
+const mockSyncTransactions = vi.hoisted(() => vi.fn());
+const mockRefreshAccountBalances = vi.hoisted(() => vi.fn());
 
 vi.mock('./lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./lib/api')>();
@@ -52,14 +60,44 @@ vi.mock('./lib/api', async (importOriginal) => {
     // Out-of-scope datasets (declared out of this remediation's boundary, same as the original
     // audit's own scope) — trivial, instantly-resolved stubs; their content is irrelevant here.
     getLinkedItems: mockGetLinkedItems,
-    getTransactions: vi.fn().mockResolvedValue({ transactions: [] }),
-    getBudgetCategories: vi.fn().mockResolvedValue({ categories: [] }),
-    getRecurringStreams: vi.fn().mockResolvedValue({ streams: [], total_monthly_outflow: 0, total_monthly_inflow: 0 }),
-    getLoans: vi.fn().mockResolvedValue({ loans: [], total_debt: 0, total_minimum_payment: 0 }),
+    getTransactions: mockGetTransactions,
+    getBudgetCategories: mockGetBudgetCategories,
+    getRecurringStreams: mockGetRecurringStreams,
+    getLoans: mockGetLoans,
     getAssetsSummary: mockGetAssetsSummary,
     getManualLoans: vi.fn().mockResolvedValue({ loans: [] }),
     getCategoryMappings: vi.fn().mockResolvedValue({ mappings: [] }),
     getPlaidCategories: vi.fn().mockResolvedValue({ categories: [] }),
+    syncTransactions: mockSyncTransactions,
+    refreshAccountBalances: mockRefreshAccountBalances,
+    // Not otherwise controlled — only used by the same-session ad-hoc-ordering test (toggling an
+    // account checkbox), which just needs a well-formed account back so LinkedAccounts keeps
+    // rendering correctly; the specific fields returned are irrelevant to what that test asserts.
+    updateAccountCustomization: vi.fn().mockImplementation((accountId: string, fields: Record<string, unknown>) =>
+      Promise.resolve({
+        account: {
+          id: accountId,
+          name: 'Checking',
+          official_name: null,
+          type: 'depository',
+          subtype: 'checking',
+          mask: null,
+          current_balance: 100,
+          available_balance: 100,
+          iso_currency_code: 'USD',
+          credit_limit: null,
+          savings_goal: null,
+          nickname: null,
+          color: null,
+          icon: null,
+          sort_order: 0,
+          hidden: false,
+          exclude_from_net_worth: false,
+          exclude_from_cash_flow: false,
+          ...fields,
+        },
+      })
+    ),
     // Saves — not exercised by any case in this file (no test here clicks an edit control); stubbed
     // so nothing throws if a hook's own internal wiring ever reaches one.
     updateDashboardLayout: vi.fn().mockResolvedValue({ dashboard_layout: { cards: [] } }),
@@ -196,6 +234,135 @@ function fakeLinkedItems(institutionName: string) {
   };
 }
 
+/** Builds a getLoans() payload with one loan whose name is the given, distinctive string —
+ *  rendered directly by LoanProgress (Loans tab). */
+function fakeLoans(name: string) {
+  return {
+    loans: [
+      {
+        id: `loan-${name}`,
+        loan_type: 'credit' as const,
+        name,
+        account_name: null,
+        current_balance: 100,
+        iso_currency_code: 'USD',
+        interest_rate_percentage: null,
+        origination_principal_amount: null,
+        origination_date: null,
+        minimum_payment_amount: 10,
+        next_payment_due_date: null,
+        last_payment_amount: null,
+        last_payment_date: null,
+        is_overdue: false,
+        payoff_progress_pct: null,
+      },
+    ],
+    total_debt: 100,
+    total_minimum_payment: 10,
+  };
+}
+
+/** Builds a getRecurringStreams() payload with one stream whose description is the given,
+ *  distinctive string — rendered directly by SubscriptionsRecurring (Subscriptions & Recurring
+ *  tab). */
+function fakeRecurringStreams(description: string) {
+  return {
+    streams: [
+      {
+        id: `stream-${description}`,
+        description,
+        merchant_name: null,
+        direction: 'outflow' as const,
+        frequency: 'monthly',
+        average_amount: 50,
+        last_amount: 50,
+        iso_currency_code: 'USD',
+        first_date: '2026-01-01',
+        last_date: '2026-09-01',
+        is_active: true,
+        status: 'active',
+        category: null,
+        monthly_amount: 50,
+      },
+    ],
+    total_monthly_outflow: 50,
+    total_monthly_inflow: 0,
+  };
+}
+
+/** Builds a getBudgetCategories() payload with one category whose name is the given, distinctive
+ *  string — rendered directly by BudgetCategories (Budget tab). */
+function fakeBudgetCategories(name: string) {
+  return {
+    categories: [
+      { id: `cat-${name}`, name, budget_amount: 100, color: null, sort_order: 0, emoji: null, archived_at: null, spent: 0, recent_avg_spent: 0 },
+    ],
+  };
+}
+
+/** Builds a getTransactions() payload with one transaction whose name is the given, distinctive
+ *  string — rendered directly by TransactionsFeed (Accounts tab). */
+function fakeTransactions(name: string) {
+  return {
+    transactions: [
+      {
+        id: `txn-${name}`,
+        amount: 10,
+        iso_currency_code: 'USD',
+        date: '2026-09-01',
+        name,
+        merchant_name: null,
+        category: null,
+        plaid_category: null,
+        pending: false,
+        budget_category_id: null,
+        needs_review: false,
+        splits: [],
+        accounts: { name: 'Checking', nickname: null, plaid_items: { institution_name: null } },
+      },
+    ],
+  };
+}
+
+/** Builds a getLinkedItems() payload with one item that has one real, full-shaped account —
+ *  needed (unlike fakeLinkedItems) for the LinkedAccounts UI controls (the "Exclude from net
+ *  worth" checkbox) that only render per-account. */
+function fakeLinkedItemsWithAccount(institutionName: string, accountId: string) {
+  return {
+    items: [
+      {
+        id: `item-${institutionName}`,
+        institution_id: null,
+        institution_name: institutionName,
+        status: 'active' as const,
+        accounts: [
+          {
+            id: accountId,
+            name: 'Checking',
+            official_name: null,
+            type: 'depository',
+            subtype: 'checking',
+            mask: null,
+            current_balance: 100,
+            available_balance: 100,
+            iso_currency_code: 'USD',
+            credit_limit: null,
+            savings_goal: null,
+            nickname: null,
+            color: null,
+            icon: null,
+            sort_order: 0,
+            hidden: false,
+            exclude_from_net_worth: false,
+            exclude_from_cash_flow: false,
+          },
+        ],
+      },
+    ],
+    is_sandbox: true,
+  };
+}
+
 const emptySummary = {
   net_worth: 0,
   total_assets: 0,
@@ -264,6 +431,12 @@ beforeEach(() => {
   mockGetLinkedItems.mockResolvedValue({ items: [], is_sandbox: true });
   mockGetAssetsSummary.mockResolvedValue({ groups: [], total_assets: 0 });
   mockUpdateNavLayout.mockResolvedValue({ nav_layout: { tabs: [] } });
+  mockGetRecurringStreams.mockResolvedValue({ streams: [], total_monthly_outflow: 0, total_monthly_inflow: 0 });
+  mockGetLoans.mockResolvedValue({ loans: [], total_debt: 0, total_minimum_payment: 0 });
+  mockGetBudgetCategories.mockResolvedValue({ categories: [] });
+  mockGetTransactions.mockResolvedValue({ transactions: [] });
+  mockSyncTransactions.mockResolvedValue({});
+  mockRefreshAccountBalances.mockResolvedValue({ items: [], is_sandbox: true });
 });
 
 afterEach(() => {
@@ -1180,5 +1353,401 @@ describe('30. same-session stale bootstrap response cannot replace newer Navigat
     expect(screen.getByText('Customize dashboard')).toBeTruthy();
     expect(screen.queryByText(/Couldn't load your preferences/)).toBeNull();
     expect(screen.queryByRole('tab', { name: 'Accounts' })).toBeNull(); // still B's layout
+  });
+});
+
+// --- Round 6: readiness-orphan race + ad-hoc financial-refresh ownership ------------------------
+// Codex found two remaining gaps after Round 5. Blocker 1: refreshFinancialData's `isInitial`
+// caller-supplied flag meant a background/Plaid invocation that superseded the still-pending
+// original initial invocation could commit all nine datasets but was forbidden from ever setting
+// financialOutcome — while the original initial invocation, now superseded, could no longer commit
+// anything either — permanently stranding financialLifecycleStatus at 'loading'. Fixed by making
+// "readiness-producing" a property every invocation determines for itself at its own start (via
+// financialReadySessionIdRef), not something a caller declares in advance. Blocker 2: the ad-hoc,
+// single-resource refresh functions (refreshRecurringStreams, refreshLoans, refreshAssetsSummary,
+// refreshBudgetCategories, and the two direct post-action transaction refetches) and the
+// handleAccountsRefreshed callback committed their results with no ownership check at all — a slow
+// A-initiated call could still land its data in current state well after B was fully ready, since
+// the financialLifecycleStatus gate only protects the window *before* readiness, not indefinitely.
+// Fixed with a session check (sessionIdRef.current, or the render-scoped `sessionId` closure for
+// the externally-held callback) plus a lightweight per-resource invocation counter
+// (adHocRequestIdsRef) at each call site's own commit.
+
+describe('31. a background/Plaid refresh that supersedes the pending initial invocation becomes readiness-producing (Blocker 1)', () => {
+  it('initial batch #1 still pending -> Plaid triggers #2 -> #2 succeeds -> financial gate reaches ready; #1 settling after is inert', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    const initialAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(initialAssets.promise);
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForFinancialLoading(); // #1 (initial) still pending
+
+    // A successful Plaid link triggers a SECOND grouped invocation, #2, while #1 is still in
+    // flight — this becomes the latest invocation and, since readiness has not been reached yet,
+    // is therefore also readiness-producing (this is the exact fix under test: this would have
+    // been forbidden from setting financialOutcome under Round 5's caller-supplied isInitial flag).
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Plaid-Bank'));
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    await waitForReady();
+    expect(screen.getByText(/Plaid-Bank/)).toBeTruthy();
+
+    // #1 (the original initial invocation) finally resolves — it must be completely inert: no
+    // longer latest, so it cannot commit data or touch financialOutcome, even though it itself
+    // was ALSO marked readiness-producing at its own start.
+    await act(async () => {
+      initialAssets.resolve(fakeAssetsSummary('Stale-Initial-Bank'));
+      await initialAssets.promise.catch(() => {});
+    });
+
+    expect(screen.getByText(/Plaid-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/Stale-Initial-Bank/)).toBeNull();
+    expect(screen.queryByText('Loading your financial data...')).toBeNull();
+  });
+});
+
+describe('32. a newer pre-readiness invocation failing establishes the financial error state, not stuck loading (Blocker 1)', () => {
+  it('#1 pending -> Plaid triggers #2 -> #2 fails -> financial error gate with Retry; #1 settling after cannot replace it', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    const initialAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(initialAssets.promise);
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForFinancialLoading();
+
+    mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    await waitForFinancialError();
+    expect(screen.getByText('Retry')).toBeTruthy();
+
+    await act(async () => {
+      initialAssets.resolve(fakeAssetsSummary('Stale-Initial-Bank'));
+      await initialAssets.promise.catch(() => {});
+    });
+
+    expect(screen.getByText(/Couldn't load your financial data/)).toBeTruthy();
+    expect(screen.queryByText(/Stale-Initial-Bank/)).toBeNull();
+  });
+});
+
+describe('33. background refresh failure after readiness uses actionError, not the financial error gate (Blocker 1)', () => {
+  it('a background refresh that fails after the lifecycle is ready keeps existing data visible and never shows the financial-retry gate', async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    // Persistent (not Once) — the Plaid-triggered background refresh below re-fetches this same
+    // dataset too, and it should keep returning A's own current value on that call as well (this
+    // test is about `getLinkedItems` failing, not about assets changing).
+    mockGetAssetsSummary.mockResolvedValue(fakeAssetsSummary('A-Bank Checking'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    expect(screen.getByText(/A-Bank Checking/)).toBeTruthy();
+
+    mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    expect(screen.getByText(/A-Bank Checking/)).toBeTruthy();
+    expect(screen.queryByText(/Couldn't load your financial data/)).toBeNull();
+    await waitFor(() => expect(screen.getByText(/Some dashboard data failed to load/)).toBeTruthy());
+  });
+});
+
+describe('34. refreshRecurringStreams cross-lifecycle ownership (Blocker 2)', () => {
+  it("A syncs (holding the recurring-streams refetch open); B's own data is not overwritten by A's late response", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const aRecurring = deferred<ReturnType<typeof fakeRecurringStreams>>();
+    mockGetRecurringStreams.mockReturnValueOnce(aRecurring.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetRecurringStreams.mockResolvedValueOnce(fakeRecurringStreams('B-Subscription'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    // activeTab persists across the lifecycle change — 'Sync transactions' only (re)renders once
+    // B's own financial batch is ready, so its reappearance is itself the "B is ready" signal.
+    await waitFor(() => expect(screen.getByText('Sync transactions')).toBeTruthy());
+
+    await act(async () => {
+      aRecurring.resolve(fakeRecurringStreams('A-Subscription'));
+      await aRecurring.promise.catch(() => {});
+    });
+
+    act(() => screen.getByText('Subscriptions & Recurring').click());
+    expect(screen.getByText(/B-Subscription/)).toBeTruthy();
+    expect(screen.queryByText(/A-Subscription/)).toBeNull();
+  });
+});
+
+describe('35. refreshLoans cross-lifecycle ownership (Blocker 2)', () => {
+  it("A refreshes balances (holding the loans refetch open); B's own data is not overwritten by A's late response", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    // "Refresh balances" is disabled while `items` is empty — give A a real item so the button
+    // is actually clickable.
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const aLoans = deferred<ReturnType<typeof fakeLoans>>();
+    mockGetLoans.mockReturnValueOnce(aLoans.promise);
+    mockRefreshAccountBalances.mockResolvedValueOnce({ items: [], is_sandbox: true });
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLoans.mockResolvedValueOnce(fakeLoans('B-Loan'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText('Sync transactions')).toBeTruthy());
+
+    await act(async () => {
+      aLoans.resolve(fakeLoans('A-Loan'));
+      await aLoans.promise.catch(() => {});
+    });
+
+    act(() => screen.getByText('Loans').click());
+    expect(screen.getByText(/B-Loan/)).toBeTruthy();
+    expect(screen.queryByText(/A-Loan/)).toBeNull();
+  });
+});
+
+describe('36. refreshAssetsSummary cross-lifecycle ownership (Blocker 2)', () => {
+  it("A refreshes balances (holding the assets refetch open); B's own data is not overwritten by A's late response", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    // "Refresh balances" is disabled while `items` is empty — give A a real item so the button
+    // is actually clickable.
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const aAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(aAssets.promise);
+    mockRefreshAccountBalances.mockResolvedValueOnce({ items: [], is_sandbox: true });
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('B-Bank Checking'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    // 'Sync transactions' (Accounts tab) confirms B is financially ready; AccountQuickView (where
+    // fakeAssetsSummary's account name renders) only appears on Overview.
+    await waitFor(() => expect(screen.getByText('Sync transactions')).toBeTruthy());
+    act(() => screen.getByText('Overview').click());
+    expect(screen.getByText(/B-Bank Checking/)).toBeTruthy();
+
+    await act(async () => {
+      aAssets.resolve(fakeAssetsSummary('A-Bank Checking'));
+      await aAssets.promise.catch(() => {});
+    });
+
+    expect(screen.getByText(/B-Bank Checking/)).toBeTruthy();
+    expect(screen.queryByText(/A-Bank Checking/)).toBeNull();
+  });
+});
+
+describe('37. refreshBudgetCategories cross-lifecycle ownership (Blocker 2)', () => {
+  it("A syncs (holding the budget-categories refetch open); B's own data is not overwritten by A's late response", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const aBudget = deferred<ReturnType<typeof fakeBudgetCategories>>();
+    mockGetBudgetCategories.mockReturnValueOnce(aBudget.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetBudgetCategories.mockResolvedValueOnce(fakeBudgetCategories('B-Category'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText('Sync transactions')).toBeTruthy());
+
+    await act(async () => {
+      aBudget.resolve(fakeBudgetCategories('A-Category'));
+      await aBudget.promise.catch(() => {});
+    });
+
+    act(() => screen.getByText('Budget').click());
+    expect(screen.getByText(/B-Category/)).toBeTruthy();
+    expect(screen.queryByText(/A-Category/)).toBeNull();
+  });
+});
+
+describe('38. handleSyncTransactions post-sync getTransactions cross-lifecycle ownership (Blocker 2)', () => {
+  it("A syncs (holding the post-sync transactions refetch open); B's own transactions are not overwritten by A's late response", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const aTransactions = deferred<ReturnType<typeof fakeTransactions>>();
+    mockGetTransactions.mockReturnValueOnce(aTransactions.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactions('B-Transaction'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    // Not 'Sync transactions' here — `syncing` is plain, ungated App state (not session-scoped;
+    // out of this round's declared UI-only scope), so it's still `true` from A's own still-pending
+    // sync, leaving the button showing "Syncing..." even once B is otherwise fully ready. Wait for
+    // B's own transaction directly instead.
+    await waitFor(() => expect(screen.getByText(/B-Transaction/)).toBeTruthy());
+
+    await act(async () => {
+      aTransactions.resolve(fakeTransactions('A-Transaction'));
+      await aTransactions.promise.catch(() => {});
+    });
+
+    expect(screen.getByText(/B-Transaction/)).toBeTruthy();
+    expect(screen.queryByText(/A-Transaction/)).toBeNull();
+  });
+});
+
+describe('39. handleAccountsRefreshed callback cross-lifecycle ownership (Blocker 2)', () => {
+  it("A's in-flight balance-refresh callback resolving after B is ready does not commit A's items under B", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Initial-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/A-Initial-Bank/)).toBeTruthy();
+
+    const aRefresh = deferred<ReturnType<typeof fakeLinkedItems>>();
+    mockRefreshAccountBalances.mockReturnValueOnce(aRefresh.promise);
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve();
+    });
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('B-Bank'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText('Sync transactions')).toBeTruthy());
+    expect(screen.getByText(/B-Bank/)).toBeTruthy();
+
+    // A's stale, already-in-flight balance-refresh callback resolves well after B is fully ready.
+    // This is the REAL handleAccountsRefreshed closure A's LinkedAccounts instance captured as its
+    // onRefreshed prop — invoked here exactly as LinkedAccounts' own internal promise chain would,
+    // regardless of whether that component instance is still mounted.
+    await act(async () => {
+      aRefresh.resolve(fakeLinkedItems('A-Stale-Bank'));
+      await aRefresh.promise.catch(() => {});
+    });
+
+    expect(screen.getByText(/B-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/A-Stale-Bank/)).toBeNull();
+  });
+});
+
+describe('40. same-session overlapping ad-hoc refreshes: the newer invocation wins regardless of resolution order (Blocker 2)', () => {
+  it('two overlapping refreshAssetsSummary invocations within one session settle with the newer winning', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItemsWithAccount('A-Bank', 'acct-1'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    // First invocation, via "Refresh balances" — held open.
+    const firstAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(firstAssets.promise);
+    mockRefreshAccountBalances.mockResolvedValueOnce(fakeLinkedItemsWithAccount('A-Bank', 'acct-1'));
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    // Second, independent invocation of the SAME resource — toggling the account's "Exclude from
+    // net worth" checkbox also calls refreshAssetsSummary (handleUpdateAccountCustomization) —
+    // while the first is still in flight.
+    const secondAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(secondAssets.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Exclude from net worth'));
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    // The newer (second) invocation resolves first.
+    await act(async () => {
+      secondAssets.resolve(fakeAssetsSummary('Newer-Assets'));
+      await secondAssets.promise;
+    });
+    act(() => screen.getByText('Overview').click());
+    await waitFor(() => expect(screen.getByText(/Newer-Assets/)).toBeTruthy());
+
+    // The older (first) invocation resolves last — must not overwrite the newer one.
+    await act(async () => {
+      firstAssets.resolve(fakeAssetsSummary('Older-Assets'));
+      await firstAssets.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Newer-Assets/)).toBeTruthy();
+    expect(screen.queryByText(/Older-Assets/)).toBeNull();
+  });
+});
+
+describe('41. A1 -> A3 (same user, new session): ad-hoc ownership uses session_id, not user id (Blocker 2)', () => {
+  it("A1's late refreshAssetsSummary response cannot land under A3", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    // "Refresh balances" is disabled while `items` is empty — give A1 a real item so the button
+    // is actually clickable.
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A1-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const a1Assets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(a1Assets.promise);
+    mockRefreshAccountBalances.mockResolvedValueOnce({ items: [], is_sandbox: true });
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('A3-Bank'));
+    act(() => emitAuthEvent(null));
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a3')));
+    await waitFor(() => expect(screen.getByText('Sync transactions')).toBeTruthy());
+    act(() => screen.getByText('Overview').click());
+    expect(screen.getByText(/A3-Bank/)).toBeTruthy();
+
+    await act(async () => {
+      a1Assets.resolve(fakeAssetsSummary('A1-Bank'));
+      await a1Assets.promise.catch(() => {});
+    });
+
+    expect(screen.getByText(/A3-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/A1-Bank/)).toBeNull();
   });
 });

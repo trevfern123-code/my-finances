@@ -117,10 +117,10 @@ export type PreferencesFetchOutcome = { status: 'ready'; payload: UserPreference
  * transaction/dashboard-data reads `refreshFinancialData` below fetches (everything except
  * preferences and the three reporting-range-parameterized datasets). Distinct from `loading`
  * exactly the way `PreferencesFetchOutcome` is distinct from it: `loading` is set/cleared by
- * *every* `refreshFinancialData` call, including ordinary same-session background refreshes (a
- * successful Plaid link, an account sync, ...), but this outcome is written only by that
- * function's `isInitial: true` invocations — the one fired from the session-change effect, and
- * the financial-error gate's own Retry. No unrelated background activity can ever regress this
+ * *every* `refreshFinancialData` call, but this outcome is written only by whichever invocation is
+ * "readiness-producing" for the current lifecycle — see `financialReadySessionIdRef`'s and
+ * `refreshFinancialData`'s own comments for exactly what that means and why it's determined by the
+ * invocation itself, not by a caller-supplied flag. No unrelated activity can ever regress this
  * back to 'loading' or 'error' once the current lifecycle's own initial batch has actually
  * succeeded — see the render body's own comment for why that matters (the financial-dependent
  * content gate must distinguish "this lifecycle has never successfully loaded its own financial
@@ -416,6 +416,42 @@ export default function App() {
   // line performs already happens before any previous lifecycle's in-flight request could resolve.
   const financialRequestIdRef = useRef(0);
 
+  // Tracks, for the CURRENT session only, whether financial lifecycle readiness has EVER actually
+  // been *committed* — the sessionId this holds is the one it was last set FOR, so comparing it
+  // against `sessionIdRef.current` at any later moment answers "has THIS session's initial
+  // financial batch already succeeded once?" Read (not written) at the very start of every
+  // refreshFinancialData call — see that function's own comment for why "readiness-producing" must
+  // be decided there, from this ref, rather than from a caller-supplied flag or from reading
+  // `financialLifecycleStatus` itself (a derived render value refreshFinancialData, a stable
+  // useCallback, has no safe way to read fresh — this ref is the lifecycle-safe substitute, kept
+  // in sync at the exact moment 'ready' is actually committed). Needs no explicit reset on a
+  // lifecycle change: a new session's id can never equal whatever this ref holds from the previous
+  // one (or `undefined`, before any session has ever reached ready), so every new lifecycle's first
+  // invocation is automatically readiness-producing again without any extra bookkeeping.
+  const financialReadySessionIdRef = useRef<string | undefined>(undefined);
+
+  // Per-resource invocation counters for the ad-hoc, single-dataset refresh functions further down
+  // (refreshRecurringStreams, refreshLoans, refreshAssetsSummary, refreshBudgetCategories, and the
+  // two direct post-action transaction refetches in handleSyncTransactions/
+  // handleSaveCategoryMapping) — deliberately NOT folded into financialRequestIdRef above: these
+  // are independent, narrowly-targeted operations (a Loans-tab refresh has nothing to do with a
+  // Budget-tab refresh), and forcing them through one shared counter would let an unrelated
+  // resource's newer call spuriously invalidate this one's still-legitimate in-flight request.
+  // `transactions` is shared by the two call sites that both refetch that same resource, so a
+  // same-session overlap between them still resolves to whichever is genuinely latest. Combined
+  // with a session check (sessionIdRef.current) at each call site's own commit, this closes the
+  // cross-lifecycle race these ad-hoc functions previously had no protection against at all: an
+  // old lifecycle's slow-to-resolve response landing in current state well after a new lifecycle
+  // is already fully ready, something the financialLifecycleStatus gate alone cannot catch once
+  // the new lifecycle has already reached 'ready'.
+  const adHocRequestIdsRef = useRef({
+    recurringStreams: 0,
+    loans: 0,
+    assetsSummary: 0,
+    budgetCategories: 0,
+    transactions: 0,
+  });
+
   // Only usable if it was actually fetched under the sessionId that's current *right now* — a
   // pure, per-render derivation (no mutation, no effect-ordering dependency) rather than a
   // separate "clear the old value" step, which would need to run before NavLayoutScope's own
@@ -506,14 +542,24 @@ export default function App() {
   // `loading` any longer decides whether to unmount the authenticated preference scope — see the
   // render body's own comment.
   //
-  // `options.isInitial` distinguishes the current lifecycle's own INITIAL financial-batch
-  // invocation (the one fired from the session-change effect, and the financial-error gate's own
-  // Retry — see FinancialFetchOutcome's doc comment) from an ordinary BACKGROUND refresh. Only an
-  // `isInitial` call ever writes `financialOutcome`/`financialOutcomeSessionId`, the state
-  // `financialLifecycleStatus` (and therefore the render body's financial-content gate) depends
-  // on; a background call's own failure still surfaces via the existing `actionError` banner, but
-  // never regresses an already-'ready' lifecycle's financial content gate back to loading/error —
-  // see the render body's own comment for why that gate must stay this narrowly scoped.
+  // Whether THIS invocation is "readiness-producing" — i.e. eligible to write
+  // financialOutcome/financialOutcomeSessionId, the state financialLifecycleStatus (and therefore
+  // the render body's financial-content gate) depends on — is no longer decided by a caller-
+  // supplied flag (a previous design's `isInitial` parameter). Codex found that design could
+  // strand the lifecycle forever: if a background call (e.g. Plaid) started and became the LATEST
+  // invocation before the original initial call had finished, the background call — not marked
+  // initial — would commit all nine datasets but be forbidden from ever setting financialOutcome,
+  // while the original initial call, now superseded, could no longer commit anything either
+  // (isLatest() false) — leaving financialLifecycleStatus stuck at 'loading' with nothing left in
+  // flight that could ever resolve it. Instead: "background" vs. "initial" describes UX behavior
+  // *after* lifecycle readiness exists, not something knowable in advance by the caller. Every
+  // invocation reads `financialReadySessionIdRef` (see its own comment) at ITS OWN start, BEFORE
+  // any await: if the current session hasn't reached readiness yet, THIS invocation is
+  // readiness-producing, fixed for its own whole lifetime — regardless of whether it's the
+  // original session-change-effect call, a Retry, or a same-window Plaid/background call that
+  // happens to overtake it. Once some invocation actually commits readiness for this session (via
+  // isLatest() below), every later call for the same session reads the ref as already-ready and
+  // behaves as an ordinary background refresh instead.
   //
   // Every one of the nine sibling reads below now commits its result only if `isLatest()` still
   // holds at the moment it resolves — the same monotonic-id-plus-session ownership pattern
@@ -527,12 +573,17 @@ export default function App() {
   // actually succeeded), a previous lifecycle's retained state can never be shown as the current
   // one's, even in the window before this gate's own fetch has resolved: nothing reads these nine
   // pieces of state outside that gated area.
-  const refreshFinancialData = useCallback(async (options: { isInitial?: boolean } = {}) => {
+  const refreshFinancialData = useCallback(async () => {
     // Tags this call with the sessionId it was made under, exactly like bootstrapPreferences — see
     // that function's own comment. Comparing bare user ids here would not be enough: "A1 -> logout
     // -> A3" must still reject A1's late response, even though its user id matches A3's just as
     // well.
     const requestedForSessionId = sessionIdRef.current;
+    // Captured HERE, synchronously, before any await — see this function's own leading comment and
+    // financialReadySessionIdRef's for why this must be decided at invocation start rather than
+    // re-derived later (which would let a still-not-ready invocation "steal" readiness
+    // responsibility mid-flight from whichever invocation actually turns out to be latest).
+    const isReadinessProducing = financialReadySessionIdRef.current !== requestedForSessionId;
     const requestId = ++financialRequestIdRef.current;
     const isLatest = () =>
       requestId === financialRequestIdRef.current && requestedForSessionId === sessionIdRef.current;
@@ -607,15 +658,22 @@ export default function App() {
       plaidCategoriesRes,
     ].filter((r): r is PromiseRejectedResult => r.status === 'rejected');
 
-    if (options.isInitial) {
+    if (isReadinessProducing) {
       // The ONLY writer of financialOutcome/financialOutcomeSessionId — gated by the strict
       // isLatest() check (session AND invocation), exactly like preferencesOutcome, since this
       // drives a value re-derived and gated on every render (financialLifecycleStatus), not a
       // one-shot hydration read. ANY failure among the nine is treated as "not ready": partial,
       // failed-bootstrap financial state is exactly what must never be treated as authoritative —
-      // see this function's own comment above.
+      // see this function's own comment above. `financialReadySessionIdRef` is updated in the same
+      // breath as a successful outcome — the only place it's ever written — so every later
+      // invocation for this session correctly reads readiness as already established.
       if (isLatest() && requestedForSessionId) {
-        setFinancialOutcome(failures.length > 0 ? { status: 'error' } : { status: 'ready' });
+        if (failures.length > 0) {
+          setFinancialOutcome({ status: 'error' });
+        } else {
+          setFinancialOutcome({ status: 'ready' });
+          financialReadySessionIdRef.current = requestedForSessionId;
+        }
         setFinancialOutcomeSessionId(requestedForSessionId);
       }
     } else if (failures.length > 0 && stillCurrent) {
@@ -665,12 +723,12 @@ export default function App() {
     setMonthlyBreakdown([]);
     // Two independent calls, not one combined fetch — see bootstrapPreferences' and
     // refreshFinancialData's own comments for why they're kept separate. Both are still fired
-    // together here, unconditionally, on every genuine lifecycle change: this effect is the one
-    // place a *new* lifecycle's preferences AND its own initial financial batch must be
-    // (re-)bootstrapped, as opposed to an ordinary background/Plaid refresh mid-session, which
-    // only ever calls refreshFinancialData with no options (isInitial defaults to false/omitted).
+    // together here, unconditionally, on every genuine lifecycle change. This call is automatically
+    // readiness-producing for the new session (financialReadySessionIdRef can't yet hold its id) —
+    // see refreshFinancialData's own comment for why that's now determined by the invocation
+    // itself rather than by a flag passed here.
     bootstrapPreferences();
-    refreshFinancialData({ isInitial: true });
+    refreshFinancialData();
   }, [sessionId, bootstrapPreferences, refreshFinancialData]);
 
   // The ONE production function that ever fetches any of the three reporting-range-parameterized
@@ -729,9 +787,24 @@ export default function App() {
     );
   }
 
+  // These four ad-hoc, single-resource refreshes (plus the two direct transaction refetches in
+  // handleSyncTransactions/handleSaveCategoryMapping further down) each independently capture
+  // `sessionIdRef.current` and mint a fresh id from their own bucket in adHocRequestIdsRef (see its
+  // own comment) at their own start, then check both again before committing. This closes the
+  // cross-lifecycle race the grouped refreshFinancialData/applyReportingRange ownership can't:
+  // once a new lifecycle has already reached financialLifecycleStatus === 'ready', its content is
+  // no longer behind any gate that could hide a previous lifecycle's stale response — a slow-to-
+  // resolve A-initiated call landing here well after B is fully ready would otherwise silently
+  // render A's data under B. Also guards against a newer SAME-session call being overwritten by an
+  // older one settling later (e.g. two rapid account-customization edits).
   async function refreshRecurringStreams() {
+    const expectedSessionId = sessionIdRef.current;
+    const requestId = ++adHocRequestIdsRef.current.recurringStreams;
     try {
       const res = await getRecurringStreams();
+      if (expectedSessionId !== sessionIdRef.current || requestId !== adHocRequestIdsRef.current.recurringStreams) {
+        return;
+      }
       setRecurringStreams(res.streams);
       setTotalMonthlyOutflow(res.total_monthly_outflow);
       setTotalMonthlyInflow(res.total_monthly_inflow);
@@ -741,8 +814,11 @@ export default function App() {
   }
 
   async function refreshLoans() {
+    const expectedSessionId = sessionIdRef.current;
+    const requestId = ++adHocRequestIdsRef.current.loans;
     try {
       const res = await getLoans();
+      if (expectedSessionId !== sessionIdRef.current || requestId !== adHocRequestIdsRef.current.loans) return;
       setLoans(res.loans);
       setTotalDebt(res.total_debt);
       setTotalMinimumPayment(res.total_minimum_payment);
@@ -752,8 +828,13 @@ export default function App() {
   }
 
   async function refreshAssetsSummary() {
+    const expectedSessionId = sessionIdRef.current;
+    const requestId = ++adHocRequestIdsRef.current.assetsSummary;
     try {
       const res = await getAssetsSummary();
+      if (expectedSessionId !== sessionIdRef.current || requestId !== adHocRequestIdsRef.current.assetsSummary) {
+        return;
+      }
       setAssetGroups(res.groups);
       setTotalAssets(res.total_assets);
     } catch {
@@ -765,18 +846,40 @@ export default function App() {
   // create/update/categorize endpoints — anything that can change a category's spend needs to
   // refetch the list to stay accurate, rather than trying to patch the values in locally.
   async function refreshBudgetCategories() {
+    const expectedSessionId = sessionIdRef.current;
+    const requestId = ++adHocRequestIdsRef.current.budgetCategories;
     try {
       const res = await getBudgetCategories();
+      if (expectedSessionId !== sessionIdRef.current || requestId !== adHocRequestIdsRef.current.budgetCategories) {
+        return;
+      }
       setBudgetCategories(res.categories);
     } catch {
       // ignore
     }
   }
 
+  // `newItems` arrives as a plain argument, not from a fetch this function itself makes — the
+  // async work already happened inside LinkedAccounts (a child this callback was handed to as a
+  // prop), on its own schedule, unrelated to React's render/commit cycle. Reading
+  // `sessionIdRef.current` at the moment this function actually runs would only ever say "whatever
+  // session is current right now" — useless for detecting staleness, since there's no `await`
+  // inside this function itself to create a "before/after" gap to check across. What must be
+  // compared instead is the session that was active when THIS SPECIFIC callback instance was
+  // created and handed to LinkedAccounts (a closure over `sessionId`, the plain render-scoped
+  // value — fixed for the lifetime of this exact function instance, unlike sessionIdRef.current)
+  // against whatever session is current by the time it's actually invoked. If LinkedAccounts holds
+  // onto this instance across a lifecycle change (its own async refresh resolving after the
+  // component tree it lived in has already been replaced by a new lifecycle's — deliberately not
+  // relied upon as the ownership mechanism, since an unmounted component's own already-in-flight
+  // promise chain still runs and can still call a prop function it captured), this catches it.
   async function handleAccountsRefreshed(newItems: LinkedItem[]) {
+    const expectedSessionId = sessionId;
+    if (expectedSessionId !== sessionIdRef.current) return;
     setItems(newItems);
     // The backend records a net worth snapshot, refreshes loan/liability details, and this view's
-    // grouping all depend on the same freshly-fetched balances — refetch all four.
+    // grouping all depend on the same freshly-fetched balances — refetch all four. Each of these
+    // independently re-verifies session ownership at its own commit — see their own comments.
     applyReportingRange(reportingRangeRef.current);
     refreshLoans();
     refreshAssetsSummary();
@@ -857,9 +960,16 @@ export default function App() {
   async function handleSyncTransactions() {
     setSyncing(true);
     setActionError(null);
+    // See adHocRequestIdsRef's own comment — shared with handleSaveCategoryMapping's own backfill
+    // refetch below, since both refetch the same `transactions` resource.
+    const expectedSessionId = sessionIdRef.current;
+    const requestId = ++adHocRequestIdsRef.current.transactions;
     try {
       await syncTransactionsRequest();
       const res = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
+      if (expectedSessionId !== sessionIdRef.current || requestId !== adHocRequestIdsRef.current.transactions) {
+        return;
+      }
       setTransactions(res.transactions);
       applyReportingRange(reportingRangeRef.current);
       refreshBudgetCategories();
@@ -867,7 +977,9 @@ export default function App() {
       // (manual or webhook-driven) — refetch here so this tab reflects that without a reload.
       refreshRecurringStreams();
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to sync transactions');
+      if (expectedSessionId === sessionIdRef.current) {
+        setActionError(err instanceof Error ? err.message : 'Failed to sync transactions');
+      }
     } finally {
       setSyncing(false);
     }
@@ -1021,9 +1133,15 @@ export default function App() {
       setCategoryMappings((prev) => [...prev.filter((m) => m.plaid_category !== plaidCategory), res.mapping]);
       if (backfill && res.backfilled_count > 0) {
         // Backfilling updates transaction rows directly in the database — refetch so the
-        // Accounts and Budget tabs reflect the newly-assigned categories.
+        // Accounts and Budget tabs reflect the newly-assigned categories. Shares the
+        // `transactions` bucket in adHocRequestIdsRef with handleSyncTransactions's own refetch —
+        // see that function's own comment.
+        const expectedSessionId = sessionIdRef.current;
+        const requestId = ++adHocRequestIdsRef.current.transactions;
         const transactionsRes = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
-        setTransactions(transactionsRes.transactions);
+        if (expectedSessionId === sessionIdRef.current && requestId === adHocRequestIdsRef.current.transactions) {
+          setTransactions(transactionsRes.transactions);
+        }
         refreshBudgetCategories();
       }
       return res.backfilled_count;
@@ -1155,6 +1273,11 @@ export default function App() {
   // awaiting refreshFinancialData first: applyReportingRange only needs reportingRangeRef.current,
   // which is already whatever this lifecycle's own useReportingRange last reported — it doesn't
   // depend on this particular refreshFinancialData call's own results.
+  //
+  // If a Plaid link succeeds before the current lifecycle's own financial data has ever loaded
+  // (financialLifecycleStatus still 'loading' or 'error'), this call's own refreshFinancialData()
+  // invocation is automatically readiness-producing (see that function's own comment) — it isn't a
+  // special case here at all, just the same self-determining behavior every invocation gets.
   function handlePlaidLinked() {
     refreshFinancialData();
     applyReportingRange(reportingRangeRef.current);
@@ -1250,7 +1373,7 @@ export default function App() {
                     // financial-error gate's own Retry below. Skipped when financial data is
                     // already 'ready' (e.g. only preferences failed) — never refetch something
                     // that already succeeded merely because a sibling bootstrap failed.
-                    if (financialLifecycleStatus !== 'ready') refreshFinancialData({ isInitial: true });
+                    if (financialLifecycleStatus !== 'ready') refreshFinancialData();
                   }}
                 >
                   Retry
@@ -1284,9 +1407,10 @@ export default function App() {
               // mounted and its four hooks are already hydrated. Being nested here rather than
               // replacing PreferencesScope (the way the OLD combined `loading` gate incorrectly
               // did — see Round 4's own history) means this can never unmount PreferencesScope: a
-              // background refresh (Plaid, account sync, ...) never touches financialOutcome (see
-              // refreshFinancialData's own comment), so financialLifecycleStatus only ever leaves
-              // 'ready' for a genuine new lifecycle, never for background activity mid-session.
+              // background refresh (Plaid, account sync, ...) that starts *after* this session has
+              // already reached readiness never touches financialOutcome (see refreshFinancialData's
+              // own comment on isReadinessProducing), so financialLifecycleStatus only ever leaves
+              // 'ready' for a genuine new lifecycle, never for such background activity mid-session.
               if (financialLifecycleStatus === 'loading') {
                 return <p className="hint">Loading your financial data...</p>;
               }
@@ -1294,11 +1418,7 @@ export default function App() {
                 return (
                   <p className="error">
                     Couldn't load your financial data.{' '}
-                    <button
-                      type="button"
-                      className="link-button"
-                      onClick={() => refreshFinancialData({ isInitial: true })}
-                    >
+                    <button type="button" className="link-button" onClick={() => refreshFinancialData()}>
                       Retry
                     </button>
                   </p>
