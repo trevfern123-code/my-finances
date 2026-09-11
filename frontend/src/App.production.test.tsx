@@ -52,6 +52,14 @@ const mockGetBudgetCategories = vi.hoisted(() => vi.fn());
 const mockGetTransactions = vi.hoisted(() => vi.fn());
 const mockSyncTransactions = vi.hoisted(() => vi.fn());
 const mockRefreshAccountBalances = vi.hoisted(() => vi.fn());
+// Controlled so Round 7's mutation-lifecycle-leakage regression tests can hold each mutation's own
+// response open/reject it on demand.
+const mockCreateManualLoan = vi.hoisted(() => vi.fn());
+const mockApproveTransaction = vi.hoisted(() => vi.fn());
+const mockCreateBudgetCategory = vi.hoisted(() => vi.fn());
+const mockSaveCategoryMapping = vi.hoisted(() => vi.fn());
+const mockGetPlaidCategories = vi.hoisted(() => vi.fn());
+const mockGetCategoryMappings = vi.hoisted(() => vi.fn());
 
 vi.mock('./lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./lib/api')>();
@@ -66,10 +74,14 @@ vi.mock('./lib/api', async (importOriginal) => {
     getLoans: mockGetLoans,
     getAssetsSummary: mockGetAssetsSummary,
     getManualLoans: vi.fn().mockResolvedValue({ loans: [] }),
-    getCategoryMappings: vi.fn().mockResolvedValue({ mappings: [] }),
-    getPlaidCategories: vi.fn().mockResolvedValue({ categories: [] }),
+    getCategoryMappings: mockGetCategoryMappings,
+    getPlaidCategories: mockGetPlaidCategories,
     syncTransactions: mockSyncTransactions,
     refreshAccountBalances: mockRefreshAccountBalances,
+    createManualLoan: mockCreateManualLoan,
+    approveTransaction: mockApproveTransaction,
+    createBudgetCategory: mockCreateBudgetCategory,
+    saveCategoryMapping: mockSaveCategoryMapping,
     // Not otherwise controlled — only used by the same-session ad-hoc-ordering test (toggling an
     // account checkbox), which just needs a well-formed account back so LinkedAccounts keeps
     // rendering correctly; the specific fields returned are irrelevant to what that test asserts.
@@ -324,6 +336,57 @@ function fakeTransactions(name: string) {
   };
 }
 
+/** A transaction fixture that takes an explicit id (rather than deriving one from `name`) and a
+ *  `needsReview` flag — used by the mutation-lifecycle tests, which deliberately give A's and B's
+ *  transaction the SAME id (simulating the coincidental-collision case a keyed functional-updater
+ *  patch would otherwise still silently apply across) to prove the session guard, not just the
+ *  (already-guaranteed-safe-by-id-mismatch) common case. */
+function fakeTransactionNeedingReview(id: string, name: string, needsReview: boolean) {
+  return {
+    transactions: [
+      {
+        id,
+        amount: 10,
+        iso_currency_code: 'USD',
+        date: '2026-09-01',
+        name,
+        merchant_name: null,
+        category: null,
+        plaid_category: null,
+        pending: false,
+        budget_category_id: null,
+        needs_review: needsReview,
+        splits: [],
+        accounts: { name: 'Checking', nickname: null, plaid_items: { institution_name: null } },
+      },
+    ],
+  };
+}
+
+/** Builds a createManualLoan()-shaped `{ loan }` response with a distinctive name — rendered
+ *  directly by LoanProgress (Loans tab). */
+function fakeManualLoan(name: string) {
+  return {
+    loan: {
+      id: `loan-${name}`,
+      name,
+      loan_type: 'personal' as const,
+      current_balance: 500,
+      origination_principal_amount: null,
+      interest_rate_percentage: null,
+      origination_date: null,
+      term_months: null,
+      minimum_payment_amount: null,
+      next_payment_due_date: null,
+      notes: null,
+      match_text: null,
+      payoff_progress_pct: null,
+      lifetime_principal_paid: 0,
+      lifetime_interest_paid: 0,
+    },
+  };
+}
+
 /** Builds a getLinkedItems() payload with one item that has one real, full-shaped account —
  *  needed (unlike fakeLinkedItems) for the LinkedAccounts UI controls (the "Exclude from net
  *  worth" checkbox) that only render per-account. */
@@ -437,6 +500,8 @@ beforeEach(() => {
   mockGetTransactions.mockResolvedValue({ transactions: [] });
   mockSyncTransactions.mockResolvedValue({});
   mockRefreshAccountBalances.mockResolvedValue({ items: [], is_sandbox: true });
+  mockGetPlaidCategories.mockResolvedValue({ categories: [] });
+  mockGetCategoryMappings.mockResolvedValue({ mappings: [] });
 });
 
 afterEach(() => {
@@ -1749,5 +1814,328 @@ describe('41. A1 -> A3 (same user, new session): ad-hoc ownership uses session_i
 
     expect(screen.getByText(/A3-Bank/)).toBeTruthy();
     expect(screen.queryByText(/A1-Bank/)).toBeNull();
+  });
+});
+
+// --- Round 7: resource-centric ownership — mutation-response leakage + cross-writer ordering ----
+// Codex found two remaining gaps after Round 6. Blocker 1: mutation-response handlers
+// (createManualLoan, categorize/approve/split a transaction, create/update/archive a category,
+// save/delete a category mapping, ...) applied their successful server responses with no
+// auth-lifecycle ownership check at all — the concrete "A creates a manual loan, switches to B, A's
+// create later succeeds and appends to B's loans" failure. Every one of these now captures
+// `expectedSessionId` before its own await and checks `isStillCurrentSession` before applying its
+// functional-updater patch — see that helper's own comment for why a plain session check (not a
+// resource-version reservation) is the correct, smaller mechanism for mutations specifically.
+// Blocker 2: the grouped batch and each targeted single-resource refresh used to own completely
+// separate counters — a targeted assets read and a grouped read of the SAME resource had no shared
+// way to compare "which is newer," so whichever kind of read settled last could win even after the
+// other kind had already committed something newer. `resourceVersionsRef` (see its own comment) now
+// gives every reader of a given resource — grouped or targeted — one shared counter to reserve from.
+
+describe('42. createManualLoan mutation cross-lifecycle ownership: A -> B (Blocker 1)', () => {
+  it("A's pending manual-loan create does not appear once B is ready", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'A-Personal-Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '1000' } });
+
+    const aCreate = deferred<ReturnType<typeof fakeManualLoan>>();
+    mockCreateManualLoan.mockReturnValueOnce(aCreate.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    // Switch to B; B reaches full readiness. activeTab persists as 'loans' across the lifecycle
+    // change — 'Add a loan' only (re)renders once B's own financial batch is ready, so its
+    // reappearance is itself the "B is ready" signal (waitForReady's own 'Customize dashboard'
+    // text only ever renders on the Overview tab).
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('B-Bank'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText('Add a loan')).toBeTruthy());
+
+    // A's create finally succeeds — must be completely inert under B.
+    await act(async () => {
+      aCreate.resolve(fakeManualLoan('A-Personal-Loan'));
+      await aCreate.promise.catch(() => {});
+    });
+
+    act(() => screen.getByText('Loans').click());
+    expect(screen.queryByText('A-Personal-Loan')).toBeNull();
+  });
+});
+
+describe('43. approveTransaction mutation cross-lifecycle ownership: A -> B (Blocker 1)', () => {
+  it("A's pending transaction-approve response does not flip B's same-id transaction", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactionNeedingReview('txn-shared', 'A-Transaction', true));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText('Approve')).toBeTruthy();
+
+    const aApprove = deferred<{ transaction: unknown }>();
+    mockApproveTransaction.mockReturnValueOnce(aApprove.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Approve'));
+      await Promise.resolve();
+    });
+
+    // Switch to B — deliberately the SAME transaction id, simulating the coincidental-collision
+    // case a keyed functional-updater patch alone would not protect against.
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactionNeedingReview('txn-shared', 'B-Transaction', true));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    // activeTab persists as 'accounts' across the lifecycle change — 'Customize dashboard'
+    // (waitForReady's own signal) never appears there; wait for B's own transaction directly.
+    await waitFor(() => expect(screen.getByText('B-Transaction')).toBeTruthy());
+    expect(screen.getByText('Approve')).toBeTruthy(); // still needs review under B
+
+    // A's approve finally succeeds — must not flip B's same-id transaction's needs_review.
+    await act(async () => {
+      aApprove.resolve({ transaction: {} });
+      await aApprove.promise.catch(() => {});
+    });
+
+    expect(screen.getByText('B-Transaction')).toBeTruthy();
+    expect(screen.getByText('Approve')).toBeTruthy(); // still present — not incorrectly cleared
+  });
+});
+
+describe('44. createBudgetCategory mutation cross-lifecycle ownership: A1 -> A3 (Blocker 1)', () => {
+  it("A1's pending category create does not appear once A3 is ready (same user, new session)", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Budget').click());
+
+    act(() => screen.getByText('Add category').click());
+    const form = screen.getByText('Add a budget category').closest('form') as HTMLElement;
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'A1-Category' } });
+    fireEvent.change(within(form).getByLabelText('Monthly budget'), { target: { value: '200' } });
+
+    const a1Create = deferred<{ category: unknown }>();
+    mockCreateBudgetCategory.mockReturnValueOnce(a1Create.promise);
+    await act(async () => {
+      fireEvent.click(within(form).getByText('Add category'));
+      await Promise.resolve();
+    });
+
+    // Same user, new session_id: A1 -> A3. activeTab persists as 'budget' across the lifecycle
+    // change — 'Customize dashboard' (waitForReady's own signal) never appears there; wait for
+    // A3's own category directly.
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetBudgetCategories.mockResolvedValueOnce(fakeBudgetCategories('A3-Category'));
+    act(() => emitAuthEvent(null));
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a3')));
+    await waitFor(() => expect(screen.getByText('A3-Category')).toBeTruthy());
+
+    await act(async () => {
+      a1Create.resolve({
+        category: { id: 'cat-a1', name: 'A1-Category', budget_amount: 200, color: null, sort_order: 0, emoji: null, archived_at: null },
+      });
+      await a1Create.promise.catch(() => {});
+    });
+
+    expect(screen.getByText('A3-Category')).toBeTruthy();
+    expect(screen.queryByText('A1-Category')).toBeNull();
+  });
+});
+
+describe('45. saveCategoryMapping mutation cross-lifecycle ownership: A -> B (Blocker 1)', () => {
+  it("A's pending mapping save does not apply under B, even when the same budget-category id would coincidentally exist", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetPlaidCategories.mockResolvedValue({ categories: ['FOOD_AND_DRINK'] });
+    mockGetBudgetCategories.mockResolvedValueOnce({
+      categories: [
+        { id: 'cat-1', name: 'A-Groceries', budget_amount: 100, color: null, sort_order: 0, emoji: null, archived_at: null, spent: 0, recent_avg_spent: 0 },
+      ],
+    });
+    mockGetCategoryMappings.mockResolvedValueOnce({ mappings: [] });
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Categories').click());
+
+    const select = screen.getByRole('combobox');
+    expect((select as HTMLSelectElement).value).toBe('');
+
+    const aSave = deferred<{ mapping: unknown; backfilled_count: number }>();
+    mockSaveCategoryMapping.mockReturnValueOnce(aSave.promise);
+    await act(async () => {
+      fireEvent.change(select, { target: { value: 'cat-1' } });
+      await Promise.resolve();
+    });
+
+    // Switch to B — deliberately reusing the SAME budget-category id ('cat-1', under a different
+    // name), simulating the coincidental-collision case.
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetPlaidCategories.mockResolvedValue({ categories: ['FOOD_AND_DRINK'] });
+    mockGetBudgetCategories.mockResolvedValueOnce({
+      categories: [
+        { id: 'cat-1', name: 'B-Category', budget_amount: 50, color: null, sort_order: 0, emoji: null, archived_at: null, spent: 0, recent_avg_spent: 0 },
+      ],
+    });
+    mockGetCategoryMappings.mockResolvedValueOnce({ mappings: [] });
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    // activeTab persists as 'settings' across the lifecycle change, but the whole tab-content tree
+    // (including the settings sidebar) still unmounts/remounts behind the financial-lifecycle
+    // gate — wait for the 'Settings' tab button itself to reappear before navigating again.
+    await waitFor(() => expect(screen.getByText('Settings')).toBeTruthy());
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Categories').click());
+    const bSelect = screen.getByRole('combobox');
+    expect((bSelect as HTMLSelectElement).value).toBe(''); // unmapped under B
+
+    // A's save finally succeeds — must not apply under B.
+    await act(async () => {
+      aSave.resolve({ mapping: { id: 'mapping-a', plaid_category: 'FOOD_AND_DRINK', budget_category_id: 'cat-1' }, backfilled_count: 0 });
+      await aSave.promise.catch(() => {});
+    });
+
+    expect((screen.getByRole('combobox') as HTMLSelectElement).value).toBe('');
+  });
+});
+
+describe('46. targeted assets refresh started BEFORE a grouped refresh: the later-started grouped read wins (Blocker 2)', () => {
+  it('targeted #1 starts and is held; grouped #2 starts later and commits; #1 resolving after is inert', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItemsWithAccount('A-Bank', 'acct-1'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const targetedAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(targetedAssets.promise);
+    mockRefreshAccountBalances.mockResolvedValueOnce(fakeLinkedItemsWithAccount('A-Bank', 'acct-1'));
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Grouped-Bank'));
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    act(() => screen.getByText('Overview').click());
+    await waitFor(() => expect(screen.getByText(/Grouped-Bank/)).toBeTruthy());
+
+    await act(async () => {
+      targetedAssets.resolve(fakeAssetsSummary('Targeted-Bank'));
+      await targetedAssets.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Grouped-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/Targeted-Bank/)).toBeNull();
+  });
+});
+
+describe('47. grouped refresh started BEFORE a targeted assets refresh: the later-started targeted read wins (Blocker 2)', () => {
+  it('grouped #1 starts and is held; targeted #2 starts later and commits; #1 resolving after is inert', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItemsWithAccount('A-Bank', 'acct-1'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const groupedAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(groupedAssets.promise);
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Targeted-Bank'));
+    mockRefreshAccountBalances.mockResolvedValueOnce(fakeLinkedItemsWithAccount('A-Bank', 'acct-1'));
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    act(() => screen.getByText('Overview').click());
+    await waitFor(() => expect(screen.getByText(/Targeted-Bank/)).toBeTruthy());
+
+    await act(async () => {
+      groupedAssets.resolve(fakeAssetsSummary('Grouped-Bank'));
+      await groupedAssets.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Targeted-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/Grouped-Bank/)).toBeNull();
+  });
+});
+
+describe('48. recurring-streams targeted vs. grouped ordering shares the same resource-version mechanism (Blocker 2)', () => {
+  it('targeted #1 starts and is held; grouped #2 starts later and commits; #1 resolving after is inert', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const targetedRecurring = deferred<ReturnType<typeof fakeRecurringStreams>>();
+    mockGetRecurringStreams.mockReturnValueOnce(targetedRecurring.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    mockGetRecurringStreams.mockResolvedValueOnce(fakeRecurringStreams('Grouped-Subscription'));
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    act(() => screen.getByText('Subscriptions & Recurring').click());
+    await waitFor(() => expect(screen.getByText(/Grouped-Subscription/)).toBeTruthy());
+
+    await act(async () => {
+      targetedRecurring.resolve(fakeRecurringStreams('Targeted-Subscription'));
+      await targetedRecurring.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Grouped-Subscription/)).toBeTruthy();
+    expect(screen.queryByText(/Targeted-Subscription/)).toBeNull();
+  });
+});
+
+describe('49. handleAccountsRefreshed callback vs. a newer grouped items write (Blocker 2)', () => {
+  it('old account-refresh callback work starts; a newer grouped refresh commits items; the old callback firing after is inert', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Initial-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/A-Initial-Bank/)).toBeTruthy();
+
+    const oldRefresh = deferred<ReturnType<typeof fakeLinkedItems>>();
+    mockRefreshAccountBalances.mockReturnValueOnce(oldRefresh.promise);
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve();
+    });
+
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('Grouped-Bank'));
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    expect(screen.getByText(/Grouped-Bank/)).toBeTruthy();
+
+    await act(async () => {
+      oldRefresh.resolve(fakeLinkedItems('Old-Callback-Bank'));
+      await oldRefresh.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Grouped-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/Old-Callback-Bank/)).toBeNull();
   });
 });
