@@ -112,6 +112,22 @@ const TRANSACTIONS_FETCH_LIMIT = 200;
  */
 export type PreferencesFetchOutcome = { status: 'ready'; payload: UserPreferences } | { status: 'error' };
 
+/**
+ * The current lifecycle's own INITIAL financial-batch outcome — the nine ordinary account/
+ * transaction/dashboard-data reads `refreshFinancialData` below fetches (everything except
+ * preferences and the three reporting-range-parameterized datasets). Distinct from `loading`
+ * exactly the way `PreferencesFetchOutcome` is distinct from it: `loading` is set/cleared by
+ * *every* `refreshFinancialData` call, including ordinary same-session background refreshes (a
+ * successful Plaid link, an account sync, ...), but this outcome is written only by that
+ * function's `isInitial: true` invocations — the one fired from the session-change effect, and
+ * the financial-error gate's own Retry. No unrelated background activity can ever regress this
+ * back to 'loading' or 'error' once the current lifecycle's own initial batch has actually
+ * succeeded — see the render body's own comment for why that matters (the financial-dependent
+ * content gate must distinguish "this lifecycle has never successfully loaded its own financial
+ * data yet" from "a later, unrelated background refresh happened to fail").
+ */
+export type FinancialFetchOutcome = { status: 'ready' } | { status: 'error' };
+
 // The one Navigation write coordinator for this browser tab — a genuine module-level singleton,
 // constructed exactly once when this module is first evaluated, not inside the `App` component
 // function. This is deliberate, not merely a style choice: a `useRef`-scoped instance living
@@ -315,6 +331,10 @@ export default function App() {
   // `preferencesStatus`/`preferencesForCurrentSession`'s derivation below.
   const [preferencesOutcome, setPreferencesOutcome] = useState<PreferencesFetchOutcome | undefined>(undefined);
   const [preferencesOutcomeSessionId, setPreferencesOutcomeSessionId] = useState<string | undefined>(undefined);
+  // The current lifecycle's own INITIAL financial-batch outcome — see FinancialFetchOutcome's own
+  // doc comment above, and `financialLifecycleStatus`'s derivation below.
+  const [financialOutcome, setFinancialOutcome] = useState<FinancialFetchOutcome | undefined>(undefined);
+  const [financialOutcomeSessionId, setFinancialOutcomeSessionId] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -380,6 +400,22 @@ export default function App() {
   // line performs already happens before any previous lifecycle's in-flight request could resolve.
   const preferencesRequestIdRef = useRef(0);
 
+  // A single tab-wide monotonically increasing counter — the ownership tag for the nine ordinary
+  // account/transaction/dashboard-data reads (refreshFinancialData below), mirroring
+  // rangeDataRequestIdRef's exact mechanism. Every refreshFinancialData call — the current
+  // lifecycle's own initial batch, a Plaid-triggered background refresh, or the financial-error
+  // gate's own Retry — mints a new, strictly higher id and hands it to all nine sibling reads;
+  // each read's own commit only applies if its id is still the *latest* one issued at the moment
+  // it resolves AND it was requested under the sessionId that's still current. This is what
+  // prevents a slow-to-resolve older invocation (a previous lifecycle's still-in-flight initial
+  // batch, or an older same-session refresh) from overwriting a newer invocation's already-
+  // committed results, regardless of network arrival order — see refreshFinancialData's own
+  // comment. Like preferencesRequestIdRef (and unlike rangeDataRequestIdRef), this does not need a
+  // separate bump from the session-change effect below: refreshFinancialData is always called
+  // synchronously, in that same effect tick, whenever sessionId changes, so the bump its own first
+  // line performs already happens before any previous lifecycle's in-flight request could resolve.
+  const financialRequestIdRef = useRef(0);
+
   // Only usable if it was actually fetched under the sessionId that's current *right now* — a
   // pure, per-render derivation (no mutation, no effect-ordering dependency) rather than a
   // separate "clear the old value" step, which would need to run before NavLayoutScope's own
@@ -401,6 +437,19 @@ export default function App() {
   const preferencesStatus: 'loading' | 'ready' | 'error' = preferencesOutcomeForCurrentSession?.status ?? 'loading';
   const preferencesForCurrentSession =
     preferencesOutcomeForCurrentSession?.status === 'ready' ? preferencesOutcomeForCurrentSession.payload : undefined;
+  // Same mechanism again, applied to the current lifecycle's own INITIAL financial-batch outcome.
+  // This is what lets the render body distinguish "this lifecycle has never successfully completed
+  // its own initial financial load" (loading — including the entire window before a genuine
+  // lifecycle change's own new invocation has even settled once) from "settled, and it failed"
+  // from "settled, and it succeeded" — a stale outcome tagged with an old sessionId reads as
+  // `undefined` here exactly like preferencesOutcomeForCurrentSession's equivalent does, so a
+  // previous lifecycle's already-'ready' status can never read as the new lifecycle's own.
+  const financialOutcomeForCurrentSession = currentGenerationValue(
+    financialOutcome,
+    financialOutcomeSessionId,
+    sessionId
+  );
+  const financialLifecycleStatus: 'loading' | 'ready' | 'error' = financialOutcomeForCurrentSession?.status ?? 'loading';
 
   // Fetches the current lifecycle's own preferences payload — Dashboard Layout, Appearance,
   // Financial Preferences (incl. the Safe-to-Spend toggles), Reporting Range, and nav_layout — and
@@ -422,18 +471,19 @@ export default function App() {
       requestId === preferencesRequestIdRef.current && requestedForSessionId === sessionIdRef.current;
     try {
       const preferences = await getUserPreferences();
-      // navLayoutRaw stays "tagged, not gated" exactly as it always has — see its own derivation
-      // comment above; a stale response here is harmless because a mismatched tag simply reads as
-      // unusable at read time, so it doesn't need the same latest-invocation write guard as
-      // preferencesOutcome below.
-      setNavLayoutRaw(preferences.nav_layout?.tabs ?? null);
-      if (requestedForSessionId) setNavLayoutRawSessionId(requestedForSessionId);
-      // preferencesOutcome, by contrast, must be gated at the write itself: App re-derives
-      // `preferencesStatus` fresh on *every* render and uses it to gate the entire authenticated
-      // content area, not just to decide once whether to hydrate. A stale write here would
-      // silently regress an already-'ready' (or already-newer-'error') lifecycle to whatever this
-      // older, now-irrelevant request produced.
+      // Every piece of state this one response can produce — navLayoutRaw/navLayoutRawSessionId
+      // *and* preferencesOutcome/preferencesOutcomeSessionId — is treated as ONE atomic ownership
+      // domain, gated by the SAME isLatest() check, before ANY of it is written. Previously
+      // navLayoutRaw was written unconditionally ("tagged, not gated," relying solely on its own
+      // derivation to exclude a stale response at read time) while preferencesOutcome was gated —
+      // that let an older same-session response, arriving after a newer one had already been
+      // accepted, still overwrite Navigation's payload (a mismatched *session* tag would have
+      // caught a different lifecycle's stale response, but two overlapping same-session
+      // invocations share the identical tag, so only this requestId check catches it). Since a
+      // single getUserPreferences() call is the source of both, they must stand or fall together.
       if (isLatest() && requestedForSessionId) {
+        setNavLayoutRaw(preferences.nav_layout?.tabs ?? null);
+        setNavLayoutRawSessionId(requestedForSessionId);
         setPreferencesOutcome({ status: 'ready', payload: preferences });
         setPreferencesOutcomeSessionId(requestedForSessionId);
       }
@@ -454,17 +504,38 @@ export default function App() {
   // bearing on preferencesStatus or on whether PreferencesScope exists: a Plaid-triggered refresh
   // still sets `loading` exactly as before (see the small header indicator), but nothing that reads
   // `loading` any longer decides whether to unmount the authenticated preference scope — see the
-  // render body's own comment. Before this split, a single combined refreshAll() meant any
-  // background call — including one with nothing to do with authentication — forced `loading`
-  // true, which the render body used to (incorrectly) treat as a reason to replace PreferencesScope
-  // with the bootstrap "Loading..." placeholder, unmounting all four preference hooks (and any
-  // in-flight save's SaveStatusTracker) for the duration of that unrelated refresh.
-  const refreshFinancialData = useCallback(async () => {
+  // render body's own comment.
+  //
+  // `options.isInitial` distinguishes the current lifecycle's own INITIAL financial-batch
+  // invocation (the one fired from the session-change effect, and the financial-error gate's own
+  // Retry — see FinancialFetchOutcome's doc comment) from an ordinary BACKGROUND refresh. Only an
+  // `isInitial` call ever writes `financialOutcome`/`financialOutcomeSessionId`, the state
+  // `financialLifecycleStatus` (and therefore the render body's financial-content gate) depends
+  // on; a background call's own failure still surfaces via the existing `actionError` banner, but
+  // never regresses an already-'ready' lifecycle's financial content gate back to loading/error —
+  // see the render body's own comment for why that gate must stay this narrowly scoped.
+  //
+  // Every one of the nine sibling reads below now commits its result only if `isLatest()` still
+  // holds at the moment it resolves — the same monotonic-id-plus-session ownership pattern
+  // applyReportingRange already uses for the three range-dependent datasets. This is what prevents
+  // a slow-to-resolve PREVIOUS lifecycle's still-in-flight initial batch (or an older same-session
+  // invocation) from landing its account/transaction/budget/etc. values into CURRENT state after a
+  // newer invocation has already committed its own — the concrete "A's accounts render under B" /
+  // "an overlapping older financial refresh overwrites a newer one" failures this closes. Combined
+  // with the render body's own financialLifecycleStatus gate (which hides all financial-dependent
+  // content — including Safe to Spend — until the CURRENT lifecycle's own initial batch has
+  // actually succeeded), a previous lifecycle's retained state can never be shown as the current
+  // one's, even in the window before this gate's own fetch has resolved: nothing reads these nine
+  // pieces of state outside that gated area.
+  const refreshFinancialData = useCallback(async (options: { isInitial?: boolean } = {}) => {
     // Tags this call with the sessionId it was made under, exactly like bootstrapPreferences — see
     // that function's own comment. Comparing bare user ids here would not be enough: "A1 -> logout
     // -> A3" must still reject A1's late response, even though its user id matches A3's just as
     // well.
     const requestedForSessionId = sessionIdRef.current;
+    const requestId = ++financialRequestIdRef.current;
+    const isLatest = () =>
+      requestId === financialRequestIdRef.current && requestedForSessionId === sessionIdRef.current;
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
     // blank the entire dashboard when the other calls succeeded fine.
@@ -490,37 +561,38 @@ export default function App() {
       getPlaidCategories(),
     ]);
 
-    if (itemsRes.status === 'fulfilled') {
-      setItems(itemsRes.value.items);
-      setIsSandbox(itemsRes.value.is_sandbox);
+    // All nine sibling commits share this one ownership check — a superseded invocation performs
+    // ZERO state mutations from its response, not even for the datasets that did fetch cleanly.
+    if (isLatest()) {
+      if (itemsRes.status === 'fulfilled') {
+        setItems(itemsRes.value.items);
+        setIsSandbox(itemsRes.value.is_sandbox);
+      }
+      if (transactionsRes.status === 'fulfilled') setTransactions(transactionsRes.value.transactions);
+      if (categoriesRes.status === 'fulfilled') setBudgetCategories(categoriesRes.value.categories);
+      if (recurringRes.status === 'fulfilled') {
+        setRecurringStreams(recurringRes.value.streams);
+        setTotalMonthlyOutflow(recurringRes.value.total_monthly_outflow);
+        setTotalMonthlyInflow(recurringRes.value.total_monthly_inflow);
+      }
+      if (loansRes.status === 'fulfilled') {
+        setLoans(loansRes.value.loans);
+        setTotalDebt(loansRes.value.total_debt);
+        setTotalMinimumPayment(loansRes.value.total_minimum_payment);
+      }
+      if (assetsRes.status === 'fulfilled') {
+        setAssetGroups(assetsRes.value.groups);
+        setTotalAssets(assetsRes.value.total_assets);
+      }
+      if (manualLoansRes.status === 'fulfilled') setManualLoans(manualLoansRes.value.loans);
+      if (categoryMappingsRes.status === 'fulfilled') setCategoryMappings(categoryMappingsRes.value.mappings);
+      if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
     }
-    if (transactionsRes.status === 'fulfilled') setTransactions(transactionsRes.value.transactions);
-    if (categoriesRes.status === 'fulfilled') setBudgetCategories(categoriesRes.value.categories);
-    if (recurringRes.status === 'fulfilled') {
-      setRecurringStreams(recurringRes.value.streams);
-      setTotalMonthlyOutflow(recurringRes.value.total_monthly_outflow);
-      setTotalMonthlyInflow(recurringRes.value.total_monthly_inflow);
-    }
-    if (loansRes.status === 'fulfilled') {
-      setLoans(loansRes.value.loans);
-      setTotalDebt(loansRes.value.total_debt);
-      setTotalMinimumPayment(loansRes.value.total_minimum_payment);
-    }
-    if (assetsRes.status === 'fulfilled') {
-      setAssetGroups(assetsRes.value.groups);
-      setTotalAssets(assetsRes.value.total_assets);
-    }
-    if (manualLoansRes.status === 'fulfilled') setManualLoans(manualLoansRes.value.loans);
-    if (categoryMappingsRes.status === 'fulfilled') setCategoryMappings(categoryMappingsRes.value.mappings);
-    if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
 
-    // Whether THIS call's own lifecycle is still the one currently active — checked once, here,
-    // right after the shared await, and reused for the two remaining state writes below
-    // (`loading`/`actionError`). A stale, now-superseded lifecycle's completion — success OR
-    // failure — must never touch either. (The other per-dataset setters above — items,
-    // transactions, budgetCategories, and so on — are intentionally left as they were: gating those
-    // too is a real, adjacent concern, but it's outside this remediation's declared scope, same as
-    // the original audit's own boundary around Categories/Accounts/Budgets/Plaid.)
+    // Whether THIS call's own lifecycle is still the one currently active — reused below for
+    // `loading`/background `actionError`. Deliberately the coarser, session-only check (not the
+    // stricter `isLatest()` above): a same-session overlap between two background refreshes
+    // toggling `loading` slightly out of order is harmless UI flicker, not a correctness issue.
     const stillCurrent = requestedForSessionId === sessionIdRef.current;
 
     const failures = [
@@ -534,7 +606,24 @@ export default function App() {
       categoryMappingsRes,
       plaidCategoriesRes,
     ].filter((r): r is PromiseRejectedResult => r.status === 'rejected');
-    if (failures.length > 0 && stillCurrent) {
+
+    if (options.isInitial) {
+      // The ONLY writer of financialOutcome/financialOutcomeSessionId — gated by the strict
+      // isLatest() check (session AND invocation), exactly like preferencesOutcome, since this
+      // drives a value re-derived and gated on every render (financialLifecycleStatus), not a
+      // one-shot hydration read. ANY failure among the nine is treated as "not ready": partial,
+      // failed-bootstrap financial state is exactly what must never be treated as authoritative —
+      // see this function's own comment above.
+      if (isLatest() && requestedForSessionId) {
+        setFinancialOutcome(failures.length > 0 ? { status: 'error' } : { status: 'ready' });
+        setFinancialOutcomeSessionId(requestedForSessionId);
+      }
+    } else if (failures.length > 0 && stillCurrent) {
+      // Background-refresh failure path — unchanged from before: surfaces via the existing
+      // actionError banner, never touches financialOutcome, so an already-'ready' lifecycle's
+      // financial content gate stays open and its last-valid data stays visible (see this
+      // function's own comment for why background failures must not re-hide already-ready
+      // content).
       console.error('Some dashboard data failed to load:', failures.map((f) => f.reason));
       setActionError('Some dashboard data failed to load — see console for details.');
     }
@@ -577,10 +666,11 @@ export default function App() {
     // Two independent calls, not one combined fetch — see bootstrapPreferences' and
     // refreshFinancialData's own comments for why they're kept separate. Both are still fired
     // together here, unconditionally, on every genuine lifecycle change: this effect is the one
-    // place a *new* lifecycle's preferences must be (re-)bootstrapped, as opposed to an ordinary
-    // background/Plaid refresh mid-session, which only ever calls refreshFinancialData.
+    // place a *new* lifecycle's preferences AND its own initial financial batch must be
+    // (re-)bootstrapped, as opposed to an ordinary background/Plaid refresh mid-session, which
+    // only ever calls refreshFinancialData with no options (isInitial defaults to false/omitted).
     bootstrapPreferences();
-    refreshFinancialData();
+    refreshFinancialData({ isInitial: true });
   }, [sessionId, bootstrapPreferences, refreshFinancialData]);
 
   // The ONE production function that ever fetches any of the three reporting-range-parameterized
@@ -1114,7 +1204,27 @@ export default function App() {
           instance already has the real values. The only way that's true is if mounting itself
           waits until the real payload exists — so `preferencesStatus === 'loading'`/`'error'` are
           checked and returned from *before* PreferencesScope is ever reached, not passed into it
-          as a prop for it to react to. */}
+          as a prop for it to react to.
+
+          A THIRD, independent gate lives just inside PreferencesScope's own children (see the
+          financialLifecycleStatus check there) for the current lifecycle's own INITIAL financial
+          batch — the nine ordinary account/transaction/dashboard-data reads refreshFinancialData
+          fetches. Preferences and that initial financial batch are kicked off in parallel (the
+          session-change effect below fires both), so preferencesStatus can reach 'ready' — and
+          PreferencesScope can mount — before the financial batch has finished. Without a separate
+          gate for that, the tab content below (which reads items/transactions/budgetCategories/
+          Safe-to-Spend's other inputs directly, not through any lifecycle-tagged derivation) could
+          render whatever those pieces of App state already happened to hold — for a genuine new
+          lifecycle, that's either misleading empty defaults or, worse, a still-retained previous
+          lifecycle's financial data. financialLifecycleStatus is tagged by sessionId exactly like
+          preferencesStatus (see its own derivation), so a stale prior lifecycle's 'ready' can never
+          read as the new one's; unlike preferencesStatus, an ordinary background refresh (Plaid, an
+          account sync, ...) never touches it at all (see refreshFinancialData's own comment), so —
+          just like the preferences gate — it can only ever move away from 'ready' for a genuine new
+          lifecycle, never for background activity mid-session. This is nested inside
+          PreferencesScope, not layered alongside it at this level, specifically so that a still-
+          loading or failed initial financial batch can never cause PreferencesScope itself (and the
+          four hooks/save-status it owns) to be replaced or reset. */}
       <NavLayoutScope
         key={sessionId!}
         userId={userId}
@@ -1129,7 +1239,20 @@ export default function App() {
             return (
               <p className="error">
                 Couldn't load your preferences.{' '}
-                <button type="button" className="link-button" onClick={() => bootstrapPreferences()}>
+                <button
+                  type="button"
+                  className="link-button"
+                  onClick={() => {
+                    bootstrapPreferences();
+                    // A full-backend-outage recovery: if the current lifecycle's initial financial
+                    // batch also hasn't succeeded yet, this one Retry click resolves both, rather
+                    // than requiring a second click once this gate finally lets the user reach the
+                    // financial-error gate's own Retry below. Skipped when financial data is
+                    // already 'ready' (e.g. only preferences failed) — never refetch something
+                    // that already succeeded merely because a sibling bootstrap failed.
+                    if (financialLifecycleStatus !== 'ready') refreshFinancialData({ isInitial: true });
+                  }}
+                >
                   Retry
                 </button>
               </p>
@@ -1152,6 +1275,36 @@ export default function App() {
               onReportingRangeReady={applyReportingRange}
             >
               {({ dashboardLayout, appearance, financialPreferences, reportingRange }) => {
+              // A second, independent gate nested *inside* PreferencesScope — deliberately not
+              // merged with the preferencesStatus gate above. Preferences and the initial
+              // financial batch are fetched in parallel from the same session-change effect (see
+              // that effect's own comment); if the current lifecycle's financial batch hasn't
+              // finished (or failed) yet, financial-dependent content — every tab below, including
+              // Safe to Spend — must stay hidden even though PreferencesScope itself is already
+              // mounted and its four hooks are already hydrated. Being nested here rather than
+              // replacing PreferencesScope (the way the OLD combined `loading` gate incorrectly
+              // did — see Round 4's own history) means this can never unmount PreferencesScope: a
+              // background refresh (Plaid, account sync, ...) never touches financialOutcome (see
+              // refreshFinancialData's own comment), so financialLifecycleStatus only ever leaves
+              // 'ready' for a genuine new lifecycle, never for background activity mid-session.
+              if (financialLifecycleStatus === 'loading') {
+                return <p className="hint">Loading your financial data...</p>;
+              }
+              if (financialLifecycleStatus === 'error') {
+                return (
+                  <p className="error">
+                    Couldn't load your financial data.{' '}
+                    <button
+                      type="button"
+                      className="link-button"
+                      onClick={() => refreshFinancialData({ isInitial: true })}
+                    >
+                      Retry
+                    </button>
+                  </p>
+                );
+              }
+
               // The current web/PWA's own decision about primary-tab-bar order (Overview first,
               // Settings last) — see lib/webTabNav.ts. Recomputed on every render of this
               // render-prop; cheap, and avoids a second piece of state that could drift from

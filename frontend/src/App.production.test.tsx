@@ -37,6 +37,13 @@ const mockUpdateFinancialPreferences = vi.hoisted(() => vi.fn());
 // Controlled so the background-loading-indicator test can hold `loading` true on demand — one of
 // refreshFinancialData's 9 out-of-scope datasets, otherwise trivially stubbed like its siblings.
 const mockGetLinkedItems = vi.hoisted(() => vi.fn());
+// Controlled so Round 5's financial-lifecycle tests can hold this one of the nine ordinary
+// datasets open/reject it on demand, and distinguish "whose" financial data is currently rendered
+// (via a distinctive account name in AccountQuickView, always visible on Overview by default).
+const mockGetAssetsSummary = vi.hoisted(() => vi.fn());
+// Controlled so the Navigation ownership regression test can inspect exactly what layout a save
+// actually persists.
+const mockUpdateNavLayout = vi.hoisted(() => vi.fn());
 
 vi.mock('./lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./lib/api')>();
@@ -49,7 +56,7 @@ vi.mock('./lib/api', async (importOriginal) => {
     getBudgetCategories: vi.fn().mockResolvedValue({ categories: [] }),
     getRecurringStreams: vi.fn().mockResolvedValue({ streams: [], total_monthly_outflow: 0, total_monthly_inflow: 0 }),
     getLoans: vi.fn().mockResolvedValue({ loans: [], total_debt: 0, total_minimum_payment: 0 }),
-    getAssetsSummary: vi.fn().mockResolvedValue({ groups: [], total_assets: 0 }),
+    getAssetsSummary: mockGetAssetsSummary,
     getManualLoans: vi.fn().mockResolvedValue({ loans: [] }),
     getCategoryMappings: vi.fn().mockResolvedValue({ mappings: [] }),
     getPlaidCategories: vi.fn().mockResolvedValue({ categories: [] }),
@@ -59,7 +66,7 @@ vi.mock('./lib/api', async (importOriginal) => {
     updateAppearance: vi.fn().mockResolvedValue({ theme: 'system', accent_color: 'green' }),
     updateFinancialPreferences: mockUpdateFinancialPreferences,
     updateReportingRange: vi.fn().mockResolvedValue({ reporting_range: 'last_6_months' }),
-    updateNavLayout: vi.fn().mockResolvedValue({ nav_layout: { tabs: [] } }),
+    updateNavLayout: mockUpdateNavLayout,
     // PlaidLink's own two direct dependencies — PlaidLink calls createLinkToken() on mount; the
     // Plaid-link test in this file drives the rest through the mocked react-plaid-link hook below.
     createLinkToken: vi.fn().mockResolvedValue({ link_token: 'fake-link-token' }),
@@ -141,6 +148,54 @@ function fakePreferences(overrides: Partial<UserPreferences> = {}): UserPreferen
   };
 }
 
+/** Builds a getAssetsSummary() payload with one checking account whose name is the given,
+ *  distinctive string — rendered directly by AccountQuickView (visible on Overview by default),
+ *  giving Round 5's financial-lifecycle tests an easy, unambiguous "whose financial data is this"
+ *  signal, independent of the range-dependent `summary`/net-worth state (which already has its own
+ *  ownership coverage in the Round 3 tests above). */
+function fakeAssetsSummary(accountName: string, balance = 1000) {
+  return {
+    groups: [
+      {
+        category: 'checking' as const,
+        label: 'Checking',
+        total: balance,
+        accounts: [
+          {
+            id: `acct-${accountName}`,
+            name: accountName,
+            official_name: null,
+            type: 'depository',
+            subtype: 'checking',
+            current_balance: balance,
+            iso_currency_code: 'USD',
+            institution_name: null,
+            savings_goal: null,
+            nickname: null,
+            color: null,
+            icon: null,
+            sort_order: 0,
+            hidden: false,
+            exclude_from_net_worth: false,
+          },
+        ],
+      },
+    ],
+    total_assets: balance,
+  };
+}
+
+/** Builds a getLinkedItems() payload with one item whose institution name is the given,
+ *  distinctive string — rendered directly by LinkedAccounts (Accounts tab). Used alongside
+ *  fakeAssetsSummary to prove two sibling reads from the same refreshFinancialData invocation
+ *  commit together. */
+function fakeLinkedItems(institutionName: string) {
+  return {
+    items: [{ id: `item-${institutionName}`, institution_id: null, institution_name: institutionName, status: 'active' as const, accounts: [] }],
+    is_sandbox: true,
+  };
+}
+
 const emptySummary = {
   net_worth: 0,
   total_assets: 0,
@@ -171,6 +226,17 @@ async function waitForPreferencesError() {
   await waitFor(() => expect(screen.getByText(/Couldn't load your preferences/)).toBeTruthy());
 }
 
+/** Proves preferences are ready (PreferencesScope mounted) while the current lifecycle's initial
+ *  financial batch is still pending — this text only ever renders from inside PreferencesScope's
+ *  own children, so its presence is itself the signal, not just an absence check. */
+async function waitForFinancialLoading() {
+  await waitFor(() => expect(screen.getByText('Loading your financial data...')).toBeTruthy());
+}
+
+async function waitForFinancialError() {
+  await waitFor(() => expect(screen.getByText(/Couldn't load your financial data/)).toBeTruthy());
+}
+
 /** Reads the Overview "Net worth" stat card's displayed value — `null` if the card isn't rendered
  *  at all (OverviewStats only renders once `summary` is non-null; App.tsx's applyReportingRange
  *  clears `summary` to `null` on every lifecycle change and at the start of every range attempt —
@@ -196,6 +262,8 @@ beforeEach(() => {
   stubRangeDataTrivially();
   mockUpdateFinancialPreferences.mockResolvedValue({});
   mockGetLinkedItems.mockResolvedValue({ items: [], is_sandbox: true });
+  mockGetAssetsSummary.mockResolvedValue({ groups: [], total_assets: 0 });
+  mockUpdateNavLayout.mockResolvedValue({ nav_layout: { tabs: [] } });
 });
 
 afterEach(() => {
@@ -755,5 +823,362 @@ describe('20. a genuine lifecycle change still remounts PreferencesScope (contra
     // A genuine lifecycle change DOES remount PreferencesScope — B starts with the customizer
     // closed, not carrying over A's local UI state.
     expect(screen.queryByText('Done')).toBeNull();
+  });
+});
+
+// --- Round 5: financial lifecycle readiness + Navigation bootstrap ownership --------------------
+// Codex found two remaining gaps after Round 4: (1) preferences and the nine ordinary financial
+// datasets are bootstrapped in parallel, so preferencesStatus could reach 'ready' — mounting
+// PreferencesScope — before the current lifecycle's own financial data had ever loaded, exposing
+// either misleading empty defaults (a genuinely new lifecycle) or a previous lifecycle's still-
+// retained financial state; and (2) bootstrapPreferences's latest-invocation ownership protected
+// preferencesOutcome but not navLayoutRaw/navLayoutRawSessionId, which were still written
+// unconditionally, so an older same-session bootstrap response could overwrite Navigation's payload
+// after a newer one had already been accepted. App.tsx now adds a third, independent
+// financialLifecycleStatus gate (nested inside PreferencesScope, never replacing it) plus
+// financialRequestIdRef ownership for the nine datasets' own commits, and treats every piece of
+// state one bootstrapPreferences response can produce (navLayoutRaw included) as one atomic
+// ownership domain gated by the same isLatest() check.
+
+describe('21. slow initial financial load does not expose default/empty results as authoritative (Blocker 1)', () => {
+  it('financial content stays gated behind a loading state until the initial batch resolves', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    const pendingAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(pendingAssets.promise);
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+
+    // Preferences ready (proven by this gate rendering at all), financial batch still pending.
+    await waitForFinancialLoading();
+    expect(screen.queryByText('Customize dashboard')).toBeNull();
+    expect(screen.queryByText('Safe to spend')).toBeNull();
+
+    await act(async () => {
+      pendingAssets.resolve(fakeAssetsSummary('A-Bank Checking'));
+      await pendingAssets.promise;
+    });
+
+    await waitForReady();
+    expect(screen.getByText(/A-Bank Checking/)).toBeTruthy();
+  });
+});
+
+describe('22. A -> B: A\'s financial data must not render for B while B\'s initial batch is pending (Blocker 1)', () => {
+  it('A loads fully with distinctive values; B shows neither A\'s data nor fake defaults while pending', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('A-Bank Checking'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    expect(screen.getByText(/A-Bank Checking/)).toBeTruthy();
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    const bAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(bAssets.promise);
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+
+    await waitForFinancialLoading();
+    expect(screen.queryByText(/A-Bank Checking/)).toBeNull();
+    expect(screen.queryByText('Customize dashboard')).toBeNull();
+
+    await act(async () => {
+      bAssets.resolve(fakeAssetsSummary('B-Bank Savings'));
+      await bAssets.promise;
+    });
+    await waitForReady();
+    expect(screen.getByText(/B-Bank Savings/)).toBeTruthy();
+    expect(screen.queryByText(/A-Bank Checking/)).toBeNull();
+  });
+});
+
+describe('23. A1 -> A3 (same user, new session): retained financial data is excluded the same way (Blocker 1)', () => {
+  it('A1 loads fully; A3 shows neither A1\'s data nor fake defaults while its own batch is pending', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('A1-Bank Checking'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    expect(screen.getByText(/A1-Bank Checking/)).toBeTruthy();
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    const a3Assets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(a3Assets.promise);
+    act(() => emitAuthEvent(null));
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a3')));
+
+    await waitForFinancialLoading();
+    expect(screen.queryByText(/A1-Bank Checking/)).toBeNull();
+
+    await act(async () => {
+      a3Assets.resolve(fakeAssetsSummary('A3-Bank Savings'));
+      await a3Assets.promise;
+    });
+    await waitForReady();
+    expect(screen.getByText(/A3-Bank Savings/)).toBeTruthy();
+    expect(screen.queryByText(/A1-Bank Checking/)).toBeNull();
+  });
+});
+
+describe('24. a late-resolving previous-lifecycle financial request cannot mutate the current lifecycle\'s state (Blocker 1)', () => {
+  it('A\'s stale assets response resolving after B is ready does not overwrite B', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    const aAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(aAssets.promise);
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForFinancialLoading(); // A's own batch still pending
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('B-Bank Checking'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitForReady();
+    expect(screen.getByText(/B-Bank Checking/)).toBeTruthy();
+
+    await act(async () => {
+      aAssets.resolve(fakeAssetsSummary('A-Bank Checking'));
+      await aAssets.promise.catch(() => {});
+    });
+
+    expect(screen.getByText(/B-Bank Checking/)).toBeTruthy();
+    expect(screen.queryByText(/A-Bank Checking/)).toBeNull();
+  });
+});
+
+describe('25. initial financial failure shows an explicit error/retry gate, not fake empty content (Blocker 1)', () => {
+  it('preferences succeed, financial batch fails -> error gate (PreferencesScope stays mounted) -> Retry -> success', async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences({ theme: 'dark' }));
+    mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForFinancialError();
+    expect(screen.queryByText('Customize dashboard')).toBeNull();
+    expect(screen.queryByText('Safe to spend')).toBeNull();
+    // PreferencesScope's own hooks are already mounted/hydrated, independent of the financial
+    // gate — the four hooks are called in PreferencesScope's own body, not inside the children
+    // callback the financial gate short-circuits — proven here by useAppearance's mount effect
+    // having already applied the real (non-default) theme to the document.
+    expect(document.documentElement.dataset.theme).toBe('dark');
+
+    mockGetLinkedItems.mockResolvedValueOnce({ items: [], is_sandbox: true });
+    act(() => screen.getByText('Retry').click());
+
+    await waitForReady();
+    expect(document.documentElement.dataset.theme).toBe('dark'); // same hook instance throughout
+  });
+});
+
+describe('26. full backend outage: one preference Retry also recovers an unresolved financial bootstrap (Blocker 1)', () => {
+  it('both preference bootstrap and the initial financial batch fail; Retry recovers both without a second click', async () => {
+    mockGetUserPreferences.mockRejectedValueOnce(new Error('down'));
+    mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForPreferencesError();
+    // The financial-error gate is never even reached yet — preferencesStatus itself is 'error'.
+    expect(screen.queryByText(/Couldn't load your financial data/)).toBeNull();
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce({ items: [], is_sandbox: true });
+    act(() => screen.getByText('Retry').click());
+
+    await waitForReady();
+    expect(screen.queryByText(/Couldn't load your preferences/)).toBeNull();
+    expect(screen.queryByText(/Couldn't load your financial data/)).toBeNull();
+  });
+});
+
+describe('27. same-session background refresh does not revert financial lifecycle readiness (Blocker 1)', () => {
+  it('a Plaid-triggered background refresh keeps existing financial content visible, never re-enters the initial loading gate', async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('A-Bank Checking'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    expect(screen.getByText(/A-Bank Checking/)).toBeTruthy();
+
+    const pendingAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(pendingAssets.promise);
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    // Even with the background refresh's own assets request still pending, the last-valid current
+    // data stays visible — never replaced by the initial "Loading your financial data..." gate.
+    expect(screen.queryByText('Loading your financial data...')).toBeNull();
+    expect(screen.getByText(/A-Bank Checking/)).toBeTruthy();
+
+    await act(async () => {
+      pendingAssets.resolve(fakeAssetsSummary('A-Bank Checking'));
+      await pendingAssets.promise;
+    });
+  });
+});
+
+describe('28. overlapping background financial refresh invocations: the newer wins regardless of resolution order (Blocker 1)', () => {
+  it('two overlapping Plaid-triggered refreshes; the older settling last does not overwrite the newer', async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Initial-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+
+    const firstRefresh = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(firstRefresh.promise);
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token-1');
+      await Promise.resolve();
+    });
+
+    const secondRefresh = deferred<ReturnType<typeof fakeAssetsSummary>>();
+    mockGetAssetsSummary.mockReturnValueOnce(secondRefresh.promise);
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token-2');
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      secondRefresh.resolve(fakeAssetsSummary('Newer-Bank'));
+      await secondRefresh.promise;
+    });
+    await waitFor(() => expect(screen.getByText(/Newer-Bank/)).toBeTruthy());
+
+    await act(async () => {
+      firstRefresh.resolve(fakeAssetsSummary('Older-Bank'));
+      await firstRefresh.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Newer-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/Older-Bank/)).toBeNull();
+  });
+});
+
+describe('29. all nine sibling financial reads from one invocation commit together (Blocker 1)', () => {
+  it('one successful initial invocation commits both assetGroups (Overview) and items (Accounts tab)', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Sibling-Bank'));
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('Sibling Institution'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+
+    expect(screen.getByText(/Sibling-Bank/)).toBeTruthy(); // from getAssetsSummary
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/Sibling Institution/)).toBeTruthy(); // from getLinkedItems, same invocation
+  });
+});
+
+describe('30. same-session stale bootstrap response cannot replace newer Navigation data (Blocker 2)', () => {
+  it('retry #1 pending with layout A -> retry #2 succeeds with layout B -> retry #1 resolves last with layout A: Navigation reflects B, and a later save persists based on B', async () => {
+    mockGetUserPreferences.mockRejectedValueOnce(new Error('initial failure'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForPreferencesError();
+
+    const retry1 = deferred<UserPreferences>();
+    mockGetUserPreferences.mockReturnValueOnce(retry1.promise);
+    act(() => screen.getByText('Retry').click());
+    await waitForPreferencesError(); // retry #1 still pending — Retry remains clickable
+
+    const retry2 = deferred<UserPreferences>();
+    mockGetUserPreferences.mockReturnValueOnce(retry2.promise);
+    act(() => screen.getByText('Retry').click());
+
+    const layoutB = [
+      { id: 'monthly', visible: true },
+      { id: 'budget', visible: true },
+      { id: 'recurring', visible: true },
+      { id: 'loans', visible: true },
+      { id: 'income', visible: true },
+      { id: 'accounts', visible: false },
+    ];
+    const layoutA = [
+      { id: 'monthly', visible: true },
+      { id: 'budget', visible: true },
+      { id: 'recurring', visible: true },
+      { id: 'loans', visible: false },
+      { id: 'income', visible: true },
+      { id: 'accounts', visible: true },
+    ];
+
+    // Both settle within the SAME batch — #2 (newer, B) first, #1 (older, A) immediately after,
+    // with no intervening render/effect flush between the two. This is deliberate, not
+    // incidental: useNavLayout has its own one-shot hydration guard (hydratedRef) that hydrates
+    // from whichever value of `saved` its effect *actually observes* — if React had a chance to
+    // commit and run that effect after B alone (as two separate `act()` calls would allow), the
+    // effect would already be hydrated-and-locked onto B before A could ever be written, masking
+    // the exact write-level bug under test (an unguarded navLayoutRaw write from a stale
+    // invocation). Resolving both before yielding back to `act()` means React's own automatic
+    // batching coalesces both state updates into ONE commit, so the effect only ever sees
+    // whichever value was *written last* — reproducing Codex's exact "#1 later returns older
+    // payload A before Navigation has hydrated" sequence.
+    await act(async () => {
+      retry2.resolve(fakePreferences({ nav_layout: { tabs: layoutB } }));
+      retry1.resolve(fakePreferences({ nav_layout: { tabs: layoutA } }));
+      await Promise.all([retry2.promise, retry1.promise.catch(() => {})]);
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    await waitForReady();
+
+    // Final rendered Navigation must reflect B — the latest invocation — never the stale A that
+    // happened to be *written* last at the state level.
+    expect(screen.queryByRole('tab', { name: 'Loans' })).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: 'Accounts' })).toBeNull();
+
+    // Perform a Navigation change and verify persistence is based on B, not stale A: toggling
+    // 'monthly' (visible in both A and B, so the toggle itself doesn't distinguish them) should
+    // still send 'accounts: visible=false' (B's own value) in the same save, never A's
+    // 'accounts: visible=true'.
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Navigation').click());
+    // 'Monthly Breakdown' also matches TabNav's own (still-rendered) tab button — find the
+    // Navigation-settings row specifically via its distinct label class.
+    const monthlyLabel = screen
+      .getAllByText('Monthly Breakdown')
+      .find((el) => el.className === 'dashboard-customizer-label')!;
+    const monthlyRow = monthlyLabel.closest('.dashboard-customizer-row') as HTMLElement;
+    await act(async () => {
+      within(monthlyRow).getByText('Hide').click();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(mockUpdateNavLayout).toHaveBeenCalled());
+    const lastCall = mockUpdateNavLayout.mock.calls.at(-1)!;
+    const savedTabs = (lastCall[0] as { tabs: { id: string; visible: boolean }[] }).tabs;
+    const savedAccounts = savedTabs.find((t) => t.id === 'accounts');
+    const savedMonthly = savedTabs.find((t) => t.id === 'monthly');
+    expect(savedAccounts?.visible).toBe(false); // B's value, not stale A's `true`
+    expect(savedMonthly?.visible).toBe(false); // the just-toggled field
+  });
+
+  it('an older same-session bootstrap FAILURE resolving after a newer success remains inert for Navigation too', async () => {
+    mockGetUserPreferences.mockRejectedValueOnce(new Error('initial failure'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForPreferencesError();
+
+    const retry1 = deferred<UserPreferences>();
+    mockGetUserPreferences.mockReturnValueOnce(retry1.promise);
+    act(() => screen.getByText('Retry').click());
+    await waitForPreferencesError();
+
+    const retry2 = deferred<UserPreferences>();
+    mockGetUserPreferences.mockReturnValueOnce(retry2.promise);
+    act(() => screen.getByText('Retry').click());
+
+    await act(async () => {
+      retry2.resolve(fakePreferences({ nav_layout: { tabs: [{ id: 'accounts', visible: false }] } }));
+      await retry2.promise;
+    });
+    await waitForReady();
+    expect(screen.queryByRole('tab', { name: 'Accounts' })).toBeNull();
+
+    await act(async () => {
+      retry1.reject(new Error('stale failure'));
+      await retry1.promise.catch(() => {});
+    });
+
+    expect(screen.getByText('Customize dashboard')).toBeTruthy();
+    expect(screen.queryByText(/Couldn't load your preferences/)).toBeNull();
+    expect(screen.queryByRole('tab', { name: 'Accounts' })).toBeNull(); // still B's layout
   });
 });
