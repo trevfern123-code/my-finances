@@ -17,11 +17,11 @@
 // `BootstrapHarness`) instead of the real one; that copy could (and did) silently drift from what
 // App.tsx actually does. There is now only one place this logic exists — see hooks/useAuthSession.ts.
 import { act, cleanup, render, waitFor } from '@testing-library/react';
-import { useCallback, useEffect, useLayoutEffect, useRef, StrictMode, type MutableRefObject } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, StrictMode, type MutableRefObject } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { NavLayoutScope, navigationWriteCoordinator } from './App';
-import type { AuthState } from './lib/authGeneration';
-import type { NavLayoutEntry } from './lib/api';
+import { NavLayoutScope, PreferencesScope, navigationWriteCoordinator } from './App';
+import { currentGenerationValue, type AuthState } from './lib/authGeneration';
+import type { NavLayoutEntry, UserPreferences } from './lib/api';
 import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
 import { useAuthSession } from './hooks/useAuthSession';
 
@@ -83,6 +83,132 @@ let latestLiveCallback: LiveCallback | null = null;
 function emitAuthEvent(session: FakeSession | null) {
   currentFakeSession = session;
   latestLiveCallback!('AUTH_EVENT', session);
+}
+
+type PrefsFrame = {
+  userId: string | null;
+  sessionId: string | null;
+  dashboardVisibleIds: string[];
+  theme: string;
+  accent: string;
+  minimumCashBuffer: number;
+  savingsRateTarget: number;
+  includeUpcomingBills: boolean;
+  range: string;
+};
+
+/** Builds a full UserPreferences payload (the exact shape App.tsx's real refreshAll() gets back
+ *  from getUserPreferences()) with sensible defaults, so each test only has to override the
+ *  field(s) it actually cares about. */
+function fakePreferences(overrides: Partial<UserPreferences> = {}): UserPreferences {
+  return {
+    dashboard_layout: null,
+    nav_layout: null,
+    theme: 'system',
+    accent_color: 'green',
+    minimum_cash_buffer: 0,
+    upcoming_bills_days: 14,
+    recent_avg_months: 2,
+    savings_rate_target: 15,
+    safe_to_spend_include_upcoming_bills: true,
+    safe_to_spend_include_remaining_budget: true,
+    reporting_range: 'last_6_months',
+    ...overrides,
+  };
+}
+
+/** Imperative escape hatch for tests to simulate "App.tsx's refreshAll() just had its
+ *  getUserPreferences() call resolve" — reassigned on every PreferencesHarness render (same
+ *  pattern as `emitAuthEvent`/`latestLiveCallback` above), always pointing at the currently
+ *  mounted harness instance's own setters. `forSessionId` lets a test simulate a fetch that was
+ *  *initiated* under an earlier sessionId resolving after the lifecycle has already moved on —
+ *  exactly mirroring App.tsx's own `requestedForSessionId` capture in refreshAll. */
+let resolvePreferencesFetch: ((payload: UserPreferences, forSessionId: string) => void) | null = null;
+
+/** Thin test-local wrapper mirroring App.tsx's own preferencesRaw/preferencesRawSessionId state
+ *  and currentGenerationValue derivation exactly — reusing the real, exported PreferencesScope
+ *  and the real currentGenerationValue function, not a re-implementation of either. Directly
+ *  analogous to how AuthHarness already mirrors App.tsx's sessionIdRef/isSessionCurrent wiring
+ *  around the real, exported NavLayoutScope. */
+function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
+  const auth = useAuthSession();
+  const userId = auth.session?.user.id ?? null;
+  const sessionIdRef = useRef(auth.sessionId);
+  useLayoutEffect(() => {
+    sessionIdRef.current = auth.sessionId;
+  }, [auth.sessionId]);
+  const isSessionCurrent = useCallback((id: string) => sessionIdRef.current === id, []);
+
+  const [preferencesRaw, setPreferencesRaw] = useState<UserPreferences | undefined>(undefined);
+  const [preferencesRawSessionId, setPreferencesRawSessionId] = useState<string | undefined>(undefined);
+  const preferencesForCurrentSession = currentGenerationValue(preferencesRaw, preferencesRawSessionId, auth.sessionId);
+
+  resolvePreferencesFetch = (payload, forSessionId) => {
+    setPreferencesRaw(payload);
+    setPreferencesRawSessionId(forSessionId);
+  };
+
+  return (
+    <PreferencesScope
+      key={auth.sessionId ?? 'signed-out'}
+      userId={userId}
+      sessionId={auth.sessionId ?? ''}
+      isSessionCurrent={isSessionCurrent}
+      saved={preferencesForCurrentSession}
+      onReportingRangeReady={() => {}}
+    >
+      {({ dashboardLayout, appearance, financialPreferences, reportingRange }) => {
+        frames.push({
+          userId,
+          sessionId: auth.sessionId,
+          dashboardVisibleIds: dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id),
+          theme: appearance.theme,
+          accent: appearance.accent,
+          minimumCashBuffer: financialPreferences.minimumCashBuffer,
+          savingsRateTarget: financialPreferences.savingsRateTarget,
+          includeUpcomingBills: financialPreferences.includeUpcomingBills,
+          range: reportingRange.range,
+        });
+        return (
+          <div data-testid="prefs-content">
+            <button data-testid="toggle-stats" onClick={() => dashboardLayout.toggleVisibility('stats')}>
+              Toggle stats
+            </button>
+            <button data-testid="set-theme-dark" onClick={() => appearance.setTheme('dark')}>
+              Dark
+            </button>
+            <button data-testid="set-accent-blue" onClick={() => appearance.setAccent('blue')}>
+              Blue
+            </button>
+            <button data-testid="appearance-retry" onClick={() => appearance.retry()}>
+              Retry appearance
+            </button>
+            <span data-testid="appearance-status">{appearance.saveStatus}</span>
+            <button data-testid="set-savings-rate-25" onClick={() => financialPreferences.setSavingsRateTarget(25)}>
+              Set savings 25
+            </button>
+            <button data-testid="set-min-cash-500" onClick={() => financialPreferences.setMinimumCashBuffer(500)}>
+              Set min cash 500
+            </button>
+            <button data-testid="financial-retry" onClick={() => financialPreferences.retry()}>
+              Retry financial
+            </button>
+            <span data-testid="financial-status">{financialPreferences.saveStatus}</span>
+            <button data-testid="set-range-3m" onClick={() => reportingRange.setRange('last_3_months')}>
+              3 months
+            </button>
+            <span data-testid="layout">{JSON.stringify(dashboardLayout.layout)}</span>
+            <span data-testid="theme">{appearance.theme}</span>
+            <span data-testid="accent">{appearance.accent}</span>
+            <span data-testid="savings-rate">{financialPreferences.savingsRateTarget}</span>
+            <span data-testid="min-cash">{financialPreferences.minimumCashBuffer}</span>
+            <span data-testid="include-upcoming-bills">{String(financialPreferences.includeUpcomingBills)}</span>
+            <span data-testid="range">{reportingRange.range}</span>
+          </div>
+        );
+      }}
+    </PreferencesScope>
+  );
 }
 
 function AuthHarness({
@@ -173,6 +299,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn());
   currentFakeSession = null;
   latestLiveCallback = null;
+  resolvePreferencesFetch = null;
   mockOnAuthStateChange.mockImplementation((cb: LiveCallback) => {
     latestLiveCallback = cb;
     return { data: { subscription: { unsubscribe: vi.fn() } } };
@@ -790,5 +917,383 @@ describe('11. NavigationWriteCoordinator lifetime — survives a full harness (A
     expect(fetch).toHaveBeenCalledTimes(1); // still just the old attachment's own (now-settled) call
 
     mountNew.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Authenticated preference isolation remediation — PreferencesScope (Dashboard Layout, Appearance,
+// Financial Preferences incl. Safe-to-Spend, Reporting Range). Mirrors the NavLayoutScope test
+// sections above in structure and intent: these four hooks used to live directly in App, which
+// never unmounts across auth transitions, so each hook's one-shot `hydrated` ref only ever
+// hydrated once *ever* — a later fetch for a different user, or the same user's new session, was
+// silently ignored. PreferencesHarness exercises the real, exported PreferencesScope exactly the
+// way AuthHarness already exercises the real, exported NavLayoutScope.
+// ---------------------------------------------------------------------------------------------
+
+describe('12. PreferencesScope — cross-lifecycle isolation (all four preference systems)', () => {
+  it("A -> B without a page reload: B never renders A's dashboard layout, theme, financial preferences, or reporting range", async () => {
+    const frames: PrefsFrame[] = [];
+    render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(
+        fakePreferences({
+          dashboard_layout: { cards: [{ id: 'stats', visible: false }] },
+          theme: 'dark',
+          accent_color: 'purple',
+          minimum_cash_buffer: 1000,
+          savings_rate_target: 40,
+          safe_to_spend_include_upcoming_bills: false,
+          reporting_range: 'last_12_months',
+        }),
+        'sid-a1'
+      );
+    });
+    await waitFor(() => expect(frames.some((f) => f.userId === 'user-a')).toBe(true));
+    const aFrame = frames.filter((f) => f.userId === 'user-a').at(-1)!;
+    expect(aFrame.theme).toBe('dark');
+    expect(aFrame.range).toBe('last_12_months');
+    expect(aFrame.dashboardVisibleIds).not.toContain('stats');
+
+    // B logs in — same tab, no reload.
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-b1'); // B's own defaults — nothing like A's
+    });
+
+    await waitFor(() => expect(frames.some((f) => f.userId === 'user-b')).toBe(true));
+    const bFrame = frames.filter((f) => f.userId === 'user-b').at(-1)!;
+    // Dashboard Layout: B does not render A's dashboard layout.
+    expect(bFrame.dashboardVisibleIds).toContain('stats');
+    // Appearance: B does not keep A's authenticated appearance after hydration.
+    expect(bFrame.theme).toBe('system');
+    expect(bFrame.accent).toBe('green');
+    // Financial Preferences (incl. Safe-to-Spend): B receives B's own preferences/values.
+    expect(bFrame.minimumCashBuffer).toBe(0);
+    expect(bFrame.savingsRateTarget).toBe(15);
+    expect(bFrame.includeUpcomingBills).toBe(true);
+    // Reporting Range: B's reports use B's reporting range.
+    expect(bFrame.range).toBe('last_6_months');
+  });
+
+  it("A1 -> A3 same-user relogin: A3 rehydrates from the server rather than keeping A1's in-memory state", async () => {
+    const frames: PrefsFrame[] = [];
+    render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ theme: 'light', savings_rate_target: 10, reporting_range: 'this_month' }), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+
+    // A signs out, then back in as themselves — a brand-new Supabase session_id, simulating a
+    // change made on another device in between (a newer savings_rate_target/range on the server).
+    act(() => emitAuthEvent(null));
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a3')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ theme: 'dark', savings_rate_target: 25, reporting_range: 'last_12_months' }), 'sid-a3');
+    });
+
+    await waitFor(() => {
+      const a3Frame = frames.filter((f) => f.sessionId === 'sid-a3').at(-1)!;
+      expect(a3Frame.theme).toBe('dark');
+      expect(a3Frame.savingsRateTarget).toBe(25); // Financial Preferences: A1 -> A3 gets the current server range/values
+      expect(a3Frame.range).toBe('last_12_months'); // Reporting Range: A1 -> A3 gets the current server range
+    });
+  });
+
+  it("a stale A fetch resolving after B has already logged in is discarded, even though it resolves last", async () => {
+    const frames: PrefsFrame[] = [];
+    render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    // A's fetch is deliberately NOT resolved yet — B logs in first.
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ theme: 'dark' }), 'sid-b1'); // B's own fetch resolves
+    });
+    await waitFor(() => {
+      const bFrame = frames.filter((f) => f.sessionId === 'sid-b1').at(-1)!;
+      expect(bFrame.theme).toBe('dark');
+    });
+
+    // A's stale fetch — tagged with A's own sessionId — finally resolves, after B's.
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ theme: 'light' }), 'sid-a1');
+    });
+
+    // B's scope must still show B's own (already-hydrated) theme — A's late response never
+    // reaches it, both because it's tagged with a sessionId that no longer matches, and because
+    // B's hook already hydrated once and ignores any further saved-prop change regardless.
+    const last = frames.at(-1)!;
+    expect(last.sessionId).toBe('sid-b1');
+    expect(last.theme).toBe('dark');
+  });
+
+  it('a stale A1 fetch resolving after A3 is discarded (same user, different lifecycle)', async () => {
+    const frames: PrefsFrame[] = [];
+    render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    // A1's fetch is not resolved yet.
+    act(() => emitAuthEvent(null));
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a3')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ savings_rate_target: 25 }), 'sid-a3');
+    });
+    await waitFor(() => {
+      const a3Frame = frames.filter((f) => f.sessionId === 'sid-a3').at(-1)!;
+      expect(a3Frame.savingsRateTarget).toBe(25);
+    });
+
+    // A1's stale fetch finally resolves, after A3's.
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ savings_rate_target: 10 }), 'sid-a1');
+    });
+
+    const last = frames.at(-1)!;
+    expect(last.sessionId).toBe('sid-a3');
+    expect(last.savingsRateTarget).toBe(25); // not A1's stale 10
+  });
+
+  it('a token refresh under the same session_id does not remount or re-hydrate any of the four hooks', async () => {
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ theme: 'dark', accent_color: 'green' }), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.theme === 'dark')).toBe(true));
+
+    // A locally edits the accent — this must survive a same-session token refresh untouched. A
+    // spurious remount would lose this unpersisted-yet local edit and fall back to whatever
+    // useAppearance's own hydration effect re-derives from `saved` (still tagged sid-a1, still
+    // 'green') — so surviving as 'blue' is a real, distinguishing signal that no remount happened.
+    vi.mocked(fetch).mockResolvedValue(okResponse({ theme: 'dark', accent_color: 'blue' }) as never);
+    act(() => getByTestId('set-accent-blue').click());
+    await waitFor(() => expect(getByTestId('accent').textContent).toBe('blue'));
+
+    // A token refresh: same user, same session_id (fakeSession is deterministic per (userId,
+    // sessionId) pair, so calling it again with the identical pair models Supabase re-emitting
+    // the same session after a refresh — the access token changes in practice, but this harness
+    // doesn't need to vary the token string for sessionId comparisons to hold).
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+
+    // sessionId is unchanged, so PreferencesScope never remounts, and no new hydration happens —
+    // the locally-edited accent is untouched. A spurious remount would have reset it to 'green'
+    // (useAppearance's hydration effect re-deriving from `saved`, still tagged sid-a1).
+    expect(getByTestId('accent').textContent).toBe('blue');
+  });
+});
+
+describe('13. Dashboard Layout — save ownership', () => {
+  it('a toggle made under A cannot persist an A-derived layout once B is current', async () => {
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+
+    // A's own session lookup for this save is held open until after B becomes current.
+    const lookup = deferred<{ data: { session: FakeSession | null } }>();
+    mockGetSession.mockReturnValueOnce(lookup.promise);
+    act(() => getByTestId('toggle-stats').click()); // A's edit — save() dispatched, awaiting getSession()
+
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1'))); // B becomes current before the lookup resolves
+
+    await act(async () => {
+      lookup.resolve({ data: { session: fakeSession('user-b', 'sid-b1') } }); // the session actually returned is B's
+      await lookup.promise;
+    });
+
+    expect(fetch).not.toHaveBeenCalled(); // A's edit never reached the network under B's credentials
+  });
+});
+
+describe('14. Appearance — stale save completion and Retry cannot cross into a new lifecycle', () => {
+  it("a stale A save success cannot update B's appearance save status", async () => {
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+
+    const fetchCall = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    vi.mocked(fetch).mockReturnValueOnce(fetchCall.promise as never);
+    act(() => getByTestId('set-theme-dark').click()); // A's save dispatched, held open
+    await waitFor(() => expect(getByTestId('appearance-status').textContent).toBe('saving'));
+
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1'))); // B becomes current — a fresh scope mounts
+    expect(getByTestId('appearance-status').textContent).toBe('idle'); // B's brand-new tracker starts idle
+
+    // A's stale save finally settles successfully.
+    await act(async () => {
+      fetchCall.resolve(okResponse({ theme: 'dark', accent_color: 'green' }));
+      await fetchCall.promise;
+    });
+
+    // B's own (freshly mounted) appearance scope must never show a save it never made.
+    expect(getByTestId('appearance-status').textContent).toBe('idle');
+  });
+
+  it("a stale A Retry cannot execute A's appearance write under B's credentials", async () => {
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: () => Promise.resolve({ error: 'network down' }),
+    } as never);
+    act(() => getByTestId('set-theme-dark').click()); // A's save fails
+    await waitFor(() => expect(getByTestId('appearance-status').textContent).toBe('error'));
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1'))); // B logs in — a fresh scope, nothing failed yet
+
+    // B's Retry button belongs to a brand-new SaveStatusTracker (PreferencesScope remounted) —
+    // there's nothing of B's own to retry, so it must be a no-op: no new network call.
+    act(() => getByTestId('appearance-retry').click());
+    expect(fetch).toHaveBeenCalledTimes(1); // still just A's original (already-settled) failed call
+  });
+});
+
+describe('15. Financial Preferences (incl. Safe-to-Spend) — the priority regression target', () => {
+  it("A1 -> A3: A3 rehydrates the server's current values, and editing one field does not clobber the others back to A1's stale snapshot", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      okResponse({
+        minimum_cash_buffer: 500,
+        upcoming_bills_days: 14,
+        recent_avg_months: 2,
+        savings_rate_target: 25,
+        safe_to_spend_include_upcoming_bills: true,
+        safe_to_spend_include_remaining_budget: true,
+      }) as never
+    );
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    // A1: hydrates with the OLD savings_rate_target (15) — the value before a change made on
+    // another device.
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ savings_rate_target: 15 }), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+
+    // A signs out, then back in as themselves (A3) — without a page reload. The server now has a
+    // NEWER savings_rate_target (25), set from another device in between.
+    act(() => emitAuthEvent(null));
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a3')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences({ savings_rate_target: 25, minimum_cash_buffer: 0 }), 'sid-a3');
+    });
+
+    // A3 must show the server's current value, not A1's stale one.
+    await waitFor(() => expect(getByTestId('savings-rate').textContent).toBe('25'));
+
+    // A3 edits ONE field (minimum_cash_buffer) — this must persist savings_rate_target=25 (A3's
+    // own rehydrated value), never A1's stale 15, even though A1's in-memory state existed first.
+    act(() => getByTestId('set-min-cash-500').click());
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
+    const sentBody = JSON.parse((lastCall[1] as RequestInit).body as string);
+    expect(sentBody.minimum_cash_buffer).toBe(500); // the actual edit
+    expect(sentBody.savings_rate_target).toBe(25); // A3's own value — never A1's stale 15
+  });
+
+  it("a stale A1 save cannot execute under A3's credentials", async () => {
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+
+    const lookup = deferred<{ data: { session: FakeSession | null } }>();
+    mockGetSession.mockReturnValueOnce(lookup.promise);
+    act(() => getByTestId('set-savings-rate-25').click()); // A1's edit — awaiting its own session lookup
+
+    act(() => emitAuthEvent(null));
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a3'))); // same user re-logs in before the lookup resolves
+
+    await act(async () => {
+      lookup.resolve({ data: { session: fakeSession('user-a', 'sid-a3') } }); // returns A3's session, not A1's
+      await lookup.promise;
+    });
+
+    expect(fetch).not.toHaveBeenCalled(); // A1's edit never reached the network under A3
+  });
+});
+
+describe('16. Reporting Range — save ownership', () => {
+  it("a stale A range save cannot execute under B's credentials", async () => {
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+
+    const lookup = deferred<{ data: { session: FakeSession | null } }>();
+    mockGetSession.mockReturnValueOnce(lookup.promise);
+    act(() => getByTestId('set-range-3m').click()); // A's range change — awaiting its own session lookup
+
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+
+    await act(async () => {
+      lookup.resolve({ data: { session: fakeSession('user-b', 'sid-b1') } });
+      await lookup.promise;
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('17. PreferencesScope under StrictMode', () => {
+  it('a real edit under StrictMode setup -> cleanup -> setup actually reaches persistence', async () => {
+    vi.mocked(fetch).mockResolvedValue(okResponse({ theme: 'dark', accent_color: 'green' }) as never);
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(
+      <StrictMode>
+        <PreferencesHarness frames={frames} />
+      </StrictMode>
+    );
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+
+    act(() => getByTestId('set-theme-dark').click());
+
+    // If StrictMode's simulated cleanup had left any of the four hooks (or their SaveStatusTracker)
+    // in a broken state, this would silently never reach the network.
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    await waitFor(() => expect(getByTestId('appearance-status').textContent).toBe('saved'));
+
+    // Exactly one PUT reached the network for this one click — StrictMode's double-invoke must not
+    // have caused a double-persist.
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

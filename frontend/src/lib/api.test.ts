@@ -5,7 +5,13 @@ vi.mock('./supabaseClient', () => ({
   supabase: { auth: { getSession: mockGetSession } },
 }));
 
-import { updateNavLayout } from './api';
+import {
+  updateNavLayout,
+  updateDashboardLayout,
+  updateAppearance,
+  updateFinancialPreferences,
+  updateReportingRange,
+} from './api';
 
 const SESSION_A = { user: { id: 'user-a' }, access_token: 'a-token' };
 const SESSION_B = { user: { id: 'user-b' }, access_token: 'b-token' };
@@ -92,5 +98,80 @@ describe('updateNavLayout — request bound to the authenticated owner', () => {
 
     await expect(updateNavLayout({ tabs: [] }, verifyOwnership)).rejects.toThrow();
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The authenticated-preference-isolation remediation made `verifyOwnership` required (not
+ * optional) on every one of these four update* functions too, for the identical reason
+ * updateNavLayout already required it — closing the narrow window where a save created under one
+ * authenticated lifecycle could otherwise be sent under whichever lifecycle happens to be current
+ * by the time authedFetch's own session lookup resolves. These are deliberately compact (one
+ * owner-mismatch case, one success case) per function rather than the full 5-case matrix above —
+ * the underlying mechanism (authedFetch's verifyOwnership check, including the clock-skew retry)
+ * is already exhaustively covered there; what these confirm is only that each function actually
+ * threads its own verifyOwnership argument through to it, catching a copy-paste mistake in any
+ * one of the four.
+ */
+describe.each([
+  {
+    label: 'updateDashboardLayout',
+    call: (verify: (session: { user: { id: string } }) => boolean) =>
+      updateDashboardLayout({ cards: [] }, verify as never),
+    successBody: { dashboard_layout: { cards: [] } },
+  },
+  {
+    label: 'updateAppearance',
+    call: (verify: (session: { user: { id: string } }) => boolean) =>
+      updateAppearance({ theme: 'dark', accent_color: 'green' }, verify as never),
+    successBody: { theme: 'dark', accent_color: 'green' },
+  },
+  {
+    label: 'updateFinancialPreferences',
+    call: (verify: (session: { user: { id: string } }) => boolean) =>
+      updateFinancialPreferences(
+        {
+          minimum_cash_buffer: 0,
+          upcoming_bills_days: 14,
+          recent_avg_months: 2,
+          savings_rate_target: 15,
+          safe_to_spend_include_upcoming_bills: true,
+          safe_to_spend_include_remaining_budget: true,
+        },
+        verify as never
+      ),
+    successBody: {
+      minimum_cash_buffer: 0,
+      upcoming_bills_days: 14,
+      recent_avg_months: 2,
+      savings_rate_target: 15,
+      safe_to_spend_include_upcoming_bills: true,
+      safe_to_spend_include_remaining_budget: true,
+    },
+  },
+  {
+    label: 'updateReportingRange',
+    call: (verify: (session: { user: { id: string } }) => boolean) =>
+      updateReportingRange({ reporting_range: '3m' as never }, verify as never),
+    successBody: { reporting_range: '3m' },
+  },
+])('$label — request bound to the authenticated owner', ({ call, successBody }) => {
+  it('does not send the write if the session resolves to a different user before the lookup completes', async () => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_B } });
+    const verifyOwnership = (session: { user: { id: string } }) => session.user.id === 'user-a';
+
+    await expect(call(verifyOwnership)).rejects.toThrow(/owner/i);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('succeeds normally when ownership verifies', async () => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+    vi.mocked(fetch).mockResolvedValue(okResponse(successBody) as never);
+    const verifyOwnership = (session: { user: { id: string } }) => session.user.id === 'user-a';
+
+    const result = await call(verifyOwnership);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(successBody);
   });
 });

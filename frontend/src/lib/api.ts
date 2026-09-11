@@ -646,19 +646,26 @@ export function getUserPreferences(): Promise<UserPreferences> {
   return authedFetch('/api/user-preferences');
 }
 
-export function updateDashboardLayout(layout: DashboardLayout): Promise<{ dashboard_layout: DashboardLayout }> {
-  return authedFetch('/api/user-preferences/dashboard-layout', {
-    method: 'PUT',
-    body: JSON.stringify(layout),
-  });
+/**
+ * `verifyOwnership` is required (not optional) on every update* function in this file, for the
+ * same reason it's required on updateNavLayout: each of these saves must be bound to the
+ * authenticated identity it was created for, checked at the moment the request is actually about
+ * to be sent — including on a clock-skew retry — never merely at the moment the caller decided to
+ * save. See authedFetch's own doc comment for exactly what this closes, and App.tsx's
+ * PreferencesScope for how each hook's verifyOwnership is assembled.
+ */
+export function updateDashboardLayout(
+  layout: DashboardLayout,
+  verifyOwnership: (session: Session) => boolean
+): Promise<{ dashboard_layout: DashboardLayout }> {
+  return authedFetch(
+    '/api/user-preferences/dashboard-layout',
+    { method: 'PUT', body: JSON.stringify(layout) },
+    false,
+    verifyOwnership
+  );
 }
 
-/**
- * `verifyOwnership` is required (not optional) here, deliberately: every Navigation save must be
- * bound to the authenticated identity it was created for, checked at the moment this request is
- * actually about to be sent — including on a clock-skew retry — never merely at the moment the
- * caller decided to save. See authedFetch's own doc comment for exactly what this closes.
- */
 export function updateNavLayout(
   layout: NavLayout,
   verifyOwnership: (session: Session) => boolean
@@ -671,31 +678,41 @@ export function updateNavLayout(
   );
 }
 
-export function updateAppearance(appearance: {
-  theme: string;
-  accent_color: string;
-}): Promise<{ theme: string; accent_color: string }> {
-  return authedFetch('/api/user-preferences/appearance', {
-    method: 'PUT',
-    body: JSON.stringify(appearance),
-  });
+export function updateAppearance(
+  appearance: { theme: string; accent_color: string },
+  verifyOwnership: (session: Session) => boolean
+): Promise<{ theme: string; accent_color: string }> {
+  return authedFetch(
+    '/api/user-preferences/appearance',
+    { method: 'PUT', body: JSON.stringify(appearance) },
+    false,
+    verifyOwnership
+  );
 }
 
-export function updateReportingRange(prefs: { reporting_range: ReportingRangeId }): Promise<{ reporting_range: string }> {
-  return authedFetch('/api/user-preferences/reporting-range', {
-    method: 'PUT',
-    body: JSON.stringify(prefs),
-  });
+export function updateReportingRange(
+  prefs: { reporting_range: ReportingRangeId },
+  verifyOwnership: (session: Session) => boolean
+): Promise<{ reporting_range: string }> {
+  return authedFetch(
+    '/api/user-preferences/reporting-range',
+    { method: 'PUT', body: JSON.stringify(prefs) },
+    false,
+    verifyOwnership
+  );
 }
 
-export function updateFinancialPreferences(prefs: {
-  minimum_cash_buffer: number;
-  upcoming_bills_days: number;
-  recent_avg_months: number;
-  savings_rate_target: number;
-  safe_to_spend_include_upcoming_bills: boolean;
-  safe_to_spend_include_remaining_budget: boolean;
-}): Promise<{
+export function updateFinancialPreferences(
+  prefs: {
+    minimum_cash_buffer: number;
+    upcoming_bills_days: number;
+    recent_avg_months: number;
+    savings_rate_target: number;
+    safe_to_spend_include_upcoming_bills: boolean;
+    safe_to_spend_include_remaining_budget: boolean;
+  },
+  verifyOwnership: (session: Session) => boolean
+): Promise<{
   minimum_cash_buffer: number;
   upcoming_bills_days: number;
   recent_avg_months: number;
@@ -703,8 +720,10 @@ export function updateFinancialPreferences(prefs: {
   safe_to_spend_include_upcoming_bills: boolean;
   safe_to_spend_include_remaining_budget: boolean;
 }> {
-  return authedFetch('/api/user-preferences/financial', {
-    method: 'PUT',
-    body: JSON.stringify(prefs),
-  });
+  return authedFetch(
+    '/api/user-preferences/financial',
+    { method: 'PUT', body: JSON.stringify(prefs) },
+    false,
+    verifyOwnership
+  );
 }

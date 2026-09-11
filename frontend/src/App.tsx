@@ -40,7 +40,6 @@ import {
   type AssetGroup,
   type BudgetCategory,
   type CategoryMapping,
-  type DashboardCardEntry,
   type LinkedItem,
   type Loan,
   type LoanPayment,
@@ -53,12 +52,14 @@ import {
   type RecurringStream,
   type SpendingSummary,
   type TransactionItem,
+  type UserPreferences,
 } from './lib/api';
 import { currentGenerationValue } from './lib/authGeneration';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { decodeSessionId } from './lib/jwt';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
 import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
+import { DEFAULT_REPORTING_RANGE, type ReportingRangeId } from './lib/reportingRange';
 import { buildWebTabList } from './lib/webTabNav';
 import { useAuthSession } from './hooks/useAuthSession';
 import { useDashboardLayout } from './hooks/useDashboardLayout';
@@ -121,12 +122,13 @@ export const navigationWriteCoordinator = new NavigationWriteCoordinator({
  * even a single frame — where one lifecycle's layout could render under a different one.
  *
  * Only this hook's own state is scoped this way — every other piece of App's state (items,
- * transactions, appearance, financial preferences, etc.) intentionally keeps living in the outer,
- * unkeyed App component, exactly as it did before. A render-prop (`children`) is used instead of
- * threading the rest of App's local state through as a long, separate prop list — the function
- * passed as `children` is defined inline inside App's own render body, so it already has ordinary
- * closure access to everything else App owns (activeTab, items, handlers, ...) without this
- * component needing to know about any of it.
+ * transactions, etc.) intentionally keeps living in the outer, unkeyed App component, exactly as
+ * it did before. Dashboard Layout, Appearance, Financial Preferences, and Reporting Range get the
+ * same keyed-scope treatment via the sibling `PreferencesScope` below, for the same reason. A
+ * render-prop (`children`) is used instead of threading the rest of App's local state through as
+ * a long, separate prop list — the function passed as `children` is defined inline inside App's
+ * own render body, so it already has ordinary closure access to everything else App owns
+ * (activeTab, items, handlers, ...) without this component needing to know about any of it.
  */
 export function NavLayoutScope({
   userId,
@@ -161,6 +163,102 @@ export function NavLayoutScope({
   return <>{children(navLayout)}</>;
 }
 
+/**
+ * Scopes the four "older" preference hooks — Dashboard Layout, Appearance, Financial Preferences
+ * (including the Safe-to-Spend toggles), and Reporting Range — and their lifecycle-sensitive
+ * internal state (each hook's own one-shot hydration ref, plus useAppearance's and
+ * useFinancialPreferences's own SaveStatusTracker instance) to exactly one authenticated login
+ * lifecycle. Mirrors `NavLayoutScope` above exactly, for exactly the same reason: App.tsx renders
+ * this keyed by Supabase's own `session_id` JWT claim (`<PreferencesScope key={sessionId} ...>`),
+ * so whenever that changes, React unmounts the previous instance and mounts a brand-new one with
+ * fresh initial state for all four hooks.
+ *
+ * This closes the authenticated-lifecycle isolation defects a standalone audit found: these four
+ * hooks used to live directly in `App`, which never unmounts across auth transitions (A -> B,
+ * A1 -> A3, or a plain logout/login) — so each hook's one-shot `hydrated` ref only ever hydrated
+ * once *ever* per page load, and a later `getUserPreferences()` fetch for a different user, or
+ * the same user's new session, was silently ignored, leaving the previous lifecycle's dashboard
+ * layout, theme, financial preferences, and reporting range visible — and, on the next edit,
+ * persisted — under the new one. Once this scope itself remounts per lifecycle, that same
+ * one-shot hydration ref becomes exactly right: a fresh mount always starts unhydrated, so there
+ * is no window where a stale lifecycle's preferences could ever be shown or persisted over a
+ * newer one's.
+ *
+ * `saved` is the whole `getUserPreferences()` payload — already rejected by App.tsx's own
+ * session-id-tagged derivation (`preferencesForCurrentSession`, built with
+ * lib/authGeneration.ts's currentGenerationValue, the exact mechanism Navigation's own
+ * `navLayoutRawForCurrentSession` already uses) if it doesn't belong to the *current* lifecycle.
+ * That closes the sibling race this scope's remount alone cannot: "A's fetch starts, logout, B
+ * logs in, B's fetch completes, A's fetch resolves last" — A's late response is tagged with A's
+ * own sessionId, so the derivation discards it regardless of arrival order, and it never reaches
+ * these hooks even if B's scope hasn't remounted yet by the time it resolves.
+ *
+ * `verifyOwnership` mirrors NavLayoutScope's exactly: the *returned* session's user id, the
+ * *returned* session's own decoded session_id compared directly against this mount's immutable
+ * `sessionId`, and the ambient `isSessionCurrent` check as additional defense-in-depth. Every
+ * save from any of the four hooks is bound to it, checked by lib/api.ts's authedFetch immediately
+ * before the write is actually sent — including on its clock-skew retry.
+ *
+ * Deliberately narrow, per the remediation's own scope: only these four hooks live here.
+ * `activeTab`, `items`, `transactions`, `summary`/`netWorthHistory`/`monthlyBreakdown`, and every
+ * other piece of App's state stay in the outer, unkeyed `App` component exactly as they did
+ * before. None of these four preferences has a write queue (unlike Navigation), so this — scope-
+ * level hydration reset plus per-save request-time ownership — is the whole mechanism required;
+ * this does not introduce a coordinator or attachment-id system.
+ */
+export function PreferencesScope({
+  userId,
+  sessionId,
+  isSessionCurrent,
+  saved,
+  onReportingRangeReady,
+  children,
+}: {
+  userId: string | null;
+  sessionId: string;
+  isSessionCurrent: (sessionId: string) => boolean;
+  saved: UserPreferences | undefined;
+  onReportingRangeReady: (range: ReportingRangeId) => void;
+  children: (prefs: {
+    dashboardLayout: ReturnType<typeof useDashboardLayout>;
+    appearance: ReturnType<typeof useAppearance>;
+    financialPreferences: ReturnType<typeof useFinancialPreferences>;
+    reportingRange: ReturnType<typeof useReportingRange>;
+  }) => ReactNode;
+}) {
+  const verifyOwnership = (session: Session) =>
+    session.user.id === userId && decodeSessionId(session.access_token) === sessionId && isSessionCurrent(sessionId);
+
+  const dashboardLayout = useDashboardLayout(
+    saved === undefined ? undefined : (saved.dashboard_layout?.cards ?? null),
+    verifyOwnership
+  );
+  const appearance = useAppearance(
+    saved === undefined ? undefined : { theme: saved.theme, accent_color: saved.accent_color },
+    verifyOwnership
+  );
+  const financialPreferences = useFinancialPreferences(
+    saved === undefined
+      ? undefined
+      : {
+          minimum_cash_buffer: saved.minimum_cash_buffer,
+          upcoming_bills_days: saved.upcoming_bills_days,
+          recent_avg_months: saved.recent_avg_months,
+          savings_rate_target: saved.savings_rate_target,
+          safe_to_spend_include_upcoming_bills: saved.safe_to_spend_include_upcoming_bills,
+          safe_to_spend_include_remaining_budget: saved.safe_to_spend_include_remaining_budget,
+        },
+    verifyOwnership
+  );
+  const reportingRange = useReportingRange(
+    saved === undefined ? undefined : saved.reporting_range,
+    verifyOwnership,
+    onReportingRangeReady
+  );
+
+  return <>{children({ dashboardLayout, appearance, financialPreferences, reportingRange })}</>;
+}
+
 export default function App() {
   // `{ session, sessionId }` as one atomic unit, and the bootstrap/live-event wiring that produces
   // it (including the StrictMode/unmount-safe invalidation guard) — see hooks/useAuthSession.ts's
@@ -187,52 +285,47 @@ export default function App() {
   const [totalAssets, setTotalAssets] = useState(0);
   const [categoryMappings, setCategoryMappings] = useState<CategoryMapping[]>([]);
   const [plaidCategories, setPlaidCategories] = useState<string[]>([]);
-  // undefined = not fetched yet, null = fetched but the user has never customized anything —
-  // useDashboardLayout treats both as "use the default layout," it only matters for hydration timing.
-  const [dashboardLayoutRaw, setDashboardLayoutRaw] = useState<DashboardCardEntry[] | null | undefined>(undefined);
   const [navLayoutRaw, setNavLayoutRaw] = useState<NavLayoutEntry[] | null | undefined>(undefined);
   // Tags navLayoutRaw with the sessionId it was fetched under — see the derivation below and
   // lib/authGeneration.ts's currentGenerationValue. This is what lets a fetch response prove it
   // belongs to the *current* authenticated lifecycle, not merely the current user id.
   const [navLayoutRawSessionId, setNavLayoutRawSessionId] = useState<string | undefined>(undefined);
-  const [appearanceRaw, setAppearanceRaw] = useState<
-    { theme: string; accent_color: string } | null | undefined
-  >(undefined);
-  const [financialPreferencesRaw, setFinancialPreferencesRaw] = useState<
-    | {
-        minimum_cash_buffer: number;
-        upcoming_bills_days: number;
-        recent_avg_months: number;
-        savings_rate_target: number;
-        safe_to_spend_include_upcoming_bills: boolean;
-        safe_to_spend_include_remaining_budget: boolean;
-      }
-    | null
-    | undefined
-  >(undefined);
-  const [reportingRangeRaw, setReportingRangeRaw] = useState<string | null | undefined>(undefined);
+  // The whole getUserPreferences() payload for PreferencesScope's four hooks (Dashboard Layout,
+  // Appearance, Financial Preferences, Reporting Range) — undefined until the first fetch for the
+  // current lifecycle completes. Tagged with `preferencesRawSessionId` for exactly the same reason
+  // navLayoutRaw is: see preferencesForCurrentSession's derivation below.
+  const [preferencesRaw, setPreferencesRaw] = useState<UserPreferences | undefined>(undefined);
+  const [preferencesRawSessionId, setPreferencesRawSessionId] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const userId = session?.user.id ?? null;
 
   // Mirrors sessionId for reads from inside async closures (refreshAll's own capture below, and
-  // NavLayoutScope's isSessionCurrent) that must see the *latest* value at the moment they
-  // actually run, not whatever was current when they were defined. Updated in useLayoutEffect, not
-  // during render: a render-phase write here would be a mutation an abandoned/superseded
-  // concurrent render could leave behind even though React never committed it, letting the ref
-  // represent a lifecycle nothing on screen actually reflects. useLayoutEffect only ever runs for
-  // a render React actually committed, and — because it runs synchronously, before the browser can
-  // paint or any pending microtask (like an in-flight authedFetch's session-lookup continuation)
-  // can resume — this write always completes before anything async could possibly read a stale
-  // value past the commit that produced it. This is deliberately kept as an *additional* check
-  // alongside NavLayoutScope's direct, returned-session comparison (see its own doc comment) —
-  // never the only one.
+  // NavLayoutScope's/PreferencesScope's isSessionCurrent) that must see the *latest* value at the
+  // moment they actually run, not whatever was current when they were defined. Updated in
+  // useLayoutEffect, not during render: a render-phase write here would be a mutation an
+  // abandoned/superseded concurrent render could leave behind even though React never committed
+  // it, letting the ref represent a lifecycle nothing on screen actually reflects.
+  // useLayoutEffect only ever runs for a render React actually committed, and — because it runs
+  // synchronously, before the browser can paint or any pending microtask (like an in-flight
+  // authedFetch's session-lookup continuation) can resume — this write always completes before
+  // anything async could possibly read a stale value past the commit that produced it. This is
+  // deliberately kept as an *additional* check alongside each scope's direct, returned-session
+  // comparison (see their own doc comments) — never the only one.
   const sessionIdRef = useRef(sessionId);
   useLayoutEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
   const isSessionCurrent = useCallback((id: string) => sessionIdRef.current === id, []);
+
+  // Mirrors PreferencesScope's own useReportingRange for the handful of App-level call sites
+  // (refreshAll's initial fetch of range-dependent data, and the account/transaction handlers
+  // further down) that need "whatever range is current" without themselves living inside that
+  // scope. Written only by applyReportingRange below, itself only ever called from
+  // PreferencesScope's onReportingRangeReady — see that function's own comment for why refreshAll
+  // no longer reads or fetches by range at all.
+  const reportingRangeRef = useRef<ReportingRangeId>(DEFAULT_REPORTING_RANGE);
 
   // Only usable if it was actually fetched under the sessionId that's current *right now* — a
   // pure, per-render derivation (no mutation, no effect-ordering dependency) rather than a
@@ -240,29 +333,28 @@ export default function App() {
   // first render for the new lifecycle to avoid a stale hydration, and effect ordering (children
   // fire before parents) can't guarantee that. See lib/authGeneration.ts's currentGenerationValue.
   const navLayoutRawForCurrentSession = currentGenerationValue(navLayoutRaw, navLayoutRawSessionId, sessionId);
-
-  const dashboardLayout = useDashboardLayout(dashboardLayoutRaw);
-  const appearance = useAppearance(appearanceRaw);
-  const financialPreferences = useFinancialPreferences(financialPreferencesRaw);
-  const reportingRange = useReportingRange(reportingRangeRaw);
+  // Same mechanism, for PreferencesScope's whole payload — see that component's own doc comment
+  // for exactly which race this closes.
+  const preferencesForCurrentSession = currentGenerationValue(preferencesRaw, preferencesRawSessionId, sessionId);
 
   const refreshAll = useCallback(async () => {
-    // Tags this fetch with the sessionId it was made under — see the setNavLayoutRawSessionId call
-    // below and lib/authGeneration.ts's currentGenerationValue, which is what actually decides
-    // whether the result is ever usable. Comparing bare user ids here would not be enough: "A1 ->
-    // logout -> A3" must still reject A1's late response, even though its user id matches A3's
-    // just as well.
+    // Tags this fetch with the sessionId it was made under — see the setNavLayoutRawSessionId/
+    // setPreferencesRawSessionId calls below and lib/authGeneration.ts's currentGenerationValue,
+    // which is what actually decides whether the result is ever usable. Comparing bare user ids
+    // here would not be enough: "A1 -> logout -> A3" must still reject A1's late response, even
+    // though its user id matches A3's just as well.
     const requestedForSessionId = sessionIdRef.current;
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
-    // blank the entire dashboard when the other calls succeeded fine.
+    // blank the entire dashboard when the other calls succeeded fine. Deliberately excludes the
+    // three reporting-range-parameterized calls (spending summary, net worth history, monthly
+    // breakdown) — those are owned by applyReportingRange below, driven by PreferencesScope's own
+    // useReportingRange, so a plain lifecycle refresh here never has to guess at a range before
+    // that scope has had a chance to hydrate it.
     const [
       itemsRes,
       transactionsRes,
       categoriesRes,
-      summaryRes,
-      netWorthRes,
-      breakdownRes,
       recurringRes,
       loansRes,
       assetsRes,
@@ -274,9 +366,6 @@ export default function App() {
       getLinkedItems(),
       getTransactions(TRANSACTIONS_FETCH_LIMIT),
       getBudgetCategories(),
-      getSpendingSummary(reportingRange.range),
-      getNetWorthHistory(reportingRange.range),
-      getMonthlyBreakdown(reportingRange.range),
       getRecurringStreams(),
       getLoans(),
       getAssetsSummary(),
@@ -292,9 +381,6 @@ export default function App() {
     }
     if (transactionsRes.status === 'fulfilled') setTransactions(transactionsRes.value.transactions);
     if (categoriesRes.status === 'fulfilled') setBudgetCategories(categoriesRes.value.categories);
-    if (summaryRes.status === 'fulfilled') setSummary(summaryRes.value);
-    if (netWorthRes.status === 'fulfilled') setNetWorthHistory(netWorthRes.value.history);
-    if (breakdownRes.status === 'fulfilled') setMonthlyBreakdown(breakdownRes.value.months);
     if (recurringRes.status === 'fulfilled') {
       setRecurringStreams(recurringRes.value.streams);
       setTotalMonthlyOutflow(recurringRes.value.total_monthly_outflow);
@@ -313,35 +399,22 @@ export default function App() {
     if (categoryMappingsRes.status === 'fulfilled') setCategoryMappings(categoryMappingsRes.value.mappings);
     if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
     if (userPreferencesRes.status === 'fulfilled') {
-      setDashboardLayoutRaw(userPreferencesRes.value.dashboard_layout?.cards ?? null);
       // Tagged, not gated: writing this unconditionally is safe because nothing ever *reads*
-      // navLayoutRaw directly — only navLayoutRawForCurrentSession's derivation does, and it
-      // already refuses any value whose tagged sessionId doesn't match whatever is current by
-      // the time it's read, regardless of how this write is timed relative to that.
+      // navLayoutRaw/preferencesRaw directly — only navLayoutRawForCurrentSession's and
+      // preferencesForCurrentSession's derivations do, and both already refuse any value whose
+      // tagged sessionId doesn't match whatever is current by the time it's read, regardless of
+      // how this write is timed relative to that (including a genuinely stale fetch — "A starts,
+      // logout, B logs in, A resolves last" — resolving after this point).
+      setPreferencesRaw(userPreferencesRes.value);
+      if (requestedForSessionId) setPreferencesRawSessionId(requestedForSessionId);
       setNavLayoutRaw(userPreferencesRes.value.nav_layout?.tabs ?? null);
       if (requestedForSessionId) setNavLayoutRawSessionId(requestedForSessionId);
-      setAppearanceRaw({
-        theme: userPreferencesRes.value.theme,
-        accent_color: userPreferencesRes.value.accent_color,
-      });
-      setFinancialPreferencesRaw({
-        minimum_cash_buffer: userPreferencesRes.value.minimum_cash_buffer,
-        upcoming_bills_days: userPreferencesRes.value.upcoming_bills_days,
-        recent_avg_months: userPreferencesRes.value.recent_avg_months,
-        savings_rate_target: userPreferencesRes.value.savings_rate_target,
-        safe_to_spend_include_upcoming_bills: userPreferencesRes.value.safe_to_spend_include_upcoming_bills,
-        safe_to_spend_include_remaining_budget: userPreferencesRes.value.safe_to_spend_include_remaining_budget,
-      });
-      setReportingRangeRaw(userPreferencesRes.value.reporting_range);
     }
 
     const failures = [
       itemsRes,
       transactionsRes,
       categoriesRes,
-      summaryRes,
-      netWorthRes,
-      breakdownRes,
       recurringRes,
       loansRes,
       assetsRes,
@@ -356,7 +429,7 @@ export default function App() {
     }
 
     setLoading(false);
-  }, [reportingRange.range]);
+  }, []);
 
   useEffect(() => {
     // Keyed on `sessionId`, not `userId` and not `session` object identity. `session` gets a new
@@ -364,38 +437,57 @@ export default function App() {
     // in user (e.g. on tab focus) or a routine token refresh — `sessionId` is unchanged by either,
     // so this doesn't spuriously re-fire for them. Keying on `userId` alone would miss a batched
     // same-user logout/login (A1 -> SIGNED_OUT -> SIGNED_IN A3): the *final* committed userId is
-    // unchanged (still A), so a userId-keyed effect would never re-fire and Navigation would stay
-    // hydrated from A1's stale preferences — sessionId genuinely changes across that exact
+    // unchanged (still A), so a userId-keyed effect would never re-fire and Navigation/Preferences
+    // would stay hydrated from A1's stale data — sessionId genuinely changes across that exact
     // transition, so this effect correctly re-fires and refetches for A3's own data.
     if (sessionId) refreshAll();
   }, [sessionId, refreshAll]);
 
-  // Best-effort — account/transaction refresh already succeeded by the time this runs,
-  // so a failure here shouldn't surface as an error for an action the user didn't take.
-  async function refreshSummary() {
+  // Best-effort — account/transaction refresh already succeeded by the time this runs, so a
+  // failure here shouldn't surface as an error for an action the user didn't take. `range`
+  // defaults to whatever PreferencesScope's useReportingRange last reported (see
+  // applyReportingRange) — every existing caller below calls these with no argument, exactly as
+  // before this change.
+  async function refreshSummary(range: ReportingRangeId = reportingRangeRef.current) {
     try {
-      setSummary(await getSpendingSummary(reportingRange.range));
+      setSummary(await getSpendingSummary(range));
     } catch {
       // ignore
     }
   }
 
-  async function refreshNetWorthHistory() {
+  async function refreshNetWorthHistory(range: ReportingRangeId = reportingRangeRef.current) {
     try {
-      const res = await getNetWorthHistory(reportingRange.range);
+      const res = await getNetWorthHistory(range);
       setNetWorthHistory(res.history);
     } catch {
       // ignore
     }
   }
 
-  async function refreshMonthlyBreakdown() {
+  async function refreshMonthlyBreakdown(range: ReportingRangeId = reportingRangeRef.current) {
     try {
-      const res = await getMonthlyBreakdown(reportingRange.range);
+      const res = await getMonthlyBreakdown(range);
       setMonthlyBreakdown(res.months);
     } catch {
       // ignore
     }
+  }
+
+  // The sole entry point for the three reporting-range-parameterized fetches (spending summary,
+  // net worth history, monthly breakdown) — called from PreferencesScope's useReportingRange, via
+  // its onReportingRangeReady prop, once when that scope's range first hydrates for this
+  // lifecycle and again every time the user picks a new range. Deliberately *not* routed through
+  // refreshAll: refreshAll now fires only on a genuine lifecycle change and fetches everything
+  // range-independent, so a plain reporting-range change refreshes exactly these three datasets —
+  // it never re-fetches (and, via the tagged preferencesRaw, never re-hydrates) Dashboard Layout,
+  // Appearance, or Financial Preferences, and a lifecycle change never has to fetch these three
+  // twice (once at a stale/default range, once at the real one).
+  function applyReportingRange(range: ReportingRangeId) {
+    reportingRangeRef.current = range;
+    refreshSummary(range);
+    refreshNetWorthHistory(range);
+    refreshMonthlyBreakdown(range);
   }
 
   async function refreshRecurringStreams() {
@@ -812,70 +904,6 @@ export default function App() {
   // budgetCategories array and decide per-row whether to surface it.
   const activeBudgetCategories = budgetCategories.filter((c) => c.archived_at === null);
 
-  // Card components know nothing about customization — this is the one place that maps a card
-  // id to what it actually renders, preserving each card's existing data-availability guard
-  // (e.g. `stats` needs `summary`) exactly as it worked before dashboard customization existed.
-  function renderOverviewCard(id: CardId) {
-    switch (id) {
-      case 'stats':
-        return summary ? (
-          <OverviewStats
-            netWorth={summary.net_worth}
-            netWorthHistory={netWorthHistory}
-            assetGroups={assetGroups}
-            monthlySpending={summary.monthly_spending}
-          />
-        ) : null;
-      case 'safe_to_spend':
-        return (
-          <SafeToSpend
-            assetGroups={assetGroups}
-            recurringStreams={recurringStreams}
-            loans={loans}
-            manualLoans={manualLoans}
-            budgetCategories={activeBudgetCategories}
-            upcomingBillsDays={financialPreferences.upcomingBillsDays}
-            minimumCashBuffer={financialPreferences.minimumCashBuffer}
-            includeUpcomingBills={financialPreferences.includeUpcomingBills}
-            includeRemainingBudget={financialPreferences.includeRemainingBudget}
-          />
-        );
-      case 'cash_flow_pace':
-        return summary ? (
-          <CashFlowPace
-            budgetCategories={activeBudgetCategories}
-            currentMonthIncome={summary.current_month.income}
-            currentMonthSpent={summary.current_month.spent}
-          />
-        ) : null;
-      case 'accounts_quick_view':
-        return <AccountQuickView assetGroups={assetGroups} />;
-      case 'upcoming_bills':
-        return (
-          <UpcomingBills
-            recurringStreams={recurringStreams}
-            loans={loans}
-            manualLoans={manualLoans}
-            daysAhead={financialPreferences.upcomingBillsDays}
-          />
-        );
-      case 'recent_activity':
-        return (
-          <RecentActivity
-            transactions={transactions}
-            budgetCategories={budgetCategories}
-            onViewAll={() => setActiveTab('accounts')}
-          />
-        );
-      case 'monthly_spending_chart':
-        return summary ? <MonthlySpendingChart summary={summary} /> : null;
-      case 'net_worth_chart':
-        return <NetWorthChart history={netWorthHistory} />;
-      default:
-        return null;
-    }
-  }
-
   if (!session) {
     return <Auth />;
   }
@@ -894,14 +922,15 @@ export default function App() {
 
       {actionError && <p className="error">{actionError}</p>}
 
-      {/* NavLayoutScope sits outside the loading check deliberately: loading is a general
-          "some data fetch is in flight" flag (set by every refreshAll() call, including ones with
-          nothing to do with authentication, e.g. PlaidLink's onLinked) — it must only ever affect
-          what's rendered *inside* Navigation's authenticated scope, never whether that scope
-          exists. Only `key={sessionId}` controls that. sessionId! below: this JSX only renders
-          once the earlier `!session` early return has already confirmed we're authenticated, and
-          `session`/`sessionId` are always set together, atomically, by the same reducer action —
-          TypeScript just can't see that correlation across two destructured fields. */}
+      {/* NavLayoutScope/PreferencesScope both sit outside the loading check deliberately: loading
+          is a general "some data fetch is in flight" flag (set by every refreshAll() call,
+          including ones with nothing to do with authentication, e.g. PlaidLink's onLinked) — it
+          must only ever affect what's rendered *inside* each authenticated scope, never whether
+          those scopes exist. Only `key={sessionId}` controls that. sessionId! below: this JSX
+          only renders once the earlier `!session` early return has already confirmed we're
+          authenticated, and `session`/`sessionId` are always set together, atomically, by the
+          same reducer action — TypeScript just can't see that correlation across two destructured
+          fields. */}
       <NavLayoutScope
         key={sessionId!}
         userId={userId}
@@ -910,156 +939,243 @@ export default function App() {
         coordinator={navigationWriteCoordinator}
         saved={navLayoutRawForCurrentSession}
       >
-        {(navLayout) => {
-          if (loading) return <p className="hint">Loading...</p>;
-          // The current web/PWA's own decision about primary-tab-bar order (Overview first,
-          // Settings last) — see lib/webTabNav.ts. Recomputed on every render of this render-prop;
-          // cheap, and avoids a second piece of state that could drift from navLayout.layout.
-          const TABS = buildWebTabList(getVisibleOrderedTabIds(navLayout.layout));
-          return (
-            <>
-              <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
+        {(navLayout) => (
+          <PreferencesScope
+            key={sessionId!}
+            userId={userId}
+            sessionId={sessionId!}
+            isSessionCurrent={isSessionCurrent}
+            saved={preferencesForCurrentSession}
+            onReportingRangeReady={applyReportingRange}
+          >
+            {({ dashboardLayout, appearance, financialPreferences, reportingRange }) => {
+              if (loading) return <p className="hint">Loading...</p>;
+              // The current web/PWA's own decision about primary-tab-bar order (Overview first,
+              // Settings last) — see lib/webTabNav.ts. Recomputed on every render of this
+              // render-prop; cheap, and avoids a second piece of state that could drift from
+              // navLayout.layout.
+              const TABS = buildWebTabList(getVisibleOrderedTabIds(navLayout.layout));
 
-              {activeTab === 'overview' && (
-                <div className="tab-panel">
-                  <div className="section-header overview-header">
-                    <span className="hint">Overview</span>
-                    <button type="button" className="link-button" onClick={() => dashboardLayout.setCustomizing(true)}>
-                      Customize dashboard
-                    </button>
-                  </div>
+              // Card components know nothing about customization — this is the one place that
+              // maps a card id to what it actually renders, preserving each card's existing
+              // data-availability guard (e.g. `stats` needs `summary`) exactly as it worked
+              // before dashboard customization existed. Defined inside this render-prop (rather
+              // than at App's top level) purely so it can close over `financialPreferences`,
+              // which now lives in PreferencesScope; every other value it uses (summary,
+              // netWorthHistory, assetGroups, ...) is unchanged App-level state.
+              function renderOverviewCard(id: CardId) {
+                switch (id) {
+                  case 'stats':
+                    return summary ? (
+                      <OverviewStats
+                        netWorth={summary.net_worth}
+                        netWorthHistory={netWorthHistory}
+                        assetGroups={assetGroups}
+                        monthlySpending={summary.monthly_spending}
+                      />
+                    ) : null;
+                  case 'safe_to_spend':
+                    return (
+                      <SafeToSpend
+                        assetGroups={assetGroups}
+                        recurringStreams={recurringStreams}
+                        loans={loans}
+                        manualLoans={manualLoans}
+                        budgetCategories={activeBudgetCategories}
+                        upcomingBillsDays={financialPreferences.upcomingBillsDays}
+                        minimumCashBuffer={financialPreferences.minimumCashBuffer}
+                        includeUpcomingBills={financialPreferences.includeUpcomingBills}
+                        includeRemainingBudget={financialPreferences.includeRemainingBudget}
+                      />
+                    );
+                  case 'cash_flow_pace':
+                    return summary ? (
+                      <CashFlowPace
+                        budgetCategories={activeBudgetCategories}
+                        currentMonthIncome={summary.current_month.income}
+                        currentMonthSpent={summary.current_month.spent}
+                      />
+                    ) : null;
+                  case 'accounts_quick_view':
+                    return <AccountQuickView assetGroups={assetGroups} />;
+                  case 'upcoming_bills':
+                    return (
+                      <UpcomingBills
+                        recurringStreams={recurringStreams}
+                        loans={loans}
+                        manualLoans={manualLoans}
+                        daysAhead={financialPreferences.upcomingBillsDays}
+                      />
+                    );
+                  case 'recent_activity':
+                    return (
+                      <RecentActivity
+                        transactions={transactions}
+                        budgetCategories={budgetCategories}
+                        onViewAll={() => setActiveTab('accounts')}
+                      />
+                    );
+                  case 'monthly_spending_chart':
+                    return summary ? <MonthlySpendingChart summary={summary} /> : null;
+                  case 'net_worth_chart':
+                    return <NetWorthChart history={netWorthHistory} />;
+                  default:
+                    return null;
+                }
+              }
 
-                  {!dashboardLayout.customizing &&
-                    dashboardLayout.layout.some(
-                      (c) => c.visible && (c.id === 'monthly_spending_chart' || c.id === 'net_worth_chart')
-                    ) && <ReportingRangeSelector range={reportingRange.range} onChange={reportingRange.setRange} />}
+              return (
+                <>
+                  <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
 
-                  {dashboardLayout.customizing ? (
-                    <DashboardCustomizer
-                      layout={dashboardLayout.layout}
-                      onToggleVisibility={dashboardLayout.toggleVisibility}
-                      onMove={dashboardLayout.move}
-                      onApplyPreset={dashboardLayout.applyPreset}
-                      onDone={() => dashboardLayout.setCustomizing(false)}
-                    />
-                  ) : (
-                    groupCardsIntoRows(
-                      dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id)
-                    ).map((row) =>
-                      row.length === 2 ? (
-                        <div className="dashboard-grid" key={row.join('+')}>
-                          <div>{renderOverviewCard(row[0])}</div>
-                          <div>{renderOverviewCard(row[1])}</div>
-                        </div>
+                  {activeTab === 'overview' && (
+                    <div className="tab-panel">
+                      <div className="section-header overview-header">
+                        <span className="hint">Overview</span>
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => dashboardLayout.setCustomizing(true)}
+                        >
+                          Customize dashboard
+                        </button>
+                      </div>
+
+                      {!dashboardLayout.customizing &&
+                        dashboardLayout.layout.some(
+                          (c) => c.visible && (c.id === 'monthly_spending_chart' || c.id === 'net_worth_chart')
+                        ) && (
+                          <ReportingRangeSelector range={reportingRange.range} onChange={reportingRange.setRange} />
+                        )}
+
+                      {dashboardLayout.customizing ? (
+                        <DashboardCustomizer
+                          layout={dashboardLayout.layout}
+                          onToggleVisibility={dashboardLayout.toggleVisibility}
+                          onMove={dashboardLayout.move}
+                          onApplyPreset={dashboardLayout.applyPreset}
+                          onDone={() => dashboardLayout.setCustomizing(false)}
+                        />
                       ) : (
-                        <div key={row[0]}>{renderOverviewCard(row[0])}</div>
-                      )
-                    )
+                        groupCardsIntoRows(
+                          dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id)
+                        ).map((row) =>
+                          row.length === 2 ? (
+                            <div className="dashboard-grid" key={row.join('+')}>
+                              <div>{renderOverviewCard(row[0])}</div>
+                              <div>{renderOverviewCard(row[1])}</div>
+                            </div>
+                          ) : (
+                            <div key={row[0]}>{renderOverviewCard(row[0])}</div>
+                          )
+                        )
+                      )}
+                    </div>
                   )}
-                </div>
-              )}
 
-              {activeTab === 'monthly' && (
-                <MonthlyBreakdown
-                  months={monthlyBreakdown}
-                  transactions={transactions}
-                  reportingRange={reportingRange.range}
-                  onSetReportingRange={reportingRange.setRange}
-                />
-              )}
+                  {activeTab === 'monthly' && (
+                    <MonthlyBreakdown
+                      months={monthlyBreakdown}
+                      transactions={transactions}
+                      reportingRange={reportingRange.range}
+                      onSetReportingRange={reportingRange.setRange}
+                    />
+                  )}
 
-              {activeTab === 'budget' && (
-                <BudgetCategories
-                  categories={budgetCategories}
-                  transactions={transactions}
-                  recentAvgMonths={financialPreferences.recentAvgMonths}
-                  onCreate={handleCreateCategory}
-                  onUpdate={handleUpdateCategory}
-                  onUpdateEmoji={handleUpdateCategoryEmoji}
-                  onUpdateColor={handleUpdateCategoryColor}
-                  onReorder={handleReorderCategory}
-                  onArchive={handleArchiveCategory}
-                  onUnarchive={handleUnarchiveCategory}
-                />
-              )}
+                  {activeTab === 'budget' && (
+                    <BudgetCategories
+                      categories={budgetCategories}
+                      transactions={transactions}
+                      recentAvgMonths={financialPreferences.recentAvgMonths}
+                      onCreate={handleCreateCategory}
+                      onUpdate={handleUpdateCategory}
+                      onUpdateEmoji={handleUpdateCategoryEmoji}
+                      onUpdateColor={handleUpdateCategoryColor}
+                      onReorder={handleReorderCategory}
+                      onArchive={handleArchiveCategory}
+                      onUnarchive={handleUnarchiveCategory}
+                    />
+                  )}
 
-              {activeTab === 'recurring' && (
-                <SubscriptionsRecurring
-                  streams={recurringStreams}
-                  totalMonthlyOutflow={totalMonthlyOutflow}
-                  totalMonthlyInflow={totalMonthlyInflow}
-                />
-              )}
+                  {activeTab === 'recurring' && (
+                    <SubscriptionsRecurring
+                      streams={recurringStreams}
+                      totalMonthlyOutflow={totalMonthlyOutflow}
+                      totalMonthlyInflow={totalMonthlyInflow}
+                    />
+                  )}
 
-              {activeTab === 'loans' && (
-                <LoanProgress
-                  loans={loans}
-                  manualLoans={manualLoans}
-                  totalDebt={totalDebt}
-                  totalMinimumPayment={totalMinimumPayment}
-                  onCreateManualLoan={handleCreateManualLoan}
-                  onUpdateManualLoan={handleUpdateManualLoan}
-                  onDeleteManualLoan={handleDeleteManualLoan}
-                  onFetchPayments={handleFetchPayments}
-                  onUpdateLinkedPayment={handleUpdateLinkedPayment}
-                  onUnlinkPayment={handleUnlinkPayment}
-                  onCreateManualPayment={handleCreateManualPayment}
-                  onUpdateManualPayment={handleUpdateManualPayment}
-                  onDeleteManualPayment={handleDeleteManualPayment}
-                />
-              )}
+                  {activeTab === 'loans' && (
+                    <LoanProgress
+                      loans={loans}
+                      manualLoans={manualLoans}
+                      totalDebt={totalDebt}
+                      totalMinimumPayment={totalMinimumPayment}
+                      onCreateManualLoan={handleCreateManualLoan}
+                      onUpdateManualLoan={handleUpdateManualLoan}
+                      onDeleteManualLoan={handleDeleteManualLoan}
+                      onFetchPayments={handleFetchPayments}
+                      onUpdateLinkedPayment={handleUpdateLinkedPayment}
+                      onUnlinkPayment={handleUnlinkPayment}
+                      onCreateManualPayment={handleCreateManualPayment}
+                      onUpdateManualPayment={handleUpdateManualPayment}
+                      onDeleteManualPayment={handleDeleteManualPayment}
+                    />
+                  )}
 
-              {activeTab === 'income' && (
-                <IncomeSavings
-                  groups={assetGroups}
-                  totalAssets={totalAssets}
-                  recurringStreams={recurringStreams}
-                  currentMonthIncome={summary?.current_month.income ?? 0}
-                  currentMonthSpent={summary?.current_month.spent ?? 0}
-                  savingsRateTarget={financialPreferences.savingsRateTarget}
-                  onUpdateSavingsGoal={handleUpdateSavingsGoal}
-                />
-              )}
+                  {activeTab === 'income' && (
+                    <IncomeSavings
+                      groups={assetGroups}
+                      totalAssets={totalAssets}
+                      recurringStreams={recurringStreams}
+                      currentMonthIncome={summary?.current_month.income ?? 0}
+                      currentMonthSpent={summary?.current_month.spent ?? 0}
+                      savingsRateTarget={financialPreferences.savingsRateTarget}
+                      onUpdateSavingsGoal={handleUpdateSavingsGoal}
+                    />
+                  )}
 
-              {activeTab === 'accounts' && (
-                <div className="tab-panel">
-                  <LinkedAccounts
-                    items={items}
-                    isSandbox={isSandbox}
-                    onRefreshed={handleAccountsRefreshed}
-                    onUpdateCreditLimit={handleUpdateCreditLimit}
-                    onUpdateCustomization={handleUpdateAccountCustomization}
-                  />
-                  <TransactionsFeed
-                    transactions={transactions}
-                    budgetCategories={budgetCategories}
-                    syncing={syncing}
-                    onSync={handleSyncTransactions}
-                    onCategorize={handleCategorize}
-                    onApprove={handleApproveTransaction}
-                    onSaveSplits={handleSaveTransactionSplits}
-                    onClearSplits={handleClearTransactionSplits}
-                  />
-                </div>
-              )}
+                  {activeTab === 'accounts' && (
+                    <div className="tab-panel">
+                      <LinkedAccounts
+                        items={items}
+                        isSandbox={isSandbox}
+                        onRefreshed={handleAccountsRefreshed}
+                        onUpdateCreditLimit={handleUpdateCreditLimit}
+                        onUpdateCustomization={handleUpdateAccountCustomization}
+                      />
+                      <TransactionsFeed
+                        transactions={transactions}
+                        budgetCategories={budgetCategories}
+                        syncing={syncing}
+                        onSync={handleSyncTransactions}
+                        onCategorize={handleCategorize}
+                        onApprove={handleApproveTransaction}
+                        onSaveSplits={handleSaveTransactionSplits}
+                        onClearSplits={handleClearTransactionSplits}
+                      />
+                    </div>
+                  )}
 
-              {activeTab === 'settings' && (
-                <Settings
-                  appearance={appearance}
-                  financialPreferences={financialPreferences}
-                  navLayout={navLayout}
-                  categoryMappings={{
-                    plaidCategories,
-                    mappings: categoryMappings,
-                    budgetCategories: activeBudgetCategories,
-                    onSave: handleSaveCategoryMapping,
-                    onDelete: handleDeleteCategoryMapping,
-                  }}
-                />
-              )}
-            </>
-          );
-        }}
+                  {activeTab === 'settings' && (
+                    <Settings
+                      appearance={appearance}
+                      financialPreferences={financialPreferences}
+                      navLayout={navLayout}
+                      categoryMappings={{
+                        plaidCategories,
+                        mappings: categoryMappings,
+                        budgetCategories: activeBudgetCategories,
+                        onSave: handleSaveCategoryMapping,
+                        onDelete: handleDeleteCategoryMapping,
+                      }}
+                    />
+                  )}
+                </>
+              );
+            }}
+          </PreferencesScope>
+        )}
       </NavLayoutScope>
     </div>
   );
