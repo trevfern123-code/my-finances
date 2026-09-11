@@ -5,11 +5,13 @@ import { completeReauth, createReauthLinkToken, type LinkedItem } from '../lib/a
 export function ReconnectButton({
   itemId,
   institutionName,
-  onReconnected,
+  createRefreshCommitter,
 }: {
   itemId: string;
   institutionName: string | null;
-  onReconnected: (items: LinkedItem[]) => void;
+  // See LinkedAccounts's own prop of the same name — called at the start of THIS component's
+  // own async reconnect operation, not derived from a parent render snapshot.
+  createRefreshCommitter: () => (items: LinkedItem[]) => void;
 }) {
   const [linkToken, setLinkToken] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -18,9 +20,10 @@ export function ReconnectButton({
   const onSuccess: PlaidLinkOnSuccess = async () => {
     setBusy(true);
     setError(null);
+    const commit = createRefreshCommitter();
     try {
       const res = await completeReauth(itemId);
-      onReconnected(res.items);
+      commit(res.items);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Reconnection failed');
     } finally {

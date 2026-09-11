@@ -378,6 +378,36 @@ export default function App() {
     return expectedSessionId === sessionIdRef.current;
   }
 
+  // Used by every mutation handler below whose successful response should both (a) apply its own
+  // local functional-updater patch and (b) invalidate any earlier-reserved READ of the same
+  // resource that hasn't resolved yet. A functional updater alone is safe against a read that
+  // resolves BEFORE the mutation commits (the mutation's own patch simply applies on top of
+  // whatever's there), but not against a full-resource READ reserved *before* the mutation
+  // succeeded that only resolves *after* — that read still holds a version older than nothing (the
+  // mutation never advanced the counter), so it still passes its own staleness check and its
+  // full-array replacement silently erases the mutation's patch (the concrete "grouped budgets
+  // read starts, category-create succeeds, the old read resolves and wipes the new category"
+  // failure Codex found). Bumping the resource's shared version at the moment the mutation actually
+  // commits — before applying the patch — closes that: any read reserved earlier now compares its
+  // old version against a newer current one and is discarded when it resolves, while a read that
+  // starts AFTER this point reserves its own newer version and can safely replace this local patch
+  // with the server's own (now mutation-inclusive) snapshot later. Returns false, having done
+  // NOTHING at all — no version bump, no patch, no side effect of any kind — if the session has
+  // since moved on: an old lifecycle's stale response must never advance a resource version another
+  // (current) lifecycle is relying on, nor may it perform any follow-up work gated on that bump
+  // (see handleSaveCategoryMapping's own comment for the concrete backfill-continuation failure
+  // this specifically prevents).
+  function commitMutationForResource<K extends keyof typeof resourceVersionsRef.current>(
+    resource: K,
+    expectedSessionId: string | null,
+    apply: () => void
+  ): boolean {
+    if (!isStillCurrentSession(expectedSessionId)) return false;
+    resourceVersionsRef.current[resource] += 1;
+    apply();
+    return true;
+  }
+
   // Mirrors PreferencesScope's own useReportingRange for the handful of App-level call sites
   // (handlePlaidLinked's own range refresh, and the account/transaction handlers further down)
   // that need "whatever range is current" without themselves living inside that scope. Written
@@ -454,7 +484,8 @@ export default function App() {
   // part of the grouped refreshFinancialData batch, a targeted single-resource refresh
   // (refreshRecurringStreams, refreshLoans, refreshAssetsSummary, refreshBudgetCategories), the two
   // direct post-action transaction refetches (handleSyncTransactions/handleSaveCategoryMapping), or
-  // handleAccountsRefreshed's own items commit. Round 6 gave the grouped batch its own counter
+  // an account child operation committed via createAccountsRefreshCommitter (see its own doc
+  // comment). Round 6 gave the grouped batch its own counter
   // (financialRequestIdRef) and every targeted refresh its own separate one — Codex found that
   // split lets a same-session grouped read and a targeted read of the SAME resource race each
   // other with no shared ownership at all: whichever happened to reserve ITS OWN counter most
@@ -480,6 +511,15 @@ export default function App() {
     assets: 0,
     budgets: 0,
     categoryMappings: 0,
+    // No targeted reader or mutation ever writes plaidCategories — refreshFinancialData is its
+    // only writer — so this exists purely for GROUPED-vs-GROUPED same-session ordering (two
+    // overlapping grouped invocations, e.g. a StrictMode double-invoke or a rapid Plaid retry): the
+    // grouped `financialRequestIdRef`/`isLatest()` check alone protects the *other* eight resources
+    // together as one unit only when the SAME invocation owns all of them, but Round 7 left
+    // plaidCategories out of the per-resource reservation entirely, gated only by the coarse
+    // session-only `stillCurrent` check — an older grouped invocation resolving after a newer one
+    // could still overwrite it.
+    plaidCategories: 0,
   });
 
   // Only usable if it was actually fetched under the sessionId that's current *right now* — a
@@ -635,6 +675,7 @@ export default function App() {
     const assetsVersion = ++resourceVersionsRef.current.assets;
     const manualLoansVersion = ++resourceVersionsRef.current.manualLoans;
     const categoryMappingsVersion = ++resourceVersionsRef.current.categoryMappings;
+    const plaidCategoriesVersion = ++resourceVersionsRef.current.plaidCategories;
     setLoading(true);
     // allSettled rather than all — one endpoint failing (e.g. a pending migration) shouldn't
     // blank the entire dashboard when the other calls succeeded fine.
@@ -715,9 +756,16 @@ export default function App() {
     ) {
       setCategoryMappings(categoryMappingsRes.value.mappings);
     }
-    // No competing writer exists for plaidCategories (no targeted refresh, no mutation touches it)
-    // — the session check alone matches its previous protection exactly.
-    if (plaidCategoriesRes.status === 'fulfilled' && stillCurrent) {
+    // No TARGETED reader or mutation ever writes plaidCategories, but two overlapping GROUPED
+    // invocations still race each other for it exactly like every other resource here — see
+    // resourceVersionsRef's own comment for the specific same-session grouped-vs-grouped gap this
+    // closes (a coarse session-only check alone can't tell an older grouped invocation from a
+    // newer one within the same session).
+    if (
+      plaidCategoriesRes.status === 'fulfilled' &&
+      stillCurrent &&
+      plaidCategoriesVersion === resourceVersionsRef.current.plaidCategories
+    ) {
       setPlaidCategories(plaidCategoriesRes.value.categories);
     }
 
@@ -863,8 +911,9 @@ export default function App() {
   }
 
   // These four targeted, single-resource refreshes (plus the two direct transaction refetches in
-  // handleSyncTransactions/handleSaveCategoryMapping further down, and handleAccountsRefreshed's
-  // own items commit) each independently capture `sessionIdRef.current` AND reserve a version from
+  // handleSyncTransactions/handleSaveCategoryMapping further down, and each account child
+  // operation committed via createAccountsRefreshCommitter) each independently capture
+  // `sessionIdRef.current` AND reserve a version from
   // their resource's own counter in `resourceVersionsRef` (see its own comment) at their own start,
   // then check both again before committing. Sharing that counter with refreshFinancialData's own
   // per-resource reservations for the SAME resources is what makes a same-session grouped read and
@@ -937,46 +986,38 @@ export default function App() {
     }
   }
 
-  // `newItems` arrives as a plain argument, not from a fetch this function itself makes — the
-  // async work already happened inside LinkedAccounts (a child this callback was handed to as a
-  // prop), on its own schedule, unrelated to React's render/commit cycle. Reading
-  // `sessionIdRef.current` at the moment this function actually runs would only ever say "whatever
-  // session is current right now" — useless for detecting staleness, since there's no `await`
-  // inside this function itself to create a "before/after" gap to check across. What must be
-  // compared instead is the session that was active when THIS SPECIFIC callback instance was
-  // created and handed to LinkedAccounts (a closure over `sessionId`, the plain render-scoped
-  // value — fixed for the lifetime of this exact function instance, unlike sessionIdRef.current)
-  // against whatever session is current by the time it's actually invoked. If LinkedAccounts holds
-  // onto this instance across a lifecycle change (its own async refresh resolving after the
-  // component tree it lived in has already been replaced by a new lifecycle's — deliberately not
-  // relied upon as the ownership mechanism, since an unmounted component's own already-in-flight
-  // promise chain still runs and can still call a prop function it captured), this catches it.
+  // Account refresh/reconnect operations (Refresh balances, sandbox reset, Plaid reconnect) each
+  // run their own async work inside a CHILD component (LinkedAccounts / ReconnectButton), on their
+  // own schedule, unrelated to React's render/commit cycle — so there's no `await` in App.tsx
+  // itself to create a before/after gap to check ownership across. A single ownership token
+  // captured once per App render (the old `itemsVersionAtRender`) isn't enough: two such
+  // operations can both originate from the SAME render (e.g. the user clicks "Refresh balances"
+  // twice in a row, or clicks Refresh then Reconnect before the first resolves) and would then
+  // share one identical captured version. If the earlier-STARTED operation resolves first and
+  // commits, it bumps that shared version — which then makes the later-STARTED (and correctly
+  // entitled to win) operation look stale against a version its own start already accounted for.
   //
-  // `itemsVersionAtRender` closes the SAME-session gap the session check alone can't: if a newer
-  // grouped or targeted items read has already committed since this callback instance was created
-  // (handed to LinkedAccounts as the `onRefreshed` prop), this callback's own — now stale — items
-  // must not overwrite it, even though nothing about the lifecycle itself changed. It's captured
-  // the same way `sessionId` is (a plain render-scoped read, not `resourceVersionsRef.current.items`
-  // read fresh at call time, which would trivially always match itself and protect nothing): every
-  // render reads whatever `resourceVersionsRef.current.items` is at that moment, and the specific
-  // function instance LinkedAccounts ends up holding when the user actually clicks "Refresh
-  // balances" is whichever render most recently produced one, i.e. the version that was current
-  // when this refresh effectively began. On success this bumps the counter itself before writing,
-  // so it correctly supersedes anything reserved even earlier than that in turn.
-  const itemsVersionAtRender = resourceVersionsRef.current.items;
-  async function handleAccountsRefreshed(newItems: LinkedItem[]) {
-    const expectedSessionId = sessionId;
-    if (expectedSessionId !== sessionIdRef.current) return;
-    if (itemsVersionAtRender !== resourceVersionsRef.current.items) return;
-    resourceVersionsRef.current.items += 1;
-    setItems(newItems);
-    // The backend records a net worth snapshot, refreshes loan/liability details, and this view's
-    // grouping all depend on the same freshly-fetched balances — refetch all four. Each of these
-    // independently re-verifies session/resource ownership at its own commit — see their own
-    // comments.
-    applyReportingRange(reportingRangeRef.current);
-    refreshLoans();
-    refreshAssetsSummary();
+  // The fix is to reserve ownership at the moment EACH child operation actually begins, not at
+  // App's render. This factory is called by the child right before ITS OWN async call starts (its
+  // own `await`), returning a completion function that has already closed over the session and
+  // items-version exactly as of that moment — so two operations from the same render each get
+  // their own distinct token, and whichever one actually started later legitimately wins
+  // regardless of resolution order.
+  function createAccountsRefreshCommitter(): (newItems: LinkedItem[]) => void {
+    const expectedSessionId = sessionIdRef.current;
+    const itemsVersion = ++resourceVersionsRef.current.items;
+    return (newItems: LinkedItem[]) => {
+      if (expectedSessionId !== sessionIdRef.current) return;
+      if (itemsVersion !== resourceVersionsRef.current.items) return;
+      setItems(newItems);
+      // The backend records a net worth snapshot, refreshes loan/liability details, and this
+      // view's grouping all depend on the same freshly-fetched balances — refetch all three. Each
+      // independently re-verifies session/resource ownership at its own commit — see their own
+      // comments.
+      applyReportingRange(reportingRangeRef.current);
+      refreshLoans();
+      refreshAssetsSummary();
+    };
   }
 
   async function handleUpdateCreditLimit(accountId: string, creditLimit: number | null) {
@@ -984,14 +1025,14 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateAccountCreditLimit(accountId, creditLimit);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('items', expectedSessionId, () => {
         setItems((prev) =>
           prev.map((item) => ({
             ...item,
             accounts: item.accounts.map((a) => (a.id === accountId ? res.account : a)),
           }))
         );
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update credit limit');
@@ -1004,7 +1045,7 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateAccountSavingsGoal(accountId, savingsGoal);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('assets', expectedSessionId, () => {
         setAssetGroups((prev) =>
           prev.map((group) => ({
             ...group,
@@ -1013,7 +1054,7 @@ export default function App() {
             ),
           }))
         );
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update savings goal');
@@ -1037,17 +1078,19 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateAccountCustomization(accountId, fields);
-      if (!isStillCurrentSession(expectedSessionId)) return;
-      setItems((prev) =>
-        prev.map((item) => ({
-          ...item,
-          accounts: item.accounts.map((a) => (a.id === accountId ? res.account : a)),
-        }))
-      );
+      const committed = commitMutationForResource('items', expectedSessionId, () => {
+        setItems((prev) =>
+          prev.map((item) => ({
+            ...item,
+            accounts: item.accounts.map((a) => (a.id === accountId ? res.account : a)),
+          }))
+        );
+      });
+      if (!committed) return;
       // hidden/exclude_from_net_worth change which accounts appear in or count toward
       // assets-summary's grouped totals — simplest to refetch rather than hand-patch a
-      // filtered, grouped structure locally. Each of these independently re-verifies
-      // session/resource ownership at its own commit — see their own comments.
+      // filtered, grouped structure locally. Each of these independently reserves its own fresh
+      // resource version at its own start — see their own comments.
       refreshAssetsSummary();
       if (fields.exclude_from_net_worth !== undefined) {
         // The backend already re-snapshotted today's net worth on this change — refresh the
@@ -1101,12 +1144,12 @@ export default function App() {
       // The PATCH response is a bare `transactions` row with no joined accounts/plaid_items,
       // unlike the list endpoint — merge just the changed field instead of replacing the item.
       await setTransactionCategory(transactionId, budgetCategoryId);
-      if (isStillCurrentSession(expectedSessionId)) {
+      const committed = commitMutationForResource('transactions', expectedSessionId, () => {
         setTransactions((prev) =>
           prev.map((t) => (t.id === transactionId ? { ...t, budget_category_id: budgetCategoryId } : t))
         );
-        refreshBudgetCategories();
-      }
+      });
+      if (committed) refreshBudgetCategories();
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update category');
@@ -1119,11 +1162,11 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       await approveTransaction(transactionId);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('transactions', expectedSessionId, () => {
         setTransactions((prev) =>
           prev.map((t) => (t.id === transactionId ? { ...t, needs_review: false } : t))
         );
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to approve transaction');
@@ -1133,27 +1176,28 @@ export default function App() {
 
   // Left to throw rather than setting actionError — SplitEditor catches this itself and shows
   // the message inline next to the line items, which is more useful than a page-level banner. The
-  // session check below still applies — a stale lifecycle's own error handling is SplitEditor's
-  // business, but its successful response must not mutate a NEWER lifecycle's transactions.
+  // session check inside commitMutationForResource still applies — a stale lifecycle's own error
+  // handling is SplitEditor's business, but its successful response must not mutate a NEWER
+  // lifecycle's transactions.
   async function handleSaveTransactionSplits(
     transactionId: string,
     splits: { budget_category_id: string; amount: number }[]
   ) {
     const expectedSessionId = sessionIdRef.current;
     const res = await saveTransactionSplits(transactionId, splits);
-    if (isStillCurrentSession(expectedSessionId)) {
+    const committed = commitMutationForResource('transactions', expectedSessionId, () => {
       setTransactions((prev) => prev.map((t) => (t.id === transactionId ? { ...t, splits: res.splits } : t)));
-      refreshBudgetCategories();
-    }
+    });
+    if (committed) refreshBudgetCategories();
   }
 
   async function handleClearTransactionSplits(transactionId: string) {
     const expectedSessionId = sessionIdRef.current;
     await clearTransactionSplits(transactionId);
-    if (isStillCurrentSession(expectedSessionId)) {
+    const committed = commitMutationForResource('transactions', expectedSessionId, () => {
       setTransactions((prev) => prev.map((t) => (t.id === transactionId ? { ...t, splits: [] } : t)));
-      refreshBudgetCategories();
-    }
+    });
+    if (committed) refreshBudgetCategories();
   }
 
   async function handleCreateCategory(
@@ -1168,9 +1212,9 @@ export default function App() {
       const res = await createBudgetCategory({ name, budget_amount: budgetAmount, emoji, color });
       // A brand-new category has no transactions assigned to it yet, so both derived fields
       // are always 0 — no need to refetch just to fill in values we already know.
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => [...prev, { ...res.category, spent: 0, recent_avg_spent: 0 }]);
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to create category');
@@ -1185,9 +1229,9 @@ export default function App() {
       const res = await updateBudgetCategory(id, { budget_amount: budgetAmount });
       // Merge rather than replace — the response has no spent/recent_avg_spent, and changing
       // budget_amount doesn't change how much has actually been spent, so keep what's there.
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update category');
@@ -1200,9 +1244,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateBudgetCategory(id, { emoji });
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update category emoji');
@@ -1215,9 +1259,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateBudgetCategory(id, { color });
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update category color');
@@ -1230,9 +1274,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateBudgetCategory(id, { sort_order: sortOrder });
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to reorder categories');
@@ -1245,16 +1289,19 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateBudgetCategory(id, { archived: true });
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
-        // Archiving removes any mapping that targeted this category server-side (so future synced
-        // transactions stop landing here) — drop those from local state too, without a refetch.
-        // Same session check: both writes represent ONE mutation response, so they stand or fall
-        // together.
-        if (res.removed_mapping_ids && res.removed_mapping_ids.length > 0) {
-          const removed = new Set(res.removed_mapping_ids);
+      });
+      // Archiving removes any mapping that targeted this category server-side (so future synced
+      // transactions stop landing here) — drop those from local state too, without a refetch. A
+      // second, independent resource this same response can affect — its own commit re-verifies
+      // session ownership and invalidates earlier categoryMappings reads separately from the
+      // budgets write above.
+      if (res.removed_mapping_ids && res.removed_mapping_ids.length > 0) {
+        const removed = new Set(res.removed_mapping_ids);
+        commitMutationForResource('categoryMappings', expectedSessionId, () => {
           setCategoryMappings((prev) => prev.filter((m) => !removed.has(m.id)));
-        }
+        });
       }
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
@@ -1268,9 +1315,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateBudgetCategory(id, { archived: false });
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to unarchive category');
@@ -1287,14 +1334,26 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await saveCategoryMapping(plaidCategory, budgetCategoryId, backfill);
-      if (isStillCurrentSession(expectedSessionId)) {
+      // The ENTIRE continuation below — including the backfill follow-up — must be completely
+      // inert once the session has moved on, checked ONCE, before any of it (not merely before
+      // the categoryMappings setState). A stale continuation that still bumped
+      // resourceVersionsRef.current.transactions — even without ever calling setTransactions
+      // itself — would invalidate a NEWER lifecycle's own already-reserved grouped/targeted
+      // transactions read: that read would then compare its own (still-valid) reserved version
+      // against a version this stale bump just moved past it, discard itself as "stale," and
+      // leave the new lifecycle's transactions never committed at all. This one early return is
+      // what makes a stale response's inertness total rather than partial.
+      if (!isStillCurrentSession(expectedSessionId)) return res.backfilled_count;
+      commitMutationForResource('categoryMappings', expectedSessionId, () => {
         setCategoryMappings((prev) => [...prev.filter((m) => m.plaid_category !== plaidCategory), res.mapping]);
-      }
+      });
       if (backfill && res.backfilled_count > 0) {
         // Backfilling updates transaction rows directly in the database — refetch so the
-        // Accounts and Budget tabs reflect the newly-assigned categories. Shares the
-        // `transactions` bucket in resourceVersionsRef with handleSyncTransactions's own
-        // refetch — see that function's own comment.
+        // Accounts and Budget tabs reflect the newly-assigned categories. This is a TARGETED
+        // READ, not a direct mutation patch (the response above doesn't include the full
+        // backfilled transaction list) — it reserves its own fresh `transactions` version here,
+        // shared with handleSyncTransactions's own refetch, only now that the session guard
+        // above has already confirmed this continuation is even allowed to run.
         const version = ++resourceVersionsRef.current.transactions;
         const transactionsRes = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
         if (isStillCurrentSession(expectedSessionId) && version === resourceVersionsRef.current.transactions) {
@@ -1316,9 +1375,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       await deleteCategoryMapping(id);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('categoryMappings', expectedSessionId, () => {
         setCategoryMappings((prev) => prev.filter((m) => m.id !== id));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to remove category mapping');
@@ -1331,9 +1390,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await createManualLoan(input);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => [...prev, res.loan]);
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to add loan');
@@ -1346,9 +1405,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateManualLoan(id, input);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === id ? res.loan : l)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update loan');
@@ -1361,9 +1420,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       await deleteManualLoan(id);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.filter((l) => l.id !== id));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to delete loan');
@@ -1381,9 +1440,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateLinkedLoanPayment(loanId, transactionId, principalPortion);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update payment');
@@ -1397,9 +1456,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await unlinkLoanPayment(loanId, transactionId);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to unlink payment');
@@ -1413,9 +1472,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await createManualPayment(loanId, input);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to log payment');
@@ -1429,9 +1488,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await updateManualPayment(loanId, paymentId, input);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update payment');
@@ -1445,9 +1504,9 @@ export default function App() {
     const expectedSessionId = sessionIdRef.current;
     try {
       const res = await deleteManualPayment(loanId, paymentId);
-      if (isStillCurrentSession(expectedSessionId)) {
+      commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
-      }
+      });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to delete payment');
@@ -1820,7 +1879,7 @@ export default function App() {
                       <LinkedAccounts
                         items={items}
                         isSandbox={isSandbox}
-                        onRefreshed={handleAccountsRefreshed}
+                        createRefreshCommitter={createAccountsRefreshCommitter}
                         onUpdateCreditLimit={handleUpdateCreditLimit}
                         onUpdateCustomization={handleUpdateAccountCustomization}
                       />

@@ -175,13 +175,17 @@ function AccountCustomizationRow({
 export function LinkedAccounts({
   items,
   isSandbox,
-  onRefreshed,
+  createRefreshCommitter,
   onUpdateCreditLimit,
   onUpdateCustomization,
 }: {
   items: LinkedItem[];
   isSandbox: boolean;
-  onRefreshed: (items: LinkedItem[]) => void;
+  // Called at the exact moment THIS operation begins (before its own await) rather than once
+  // per App render — see App.tsx's createAccountsRefreshCommitter doc comment. Two operations
+  // kicked off from the same render each get their own token this way, so whichever one
+  // actually started later legitimately wins even if the other happens to resolve first.
+  createRefreshCommitter: () => (items: LinkedItem[]) => void;
   onUpdateCreditLimit: (accountId: string, creditLimit: number | null) => void;
   onUpdateCustomization: (accountId: string, fields: CustomizationFields) => void;
 }) {
@@ -192,9 +196,10 @@ export function LinkedAccounts({
   async function handleRefresh() {
     setRefreshing(true);
     setError(null);
+    const commit = createRefreshCommitter();
     try {
       const res = await refreshAccountBalances();
-      onRefreshed(res.items);
+      commit(res.items);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to refresh balances');
     } finally {
@@ -205,9 +210,10 @@ export function LinkedAccounts({
   async function handleSandboxReset(itemId: string) {
     setError(null);
     setHint(null);
+    const commit = createRefreshCommitter();
     try {
       const res = await sandboxResetLogin(itemId);
-      onRefreshed(res.items);
+      commit(res.items);
     } catch (err) {
       setError(
         err instanceof Error
@@ -264,7 +270,7 @@ export function LinkedAccounts({
                   <ReconnectButton
                     itemId={item.id}
                     institutionName={item.institution_name}
-                    onReconnected={onRefreshed}
+                    createRefreshCommitter={createRefreshCommitter}
                   />
                 )}
                 {item.status === 'credential_error' && (

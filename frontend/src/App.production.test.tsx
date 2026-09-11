@@ -52,6 +52,12 @@ const mockGetBudgetCategories = vi.hoisted(() => vi.fn());
 const mockGetTransactions = vi.hoisted(() => vi.fn());
 const mockSyncTransactions = vi.hoisted(() => vi.fn());
 const mockRefreshAccountBalances = vi.hoisted(() => vi.fn());
+// Controlled so Round 8's Accounts per-operation-ownership tests can drive a SECOND, independent
+// account child operation (LinkedAccounts's sandbox "Simulate reauth" button) concurrently with
+// "Refresh balances" — the "Refresh balances" button itself disables while its own request is in
+// flight, so a distinct operation is needed to exercise two overlapping child operations from the
+// same render.
+const mockSandboxResetLogin = vi.hoisted(() => vi.fn());
 // Controlled so Round 7's mutation-lifecycle-leakage regression tests can hold each mutation's own
 // response open/reject it on demand.
 const mockCreateManualLoan = vi.hoisted(() => vi.fn());
@@ -78,6 +84,8 @@ vi.mock('./lib/api', async (importOriginal) => {
     getPlaidCategories: mockGetPlaidCategories,
     syncTransactions: mockSyncTransactions,
     refreshAccountBalances: mockRefreshAccountBalances,
+    sandboxResetLogin: mockSandboxResetLogin,
+    sandboxFireWebhook: vi.fn().mockResolvedValue({}),
     createManualLoan: mockCreateManualLoan,
     approveTransaction: mockApproveTransaction,
     createBudgetCategory: mockCreateBudgetCategory,
@@ -1697,7 +1705,7 @@ describe('38. handleSyncTransactions post-sync getTransactions cross-lifecycle o
   });
 });
 
-describe('39. handleAccountsRefreshed callback cross-lifecycle ownership (Blocker 2)', () => {
+describe('39. account-refresh committer cross-lifecycle ownership (Blocker 2)', () => {
   it("A's in-flight balance-refresh callback resolving after B is ready does not commit A's items under B", async () => {
     mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
     mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Initial-Bank'));
@@ -1721,9 +1729,10 @@ describe('39. handleAccountsRefreshed callback cross-lifecycle ownership (Blocke
     expect(screen.getByText(/B-Bank/)).toBeTruthy();
 
     // A's stale, already-in-flight balance-refresh callback resolves well after B is fully ready.
-    // This is the REAL handleAccountsRefreshed closure A's LinkedAccounts instance captured as its
-    // onRefreshed prop — invoked here exactly as LinkedAccounts' own internal promise chain would,
-    // regardless of whether that component instance is still mounted.
+    // This is the REAL committer function A's LinkedAccounts instance received from
+    // createAccountsRefreshCommitter() and captured as its own — invoked here exactly as
+    // LinkedAccounts' own internal promise chain would, regardless of whether that component
+    // instance is still mounted.
     await act(async () => {
       aRefresh.resolve(fakeLinkedItems('A-Stale-Bank'));
       await aRefresh.promise.catch(() => {});
@@ -2107,8 +2116,8 @@ describe('48. recurring-streams targeted vs. grouped ordering shares the same re
   });
 });
 
-describe('49. handleAccountsRefreshed callback vs. a newer grouped items write (Blocker 2)', () => {
-  it('old account-refresh callback work starts; a newer grouped refresh commits items; the old callback firing after is inert', async () => {
+describe('49. account-refresh committer vs. a newer grouped items write (Blocker 2)', () => {
+  it('old account-refresh committer work starts; a newer grouped refresh commits items; the old committer firing after is inert', async () => {
     mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
     mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Initial-Bank'));
     render(<App />);
@@ -2137,5 +2146,365 @@ describe('49. handleAccountsRefreshed callback vs. a newer grouped items write (
     });
     expect(screen.getByText(/Grouped-Bank/)).toBeTruthy();
     expect(screen.queryByText(/Old-Callback-Bank/)).toBeNull();
+  });
+});
+
+// --- Round 8: per-operation-start Accounts ownership, mutation-success read invalidation --------
+// Codex found four remaining gaps after Round 7. Blocker 1: handleSaveCategoryMapping's backfill
+// continuation ran unconditionally on the awaited response, not gated by isStillCurrentSession the
+// way its own categoryMappings write was — a stale response could still bump the shared
+// `transactions` resource version and issue a follow-up fetch/refreshBudgetCategories() call after
+// a newer lifecycle had already reserved its own transactions authority, wrongly invalidating that
+// newer lifecycle's own legitimate read. Fixed with a single early return immediately after the
+// awaited response, before any of the continuation runs. Blocker 2: a successful mutation applied
+// its functional-updater patch but never invalidated a same-resource READ that had already reserved
+// an (now-stale) version before the mutation committed — that read could still resolve afterward and
+// replace-all the resource, erasing the mutation's patch. Fixed with commitMutationForResource,
+// which bumps the resource's shared version at successful commit (never at the mutation's own
+// start) before applying the patch. Blocker 3: plaidCategories participated in every grouped call
+// but had no resource-read version of its own, so two overlapping grouped reads of the SAME session
+// could commit out of order. Fixed by folding plaidCategories into the same resourceVersionsRef
+// system every other replace-all resource already uses. Blocker 4: itemsVersionAtRender captured
+// ownership once per App render, not once per child account operation — two operations kicked off
+// from the same render shared one token, so an operation that started EARLIER but resolved LATER
+// could still look "current" and incorrectly beat one that started later. Fixed by moving ownership
+// reservation into a factory, createAccountsRefreshCommitter, called by the child component at the
+// exact moment its own async operation begins.
+
+describe('50. stale category-mapping backfill continuation is completely inert across a session switch (Blocker 1)', () => {
+  it('A starts backfill -> switch to B -> B reserves transactions via its own sync -> A resolves with backfilled_count>0 -> A cannot corrupt or overwrite B\'s in-flight transactions read', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactions('A-Transaction'));
+    mockGetBudgetCategories.mockResolvedValueOnce({
+      categories: [
+        { id: 'cat-1', name: 'A-Groceries', budget_amount: 100, color: null, sort_order: 0, emoji: null, archived_at: null, spent: 0, recent_avg_spent: 0 },
+      ],
+    });
+    mockGetCategoryMappings.mockResolvedValueOnce({
+      mappings: [{ id: 'map-1', plaid_category: 'FOOD_AND_DRINK', budget_category_id: 'cat-1' }],
+    });
+    mockGetPlaidCategories.mockResolvedValueOnce({ categories: ['FOOD_AND_DRINK'] });
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Categories').click());
+
+    // A already has a mapping for FOOD_AND_DRINK -> cat-1, so "Apply to existing transactions" is
+    // immediately available — clicking it calls handleSaveCategoryMapping(..., backfill=true), the
+    // exact code path Blocker 1 found under-guarded.
+    const aSave = deferred<{ mapping: unknown; backfilled_count: number }>();
+    mockSaveCategoryMapping.mockReturnValueOnce(aSave.promise);
+    await act(async () => {
+      screen.getByText('Apply to existing transactions').click();
+      await Promise.resolve();
+    });
+
+    // Switch to B; B reaches full readiness normally.
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactions('B-Transaction'));
+    mockGetBudgetCategories.mockResolvedValueOnce({ categories: [] });
+    mockGetCategoryMappings.mockResolvedValueOnce({ mappings: [] });
+    mockGetPlaidCategories.mockResolvedValueOnce({ categories: [] });
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    // activeTab persists as 'settings' across the lifecycle change, but the whole tab-content tree
+    // still unmounts/remounts behind the financial-lifecycle gate — wait for the 'Settings' tab
+    // button itself to reappear (same pattern as test 45) before navigating to Accounts.
+    await waitFor(() => expect(screen.getByText('Settings')).toBeTruthy());
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/B-Transaction/)).toBeTruthy();
+
+    // B reserves its own, later `transactions` version via a targeted read (Sync transactions) —
+    // held open, representing B's own in-flight, legitimate read authority at the moment A's stale
+    // backfill response arrives.
+    mockSyncTransactions.mockResolvedValueOnce({});
+    const bSyncRead = deferred<ReturnType<typeof fakeTransactions>>();
+    mockGetTransactions.mockReturnValueOnce(bSyncRead.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    const callsBeforeStaleResolve = mockGetTransactions.mock.calls.length;
+
+    // A's stale backfill response resolves well after B is fully ready and has its own read
+    // in flight. Without Blocker 1's fix, the unguarded continuation below would (1) issue its own
+    // extra getTransactions() follow-up call, and (2) bump the shared `transactions` resource
+    // version out from under B's already-reserved version — corrupting B's own legitimate,
+    // still-pending read so that IT would look stale against itself once it resolves.
+    await act(async () => {
+      aSave.resolve({ mapping: { id: 'map-1', plaid_category: 'FOOD_AND_DRINK', budget_category_id: 'cat-1' }, backfilled_count: 3 });
+      await aSave.promise.catch(() => {});
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    expect(mockGetTransactions.mock.calls.length).toBe(callsBeforeStaleResolve); // no extra backfill refetch
+
+    // B's own in-flight read now resolves — it must still be able to commit; a corrupted resource
+    // version (the bug) would make this legitimate, newer read reject itself.
+    await act(async () => {
+      bSyncRead.resolve(fakeTransactions('B-Synced-Transaction'));
+      await bSyncRead.promise;
+    });
+
+    expect(screen.getByText(/B-Synced-Transaction/)).toBeTruthy();
+    expect(screen.queryByText(/A-Transaction/)).toBeNull();
+  });
+});
+
+describe('51. a successful category mutation invalidates an older, still-pending targeted budgets read (Blocker 2)', () => {
+  it('a targeted budgets read (via Sync transactions) starts and holds open -> category-create mutation succeeds and patches locally -> the stale read resolving after cannot erase it', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Bank'));
+    mockGetBudgetCategories.mockResolvedValueOnce({ categories: [] });
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactions('Initial-Tx'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    // "Sync transactions" resolves its own sync + its own transactions refetch quickly, then
+    // (synchronously after) calls refreshBudgetCategories() as a targeted, single-resource read of
+    // `budgets` — held open here to represent a read reserved BEFORE the mutation below commits.
+    mockSyncTransactions.mockResolvedValueOnce({});
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactions('Post-Sync-Tx'));
+    const groupedBudgets = deferred<ReturnType<typeof fakeBudgetCategories>>();
+    mockGetBudgetCategories.mockReturnValueOnce(groupedBudgets.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    // A category-create mutation succeeds and patches budgetCategories locally while that read is
+    // still pending.
+    mockCreateBudgetCategory.mockResolvedValueOnce({
+      category: { id: 'cat-new', name: 'New-Category', budget_amount: 200, color: null, sort_order: 0, emoji: null, archived_at: null },
+    });
+    act(() => screen.getByText('Budget').click());
+    act(() => screen.getByText('Add category').click());
+    const form = screen.getByText('Add a budget category').closest('form') as HTMLElement;
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'New-Category' } });
+    fireEvent.change(within(form).getByLabelText('Monthly budget'), { target: { value: '200' } });
+    await act(async () => {
+      fireEvent.click(within(form).getByText('Add category'));
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    expect(screen.getByText(/New-Category/)).toBeTruthy();
+
+    // The older targeted read, reserved before the mutation committed, now resolves. Without
+    // Blocker 2's fix, its full-array replacement would silently erase New-Category since the
+    // mutation never used to advance the resource version the read checks itself against.
+    await act(async () => {
+      groupedBudgets.resolve(fakeBudgetCategories('Old-Targeted-Category'));
+      await groupedBudgets.promise.catch(() => {});
+    });
+
+    expect(screen.getByText(/New-Category/)).toBeTruthy();
+    expect(screen.queryByText(/Old-Targeted-Category/)).toBeNull();
+  });
+});
+
+describe('52. a successful transaction approve mutation invalidates an older, still-pending transactions read (Blocker 2)', () => {
+  it('a transactions read (via Sync transactions) starts and holds open -> approve mutation succeeds and patches locally -> the stale read resolving after cannot erase it', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Bank'));
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactionNeedingReview('txn-1', 'Needs-Review-Tx', true));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText('Approve')).toBeTruthy();
+
+    // "Sync transactions" reserves a `transactions` version at its own start, then awaits its own
+    // sync + its own transactions refetch — held open here to represent a read reserved BEFORE the
+    // approve mutation below commits.
+    mockSyncTransactions.mockResolvedValueOnce({});
+    const syncedTransactions = deferred<ReturnType<typeof fakeTransactionNeedingReview>>();
+    mockGetTransactions.mockReturnValueOnce(syncedTransactions.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    // The approve mutation succeeds and patches the transaction locally (needs_review: false) while
+    // that read is still pending.
+    mockApproveTransaction.mockResolvedValueOnce({});
+    await act(async () => {
+      screen.getByText('Approve').click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    expect(screen.queryByText('Approve')).toBeNull(); // locally patched: approved, control gone
+
+    // The older transactions read, reserved before the approve mutation committed, resolves after
+    // with a stale (pre-approval) snapshot — without Blocker 2's fix this full-array replacement
+    // would erase the local approval patch and bring "Approve" back.
+    await act(async () => {
+      syncedTransactions.resolve(fakeTransactionNeedingReview('txn-1', 'Needs-Review-Tx', true));
+      await syncedTransactions.promise.catch(() => {});
+    });
+    expect(screen.queryByText('Approve')).toBeNull();
+  });
+});
+
+describe('53. plaidCategories: same-session overlapping grouped reads settle with the newer winning (Blocker 3)', () => {
+  it('grouped #1 starts -> grouped #2 starts and resolves first -> #1 resolves after -> #2 plaidCategories value is the one exposed', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Bank'));
+    mockGetCategoryMappings.mockResolvedValue({ mappings: [] });
+    const firstCategories = deferred<{ categories: string[] }>();
+    mockGetPlaidCategories.mockReturnValueOnce(firstCategories.promise);
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForFinancialLoading(); // #1 (initial) still pending on plaidCategories
+
+    const secondCategories = deferred<{ categories: string[] }>();
+    mockGetPlaidCategories.mockReturnValueOnce(secondCategories.promise);
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    // #2 (the Plaid-triggered grouped invocation) resolves first, with a distinctive category.
+    await act(async () => {
+      secondCategories.resolve({ categories: ['TRAVEL'] });
+      await secondCategories.promise;
+    });
+    await waitForReady();
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Categories').click());
+    expect(screen.getByText(/Travel/i)).toBeTruthy();
+
+    // #1's stale plaidCategories value resolves after — must not overwrite #2's.
+    await act(async () => {
+      firstCategories.resolve({ categories: ['FOOD_AND_DRINK'] });
+      await firstCategories.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Travel/i)).toBeTruthy();
+    expect(screen.queryByText(/Food and drink/i)).toBeNull();
+  });
+});
+
+describe('54. Accounts: a later-started child operation beats an earlier one from the same render, regardless of resolution order (Blocker 4)', () => {
+  it('op#1 (Refresh balances) then op#2 (Simulate reauth) start from the same render; op#1 resolves first but is rejected; op#2 wins', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Initial-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/A-Initial-Bank/)).toBeTruthy();
+
+    const op1 = deferred<ReturnType<typeof fakeLinkedItems>>();
+    mockRefreshAccountBalances.mockReturnValueOnce(op1.promise);
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve();
+    });
+
+    const op2 = deferred<ReturnType<typeof fakeLinkedItems>>();
+    mockSandboxResetLogin.mockReturnValueOnce(op2.promise);
+    await act(async () => {
+      screen.getByText('Simulate reauth (sandbox test)').click();
+      await Promise.resolve();
+    });
+
+    // op#1 started FIRST but resolves first too here — it must be rejected, since op#2 (started
+    // later, from the same render) has already reserved newer authority over `items`.
+    await act(async () => {
+      op1.resolve(fakeLinkedItems('Op1-Bank'));
+      await op1.promise.catch(() => {});
+    });
+    expect(screen.getByText(/A-Initial-Bank/)).toBeTruthy(); // op#1 rejected, no commit at all
+    expect(screen.queryByText(/Op1-Bank/)).toBeNull();
+
+    await act(async () => {
+      op2.resolve(fakeLinkedItems('Op2-Bank'));
+      await op2.promise;
+    });
+    expect(screen.getByText(/Op2-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/Op1-Bank/)).toBeNull();
+  });
+});
+
+describe('55. Accounts: a later-started child operation resolving first still wins once the earlier one resolves after (Blocker 4)', () => {
+  it('op#1 then op#2 start from the same render; op#2 resolves first and commits; op#1 resolving after cannot overwrite it', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Initial-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const op1 = deferred<ReturnType<typeof fakeLinkedItems>>();
+    mockRefreshAccountBalances.mockReturnValueOnce(op1.promise);
+    await act(async () => {
+      screen.getByText('Refresh balances').click();
+      await Promise.resolve();
+    });
+
+    const op2 = deferred<ReturnType<typeof fakeLinkedItems>>();
+    mockSandboxResetLogin.mockReturnValueOnce(op2.promise);
+    await act(async () => {
+      screen.getByText('Simulate reauth (sandbox test)').click();
+      await Promise.resolve();
+    });
+
+    // op#2 (started later) resolves FIRST and commits.
+    await act(async () => {
+      op2.resolve(fakeLinkedItems('Op2-Bank'));
+      await op2.promise;
+    });
+    expect(screen.getByText(/Op2-Bank/)).toBeTruthy();
+
+    // op#1 (started earlier) resolves after — must not overwrite op#2's already-committed result.
+    await act(async () => {
+      op1.resolve(fakeLinkedItems('Op1-Bank'));
+      await op1.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Op2-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/Op1-Bank/)).toBeNull();
+  });
+});
+
+describe('56. Accounts: an older grouped items read cannot overwrite a newer account child operation that already committed (Blocker 4, reverse direction)', () => {
+  it('grouped read starts and holds open -> a later account child operation resolves and commits first -> the grouped read resolving after is inert', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('A-Initial-Bank'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/A-Initial-Bank/)).toBeTruthy();
+
+    // A grouped items read (via a Plaid-link success) starts and reserves a version BEFORE the
+    // account child operation below does, then holds open.
+    const groupedItems = deferred<ReturnType<typeof fakeLinkedItems>>();
+    mockGetLinkedItems.mockReturnValueOnce(groupedItems.promise);
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+
+    const childOp = deferred<ReturnType<typeof fakeLinkedItems>>();
+    mockSandboxResetLogin.mockReturnValueOnce(childOp.promise);
+    await act(async () => {
+      screen.getByText('Simulate reauth (sandbox test)').click();
+      await Promise.resolve();
+    });
+
+    // The account child operation, started AFTER the grouped read, resolves and commits first.
+    await act(async () => {
+      childOp.resolve(fakeLinkedItems('Child-Op-Bank'));
+      await childOp.promise;
+    });
+    expect(screen.getByText(/Child-Op-Bank/)).toBeTruthy();
+
+    // The older grouped read, still holding its now-stale reserved version, resolves after — must
+    // not overwrite the newer child operation's committed result.
+    await act(async () => {
+      groupedItems.resolve(fakeLinkedItems('Old-Grouped-Bank'));
+      await groupedItems.promise.catch(() => {});
+    });
+    expect(screen.getByText(/Child-Op-Bank/)).toBeTruthy();
+    expect(screen.queryByText(/Old-Grouped-Bank/)).toBeNull();
   });
 });
