@@ -1356,7 +1356,18 @@ export default function App() {
         // above has already confirmed this continuation is even allowed to run.
         const version = ++resourceVersionsRef.current.transactions;
         const transactionsRes = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
-        if (isStillCurrentSession(expectedSessionId) && version === resourceVersionsRef.current.transactions) {
+        // A second await boundary — the session can have moved on WHILE getTransactions() was
+        // in flight, even though it hadn't yet at the check above. Re-verifying only before
+        // setTransactions is not enough: refreshBudgetCategories() below is itself an OWNED
+        // follow-up request that reserves a budgets resource version and can commit under
+        // whatever session is current when IT resolves — if that's a newer lifecycle, this
+        // stale call would advance that lifecycle's own budgets version out from under its
+        // already-reserved grouped/targeted budget read, causing that newer read's legitimate
+        // result to be discarded as "stale" even though nothing about it was actually stale.
+        // The whole rest of this continuation — the transactions commit AND the budgets
+        // follow-up — must stop together here if the session has changed.
+        if (!isStillCurrentSession(expectedSessionId)) return res.backfilled_count;
+        if (version === resourceVersionsRef.current.transactions) {
           setTransactions(transactionsRes.transactions);
         }
         refreshBudgetCategories();

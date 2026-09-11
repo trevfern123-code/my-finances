@@ -2508,3 +2508,103 @@ describe('56. Accounts: an older grouped items read cannot overwrite a newer acc
     expect(screen.queryByText(/Old-Grouped-Bank/)).toBeNull();
   });
 });
+
+// Codex Round 9: handleSaveCategoryMapping's FIRST await boundary (the saveCategoryMapping() call
+// itself) was already guarded by Round 8's fix — an early return immediately after that response if
+// the session had already changed. But the backfill continuation has a SECOND await boundary
+// (getTransactions()) that can cross a lifecycle change on its own: the session can still be current
+// right after saveCategoryMapping() resolves (so the Round 8 guard passes and the continuation enters
+// the backfill block), then change WHILE getTransactions() is in flight. The old code only re-checked
+// ownership before its own setTransactions call, then called refreshBudgetCategories() unconditionally
+// regardless of that check's outcome — an unowned, current-session-under-the-hood targeted read that
+// could advance a newer lifecycle's own budgets resource version out from under its still-pending
+// grouped read, causing that legitimate newer read to reject itself as stale once it resolved. Fixed
+// by re-checking isStillCurrentSession once, immediately after getTransactions() resolves, and
+// returning immediately if it fails — before setTransactions AND before refreshBudgetCategories().
+describe('57. handleSaveCategoryMapping: a lifecycle change during the post-backfill getTransactions() await must not let refreshBudgetCategories() run under a newer session (Blocker 1, second await boundary)', () => {
+  it("A's backfill succeeds and starts its own getTransactions() follow-up (held pending) -> switch to B mid-grouped-bootstrap with one sibling still pending -> A's stale getTransactions() resolves -> refreshBudgetCategories() never fires, and B's own grouped budgets/transactions commit normally once its pending sibling resolves", async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactions('A-Transaction'));
+    mockGetBudgetCategories.mockResolvedValueOnce({
+      categories: [
+        { id: 'cat-1', name: 'A-Groceries', budget_amount: 100, color: null, sort_order: 0, emoji: null, archived_at: null, spent: 0, recent_avg_spent: 0 },
+      ],
+    });
+    mockGetCategoryMappings.mockResolvedValueOnce({
+      mappings: [{ id: 'map-1', plaid_category: 'FOOD_AND_DRINK', budget_category_id: 'cat-1' }],
+    });
+    mockGetPlaidCategories.mockResolvedValueOnce({ categories: ['FOOD_AND_DRINK'] });
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Categories').click());
+
+    // A's save resolves WHILE A is still current — the Round 8 guard passes, so the continuation
+    // enters the backfill block and starts its own getTransactions() follow-up.
+    const aSave = deferred<{ mapping: unknown; backfilled_count: number }>();
+    mockSaveCategoryMapping.mockReturnValueOnce(aSave.promise);
+    await act(async () => {
+      screen.getByText('Apply to existing transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    // Held pending here to represent the SECOND await boundary Codex found unguarded — a lifecycle
+    // change can still happen while this specific request is in flight.
+    const aBackfillRead = deferred<ReturnType<typeof fakeTransactions>>();
+    mockGetTransactions.mockReturnValueOnce(aBackfillRead.promise);
+    await act(async () => {
+      aSave.resolve({ mapping: { id: 'map-1', plaid_category: 'FOOD_AND_DRINK', budget_category_id: 'cat-1' }, backfilled_count: 3 });
+      await aSave.promise;
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    // Switch to B while A's follow-up getTransactions() is still pending. B's own grouped bootstrap
+    // starts and reserves its own budgets/transactions resource versions immediately — but one
+    // sibling (budgetCategories) is held pending too, so B's grouped Promise.allSettled cannot commit
+    // anything yet, reproducing Codex's exact "B has reserved but not yet committed" window.
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactions('B-Transaction'));
+    const bBudgetsRead = deferred<ReturnType<typeof fakeBudgetCategories>>();
+    mockGetBudgetCategories.mockReturnValueOnce(bBudgetsRead.promise);
+    mockGetCategoryMappings.mockResolvedValueOnce({ mappings: [] });
+    mockGetPlaidCategories.mockResolvedValueOnce({ categories: [] });
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitForFinancialLoading();
+
+    const budgetCallsBeforeStaleResolve = mockGetBudgetCategories.mock.calls.length;
+    const transactionsCallsBeforeStaleResolve = mockGetTransactions.mock.calls.length;
+
+    // A's stale follow-up resolves now, well after B is current and mid-bootstrap. Without Round 9's
+    // fix, the unguarded continuation would call refreshBudgetCategories() here under B's session — a
+    // targeted read that reserves a NEW budgets version, advancing it out from under B's own grouped
+    // budgetsVersion reservation above, so that when B's held sibling resolves, B's own grouped budget
+    // commit would reject itself as stale.
+    await act(async () => {
+      aBackfillRead.resolve(fakeTransactions('A-Stale-Transaction'));
+      await aBackfillRead.promise.catch(() => {});
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    expect(mockGetBudgetCategories.mock.calls.length).toBe(budgetCallsBeforeStaleResolve); // no extra refreshBudgetCategories() call
+    expect(mockGetTransactions.mock.calls.length).toBe(transactionsCallsBeforeStaleResolve); // no extra transactions call either
+
+    // B's still-pending grouped sibling now resolves — its budgets (and the rest of the grouped
+    // batch, including B's own transactions) must commit normally, unaffected by A's stale work.
+    await act(async () => {
+      bBudgetsRead.resolve(fakeBudgetCategories('B-Groceries'));
+      await bBudgetsRead.promise;
+    });
+
+    // activeTab persisted as 'settings' across the lifecycle change (same as test 50) — wait for the
+    // tab bar itself to reappear (financialLifecycleStatus === 'ready') rather than waitForReady(),
+    // whose own signal only ever renders on the Overview tab.
+    await waitFor(() => expect(screen.getByText('Settings')).toBeTruthy());
+    act(() => screen.getByText('Budget').click());
+    expect(screen.getByText(/B-Groceries/)).toBeTruthy();
+    expect(screen.queryByText(/A-Groceries/)).toBeNull();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/B-Transaction/)).toBeTruthy();
+    expect(screen.queryByText(/A-Transaction/)).toBeNull();
+    expect(screen.queryByText(/A-Stale-Transaction/)).toBeNull();
+  });
+});
