@@ -9,7 +9,7 @@
 // auth events and controls the handful of lib/api.ts data functions App actually depends on,
 // exactly the way a real browser's network layer would, and then asserts on what the real
 // component actually renders.
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import type { UserPreferences } from './lib/api';
@@ -31,6 +31,12 @@ const mockGetUserPreferences = vi.hoisted(() => vi.fn());
 const mockGetSpendingSummary = vi.hoisted(() => vi.fn());
 const mockGetNetWorthHistory = vi.hoisted(() => vi.fn());
 const mockGetMonthlyBreakdown = vi.hoisted(() => vi.fn());
+// Controlled (rather than trivially stubbed) so Round 4's in-flight-save regression tests can hold
+// a Financial Preferences PUT open and inspect exactly what payload a later save actually sends.
+const mockUpdateFinancialPreferences = vi.hoisted(() => vi.fn());
+// Controlled so the background-loading-indicator test can hold `loading` true on demand — one of
+// refreshFinancialData's 9 out-of-scope datasets, otherwise trivially stubbed like its siblings.
+const mockGetLinkedItems = vi.hoisted(() => vi.fn());
 
 vi.mock('./lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./lib/api')>();
@@ -38,7 +44,7 @@ vi.mock('./lib/api', async (importOriginal) => {
     ...actual,
     // Out-of-scope datasets (declared out of this remediation's boundary, same as the original
     // audit's own scope) — trivial, instantly-resolved stubs; their content is irrelevant here.
-    getLinkedItems: vi.fn().mockResolvedValue({ items: [], is_sandbox: true }),
+    getLinkedItems: mockGetLinkedItems,
     getTransactions: vi.fn().mockResolvedValue({ transactions: [] }),
     getBudgetCategories: vi.fn().mockResolvedValue({ categories: [] }),
     getRecurringStreams: vi.fn().mockResolvedValue({ streams: [], total_monthly_outflow: 0, total_monthly_inflow: 0 }),
@@ -51,7 +57,7 @@ vi.mock('./lib/api', async (importOriginal) => {
     // so nothing throws if a hook's own internal wiring ever reaches one.
     updateDashboardLayout: vi.fn().mockResolvedValue({ dashboard_layout: { cards: [] } }),
     updateAppearance: vi.fn().mockResolvedValue({ theme: 'system', accent_color: 'green' }),
-    updateFinancialPreferences: vi.fn().mockResolvedValue({}),
+    updateFinancialPreferences: mockUpdateFinancialPreferences,
     updateReportingRange: vi.fn().mockResolvedValue({ reporting_range: 'last_6_months' }),
     updateNavLayout: vi.fn().mockResolvedValue({ nav_layout: { tabs: [] } }),
     // PlaidLink's own two direct dependencies — PlaidLink calls createLinkToken() on mount; the
@@ -188,6 +194,8 @@ beforeEach(() => {
   });
   mockGetSession.mockImplementation(() => Promise.resolve({ data: { session: currentFakeSession } }));
   stubRangeDataTrivially();
+  mockUpdateFinancialPreferences.mockResolvedValue({});
+  mockGetLinkedItems.mockResolvedValue({ items: [], is_sandbox: true });
 });
 
 afterEach(() => {
@@ -474,5 +482,278 @@ describe('12. successful Plaid link refreshes range data through the same fresh-
     });
 
     await waitFor(() => expect(readNetWorth()).toBe('$400'));
+  });
+});
+
+// --- Round 4: preference-bootstrap / background-refresh isolation -------------------------------
+// Codex found that a single combined refreshAll() meant ANY background refresh — including a
+// successful Plaid link, which has nothing to do with authentication — set the same `loading` flag
+// the render body used to gate PreferencesScope's very existence, unmounting (and losing any
+// in-flight save from) all four preference hooks for the duration of that unrelated refresh. App.tsx
+// now splits this into bootstrapPreferences (preferences only, the only thing preferencesStatus
+// depends on) and refreshFinancialData (everything else, including `loading`) — see both functions'
+// own doc comments. These tests exercise that split, plus the latest-invocation ownership
+// bootstrapPreferences needed for two overlapping same-session invocations (sessionId tagging alone
+// already covered a *different* lifecycle's stale outcome — see the Round 3 tests above).
+
+describe('13. a successful Plaid link does not unmount PreferencesScope or re-bootstrap preferences', () => {
+  it('local dashboard-customizer UI state (never persisted) survives a Plaid-triggered background refresh', async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+
+    // Purely local, never-persisted UI state — this can only still be true after a background
+    // refresh if useDashboardLayout's instance inside PreferencesScope is literally the same one,
+    // i.e. PreferencesScope never unmounted.
+    act(() => screen.getByText('Customize dashboard').click());
+    expect(screen.getByText('Done')).toBeTruthy();
+
+    const preferencesCallsBefore = mockGetUserPreferences.mock.calls.length;
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    expect(screen.getByText('Done')).toBeTruthy(); // still open — PreferencesScope never remounted
+    // Plaid must not perform an unrelated preference re-bootstrap at all.
+    expect(mockGetUserPreferences.mock.calls.length).toBe(preferencesCallsBefore);
+  });
+});
+
+describe('14. an in-flight Financial Preferences save survives a same-session Plaid refresh (critical regression)', () => {
+  it('a pending PUT is not clobbered by Plaid, and a later sibling edit does not resurrect the stale pre-edit bundle', async () => {
+    mockGetUserPreferences.mockResolvedValue(
+      fakePreferences({ savings_rate_target: 15, minimum_cash_buffer: 100 })
+    );
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Financial Preferences').click());
+    const savingsRow = screen.getByText('Savings-rate target').closest('.financial-prefs-row') as HTMLElement;
+    const savingsInput = within(savingsRow).getByRole('spinbutton') as HTMLInputElement;
+    expect(savingsInput.value).toBe('15');
+
+    // Hold this save's PUT open — still in flight when Plaid succeeds below.
+    const pendingPut = deferred<Record<string, unknown>>();
+    mockUpdateFinancialPreferences.mockReturnValueOnce(pendingPut.promise);
+    fireEvent.change(savingsInput, { target: { value: '30' } });
+    fireEvent.blur(savingsInput);
+    expect(savingsInput.value).toBe('30'); // local edit applies immediately, independent of the PUT
+
+    const preferencesCallsBefore = mockGetUserPreferences.mock.calls.length;
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    // No unrelated re-bootstrap happened, and the locally-edited value is still what's shown/
+    // editable — never reverted to the pre-edit server value of 15.
+    expect(mockGetUserPreferences.mock.calls.length).toBe(preferencesCallsBefore);
+    expect(savingsInput.value).toBe('30');
+
+    // The original PUT now finally succeeds.
+    await act(async () => {
+      pendingPut.resolve({});
+      await pendingPut.promise;
+    });
+    expect(savingsInput.value).toBe('30');
+
+    // A later, sibling-field edit persists the FULL current bundle — it must reflect the
+    // already-applied 30, never the stale pre-edit 15 the old server payload still held.
+    const cashBufferRow = screen.getByText('Minimum cash buffer').closest('.financial-prefs-row') as HTMLElement;
+    const cashBufferInput = within(cashBufferRow).getByRole('spinbutton') as HTMLInputElement;
+    mockUpdateFinancialPreferences.mockResolvedValueOnce({});
+    fireEvent.change(cashBufferInput, { target: { value: '250' } });
+    await act(async () => {
+      fireEvent.blur(cashBufferInput);
+    });
+
+    const lastCall = mockUpdateFinancialPreferences.mock.calls.at(-1)!;
+    expect(lastCall[0]).toMatchObject({ savings_rate_target: 30, minimum_cash_buffer: 250 });
+  });
+});
+
+describe('15. SaveStatusTracker survives a same-session Plaid/background refresh', () => {
+  it('a pending save keeps showing "Saving…" through a Plaid refresh, then resolves normally', async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences({ savings_rate_target: 15 }));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Financial Preferences').click());
+    const savingsRow = screen.getByText('Savings-rate target').closest('.financial-prefs-row') as HTMLElement;
+    const savingsInput = within(savingsRow).getByRole('spinbutton') as HTMLInputElement;
+
+    const pendingPut = deferred<Record<string, unknown>>();
+    mockUpdateFinancialPreferences.mockReturnValueOnce(pendingPut.promise);
+    fireEvent.change(savingsInput, { target: { value: '20' } });
+    fireEvent.blur(savingsInput);
+    await waitFor(() => expect(screen.getByText('Saving…')).toBeTruthy());
+
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    // The same SaveStatusTracker instance is still active — still "Saving…", not reset to idle
+    // (which renders nothing) by an unrelated background refresh.
+    expect(screen.getByText('Saving…')).toBeTruthy();
+
+    await act(async () => {
+      pendingPut.resolve({});
+      await pendingPut.promise;
+    });
+    await waitFor(() => expect(screen.getByText('Saved ✓')).toBeTruthy());
+  });
+});
+
+describe('16. ordinary background loading no longer sends an already-ready lifecycle back through the bootstrap gate', () => {
+  it('shows a "Refreshing…" indicator without unmounting preference-dependent UI', async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    expect(screen.queryByText('Refreshing…')).toBeNull();
+
+    // Held open so `loading` reliably stays true for this assertion regardless of exactly how many
+    // microtask hops PlaidLink's own onSuccess (which awaits exchangePublicToken before calling
+    // onLinked) takes to actually reach refreshFinancialData's setLoading(true).
+    const pendingItems = deferred<{ items: unknown[]; is_sandbox: boolean }>();
+    mockGetLinkedItems.mockReturnValueOnce(pendingItems.promise);
+
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    expect(screen.getByText('Refreshing…')).toBeTruthy();
+    // Preference-dependent UI (gated behind preferencesStatus, not loading) stays mounted.
+    expect(screen.getByText('Customize dashboard')).toBeTruthy();
+    expect(screen.queryByText('Loading...')).toBeNull();
+
+    await act(async () => {
+      pendingItems.resolve({ items: [], is_sandbox: true });
+      await pendingItems.promise;
+    });
+    expect(screen.queryByText('Refreshing…')).toBeNull();
+  });
+});
+
+describe('17. same-session stale preference SUCCESS cannot replace a newer current outcome (Blocker 2)', () => {
+  it('retry #1 pending -> retry #2 succeeds -> retry #1 succeeds last: retry #2 remains current (also covers overlapping Retry attempts)', async () => {
+    mockGetUserPreferences.mockRejectedValueOnce(new Error('initial failure'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForPreferencesError();
+
+    const retry1 = deferred<UserPreferences>();
+    mockGetUserPreferences.mockReturnValueOnce(retry1.promise);
+    act(() => screen.getByText('Retry').click());
+    // Still 'error' (retry #1 hasn't settled) — nothing disables Retry while a request is pending,
+    // so a second, overlapping same-session attempt is reachable through the real DOM.
+    await waitForPreferencesError();
+
+    const retry2 = deferred<UserPreferences>();
+    mockGetUserPreferences.mockReturnValueOnce(retry2.promise);
+    act(() => screen.getByText('Retry').click());
+
+    // The newer invocation (retry #2) succeeds first.
+    await act(async () => {
+      retry2.resolve(fakePreferences({ savings_rate_target: 42 }));
+      await retry2.promise;
+    });
+    await waitForReady();
+
+    // The older invocation (retry #1) succeeds last, with a different value — must not win, even
+    // though both share the exact same sessionId.
+    await act(async () => {
+      retry1.resolve(fakePreferences({ savings_rate_target: 7 }));
+      await retry1.promise.catch(() => {});
+    });
+
+    expect(screen.getByText('Customize dashboard')).toBeTruthy();
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Financial Preferences').click());
+    const savingsRow = screen.getByText('Savings-rate target').closest('.financial-prefs-row') as HTMLElement;
+    expect((within(savingsRow).getByRole('spinbutton') as HTMLInputElement).value).toBe('42');
+  });
+});
+
+describe('18. same-session stale preference FAILURE cannot regress a newer ready outcome (Blocker 2)', () => {
+  it('retry #1 pending -> retry #2 succeeds -> retry #1 fails last: state remains ready from retry #2', async () => {
+    mockGetUserPreferences.mockRejectedValueOnce(new Error('initial failure'));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForPreferencesError();
+
+    const retry1 = deferred<UserPreferences>();
+    mockGetUserPreferences.mockReturnValueOnce(retry1.promise);
+    act(() => screen.getByText('Retry').click());
+    await waitForPreferencesError();
+
+    const retry2 = deferred<UserPreferences>();
+    mockGetUserPreferences.mockReturnValueOnce(retry2.promise);
+    act(() => screen.getByText('Retry').click());
+
+    await act(async () => {
+      retry2.resolve(fakePreferences());
+      await retry2.promise;
+    });
+    await waitForReady();
+
+    // The older, now-superseded retry finally rejects — must not regress the UI back to the error
+    // gate; no request remains in flight to ever recover it if it did.
+    await act(async () => {
+      retry1.reject(new Error('stale failure'));
+      await retry1.promise.catch(() => {});
+    });
+
+    expect(screen.getByText('Customize dashboard')).toBeTruthy();
+    expect(screen.queryByText(/Couldn't load your preferences/)).toBeNull();
+  });
+});
+
+describe('19. a successful Plaid link issues exactly one range-data refresh', () => {
+  it('each range-dependent endpoint is called exactly once, not twice from a redundant scope remount', async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+
+    const summaryCallsBefore = mockGetSpendingSummary.mock.calls.length;
+    const historyCallsBefore = mockGetNetWorthHistory.mock.calls.length;
+    const breakdownCallsBefore = mockGetMonthlyBreakdown.mock.calls.length;
+
+    await act(async () => {
+      capturedPlaidOnSuccess!('fake-public-token');
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(summaryCallsBefore + 1);
+    expect(mockGetNetWorthHistory.mock.calls.length).toBe(historyCallsBefore + 1);
+    expect(mockGetMonthlyBreakdown.mock.calls.length).toBe(breakdownCallsBefore + 1);
+  });
+});
+
+describe('20. a genuine lifecycle change still remounts PreferencesScope (contrast with Blocker 1)', () => {
+  it('A -> B resets local dashboard-customizer UI state, unlike a same-session background refresh', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+
+    act(() => screen.getByText('Customize dashboard').click());
+    expect(screen.getByText('Done')).toBeTruthy();
+
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitForReady();
+
+    // A genuine lifecycle change DOES remount PreferencesScope — B starts with the customizer
+    // closed, not carrying over A's local UI state.
+    expect(screen.queryByText('Done')).toBeNull();
   });
 });

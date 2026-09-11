@@ -113,9 +113,9 @@ type PrefsFrame = {
   rangeNetWorth: number | undefined;
 };
 
-/** Builds a full UserPreferences payload (the exact shape App.tsx's real refreshAll() gets back
- *  from getUserPreferences()) with sensible defaults, so each test only has to override the
- *  field(s) it actually cares about. */
+/** Builds a full UserPreferences payload (the exact shape App.tsx's real bootstrapPreferences()
+ *  gets back from getUserPreferences()) with sensible defaults, so each test only has to override
+ *  the field(s) it actually cares about. */
 function fakePreferences(overrides: Partial<UserPreferences> = {}): UserPreferences {
   return {
     dashboard_layout: null,
@@ -133,13 +133,14 @@ function fakePreferences(overrides: Partial<UserPreferences> = {}): UserPreferen
   };
 }
 
-/** Imperative escape hatches for tests to simulate "App.tsx's refreshAll() just had its
+/** Imperative escape hatches for tests to simulate "App.tsx's bootstrapPreferences() just had its
  *  getUserPreferences() call settle" — reassigned on every PreferencesHarness render (same pattern
  *  as `emitAuthEvent`/`latestLiveCallback` above), always pointing at the currently mounted harness
  *  instance's own setters. `forSessionId` lets a test simulate a fetch that was *initiated* under
  *  an earlier sessionId settling after the lifecycle has already moved on — exactly mirroring
- *  App.tsx's own `requestedForSessionId` capture in refreshAll. `resolvePreferencesFetch` models a
- *  successful fetch; `rejectPreferencesFetch` models `getUserPreferences()` itself rejecting. */
+ *  App.tsx's own `requestedForSessionId` capture in bootstrapPreferences. `resolvePreferencesFetch`
+ *  models a successful fetch; `rejectPreferencesFetch` models `getUserPreferences()` itself
+ *  rejecting. */
 let resolvePreferencesFetch: ((payload: UserPreferences, forSessionId: string) => void) | null = null;
 let rejectPreferencesFetch: ((forSessionId: string) => void) | null = null;
 
@@ -192,9 +193,10 @@ function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
   const [rangeNetWorth, setRangeNetWorth] = useState<number | undefined>(undefined);
 
   // Clears the range-dependent proxy dataset the instant the lifecycle changes — mirrors App.tsx's
-  // own sessionId-keyed clear in its `[sessionId, refreshAll]` effect exactly, for the identical
-  // reason: without it, the render immediately after a lifecycle change could still show the
-  // previous lifecycle's own rangeNetWorth value until this scope's own hydration completes.
+  // own sessionId-keyed clear in its `[sessionId, bootstrapPreferences, refreshFinancialData]`
+  // effect exactly, for the identical reason: without it, the render immediately after a lifecycle
+  // change could still show the previous lifecycle's own rangeNetWorth value until this scope's
+  // own hydration completes.
   useEffect(() => {
     if (!auth.sessionId) return;
     setRangeNetWorth(undefined);
@@ -245,11 +247,11 @@ function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
       range: '',
       rangeNetWorth: undefined,
     });
-    // No Retry button here deliberately: App's real one just re-invokes refreshAll(), which this
-    // harness doesn't reconstruct (see the harness's own doc comment) — tests simulate a
+    // No Retry button here deliberately: App's real one just re-invokes bootstrapPreferences(),
+    // which this harness doesn't reconstruct (see the harness's own doc comment) — tests simulate a
     // successful retry the same way they simulate the original fetch, by calling
-    // resolvePreferencesFetch directly, which is the exact mechanism App's refreshAll would drive
-    // it through on a real retry.
+    // resolvePreferencesFetch directly, which is the exact mechanism App's bootstrapPreferences
+    // would drive it through on a real retry.
     return <p data-testid="prefs-error">Couldn't load preferences.</p>;
   }
   const currentPreferences = preferencesForCurrentSession!;
@@ -1119,9 +1121,10 @@ describe('12. PreferencesScope — cross-lifecycle isolation (all four preferenc
   // ready") used to be tested here directly against PreferencesHarness. It has been moved to
   // App.production.test.tsx, which renders the real, default-exported `<App>` end to end: Codex
   // flagged (twice) that this harness's own `resolvePreferencesFetch`/`rejectPreferencesFetch`
-  // write unconditionally, by design — gating them the same way App.tsx's real refreshAll now
-  // does would just be a second, parallel implementation of the exact protection under test. See
-  // App.production.test.tsx's "stale preference outcome" describe block for the real coverage.
+  // write unconditionally, by design — gating them the same way App.tsx's real bootstrapPreferences
+  // now does (including its own latest-invocation ownership, for the same-session overlap Round 4
+  // added) would just be a second, parallel implementation of the exact protection under test. See
+  // App.production.test.tsx's "stale preference outcome" describe blocks for the real coverage.
 
   it('a token refresh under the same session_id does not remount or re-hydrate any of the four hooks', async () => {
     const frames: PrefsFrame[] = [];

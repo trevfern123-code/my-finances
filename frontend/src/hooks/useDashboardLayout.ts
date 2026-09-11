@@ -24,8 +24,10 @@ import {
  * `useState` initializer function only ever runs once, on a hook instance's very first render, so
  * this hook's very first render already reflects the current lifecycle's real, server-side
  * layout: there is no intermediate committed frame — visible or not — where a default/blank
- * layout is what's actually editable. A later change to `savedCards` (e.g. an unrelated
- * refreshAll() re-fetching without a lifecycle change) is intentionally ignored, since the
+ * layout is what's actually editable. A later change to `savedCards` (e.g. App.tsx's own
+ * refreshFinancialData or bootstrapPreferences re-fetching without a lifecycle change — including
+ * from a same-session background/Plaid refresh, which no longer unmounts this hook's owning scope
+ * at all, see App.tsx's PreferencesScope doc comment) is intentionally ignored, since the
  * initializer never runs again for an already-mounted instance — the same "a later refetch never
  * clobbers a local edit" guarantee a `hydrated` ref used to provide, now structural rather than a
  * flag this hook has to maintain itself.
