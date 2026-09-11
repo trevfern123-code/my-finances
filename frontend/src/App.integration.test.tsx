@@ -19,10 +19,11 @@
 import { act, cleanup, render, waitFor } from '@testing-library/react';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, StrictMode, type MutableRefObject } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { NavLayoutScope, PreferencesScope, navigationWriteCoordinator } from './App';
+import { NavLayoutScope, PreferencesScope, navigationWriteCoordinator, type PreferencesFetchOutcome } from './App';
 import { currentGenerationValue, type AuthState } from './lib/authGeneration';
-import type { NavLayoutEntry, UserPreferences } from './lib/api';
+import { getSpendingSummary, type NavLayoutEntry, type UserPreferences } from './lib/api';
 import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
+import { DEFAULT_REPORTING_RANGE, type ReportingRangeId } from './lib/reportingRange';
 import { useAuthSession } from './hooks/useAuthSession';
 
 const mockGetSession = vi.hoisted(() => vi.fn());
@@ -64,6 +65,17 @@ function okResponse(body: unknown) {
   return { ok: true, status: 200, json: () => Promise.resolve(body) };
 }
 
+/** Whether a PUT to a URL containing `urlSubstring` was ever sent on the shared `fetch` mock — used
+ *  by the save-ownership tests below to check for a *specific* write, since the same mock now also
+ *  captures the harness's read-only range-data GETs (see PreferencesHarness's applyRangeData),
+ *  which legitimately fire alongside a save action and would make a bare "fetch was/wasn't called"
+ *  count assertion too broad. */
+function wasPutCalledWith(urlSubstring: string): boolean {
+  return vi
+    .mocked(fetch)
+    .mock.calls.some(([url, init]) => String(url).includes(urlSubstring) && (init as RequestInit | undefined)?.method === 'PUT');
+}
+
 type Frame = { userId: string | null; sessionId: string | null };
 type LiveCallback = (event: string, session: FakeSession | null) => void;
 
@@ -88,6 +100,7 @@ function emitAuthEvent(session: FakeSession | null) {
 type PrefsFrame = {
   userId: string | null;
   sessionId: string | null;
+  status: 'loading' | 'ready' | 'error';
   dashboardVisibleIds: string[];
   theme: string;
   accent: string;
@@ -95,6 +108,9 @@ type PrefsFrame = {
   savingsRateTarget: number;
   includeUpcomingBills: boolean;
   range: string;
+  /** The harness's own range-dependent proxy dataset (see applyRangeData below) — undefined until
+   *  a request for the CURRENT sessionId/range/attempt has actually committed. */
+  rangeNetWorth: number | undefined;
 };
 
 /** Builds a full UserPreferences payload (the exact shape App.tsx's real refreshAll() gets back
@@ -117,19 +133,29 @@ function fakePreferences(overrides: Partial<UserPreferences> = {}): UserPreferen
   };
 }
 
-/** Imperative escape hatch for tests to simulate "App.tsx's refreshAll() just had its
- *  getUserPreferences() call resolve" — reassigned on every PreferencesHarness render (same
- *  pattern as `emitAuthEvent`/`latestLiveCallback` above), always pointing at the currently
- *  mounted harness instance's own setters. `forSessionId` lets a test simulate a fetch that was
- *  *initiated* under an earlier sessionId resolving after the lifecycle has already moved on —
- *  exactly mirroring App.tsx's own `requestedForSessionId` capture in refreshAll. */
+/** Imperative escape hatches for tests to simulate "App.tsx's refreshAll() just had its
+ *  getUserPreferences() call settle" — reassigned on every PreferencesHarness render (same pattern
+ *  as `emitAuthEvent`/`latestLiveCallback` above), always pointing at the currently mounted harness
+ *  instance's own setters. `forSessionId` lets a test simulate a fetch that was *initiated* under
+ *  an earlier sessionId settling after the lifecycle has already moved on — exactly mirroring
+ *  App.tsx's own `requestedForSessionId` capture in refreshAll. `resolvePreferencesFetch` models a
+ *  successful fetch; `rejectPreferencesFetch` models `getUserPreferences()` itself rejecting. */
 let resolvePreferencesFetch: ((payload: UserPreferences, forSessionId: string) => void) | null = null;
+let rejectPreferencesFetch: ((forSessionId: string) => void) | null = null;
 
-/** Thin test-local wrapper mirroring App.tsx's own preferencesRaw/preferencesRawSessionId state
- *  and currentGenerationValue derivation exactly — reusing the real, exported PreferencesScope
- *  and the real currentGenerationValue function, not a re-implementation of either. Directly
- *  analogous to how AuthHarness already mirrors App.tsx's sessionIdRef/isSessionCurrent wiring
- *  around the real, exported NavLayoutScope. */
+/** Thin test-local wrapper mirroring App.tsx's own preferencesOutcome/preferencesOutcomeSessionId
+ *  state, its tri-state `preferencesStatus` derivation, and its range-dataset ownership mechanism
+ *  (reportingRangeRef/rangeDataRequestIdRef/applyReportingRange) — reusing the real, exported
+ *  PreferencesScope, the real `PreferencesFetchOutcome` type, the real `currentGenerationValue`
+ *  function, and the real `getSpendingSummary` from lib/api.ts (so a save/fetch here goes through
+ *  the same authedFetch/session-lookup path production does), not a re-implementation of any of
+ *  them. Directly analogous to how AuthHarness already mirrors App.tsx's sessionIdRef/
+ *  isSessionCurrent wiring around the real, exported NavLayoutScope. The one piece that IS
+ *  necessarily re-expressed here (not imported) is the shape of the monotonic request-id ownership
+ *  check itself — App.tsx's version lives inside its own closures over `setSummary` et al. and
+ *  can't be imported standalone without rendering all of `<App>`; the check is a single `===`
+ *  comparison against a `useRef<number>`, mirrored 1:1 with App.tsx's own (see its own comments on
+ *  `rangeDataRequestIdRef`/`applyReportingRange`/`refreshSummary`) rather than approximated. */
 function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
   const auth = useAuthSession();
   const userId = auth.session?.user.id ?? null;
@@ -139,14 +165,51 @@ function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
   }, [auth.sessionId]);
   const isSessionCurrent = useCallback((id: string) => sessionIdRef.current === id, []);
 
-  const [preferencesRaw, setPreferencesRaw] = useState<UserPreferences | undefined>(undefined);
-  const [preferencesRawSessionId, setPreferencesRawSessionId] = useState<string | undefined>(undefined);
-  const preferencesForCurrentSession = currentGenerationValue(preferencesRaw, preferencesRawSessionId, auth.sessionId);
+  const [preferencesOutcome, setPreferencesOutcome] = useState<PreferencesFetchOutcome | undefined>(undefined);
+  const [preferencesOutcomeSessionId, setPreferencesOutcomeSessionId] = useState<string | undefined>(undefined);
+  const preferencesOutcomeForCurrentSession = currentGenerationValue(
+    preferencesOutcome,
+    preferencesOutcomeSessionId,
+    auth.sessionId
+  );
+  const preferencesStatus: 'loading' | 'ready' | 'error' = preferencesOutcomeForCurrentSession?.status ?? 'loading';
+  const preferencesForCurrentSession =
+    preferencesOutcomeForCurrentSession?.status === 'ready' ? preferencesOutcomeForCurrentSession.payload : undefined;
 
   resolvePreferencesFetch = (payload, forSessionId) => {
-    setPreferencesRaw(payload);
-    setPreferencesRawSessionId(forSessionId);
+    setPreferencesOutcome({ status: 'ready', payload });
+    setPreferencesOutcomeSessionId(forSessionId);
   };
+  rejectPreferencesFetch = (forSessionId) => {
+    setPreferencesOutcome({ status: 'error' });
+    setPreferencesOutcomeSessionId(forSessionId);
+  };
+
+  // --- range-dataset ownership — mirrors App.tsx's reportingRangeRef/rangeDataRequestIdRef/
+  // applyReportingRange/refreshSummary exactly; see this function's own doc comment above. ---
+  const reportingRangeRef = useRef<ReportingRangeId>(DEFAULT_REPORTING_RANGE);
+  const rangeDataRequestIdRef = useRef(0);
+  const [rangeNetWorth, setRangeNetWorth] = useState<number | undefined>(undefined);
+
+  // Clears the range-dependent proxy dataset the instant the lifecycle changes — mirrors App.tsx's
+  // own sessionId-keyed clear in its `[sessionId, refreshAll]` effect exactly, for the identical
+  // reason: without it, the render immediately after a lifecycle change could still show the
+  // previous lifecycle's own rangeNetWorth value until this scope's own hydration completes.
+  useEffect(() => {
+    if (!auth.sessionId) return;
+    setRangeNetWorth(undefined);
+  }, [auth.sessionId]);
+
+  async function applyRangeData(range: ReportingRangeId) {
+    reportingRangeRef.current = range;
+    const requestId = ++rangeDataRequestIdRef.current;
+    try {
+      const res = await getSpendingSummary(range);
+      if (requestId === rangeDataRequestIdRef.current) setRangeNetWorth(res.net_worth);
+    } catch {
+      // ignore — mirrors App.tsx's refreshSummary
+    }
+  }
 
   return (
     <PreferencesScope
@@ -154,13 +217,15 @@ function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
       userId={userId}
       sessionId={auth.sessionId ?? ''}
       isSessionCurrent={isSessionCurrent}
+      status={preferencesStatus}
       saved={preferencesForCurrentSession}
-      onReportingRangeReady={() => {}}
+      onReportingRangeReady={applyRangeData}
     >
-      {({ dashboardLayout, appearance, financialPreferences, reportingRange }) => {
+      {({ status, dashboardLayout, appearance, financialPreferences, reportingRange }) => {
         frames.push({
           userId,
           sessionId: auth.sessionId,
+          status,
           dashboardVisibleIds: dashboardLayout.layout.filter((c) => c.visible).map((c) => c.id),
           theme: appearance.theme,
           accent: appearance.accent,
@@ -168,7 +233,19 @@ function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
           savingsRateTarget: financialPreferences.savingsRateTarget,
           includeUpcomingBills: financialPreferences.includeUpcomingBills,
           range: reportingRange.range,
+          rangeNetWorth,
         });
+        // Mirrors App.tsx's own gating exactly (see its render-prop's `if (loading || prefsStatus
+        // === 'loading') ...` / `if (prefsStatus === 'error') ...`): no interactive control exists
+        // in the DOM at all until status === 'ready' — this is what makes "edit before hydration"
+        // structurally unreachable, not merely rejected after the fact.
+        if (status === 'loading') return <p data-testid="prefs-loading">Loading preferences...</p>;
+        // No Retry button here deliberately: App's real one just re-invokes refreshAll(), which
+        // this harness doesn't reconstruct (see the harness's own doc comment) — tests simulate a
+        // successful retry the same way they simulate the original fetch, by calling
+        // resolvePreferencesFetch directly, which is the exact mechanism App's refreshAll would
+        // drive it through on a real retry.
+        if (status === 'error') return <p data-testid="prefs-error">Couldn't load preferences.</p>;
         return (
           <div data-testid="prefs-content">
             <button data-testid="toggle-stats" onClick={() => dashboardLayout.toggleVisibility('stats')}>
@@ -197,6 +274,9 @@ function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
             <button data-testid="set-range-3m" onClick={() => reportingRange.setRange('last_3_months')}>
               3 months
             </button>
+            <button data-testid="simulate-plaid-linked" onClick={() => applyRangeData(reportingRangeRef.current)}>
+              Simulate successful Plaid link
+            </button>
             <span data-testid="layout">{JSON.stringify(dashboardLayout.layout)}</span>
             <span data-testid="theme">{appearance.theme}</span>
             <span data-testid="accent">{appearance.accent}</span>
@@ -204,6 +284,7 @@ function PreferencesHarness({ frames }: { frames: PrefsFrame[] }) {
             <span data-testid="min-cash">{financialPreferences.minimumCashBuffer}</span>
             <span data-testid="include-upcoming-bills">{String(financialPreferences.includeUpcomingBills)}</span>
             <span data-testid="range">{reportingRange.range}</span>
+            <span data-testid="range-net-worth">{rangeNetWorth ?? ''}</span>
           </div>
         );
       }}
@@ -1098,6 +1179,9 @@ describe('13. Dashboard Layout — save ownership', () => {
       resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
     });
     await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+    // Hydration itself already fired a read-only range-data GET (see applyRangeData) — clear it so
+    // the assertion below is scoped to just this test's own save action.
+    vi.mocked(fetch).mockClear();
 
     // A's own session lookup for this save is held open until after B becomes current.
     const lookup = deferred<{ data: { session: FakeSession | null } }>();
@@ -1132,9 +1216,18 @@ describe('14. Appearance — stale save completion and Retry cannot cross into a
     await waitFor(() => expect(getByTestId('appearance-status').textContent).toBe('saving'));
 
     act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1'))); // B becomes current — a fresh scope mounts
-    expect(getByTestId('appearance-status').textContent).toBe('idle'); // B's brand-new tracker starts idle
+    // B's own preferences haven't hydrated yet — nothing of A's (or a default) is shown as if it
+    // were authoritative; per PreferencesScope's readiness gate, there is no appearance UI at all
+    // yet, only the loading placeholder.
+    expect(getByTestId('prefs-loading')).toBeTruthy();
 
-    // A's stale save finally settles successfully.
+    // B's own fetch resolves — a fresh scope, a fresh SaveStatusTracker, starting idle.
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-b1');
+    });
+    await waitFor(() => expect(getByTestId('appearance-status').textContent).toBe('idle'));
+
+    // A's stale save finally settles successfully, after B is already fully hydrated and idle.
     await act(async () => {
       fetchCall.resolve(okResponse({ theme: 'dark', accent_color: 'green' }));
       await fetchCall.promise;
@@ -1153,6 +1246,7 @@ describe('14. Appearance — stale save completion and Retry cannot cross into a
       resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
     });
     await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+    vi.mocked(fetch).mockClear(); // drop A's hydration-triggered range-data GET from the count below
 
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: false,
@@ -1164,11 +1258,21 @@ describe('14. Appearance — stale save completion and Retry cannot cross into a
     expect(fetch).toHaveBeenCalledTimes(1);
 
     act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1'))); // B logs in — a fresh scope, nothing failed yet
+    expect(getByTestId('prefs-loading')).toBeTruthy(); // B's own preferences not hydrated yet
 
-    // B's Retry button belongs to a brand-new SaveStatusTracker (PreferencesScope remounted) —
+    // B's own fetch resolves — a fresh, unfailed SaveStatusTracker.
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-b1');
+    });
+    await waitFor(() => expect(getByTestId('appearance-status').textContent).toBe('idle'));
+    // B's own hydration fires its own (legitimate, unrelated) range-data GET — clear it so the
+    // Retry assertion below is scoped to just the Retry click itself.
+    vi.mocked(fetch).mockClear();
+
+    // B's Retry button belongs to that brand-new SaveStatusTracker (PreferencesScope remounted) —
     // there's nothing of B's own to retry, so it must be a no-op: no new network call.
     act(() => getByTestId('appearance-retry').click());
-    expect(fetch).toHaveBeenCalledTimes(1); // still just A's original (already-settled) failed call
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -1226,6 +1330,7 @@ describe('15. Financial Preferences (incl. Safe-to-Spend) — the priority regre
       resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
     });
     await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+    vi.mocked(fetch).mockClear(); // drop A1's hydration-triggered range-data GET from the count below
 
     const lookup = deferred<{ data: { session: FakeSession | null } }>();
     mockGetSession.mockReturnValueOnce(lookup.promise);
@@ -1254,8 +1359,15 @@ describe('16. Reporting Range — save ownership', () => {
     });
     await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
 
+    // setRange() fires two independent things, each with its own authedFetch -> getSession()
+    // lookup, in this order: an immediate, read-only range-data GET (via onReportingRangeReady/
+    // applyRangeData — self-protected by its own request-id, not an ownership question) and the
+    // actual preference *save* PUT (session-lookup-gated). Only the PUT is this test's concern, so
+    // only its lookup (the second getSession() call) is held open.
     const lookup = deferred<{ data: { session: FakeSession | null } }>();
-    mockGetSession.mockReturnValueOnce(lookup.promise);
+    mockGetSession
+      .mockReturnValueOnce(Promise.resolve({ data: { session: fakeSession('user-a', 'sid-a1') } })) // the GET's own lookup
+      .mockReturnValueOnce(lookup.promise); // the PUT's own lookup — held open
     act(() => getByTestId('set-range-3m').click()); // A's range change — awaiting its own session lookup
 
     act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
@@ -1265,7 +1377,7 @@ describe('16. Reporting Range — save ownership', () => {
       await lookup.promise;
     });
 
-    expect(fetch).not.toHaveBeenCalled();
+    expect(wasPutCalledWith('/reporting-range')).toBe(false); // A's save never reached the network under B
   });
 });
 
@@ -1284,6 +1396,7 @@ describe('17. PreferencesScope under StrictMode', () => {
       resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
     });
     await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
+    vi.mocked(fetch).mockClear(); // drop hydration's own range-data GET from the count below
 
     act(() => getByTestId('set-theme-dark').click());
 
@@ -1295,5 +1408,267 @@ describe('17. PreferencesScope under StrictMode', () => {
     // Exactly one PUT reached the network for this one click — StrictMode's double-invoke must not
     // have caused a double-persist.
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round 2 correction: current-session preferences must be hydrated before they're editable; the
+// three reporting-range-parameterized datasets need their own lifecycle/range ownership; a
+// successful Plaid link must refresh them; and a preferences load failure needs a safe path back
+// to a working state. See PreferencesHarness's own doc comment for how `status`/`rangeNetWorth`/
+// `applyRangeData`/`simulate-plaid-linked` mirror App.tsx's real preferencesStatus/
+// rangeDataRequestIdRef/applyReportingRange/handlePlaidLinked.
+// ---------------------------------------------------------------------------------------------
+
+describe('18. Pre-hydration: preference controls are structurally absent, never editable-as-default', () => {
+  it("Dashboard: no toggle/move/preset control exists before this lifecycle's preferences hydrate", () => {
+    const frames: PrefsFrame[] = [];
+    const { queryByTestId, getByTestId } = render(<PreferencesHarness frames={frames} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    // Deliberately never call resolvePreferencesFetch — this lifecycle's preferences never arrive.
+    expect(getByTestId('prefs-loading')).toBeTruthy();
+    expect(queryByTestId('toggle-stats')).toBeNull();
+  });
+
+  it('Appearance: no theme/accent control exists before hydration — a default/cached value can never be persisted as authoritative', () => {
+    const frames: PrefsFrame[] = [];
+    const { queryByTestId, getByTestId } = render(<PreferencesHarness frames={frames} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    expect(getByTestId('prefs-loading')).toBeTruthy();
+    expect(queryByTestId('set-theme-dark')).toBeNull();
+    expect(queryByTestId('set-accent-blue')).toBeNull();
+  });
+
+  it('Financial Preferences: no field control exists before hydration — a default sibling value can never be persisted', () => {
+    const frames: PrefsFrame[] = [];
+    const { queryByTestId, getByTestId } = render(<PreferencesHarness frames={frames} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    expect(getByTestId('prefs-loading')).toBeTruthy();
+    expect(queryByTestId('set-savings-rate-25')).toBeNull();
+    expect(queryByTestId('set-min-cash-500')).toBeNull();
+  });
+
+  it('Reporting Range: no range control exists before hydration — a change cannot be saved and then silently reverted by the real hydration', () => {
+    const frames: PrefsFrame[] = [];
+    const { queryByTestId, getByTestId } = render(<PreferencesHarness frames={frames} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    expect(getByTestId('prefs-loading')).toBeTruthy();
+    expect(queryByTestId('set-range-3m')).toBeNull();
+  });
+
+  it('a preference-load failure leaves controls safely non-editable, with a distinct error state (not a loading spinner, not editable defaults)', async () => {
+    const frames: PrefsFrame[] = [];
+    const { queryByTestId, getByTestId } = render(<PreferencesHarness frames={frames} />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      rejectPreferencesFetch!('sid-a1');
+    });
+    await waitFor(() => expect(getByTestId('prefs-error')).toBeTruthy());
+    expect(queryByTestId('prefs-loading')).toBeNull();
+    expect(queryByTestId('toggle-stats')).toBeNull();
+    expect(queryByTestId('set-theme-dark')).toBeNull();
+    expect(queryByTestId('set-savings-rate-25')).toBeNull();
+    expect(queryByTestId('set-range-3m')).toBeNull();
+  });
+});
+
+describe('19. Range-dependent dataset lifecycle/range ownership (the summary proxy — see applyRangeData)', () => {
+  it("A's retained range data is never rendered for B", async () => {
+    vi.mocked(fetch).mockResolvedValue(okResponse({ net_worth: 111 }) as never);
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('111'));
+
+    // B logs in — the render immediately after this must never show A's 111 as if it were B's,
+    // even though B's own fetch hasn't been resolved yet.
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    const lastFrame = frames.at(-1)!;
+    expect(lastFrame.sessionId).toBe('sid-b1');
+    expect(lastFrame.rangeNetWorth).toBeUndefined(); // cleared, not A's 111
+
+    vi.mocked(fetch).mockResolvedValue(okResponse({ net_worth: 222 }) as never);
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-b1');
+    });
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('222'));
+  });
+
+  it("a late response for old user A cannot overwrite B's range data", async () => {
+    const aFetch = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    vi.mocked(fetch).mockReturnValueOnce(aFetch.promise as never); // A's hydration-triggered GET, held open
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    vi.mocked(fetch).mockResolvedValue(okResponse({ net_worth: 222 }) as never);
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-b1');
+    });
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('222'));
+
+    // A's stale GET finally resolves, after B's own has already committed.
+    await act(async () => {
+      aFetch.resolve(okResponse({ net_worth: 999 }));
+      await aFetch.promise;
+    });
+
+    expect(getByTestId('range-net-worth').textContent).toBe('222'); // never overwritten by A's late 999
+  });
+
+  it("a late response for old session A1 cannot overwrite A3's range data (same user)", async () => {
+    const a1Fetch = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    vi.mocked(fetch).mockReturnValueOnce(a1Fetch.promise as never);
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+
+    act(() => emitAuthEvent(null));
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a3')));
+    vi.mocked(fetch).mockResolvedValue(okResponse({ net_worth: 333 }) as never);
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a3');
+    });
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('333'));
+
+    await act(async () => {
+      a1Fetch.resolve(okResponse({ net_worth: 111 }));
+      await a1Fetch.promise;
+    });
+
+    expect(getByTestId('range-net-worth').textContent).toBe('333'); // never overwritten by A1's late 111
+  });
+
+  it("an old (superseded) range response cannot overwrite a newer selected range's data, even same user/session", async () => {
+    const firstRangeFetch = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    vi.mocked(fetch).mockReturnValueOnce(firstRangeFetch.promise as never); // hydration's GET, held open
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1'); // fires the held-open GET for last_6_months
+    });
+
+    // The user picks a new range before the first (6-month) request ever resolves. setRange fires
+    // its own GET first, then its save PUT — see the ordering comment in section 16's test.
+    vi.mocked(fetch).mockResolvedValueOnce(okResponse({ net_worth: 777 }) as never); // the 3-month range's own GET
+    vi.mocked(fetch).mockResolvedValueOnce(okResponse({ reporting_range: 'last_3_months' }) as never); // its save PUT
+    act(() => getByTestId('set-range-3m').click());
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('777'));
+
+    // The stale first (6-month) request finally resolves, after the 3-month one already committed.
+    await act(async () => {
+      firstRangeFetch.resolve(okResponse({ net_worth: 666 }));
+      await firstRangeFetch.promise;
+    });
+
+    expect(getByTestId('range-net-worth').textContent).toBe('777'); // never reverted by the stale 6-month response
+  });
+
+  it("a failed current-range request does not leave a prior user's range data masquerading as current", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(okResponse({ net_worth: 111 }) as never);
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('111'));
+
+    // B logs in; B's own range-data fetch fails.
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: () => Promise.resolve({ error: 'down' }),
+    } as never);
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-b1');
+    });
+
+    await waitFor(() => expect(getByTestId('prefs-content')).toBeTruthy());
+    // B's own request failed — the display shows nothing (cleared on lifecycle change), never A's
+    // retained 111 masquerading as current.
+    expect(getByTestId('range-net-worth').textContent).toBe('');
+  });
+});
+
+describe('20. Simulated successful Plaid link refreshes range-dependent data via the same protected pathway', () => {
+  it('refreshes the current-range dataset', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(okResponse({ net_worth: 111 }) as never);
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('111'));
+
+    // Balances changed (a link happened) — the SAME range's data is now different server-side.
+    vi.mocked(fetch).mockResolvedValueOnce(okResponse({ net_worth: 444 }) as never);
+    act(() => getByTestId('simulate-plaid-linked').click());
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('444'));
+  });
+
+  it('does not re-hydrate (reset) already-hydrated preferences', async () => {
+    vi.mocked(fetch).mockResolvedValue(okResponse({ net_worth: 1 }) as never);
+    const frames: PrefsFrame[] = [];
+    const { getByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+    await waitFor(() => expect(getByTestId('prefs-content')).toBeTruthy());
+
+    // A local edit to theme.
+    act(() => getByTestId('set-theme-dark').click());
+    await waitFor(() => expect(getByTestId('theme').textContent).toBe('dark'));
+
+    act(() => getByTestId('simulate-plaid-linked').click());
+
+    // The already-hydrated Appearance hook is untouched by this — still 'dark', not reset to the
+    // fetched payload's 'system' default (which is what a spurious re-hydration would produce).
+    expect(getByTestId('theme').textContent).toBe('dark');
+  });
+});
+
+describe('21. A preference-fetch failure does not permanently block range-data recovery', () => {
+  it('initial failure then a successful retry hydrates preferences and loads current-range data', async () => {
+    const frames: PrefsFrame[] = [];
+    const { getByTestId, queryByTestId } = render(<PreferencesHarness frames={frames} />);
+
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await act(async () => {
+      rejectPreferencesFetch!('sid-a1');
+    });
+    await waitFor(() => expect(getByTestId('prefs-error')).toBeTruthy());
+    expect(queryByTestId('range-net-worth')).toBeNull(); // nothing rendered/fetched during the failure
+
+    // Retry succeeds — mirrors App's real Retry button re-invoking refreshAll(), which (on
+    // success) tags a fresh 'ready' outcome exactly the way resolvePreferencesFetch does here.
+    vi.mocked(fetch).mockResolvedValueOnce(okResponse({ net_worth: 555 }) as never);
+    await act(async () => {
+      resolvePreferencesFetch!(fakePreferences(), 'sid-a1');
+    });
+
+    await waitFor(() => expect(getByTestId('prefs-content')).toBeTruthy());
+    await waitFor(() => expect(getByTestId('range-net-worth').textContent).toBe('555'));
   });
 });

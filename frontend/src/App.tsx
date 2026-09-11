@@ -95,6 +95,17 @@ import './App.css';
 // same in-memory list) cover as much history as the API allows, rather than the default 50.
 const TRANSACTIONS_FETCH_LIMIT = 200;
 
+/**
+ * The current lifecycle's own `getUserPreferences()` outcome — distinct from the general `loading`
+ * flag (set by every refreshAll() call, including ones unrelated to auth, like PlaidLink's
+ * onLinked) and distinct from "not yet resolved" vs "resolved but failed." Tagged with the
+ * sessionId it was fetched under (see `preferencesStatus`'s derivation in App) using the same
+ * currentGenerationValue mechanism as navLayoutRaw already uses — a pure, per-render
+ * derivation, so a lifecycle change is reflected the instant sessionId itself changes, with no
+ * effect-timing gap where a stale outcome could still read as current for even one render.
+ */
+export type PreferencesFetchOutcome = { status: 'ready'; payload: UserPreferences } | { status: 'error' };
+
 // The one Navigation write coordinator for this browser tab — a genuine module-level singleton,
 // constructed exactly once when this module is first evaluated, not inside the `App` component
 // function. This is deliberate, not merely a style choice: a `useRef`-scoped instance living
@@ -205,11 +216,23 @@ export function NavLayoutScope({
  * before. None of these four preferences has a write queue (unlike Navigation), so this — scope-
  * level hydration reset plus per-save request-time ownership — is the whole mechanism required;
  * this does not introduce a coordinator or attachment-id system.
+ *
+ * `status` (App's `preferencesStatus`, derived from `PreferencesFetchOutcome`) governs whether
+ * `saved` is even meaningfully populated: it's `undefined` for both `'loading'` and `'error'`, and
+ * only the current lifecycle's actual payload for `'ready'`. Passed straight through to `children`
+ * — this component doesn't decide what to render for a non-ready status (that's App's call, since
+ * it owns the copy/retry UI), it just guarantees the four hooks never hydrate from, and their
+ * controls are therefore never reachable against, anything but a fully-arrived current-lifecycle
+ * payload. This is what actually prevents "edit before hydration": until `status === 'ready'`,
+ * `saved` stays `undefined`, so every hook stays at its pre-hydration default and — because App's
+ * JSX doesn't render the interactive controls at all before `'ready'` — there is no control in the
+ * DOM capable of persisting that default as if it were authoritative.
  */
 export function PreferencesScope({
   userId,
   sessionId,
   isSessionCurrent,
+  status,
   saved,
   onReportingRangeReady,
   children,
@@ -217,9 +240,11 @@ export function PreferencesScope({
   userId: string | null;
   sessionId: string;
   isSessionCurrent: (sessionId: string) => boolean;
+  status: 'loading' | 'ready' | 'error';
   saved: UserPreferences | undefined;
   onReportingRangeReady: (range: ReportingRangeId) => void;
   children: (prefs: {
+    status: 'loading' | 'ready' | 'error';
     dashboardLayout: ReturnType<typeof useDashboardLayout>;
     appearance: ReturnType<typeof useAppearance>;
     financialPreferences: ReturnType<typeof useFinancialPreferences>;
@@ -256,7 +281,7 @@ export function PreferencesScope({
     onReportingRangeReady
   );
 
-  return <>{children({ dashboardLayout, appearance, financialPreferences, reportingRange })}</>;
+  return <>{children({ status, dashboardLayout, appearance, financialPreferences, reportingRange })}</>;
 }
 
 export default function App() {
@@ -290,12 +315,13 @@ export default function App() {
   // lib/authGeneration.ts's currentGenerationValue. This is what lets a fetch response prove it
   // belongs to the *current* authenticated lifecycle, not merely the current user id.
   const [navLayoutRawSessionId, setNavLayoutRawSessionId] = useState<string | undefined>(undefined);
-  // The whole getUserPreferences() payload for PreferencesScope's four hooks (Dashboard Layout,
-  // Appearance, Financial Preferences, Reporting Range) — undefined until the first fetch for the
-  // current lifecycle completes. Tagged with `preferencesRawSessionId` for exactly the same reason
-  // navLayoutRaw is: see preferencesForCurrentSession's derivation below.
-  const [preferencesRaw, setPreferencesRaw] = useState<UserPreferences | undefined>(undefined);
-  const [preferencesRawSessionId, setPreferencesRawSessionId] = useState<string | undefined>(undefined);
+  // The current lifecycle's own getUserPreferences() outcome for PreferencesScope's four hooks
+  // (Dashboard Layout, Appearance, Financial Preferences, Reporting Range) — undefined until the
+  // first fetch for the current lifecycle *settles, one way or the other*. Tagged with
+  // `preferencesOutcomeSessionId` for exactly the same reason navLayoutRaw is: see
+  // `preferencesStatus`/`preferencesForCurrentSession`'s derivation below.
+  const [preferencesOutcome, setPreferencesOutcome] = useState<PreferencesFetchOutcome | undefined>(undefined);
+  const [preferencesOutcomeSessionId, setPreferencesOutcomeSessionId] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -327,15 +353,41 @@ export default function App() {
   // no longer reads or fetches by range at all.
   const reportingRangeRef = useRef<ReportingRangeId>(DEFAULT_REPORTING_RANGE);
 
+  // A single tab-wide monotonically increasing counter — the ownership tag for the three
+  // reporting-range-parameterized datasets (summary/netWorthHistory/monthlyBreakdown). Every call
+  // to applyReportingRange (a lifecycle's first hydration, a user's range change, a post-Plaid-link
+  // refresh, or a preferences Retry that leads to one) mints a new, strictly higher id and hands it
+  // to that call's three fetches; each fetch's own `.then` only commits its result if its id is
+  // still the *latest* one issued at the moment it resolves (see refreshSummary et al. below). This
+  // one comparison subsumes both session and range ownership: a response tagged with an id that's
+  // been superseded by ANY later call — whether that call came from a new lifecycle, a new range,
+  // or simply a newer same-range retry — can never win, regardless of network arrival order. Never
+  // reset per lifecycle (doesn't need to be — "still the latest" is well-defined across lifecycle
+  // boundaries too, and resetting would only reintroduce a coordination question this design
+  // otherwise avoids entirely).
+  const rangeDataRequestIdRef = useRef(0);
+
   // Only usable if it was actually fetched under the sessionId that's current *right now* — a
   // pure, per-render derivation (no mutation, no effect-ordering dependency) rather than a
   // separate "clear the old value" step, which would need to run before NavLayoutScope's own
   // first render for the new lifecycle to avoid a stale hydration, and effect ordering (children
   // fire before parents) can't guarantee that. See lib/authGeneration.ts's currentGenerationValue.
   const navLayoutRawForCurrentSession = currentGenerationValue(navLayoutRaw, navLayoutRawSessionId, sessionId);
-  // Same mechanism, for PreferencesScope's whole payload — see that component's own doc comment
-  // for exactly which race this closes.
-  const preferencesForCurrentSession = currentGenerationValue(preferencesRaw, preferencesRawSessionId, sessionId);
+  // Same mechanism, applied to the current lifecycle's own preferences-fetch *outcome* rather than
+  // just its payload — this is what lets App distinguish "no outcome tagged with the current
+  // sessionId yet" (still loading) from "tagged, and it was a failure" (error) from "tagged, and it
+  // succeeded" (ready), instead of collapsing the first two into one undifferentiated `undefined`
+  // the way a plain payload-only tag would. A stale outcome tagged with an old sessionId — success
+  // or failure — reads as `undefined` here exactly like navLayoutRaw's equivalent does, so it can
+  // never mark a newer lifecycle "ready" or "errored" on its behalf.
+  const preferencesOutcomeForCurrentSession = currentGenerationValue(
+    preferencesOutcome,
+    preferencesOutcomeSessionId,
+    sessionId
+  );
+  const preferencesStatus: 'loading' | 'ready' | 'error' = preferencesOutcomeForCurrentSession?.status ?? 'loading';
+  const preferencesForCurrentSession =
+    preferencesOutcomeForCurrentSession?.status === 'ready' ? preferencesOutcomeForCurrentSession.payload : undefined;
 
   const refreshAll = useCallback(async () => {
     // Tags this fetch with the sessionId it was made under — see the setNavLayoutRawSessionId/
@@ -398,18 +450,39 @@ export default function App() {
     if (manualLoansRes.status === 'fulfilled') setManualLoans(manualLoansRes.value.loans);
     if (categoryMappingsRes.status === 'fulfilled') setCategoryMappings(categoryMappingsRes.value.mappings);
     if (plaidCategoriesRes.status === 'fulfilled') setPlaidCategories(plaidCategoriesRes.value.categories);
+    // Tagged, not gated: writing this unconditionally is safe because nothing ever *reads*
+    // navLayoutRaw/preferencesOutcome directly — only navLayoutRawForCurrentSession's and
+    // preferencesOutcomeForCurrentSession's derivations do, and both already refuse any value
+    // whose tagged sessionId doesn't match whatever is current by the time it's read, regardless
+    // of how this write is timed relative to that (including a genuinely stale fetch — "A starts,
+    // logout, B logs in, A resolves last" — resolving after this point). Written for BOTH outcomes
+    // (not just success) — an explicit 'error' outcome is what lets preferencesStatus distinguish
+    // "still loading" from "this lifecycle's fetch actually failed," which a payload-only tag
+    // (undefined either way on failure) could not.
+    if (requestedForSessionId) {
+      setPreferencesOutcome(
+        userPreferencesRes.status === 'fulfilled'
+          ? { status: 'ready', payload: userPreferencesRes.value }
+          : { status: 'error' }
+      );
+      setPreferencesOutcomeSessionId(requestedForSessionId);
+    }
     if (userPreferencesRes.status === 'fulfilled') {
-      // Tagged, not gated: writing this unconditionally is safe because nothing ever *reads*
-      // navLayoutRaw/preferencesRaw directly — only navLayoutRawForCurrentSession's and
-      // preferencesForCurrentSession's derivations do, and both already refuse any value whose
-      // tagged sessionId doesn't match whatever is current by the time it's read, regardless of
-      // how this write is timed relative to that (including a genuinely stale fetch — "A starts,
-      // logout, B logs in, A resolves last" — resolving after this point).
-      setPreferencesRaw(userPreferencesRes.value);
-      if (requestedForSessionId) setPreferencesRawSessionId(requestedForSessionId);
       setNavLayoutRaw(userPreferencesRes.value.nav_layout?.tabs ?? null);
       if (requestedForSessionId) setNavLayoutRawSessionId(requestedForSessionId);
     }
+
+    // Whether THIS call's own lifecycle is still the one currently active — checked once, here,
+    // right after the shared await, and used to gate the two remaining state writes below that
+    // aren't already self-tagged the way preferencesOutcome/navLayoutRaw are: `loading` and
+    // `actionError`. An old, now-superseded lifecycle's completion — success OR failure — must
+    // never mark a newer lifecycle "finished loading," surface an old error into it, or clobber
+    // whatever loading/error state that newer lifecycle's own, still-in-flight call is about to
+    // establish. (The other per-dataset setters above — items, transactions, budgetCategories, and
+    // so on — are intentionally left as they were: gating those too is a real, adjacent concern,
+    // but it's outside this remediation's declared scope, same as the original audit's own
+    // boundary around Categories/Accounts/Budgets/Plaid.)
+    const stillCurrent = requestedForSessionId === sessionIdRef.current;
 
     const failures = [
       itemsRes,
@@ -423,12 +496,12 @@ export default function App() {
       plaidCategoriesRes,
       userPreferencesRes,
     ].filter((r): r is PromiseRejectedResult => r.status === 'rejected');
-    if (failures.length > 0) {
+    if (failures.length > 0 && stillCurrent) {
       console.error('Some dashboard data failed to load:', failures.map((f) => f.reason));
       setActionError('Some dashboard data failed to load — see console for details.');
     }
 
-    setLoading(false);
+    if (stillCurrent) setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -440,35 +513,68 @@ export default function App() {
     // unchanged (still A), so a userId-keyed effect would never re-fire and Navigation/Preferences
     // would stay hydrated from A1's stale data — sessionId genuinely changes across that exact
     // transition, so this effect correctly re-fires and refetches for A3's own data.
-    if (sessionId) refreshAll();
+    if (!sessionId) return;
+    // Clears the three range-dependent display datasets the instant the lifecycle changes —
+    // synchronously, in this same effect, before refreshAll's first async gap and therefore before
+    // ANY of this new lifecycle's own data can possibly have arrived yet. Without this, the render
+    // immediately after a lifecycle change (until preferencesStatus reaches 'ready' and this
+    // scope's own useReportingRange hydrates and fires applyReportingRange — itself a couple of
+    // renders further on) could otherwise still be holding the *previous* lifecycle's summary/
+    // netWorthHistory/monthlyBreakdown values. `preferencesOutcome`/`navLayoutRaw`'s tagged derivations
+    // don't need this (a stale tag simply reads as unusable) because their consumers only ever
+    // render *derived* values; these three are plain, untagged state read directly by several
+    // components, so the safe equivalent is to clear them outright rather than thread a tag through
+    // every read site.
+    setSummary(null);
+    setNetWorthHistory([]);
+    setMonthlyBreakdown([]);
+    refreshAll();
   }, [sessionId, refreshAll]);
 
   // Best-effort — account/transaction refresh already succeeded by the time this runs, so a
   // failure here shouldn't surface as an error for an action the user didn't take. `range`
   // defaults to whatever PreferencesScope's useReportingRange last reported (see
-  // applyReportingRange) — every existing caller below calls these with no argument, exactly as
-  // before this change.
-  async function refreshSummary(range: ReportingRangeId = reportingRangeRef.current) {
+  // applyReportingRange); `requestId` defaults to the current rangeDataRequestIdRef value, so
+  // every existing caller below (which calls these with no arguments — an ordinary, non-range-
+  // change refresh like "an account just synced") keeps working exactly as before while still
+  // going through the same ownership check as an explicit applyReportingRange call. Only a commit
+  // whose `requestId` is still the *latest* one issued (see rangeDataRequestIdRef's own comment) is
+  // ever applied — this is what stops a late response for an old user, an old session, or an
+  // already-superseded range/attempt from ever overwriting what's currently displayed.
+  async function refreshSummary(
+    range: ReportingRangeId = reportingRangeRef.current,
+    requestId: number = rangeDataRequestIdRef.current
+  ) {
     try {
-      setSummary(await getSpendingSummary(range));
+      const res = await getSpendingSummary(range);
+      if (requestId === rangeDataRequestIdRef.current) setSummary(res);
     } catch {
-      // ignore
+      // ignore — see rangeDataRequestIdRef's comment: a failed request for what is still the
+      // current attempt leaves summary at whatever it already was (cleared on the last lifecycle
+      // change, or a still-valid earlier value for this same lifecycle/range) rather than any
+      // other lifecycle's data, so there is nothing unsafe to surface here.
     }
   }
 
-  async function refreshNetWorthHistory(range: ReportingRangeId = reportingRangeRef.current) {
+  async function refreshNetWorthHistory(
+    range: ReportingRangeId = reportingRangeRef.current,
+    requestId: number = rangeDataRequestIdRef.current
+  ) {
     try {
       const res = await getNetWorthHistory(range);
-      setNetWorthHistory(res.history);
+      if (requestId === rangeDataRequestIdRef.current) setNetWorthHistory(res.history);
     } catch {
       // ignore
     }
   }
 
-  async function refreshMonthlyBreakdown(range: ReportingRangeId = reportingRangeRef.current) {
+  async function refreshMonthlyBreakdown(
+    range: ReportingRangeId = reportingRangeRef.current,
+    requestId: number = rangeDataRequestIdRef.current
+  ) {
     try {
       const res = await getMonthlyBreakdown(range);
-      setMonthlyBreakdown(res.months);
+      if (requestId === rangeDataRequestIdRef.current) setMonthlyBreakdown(res.months);
     } catch {
       // ignore
     }
@@ -477,17 +583,20 @@ export default function App() {
   // The sole entry point for the three reporting-range-parameterized fetches (spending summary,
   // net worth history, monthly breakdown) — called from PreferencesScope's useReportingRange, via
   // its onReportingRangeReady prop, once when that scope's range first hydrates for this
-  // lifecycle and again every time the user picks a new range. Deliberately *not* routed through
+  // lifecycle and again every time the user picks a new range; also called directly after a
+  // successful Plaid link (see handlePlaidLinked) to refresh these three for the currently
+  // selected range without re-running the range-hydration path. Deliberately *not* routed through
   // refreshAll: refreshAll now fires only on a genuine lifecycle change and fetches everything
   // range-independent, so a plain reporting-range change refreshes exactly these three datasets —
-  // it never re-fetches (and, via the tagged preferencesRaw, never re-hydrates) Dashboard Layout,
-  // Appearance, or Financial Preferences, and a lifecycle change never has to fetch these three
-  // twice (once at a stale/default range, once at the real one).
+  // it never re-fetches (and, via the tagged preferencesOutcome, never re-hydrates) Dashboard
+  // Layout, Appearance, or Financial Preferences, and a lifecycle change never has to fetch these
+  // three twice (once at a stale/default range, once at the real one).
   function applyReportingRange(range: ReportingRangeId) {
     reportingRangeRef.current = range;
-    refreshSummary(range);
-    refreshNetWorthHistory(range);
-    refreshMonthlyBreakdown(range);
+    const requestId = ++rangeDataRequestIdRef.current;
+    refreshSummary(range, requestId);
+    refreshNetWorthHistory(range, requestId);
+    refreshMonthlyBreakdown(range, requestId);
   }
 
   async function refreshRecurringStreams() {
@@ -904,6 +1013,23 @@ export default function App() {
   // budgetCategories array and decide per-row whether to surface it.
   const activeBudgetCategories = budgetCategories.filter((c) => c.archived_at === null);
 
+  // A successful Plaid link changes account balances, which can change every one of the three
+  // range-dependent datasets (spending summary, net worth history, monthly breakdown) — refreshAll
+  // alone no longer covers them (see applyReportingRange's own comment for why they were split
+  // out), so this refreshes both halves explicitly: the ordinary account/transaction/preferences
+  // batch refreshAll already owns, and the three range-dependent datasets for whatever range is
+  // currently selected, via the same applyReportingRange pathway a user's own range change uses —
+  // no duplicated fetch/calculation logic, and the same request-id ownership protection applies
+  // automatically (a fresh id is minted for this call, so it can never be overtaken by, or
+  // overtake, an unrelated in-flight range fetch). Fired without awaiting refreshAll first:
+  // applyReportingRange only needs reportingRangeRef.current, which is already whatever this
+  // lifecycle's own useReportingRange last reported — it doesn't depend on this particular
+  // refreshAll call's own results.
+  function handlePlaidLinked() {
+    refreshAll();
+    applyReportingRange(reportingRangeRef.current);
+  }
+
   if (!session) {
     return <Auth />;
   }
@@ -913,7 +1039,7 @@ export default function App() {
       <header className="app-header">
         <h1>My Finances</h1>
         <div className="app-header-actions">
-          <PlaidLink onLinked={refreshAll} />
+          <PlaidLink onLinked={handlePlaidLinked} />
           <button className="link-button" onClick={() => supabase.auth.signOut()}>
             Sign out
           </button>
@@ -945,11 +1071,31 @@ export default function App() {
             userId={userId}
             sessionId={sessionId!}
             isSessionCurrent={isSessionCurrent}
+            status={preferencesStatus}
             saved={preferencesForCurrentSession}
             onReportingRangeReady={applyReportingRange}
           >
-            {({ dashboardLayout, appearance, financialPreferences, reportingRange }) => {
-              if (loading) return <p className="hint">Loading...</p>;
+            {({ status: prefsStatus, dashboardLayout, appearance, financialPreferences, reportingRange }) => {
+              // `loading` covers the ordinary account/transaction/etc batch; `prefsStatus ===
+              // 'loading'` covers this lifecycle's own preferences fetch specifically — the two
+              // together should overlap in the common case (refreshAll sets both `loading` and
+              // preferencesOutcome from the same batch), but checking both directly is what keeps
+              // this correct even if that overlap were ever imperfect, rather than relying on it.
+              // Nothing preference-dependent (or otherwise, since this gates the whole authenticated
+              // content area) renders while either is true — see PreferencesScope's own doc comment
+              // for why this, not merely ownership-checked saves, is what actually prevents editing
+              // a default/cached value as if it were this lifecycle's real, authoritative one.
+              if (loading || prefsStatus === 'loading') return <p className="hint">Loading...</p>;
+              if (prefsStatus === 'error') {
+                return (
+                  <p className="error">
+                    Couldn't load your preferences.{' '}
+                    <button type="button" className="link-button" onClick={() => refreshAll()}>
+                      Retry
+                    </button>
+                  </p>
+                );
+              }
               // The current web/PWA's own decision about primary-tab-bar order (Overview first,
               // Settings last) — see lib/webTabNav.ts. Recomputed on every render of this
               // render-prop; cheap, and avoids a second piece of state that could drift from
