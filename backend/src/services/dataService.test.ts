@@ -30,6 +30,11 @@ import {
   getPlaidItemsForUser,
   getPlaidItemByPlaidItemId,
   getPlaidItemForUser,
+  getTransactionsForReconciliation,
+  findTransferCounterpartCandidate,
+  findRefundOriginalCandidates,
+  findDanglingRefundCandidates,
+  updateTransactionRoleFields,
 } from './dataService';
 import {
   decryptAccessToken,
@@ -626,9 +631,17 @@ describe('applyTransactionChanges', () => {
       account_id: 'account-row-1',
       plaid_transaction_id: 'txn-1',
       category: 'FOOD_AND_DRINK',
+      personal_finance_category_detailed: 'COFFEE',
+      personal_finance_category_confidence: 'HIGH',
       plaid_category: 'Food and Drink > Coffee',
+      // Row-level classification (Financial Semantics Foundation Phase A) runs at insert time —
+      // an ordinary FOOD_AND_DRINK purchase falls all the way to the sign-based fallback.
+      auto_role: 'expense',
+      role_source: 'sign_default',
+      role_confidence: 'low',
+      classifier_version: 1,
     });
-    expect(result).toEqual([insertedRow]);
+    expect(result).toEqual({ insertedTransactions: [insertedRow], touchedTransactionIds: [insertedRow.id] });
   });
 
   it("auto-assigns budget_category_id from a matching category mapping when inserting", async () => {
@@ -692,12 +705,64 @@ describe('applyTransactionChanges', () => {
     });
 
     expect(mockFrom).not.toHaveBeenCalled();
-    expect(result).toEqual([]);
+    expect(result).toEqual({ insertedTransactions: [], touchedTransactionIds: [] });
   });
 
-  it('updates (not inserts) a transaction whose plaid_transaction_id already exists', async () => {
+  it('updates (not inserts) a transaction whose plaid_transaction_id already exists, and reclassifies since its category changed from what was stored', async () => {
     const existingQuery = createQueryBuilder({
-      data: [{ id: 'txn-row-1', plaid_transaction_id: 'txn-1' }],
+      data: [
+        {
+          id: 'txn-row-1',
+          plaid_transaction_id: 'txn-1',
+          category: 'GENERAL_MERCHANDISE',
+          personal_finance_category_detailed: null,
+          personal_finance_category_confidence: null,
+          manual_loan_id: null,
+          auto_role: 'expense',
+        },
+      ],
+      error: null,
+    });
+    const updateQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+
+    const result = await applyTransactionChanges({
+      userId: 'user-1',
+      added: [],
+      modified: [fakeTransaction({ pending: true })],
+      removed: [],
+      accountIdByPlaidId,
+    });
+
+    // The incoming category (FOOD_AND_DRINK, from fakeTransaction) differs from what was stored
+    // (GENERAL_MERCHANDISE) — the stored category signal materially changed, so this reclassifies.
+    expect(updateQuery.update.mock.calls[0][0]).toMatchObject({
+      pending: true,
+      auto_role: 'expense',
+      role_source: 'sign_default',
+      role_confidence: 'low',
+      classifier_version: 1,
+    });
+    expect(updateQuery.eq).toHaveBeenCalledWith('id', 'txn-row-1');
+    // Only the existence-check select happened on the table — no separate insert call, and no
+    // category-mapping lookup either (that only runs when there's something to insert).
+    expect(mockFrom).toHaveBeenCalledTimes(2);
+    expect(result.touchedTransactionIds).toEqual(['txn-row-1']);
+  });
+
+  it("an ordinary resync with unchanged category signals does not churn the already-stored role fields", async () => {
+    const existingQuery = createQueryBuilder({
+      data: [
+        {
+          id: 'txn-row-1',
+          plaid_transaction_id: 'txn-1',
+          category: 'FOOD_AND_DRINK',
+          personal_finance_category_detailed: 'COFFEE',
+          personal_finance_category_confidence: 'HIGH',
+          manual_loan_id: null,
+          auto_role: 'expense',
+        },
+      ],
       error: null,
     });
     const updateQuery = createQueryBuilder({ data: null, error: null });
@@ -706,16 +771,47 @@ describe('applyTransactionChanges', () => {
     await applyTransactionChanges({
       userId: 'user-1',
       added: [],
+      // Same category/detailed/confidence as already stored — only `pending` actually changed.
       modified: [fakeTransaction({ pending: true })],
       removed: [],
       accountIdByPlaidId,
     });
 
-    expect(updateQuery.update.mock.calls[0][0]).toMatchObject({ pending: true });
-    expect(updateQuery.eq).toHaveBeenCalledWith('id', 'txn-row-1');
-    // Only the existence-check select happened on the table — no separate insert call, and no
-    // category-mapping lookup either (that only runs when there's something to insert).
-    expect(mockFrom).toHaveBeenCalledTimes(2);
+    const updatedFields = updateQuery.update.mock.calls[0][0] as Record<string, unknown>;
+    expect('auto_role' in updatedFields).toBe(false);
+    expect('role_source' in updatedFields).toBe(false);
+    expect('role_confidence' in updatedFields).toBe(false);
+    expect('classifier_version' in updatedFields).toBe(false);
+  });
+
+  it('a transaction already linked to a manual loan is never reclassified by an ordinary resync, regardless of category drift', async () => {
+    const existingQuery = createQueryBuilder({
+      data: [
+        {
+          id: 'txn-row-1',
+          plaid_transaction_id: 'txn-1',
+          category: 'GENERAL_MERCHANDISE',
+          personal_finance_category_detailed: null,
+          personal_finance_category_confidence: null,
+          manual_loan_id: 'loan-1',
+          auto_role: 'debt_payment',
+        },
+      ],
+      error: null,
+    });
+    const updateQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+
+    await applyTransactionChanges({
+      userId: 'user-1',
+      added: [],
+      modified: [fakeTransaction({ pending: true })], // incoming category differs, but the loan link governs
+      removed: [],
+      accountIdByPlaidId,
+    });
+
+    const updatedFields = updateQuery.update.mock.calls[0][0] as Record<string, unknown>;
+    expect('auto_role' in updatedFields).toBe(false);
   });
 
   it('deletes removed transactions by their plaid_transaction_id', async () => {
@@ -879,7 +975,14 @@ describe('linkTransactionToLoan', () => {
 
     await linkTransactionToLoan('txn-1', 'loan-1', 200);
 
-    expect(linkQuery.update).toHaveBeenCalledWith({ manual_loan_id: 'loan-1', principal_portion: 200 });
+    expect(linkQuery.update).toHaveBeenCalledWith({
+      manual_loan_id: 'loan-1',
+      principal_portion: 200,
+      auto_role: 'debt_payment',
+      role_source: 'manual_loan_link',
+      role_confidence: 'high',
+      classifier_version: 1,
+    });
     expect(linkQuery.eq).toHaveBeenCalledWith('id', 'txn-1');
     expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 800 });
     expect(updateBalanceQuery.eq).toHaveBeenCalledWith('id', 'loan-1');
@@ -933,9 +1036,16 @@ describe('updateLinkedPaymentPrincipal', () => {
 });
 
 describe('unlinkPaymentFromLoan', () => {
-  it('clears the link and restores the loan balance by the payment principal portion', async () => {
+  it('clears the link, restores the loan balance, and reclassifies the transaction via the normal (non-loan) precedence', async () => {
     const fetchQuery = createQueryBuilder({
-      data: { principal_portion: 200, manual_loan_id: 'loan-1' },
+      data: {
+        principal_portion: 200,
+        manual_loan_id: 'loan-1',
+        amount: 200,
+        category: null,
+        personal_finance_category_detailed: null,
+        personal_finance_category_confidence: null,
+      },
       error: null,
     });
     const updateTxnQuery = createQueryBuilder({ data: null, error: null });
@@ -949,7 +1059,14 @@ describe('unlinkPaymentFromLoan', () => {
 
     await unlinkPaymentFromLoan('txn-1', 'loan-1');
 
-    expect(updateTxnQuery.update).toHaveBeenCalledWith({ manual_loan_id: null, principal_portion: null });
+    expect(updateTxnQuery.update).toHaveBeenCalledWith({
+      manual_loan_id: null,
+      principal_portion: null,
+      auto_role: 'expense',
+      role_source: 'sign_default',
+      role_confidence: 'low',
+      classifier_version: 1,
+    });
     expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 1000 });
   });
 });
@@ -1392,5 +1509,111 @@ describe('upsertReportingRange', () => {
       { onConflict: 'user_id' }
     );
     expect(result.reporting_range).toBe('last_12_months');
+  });
+});
+
+describe('transaction semantic-role reconciliation queries (Financial Semantics Foundation, Phase A)', () => {
+  it('getTransactionsForReconciliation returns [] without querying at all for an empty id list', async () => {
+    const result = await getTransactionsForReconciliation([]);
+    expect(mockFrom).not.toHaveBeenCalled();
+    expect(result).toEqual([]);
+  });
+
+  it('getTransactionsForReconciliation queries by exactly the given ids', async () => {
+    const query = createQueryBuilder({ data: [{ id: 'txn-1' }], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getTransactionsForReconciliation(['txn-1', 'txn-2']);
+
+    expect(query.in).toHaveBeenCalledWith('id', ['txn-1', 'txn-2']);
+  });
+
+  it('findTransferCounterpartCandidate excludes the same account and the row itself, requires the opposite exact amount, the transfer_like_unconfirmed tag, and the given date window', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await findTransferCounterpartCandidate(
+      'user-1',
+      { id: 'txn-1', account_id: 'acc-1', amount: 100, date: '2026-09-10' },
+      '2026-09-07',
+      '2026-09-13'
+    );
+
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+    expect(query.neq).toHaveBeenCalledWith('account_id', 'acc-1');
+    expect(query.neq).toHaveBeenCalledWith('id', 'txn-1');
+    expect(query.eq).toHaveBeenCalledWith('amount', -100);
+    expect(query.eq).toHaveBeenCalledWith('role_source', 'transfer_like_unconfirmed');
+    expect(query.gte).toHaveBeenCalledWith('date', '2026-09-07');
+    expect(query.lte).toHaveBeenCalledWith('date', '2026-09-13');
+  });
+
+  it('findTransferCounterpartCandidate returns null when nothing matches', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await findTransferCounterpartCandidate(
+      'user-1',
+      { id: 'txn-1', account_id: 'acc-1', amount: 100, date: '2026-09-10' },
+      '2026-09-07',
+      '2026-09-13'
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it('findRefundOriginalCandidates requires the same account, a positive amount at least covering the refund, and the given lookback start through the refund\'s own date', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await findRefundOriginalCandidates(
+      'user-1',
+      { id: 'txn-refund', account_id: 'acc-1', amount: -50, date: '2026-09-10' },
+      '2026-05-13'
+    );
+
+    expect(query.eq).toHaveBeenCalledWith('account_id', 'acc-1');
+    expect(query.gt).toHaveBeenCalledWith('amount', 0);
+    expect(query.gte).toHaveBeenCalledWith('amount', 50);
+    expect(query.gte).toHaveBeenCalledWith('date', '2026-05-13');
+    expect(query.lte).toHaveBeenCalledWith('date', '2026-09-10');
+  });
+
+  it('findDanglingRefundCandidates requires the same account, a negative amount not exceeding the purchase, the refund_candidate_unconfirmed tag, and a date on/after the purchase through the window end', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await findDanglingRefundCandidates(
+      'user-1',
+      { id: 'txn-orig', account_id: 'acc-1', amount: 50, date: '2026-09-10' },
+      '2027-01-08'
+    );
+
+    expect(query.eq).toHaveBeenCalledWith('account_id', 'acc-1');
+    expect(query.lt).toHaveBeenCalledWith('amount', 0);
+    expect(query.gte).toHaveBeenCalledWith('amount', -50);
+    expect(query.eq).toHaveBeenCalledWith('role_source', 'refund_candidate_unconfirmed');
+    expect(query.gte).toHaveBeenCalledWith('date', '2026-09-10');
+    expect(query.lte).toHaveBeenCalledWith('date', '2027-01-08');
+  });
+
+  it('updateTransactionRoleFields writes exactly the four role fields to the given id', async () => {
+    const query = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await updateTransactionRoleFields('txn-1', {
+      auto_role: 'internal_transfer',
+      role_source: 'account_pair_match',
+      role_confidence: 'high',
+      classifier_version: 1,
+    });
+
+    expect(query.update).toHaveBeenCalledWith({
+      auto_role: 'internal_transfer',
+      role_source: 'account_pair_match',
+      role_confidence: 'high',
+      classifier_version: 1,
+    });
+    expect(query.eq).toHaveBeenCalledWith('id', 'txn-1');
   });
 });

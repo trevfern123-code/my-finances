@@ -1,6 +1,7 @@
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
 import * as loansService from './loans';
+import { reconcileRelationalRoles } from './roleReconciliation';
 import { summarizeErrorSafely } from './errorSanitizer';
 
 /**
@@ -19,7 +20,7 @@ export async function syncItemTransactions(item: {
   );
 
   const accountIdByPlaidId = await dataService.getAccountIdMapForItem(item.id);
-  const insertedTransactions = await dataService.applyTransactionChanges({
+  const { insertedTransactions, touchedTransactionIds } = await dataService.applyTransactionChanges({
     userId: item.user_id,
     added,
     modified,
@@ -32,6 +33,17 @@ export async function syncItemTransactions(item: {
   // Best-effort (wrapped internally by linkNewTransactionsToManualLoans) — auto-linking loan
   // payments shouldn't fail the sync that triggered it.
   await loansService.linkNewTransactionsToManualLoans(item.user_id, insertedTransactions);
+
+  // Financial Semantics Foundation Phase A, stage 2 (see roleReconciliation.ts's own doc
+  // comment): runs immediately after this batch (and any loan auto-linking, which can itself
+  // change a row's role) has committed. Best-effort — a failure here shouldn't fail the sync that
+  // triggered it, the same reasoning already applied to recurring-stream refresh below. No
+  // existing financial calculation reads any of this yet (Phase B+ work).
+  try {
+    await reconcileRelationalRoles(item.user_id, touchedTransactionIds);
+  } catch (err) {
+    console.error(`Failed to reconcile relational transaction roles for user ${item.user_id}:`, summarizeErrorSafely(err));
+  }
 
   // Best-effort: recurring-stream detection is a separate Plaid call and a nice-to-have, not
   // core to syncing transactions — a failure here shouldn't fail the sync that triggered it.

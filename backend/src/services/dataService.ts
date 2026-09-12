@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
 import { roundToCents } from './money';
+import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION, type SemanticRole } from './transactionClassifier';
 import {
   decryptAccessToken,
   encryptAccessToken,
@@ -491,17 +492,53 @@ function mapPlaidTransaction(transaction: PlaidTransaction, accountId: string) {
     name: transaction.name,
     merchant_name: transaction.merchant_name ?? null,
     category: transaction.personal_finance_category?.primary ?? null,
+    // Financial Semantics Foundation Phase A: Plaid already sends these two fields on every
+    // transaction — .detailed is what actually distinguishes a credit-card payment from a car
+    // payment from an account transfer (the coarser .primary above can't), and .confidence_level
+    // is what the classifier gates on before trusting .detailed. Both were previously discarded;
+    // no new Plaid API call is involved in persisting them now. See transactionClassifier.ts.
+    personal_finance_category_detailed: transaction.personal_finance_category?.detailed ?? null,
+    personal_finance_category_confidence: transaction.personal_finance_category?.confidence_level ?? null,
     plaid_category: transaction.category ? transaction.category.join(' > ') : null,
     pending: transaction.pending,
   };
 }
 
+interface ExistingTransactionForClassification {
+  id: string;
+  plaid_transaction_id: string;
+  category: string | null;
+  personal_finance_category_detailed: string | null;
+  personal_finance_category_confidence: string | null;
+  manual_loan_id: string | null;
+  auto_role: string | null;
+}
+
+/** auto_role/role_source/role_confidence/classifier_version for a row-level classification —
+ *  Financial Semantics Foundation Phase A (see transactionClassifier.ts). Named distinctly from
+ *  the DB's snake_case columns so call sites can spread this directly into an insert/update
+ *  payload. */
+function roleFieldsFor(classification: ReturnType<typeof classifyRowLevel>) {
+  return {
+    auto_role: classification.autoRole,
+    role_source: classification.roleSource,
+    role_confidence: classification.roleConfidence,
+    classifier_version: classification.classifierVersion,
+  };
+}
+
 /**
- * Applies a batch of Plaid transaction changes (added/modified/removed) against
- * our `transactions` table. `accountIdByPlaidId` maps a Plaid account_id to our
+ * Applies a batch of Plaid transaction changes (added/modified/removed) against our
+ * `transactions` table, and row-level-classifies (Phase A — see transactionClassifier.ts) every
+ * inserted/updated row before returning. `accountIdByPlaidId` maps a Plaid account_id to our
  * accounts.id — transactions we can't match to a known account are skipped.
- * Returns the newly-inserted rows (id/name/merchant_name/amount only) so the caller
- * can run loan-payment matching against them without a second round-trip.
+ *
+ * Returns `insertedTransactions` (id/name/merchant_name/amount only, for the caller's existing
+ * loan-payment matching) and `touchedTransactionIds` (every inserted or updated row's id) — the
+ * latter is what the caller passes to roleReconciliation.reconcileRelationalRoles right after this
+ * batch commits, per the Financial Semantics Foundation's two-stage design. Phase A does not wire
+ * that call up in production behavior yet beyond what's specified for this foundational layer —
+ * see syncService.ts's own comment at the call site.
  */
 export async function applyTransactionChanges(params: {
   userId: string;
@@ -509,7 +546,7 @@ export async function applyTransactionChanges(params: {
   modified: PlaidTransaction[];
   removed: RemovedTransaction[];
   accountIdByPlaidId: Map<string, string>;
-}): Promise<InsertedTransaction[]> {
+}): Promise<{ insertedTransactions: InsertedTransaction[]; touchedTransactionIds: string[] }> {
   const upsertCandidates = [...params.added, ...params.modified]
     .map((t) => {
       const accountId = params.accountIdByPlaidId.get(t.account_id);
@@ -518,18 +555,21 @@ export async function applyTransactionChanges(params: {
     .filter((t): t is NonNullable<typeof t> => t !== null);
 
   let insertedRows: InsertedTransaction[] = [];
+  const touchedTransactionIds: string[] = [];
 
   if (upsertCandidates.length > 0) {
     const plaidIds = upsertCandidates.map((t) => t.plaid_transaction_id);
     const { data: existing, error: fetchError } = await supabaseAdmin
       .from('transactions')
-      .select('id, plaid_transaction_id')
+      .select(
+        'id, plaid_transaction_id, category, personal_finance_category_detailed, personal_finance_category_confidence, manual_loan_id, auto_role'
+      )
       .in('plaid_transaction_id', plaidIds);
 
     if (fetchError) throw new Error(`Failed to load existing transactions: ${fetchError.message}`);
 
     const existingByPlaidId = new Map(
-      existing.map((t) => [t.plaid_transaction_id as string, t.id as string])
+      (existing as ExistingTransactionForClassification[]).map((t) => [t.plaid_transaction_id, t])
     );
 
     const toInsert = upsertCandidates.filter((t) => !existingByPlaidId.has(t.plaid_transaction_id));
@@ -544,24 +584,66 @@ export async function applyTransactionChanges(params: {
       const budgetCategoryIdByPlaidCategory = new Map(
         mappings.map((m) => [m.plaid_category, m.budget_category_id])
       );
-      const rowsToInsert = toInsert.map((t) => ({
-        ...t,
-        needs_review: true,
-        budget_category_id: t.category ? budgetCategoryIdByPlaidCategory.get(t.category) ?? null : null,
-      }));
+      const rowsToInsert = toInsert.map((t) => {
+        // A brand-new row is never already linked to a manual loan (that only ever happens via
+        // an explicit later mutation — linkTransactionToLoan — which sets its own role fields),
+        // so step A of the classifier never applies here.
+        const classification = classifyRowLevel({
+          amount: t.amount,
+          personalFinanceCategoryPrimary: t.category,
+          personalFinanceCategoryDetailed: t.personal_finance_category_detailed,
+          personalFinanceCategoryConfidence: t.personal_finance_category_confidence,
+          manualLoanId: null,
+        });
+        return {
+          ...t,
+          needs_review: true,
+          budget_category_id: t.category ? budgetCategoryIdByPlaidCategory.get(t.category) ?? null : null,
+          ...roleFieldsFor(classification),
+        };
+      });
       const { data, error } = await supabaseAdmin
         .from('transactions')
         .insert(rowsToInsert)
         .select('id, name, merchant_name, amount');
       if (error) throw new Error(`Failed to insert transactions: ${error.message}`);
       insertedRows = (data ?? []) as InsertedTransaction[];
+      touchedTransactionIds.push(...insertedRows.map((r) => r.id));
     }
 
     for (const row of toUpdate) {
-      const id = existingByPlaidId.get(row.plaid_transaction_id)!;
+      const existingRow = existingByPlaidId.get(row.plaid_transaction_id)!;
+      const id = existingRow.id;
       const { plaid_transaction_id: _ignored, ...fields } = row;
-      const { error } = await supabaseAdmin.from('transactions').update(fields).eq('id', id);
+
+      // auto_role lifecycle (Phase A pre-implementation contract §5): an ordinary resync with
+      // unchanged semantic inputs must not churn the role fields at all — only reclassify when
+      // the category signals actually changed (or this row was never classified yet), and never
+      // when a manual-loan link already governs this row's role regardless of category.
+      let roleFields: Partial<ReturnType<typeof roleFieldsFor>> = {};
+      if (existingRow.manual_loan_id === null) {
+        const categoryChanged =
+          existingRow.category !== row.category ||
+          existingRow.personal_finance_category_detailed !== row.personal_finance_category_detailed ||
+          existingRow.personal_finance_category_confidence !== row.personal_finance_category_confidence;
+        if (categoryChanged || existingRow.auto_role === null) {
+          const classification = classifyRowLevel({
+            amount: row.amount,
+            personalFinanceCategoryPrimary: row.category,
+            personalFinanceCategoryDetailed: row.personal_finance_category_detailed,
+            personalFinanceCategoryConfidence: row.personal_finance_category_confidence,
+            manualLoanId: null,
+          });
+          roleFields = roleFieldsFor(classification);
+        }
+      }
+
+      const { error } = await supabaseAdmin
+        .from('transactions')
+        .update({ ...fields, ...roleFields })
+        .eq('id', id);
       if (error) throw new Error(`Failed to update transaction: ${error.message}`);
+      touchedTransactionIds.push(id);
     }
   }
 
@@ -575,7 +657,7 @@ export async function applyTransactionChanges(params: {
     if (error) throw new Error(`Failed to delete removed transactions: ${error.message}`);
   }
 
-  return insertedRows;
+  return { insertedTransactions: insertedRows, touchedTransactionIds };
 }
 
 /** `start`/`end` are both inclusive (YYYY-MM-DD) — matches TransactionsFeed's existing client-side
@@ -963,7 +1045,10 @@ async function adjustManualLoanBalance(loanId: string, delta: number): Promise<v
 }
 
 /** Links a transaction to a manual loan and decrements the loan's balance by principalPortion
- *  (the part of the payment that reduces principal, as opposed to interest). */
+ *  (the part of the payment that reduces principal, as opposed to interest). Also sets this
+ *  transaction's semantic role to debt_payment (manual_loan_link, high confidence) — precedence
+ *  step A always wins regardless of the transaction's own Plaid category once a manual-loan link
+ *  exists (see transactionClassifier.ts). This never touches user_role_override. */
 export async function linkTransactionToLoan(
   transactionId: string,
   loanId: string,
@@ -971,7 +1056,14 @@ export async function linkTransactionToLoan(
 ): Promise<void> {
   const { error } = await supabaseAdmin
     .from('transactions')
-    .update({ manual_loan_id: loanId, principal_portion: principalPortion })
+    .update({
+      manual_loan_id: loanId,
+      principal_portion: principalPortion,
+      auto_role: 'debt_payment' satisfies SemanticRole,
+      role_source: 'manual_loan_link',
+      role_confidence: 'high',
+      classifier_version: CURRENT_CLASSIFIER_VERSION,
+    })
     .eq('id', transactionId);
 
   if (error) throw new Error(`Failed to link transaction to loan: ${error.message}`);
@@ -1023,7 +1115,9 @@ export async function updateLinkedPaymentPrincipal(
 export async function unlinkPaymentFromLoan(transactionId: string, loanId: string): Promise<void> {
   const { data: txn, error: fetchError } = await supabaseAdmin
     .from('transactions')
-    .select('principal_portion, manual_loan_id')
+    .select(
+      'principal_portion, manual_loan_id, amount, category, personal_finance_category_detailed, personal_finance_category_confidence'
+    )
     .eq('id', transactionId)
     .maybeSingle();
 
@@ -1032,9 +1126,29 @@ export async function unlinkPaymentFromLoan(transactionId: string, loanId: strin
 
   const oldPortion = (txn.principal_portion as number | null) ?? 0;
 
+  // manual_loan_link no longer governs this row's role once unlinked — reclassify via the normal
+  // (non-loan) precedence immediately. If this lands on a relational candidate (an ambiguous
+  // transfer/refund shape), it gets the same safe sign-based fallback any other row would; unlike
+  // a sync batch, an unlink isn't followed by a reconciliation pass here (a later sync touching
+  // this row, or an explicit backfill run, can still upgrade it — see roleReconciliation.ts).
+  const classification = classifyRowLevel({
+    amount: txn.amount as number,
+    personalFinanceCategoryPrimary: txn.category as string | null,
+    personalFinanceCategoryDetailed: txn.personal_finance_category_detailed as string | null,
+    personalFinanceCategoryConfidence: txn.personal_finance_category_confidence as string | null,
+    manualLoanId: null,
+  });
+
   const { error: updateError } = await supabaseAdmin
     .from('transactions')
-    .update({ manual_loan_id: null, principal_portion: null })
+    .update({
+      manual_loan_id: null,
+      principal_portion: null,
+      auto_role: classification.autoRole,
+      role_source: classification.roleSource,
+      role_confidence: classification.roleConfidence,
+      classifier_version: classification.classifierVersion,
+    })
     .eq('id', transactionId);
 
   if (updateError) throw new Error(`Failed to unlink payment: ${updateError.message}`);
@@ -1605,4 +1719,168 @@ export async function upsertReportingRange(userId: string, reportingRange: strin
 
   if (error) throw new Error(`Failed to save reporting range: ${error.message}`);
   return data as UserPreferencesRow;
+}
+
+// ---- Transaction semantic-role reconciliation (Financial Semantics Foundation, Phase A) -------
+//
+// Everything below backs roleReconciliation.ts's bounded, two-stage relational reconciliation
+// pass — see that module's own doc comment for the full design. Not called from any production
+// request path yet in Phase A beyond what's needed to keep the classifier's own output correct;
+// no existing financial calculation reads any of it.
+
+export interface ReconciliationRow {
+  id: string;
+  account_id: string;
+  amount: number;
+  date: string;
+  name: string;
+  merchant_name: string | null;
+  category: string | null;
+  manual_loan_id: string | null;
+  auto_role: string | null;
+  role_source: string | null;
+  role_confidence: string | null;
+}
+
+const RECONCILIATION_ROW_COLUMNS =
+  'id, account_id, amount, date, name, merchant_name, category, manual_loan_id, auto_role, role_source, role_confidence';
+
+export async function getTransactionsForReconciliation(ids: string[]): Promise<ReconciliationRow[]> {
+  if (ids.length === 0) return [];
+  const { data, error } = await supabaseAdmin.from('transactions').select(RECONCILIATION_ROW_COLUMNS).in('id', ids);
+  if (error) throw new Error(`Failed to load transactions for reconciliation: ${error.message}`);
+  return (data ?? []) as ReconciliationRow[];
+}
+
+/** A credible internal-transfer counterpart for `row`: opposite sign, same/compatible amount, on
+ *  a DIFFERENT account owned by the same user, within the given inclusive date window, and itself
+ *  already tagged transfer_like_unconfirmed — deliberately conservative (both legs must
+ *  independently show Plaid's own transfer-shaped category) rather than matching against any
+ *  same-amount coincidence, which would risk false-positive transfer detection between two
+ *  unrelated transactions that merely happen to share an amount. */
+export async function findTransferCounterpartCandidate(
+  userId: string,
+  row: { id: string; account_id: string; amount: number; date: string },
+  windowStart: string,
+  windowEnd: string
+): Promise<ReconciliationRow | null> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select(`${RECONCILIATION_ROW_COLUMNS}, accounts!inner(plaid_items!inner(user_id))`)
+    .eq('accounts.plaid_items.user_id', userId)
+    .neq('account_id', row.account_id)
+    .neq('id', row.id)
+    .eq('amount', -row.amount)
+    .eq('role_source', 'transfer_like_unconfirmed')
+    .gte('date', windowStart)
+    .lte('date', windowEnd)
+    .limit(1);
+
+  if (error) throw new Error(`Failed to search for transfer counterpart: ${error.message}`);
+  const [match] = (data ?? []) as (ReconciliationRow & { accounts: unknown })[];
+  return match ?? null;
+}
+
+/** An earlier, same-account positive expense this negative `row` could be a refund against:
+ *  amount at least covering the refund (partial refunds allowed, never an over-refund), within
+ *  the lookback window, ending on or before the refund's own date. Multiple candidates are
+ *  resolved in JS by the caller (roleReconciliation.ts) via normalized name/merchant matching —
+ *  this only narrows by account/amount/date, which Postgres can do efficiently; free-text
+ *  normalization doesn't belong in the query itself. */
+export async function findRefundOriginalCandidates(
+  userId: string,
+  row: { id: string; account_id: string; amount: number; date: string },
+  windowStart: string
+): Promise<ReconciliationRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select(`${RECONCILIATION_ROW_COLUMNS}, accounts!inner(plaid_items!inner(user_id))`)
+    .eq('accounts.plaid_items.user_id', userId)
+    .eq('account_id', row.account_id)
+    .neq('id', row.id)
+    .gt('amount', 0)
+    .gte('amount', Math.abs(row.amount))
+    .gte('date', windowStart)
+    .lte('date', row.date)
+    .order('date', { ascending: false });
+
+  if (error) throw new Error(`Failed to search for refund original: ${error.message}`);
+  return (data ?? []) as ReconciliationRow[];
+}
+
+/** The reverse direction: existing, still-dangling refund candidates (negative, tagged
+ *  refund_candidate_unconfirmed) dated on/after a newly-touched positive expense `row`, within the
+ *  refund lookback window — lets a purchase that syncs AFTER its own refund still resolve that
+ *  refund once it arrives, not just the reverse temporal order. */
+export async function findDanglingRefundCandidates(
+  userId: string,
+  row: { id: string; account_id: string; amount: number; date: string },
+  windowEnd: string
+): Promise<ReconciliationRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select(`${RECONCILIATION_ROW_COLUMNS}, accounts!inner(plaid_items!inner(user_id))`)
+    .eq('accounts.plaid_items.user_id', userId)
+    .eq('account_id', row.account_id)
+    .neq('id', row.id)
+    .lt('amount', 0)
+    .gte('amount', -row.amount) // abs(candidate.amount) <= row.amount
+    .eq('role_source', 'refund_candidate_unconfirmed')
+    .gte('date', row.date)
+    .lte('date', windowEnd)
+    .order('date', { ascending: true });
+
+  if (error) throw new Error(`Failed to search for dangling refund candidates: ${error.message}`);
+  return (data ?? []) as ReconciliationRow[];
+}
+
+export interface UnclassifiedTransactionRow {
+  id: string;
+  user_id: string;
+  amount: number;
+  date: string;
+  category: string | null;
+  personal_finance_category_detailed: string | null;
+  personal_finance_category_confidence: string | null;
+  manual_loan_id: string | null;
+}
+
+/** One page of not-yet-classified transactions (`auto_role IS NULL`), oldest first — backs
+ *  backfillTransactionSemantics.ts. Deliberately no cursor/offset parameter: since every row this
+ *  returns gets classified (auto_role set to non-null) before the next call, the exact same query
+ *  naturally returns the next page on its own — a batch already processed is never returned again,
+ *  making the backfill trivially resumable across interruptions without tracking any position. */
+export async function getUnclassifiedTransactionsBatch(limit: number): Promise<UnclassifiedTransactionRow[]> {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select(
+      'id, amount, date, category, personal_finance_category_detailed, personal_finance_category_confidence, manual_loan_id, accounts!inner(plaid_items!inner(user_id))'
+    )
+    .is('auto_role', null)
+    .order('date', { ascending: true })
+    .order('id', { ascending: true })
+    .limit(limit);
+
+  if (error) throw new Error(`Failed to load unclassified transactions: ${error.message}`);
+  return (data ?? []).map((row) => {
+    const accounts = row.accounts as unknown as { plaid_items: { user_id: string } };
+    return {
+      id: row.id as string,
+      user_id: accounts.plaid_items.user_id,
+      amount: row.amount as number,
+      date: row.date as string,
+      category: row.category as string | null,
+      personal_finance_category_detailed: row.personal_finance_category_detailed as string | null,
+      personal_finance_category_confidence: row.personal_finance_category_confidence as string | null,
+      manual_loan_id: row.manual_loan_id as string | null,
+    };
+  });
+}
+
+export async function updateTransactionRoleFields(
+  id: string,
+  fields: { auto_role: SemanticRole; role_source: string; role_confidence: string; classifier_version: number }
+): Promise<void> {
+  const { error } = await supabaseAdmin.from('transactions').update(fields).eq('id', id);
+  if (error) throw new Error(`Failed to update transaction role fields: ${error.message}`);
 }

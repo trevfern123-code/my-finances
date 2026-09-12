@@ -86,6 +86,10 @@ export interface TransactionRow {
   name: string;
   merchant_name: string | null;
   category: string | null;
+  /** Plaid's `personal_finance_category.detailed` — Financial Semantics Foundation Phase A. */
+  personal_finance_category_detailed: string | null;
+  /** Plaid's raw `personal_finance_category.confidence_level` (VERY_HIGH/HIGH/MEDIUM/LOW/UNKNOWN). */
+  personal_finance_category_confidence: string | null;
   plaid_category: string | null;
   pending: boolean;
   budget_category_id: string | null;
@@ -96,6 +100,16 @@ export interface TransactionRow {
   /** True for every newly-synced transaction until the user approves it — never reset by a
    *  later Plaid update, only cleared explicitly via the approve endpoint. */
   needs_review: boolean;
+  /** System-computed semantic role — see transactionClassifier.ts. Null until classified. */
+  auto_role: string | null;
+  role_source: string | null;
+  role_confidence: string | null;
+  classifier_version: number;
+  /** User correction, if any — never written by sync/backfill/reconciliation. */
+  user_role_override: string | null;
+  /** Generated (`coalesce(user_role_override, auto_role)`) — see semanticEffects.ts for why this
+   *  alone is insufficient for a manual-loan-linked transaction without an override. */
+  effective_role: string | null;
 }
 
 export interface BudgetCategoryRow {

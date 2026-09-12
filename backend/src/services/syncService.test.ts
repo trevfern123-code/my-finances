@@ -26,6 +26,11 @@ vi.mock('./loans', () => ({
   linkNewTransactionsToManualLoans: mockLinkNewTransactionsToManualLoans,
 }));
 
+const mockReconcileRelationalRoles = vi.hoisted(() => vi.fn());
+vi.mock('./roleReconciliation', () => ({
+  reconcileRelationalRoles: mockReconcileRelationalRoles,
+}));
+
 const item = {
   id: 'item-row-1',
   user_id: 'user-1',
@@ -37,8 +42,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockGetAccountIdMapForItem.mockResolvedValue(new Map([['plaid-acc-1', 'account-row-1']]));
   mockSyncTransactions.mockResolvedValue({ added: [], modified: [], removed: [], cursor: 'new-cursor' });
-  mockApplyTransactionChanges.mockResolvedValue([]);
+  mockApplyTransactionChanges.mockResolvedValue({ insertedTransactions: [], touchedTransactionIds: [] });
   mockGetRecurringStreams.mockResolvedValue({ inflowStreams: [], outflowStreams: [] });
+  mockReconcileRelationalRoles.mockResolvedValue(undefined);
 });
 
 describe('syncItemTransactions', () => {
@@ -122,10 +128,34 @@ describe('syncItemTransactions', () => {
 
   it('links newly-inserted transactions to the user\'s manual loans', async () => {
     const insertedTransactions = [{ id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 }];
-    mockApplyTransactionChanges.mockResolvedValue(insertedTransactions);
+    mockApplyTransactionChanges.mockResolvedValue({ insertedTransactions, touchedTransactionIds: ['txn-1'] });
 
     await syncItemTransactions(item);
 
     expect(mockLinkNewTransactionsToManualLoans).toHaveBeenCalledWith('user-1', insertedTransactions);
+  });
+
+  it('runs relational role reconciliation over exactly the transactions touched by this batch, after loan auto-linking', async () => {
+    const insertedTransactions = [{ id: 'txn-1', name: 'Transfer', merchant_name: null, amount: 100 }];
+    mockApplyTransactionChanges.mockResolvedValue({
+      insertedTransactions,
+      touchedTransactionIds: ['txn-1', 'txn-2'],
+    });
+
+    await syncItemTransactions(item);
+
+    expect(mockReconcileRelationalRoles).toHaveBeenCalledWith('user-1', ['txn-1', 'txn-2']);
+    expect(mockReconcileRelationalRoles.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mockLinkNewTransactionsToManualLoans.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('does not let a relational-reconciliation failure fail the overall sync', async () => {
+    mockReconcileRelationalRoles.mockRejectedValue(new Error('reconciliation query failed'));
+
+    const result = await syncItemTransactions(item);
+
+    expect(result).toEqual({ added: 0, modified: 0, removed: 0 });
+    expect(mockSetItemStatus).toHaveBeenCalledWith('item-row-1', 'active');
   });
 });
