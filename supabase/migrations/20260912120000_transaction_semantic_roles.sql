@@ -83,3 +83,98 @@ alter table public.transactions
       or
       (auto_role is not null and role_source is not null and role_confidence is not null)
     );
+
+-- Round 3 remediation: ownership-safe, truly atomic semantic-role mutation. The application layer
+-- previously issued `UPDATE ... WHERE id IN (...)` and only inspected the returned rows for
+-- ownership AFTER the write — a wrong-user id, or one of two ids in an intended transfer pair,
+-- could already be mutated before that check ever ran. This function moves the entire
+-- verify-then-write sequence inside ONE PostgreSQL function invocation (itself one statement, one
+-- implicit transaction): it locks and counts the OWNED candidate rows before touching anything,
+-- verifies that count matches the caller's own transaction-id list exactly, performs the update,
+-- and re-verifies the affected-row count afterward. Any mismatch at any point RAISEs, which rolls
+-- back everything this call did — there is no code path that can leave a partial/half-resolved
+-- mutation durable. Used for both a single-row mutation (pass a one-element array) and an atomic
+-- transfer-pair mutation (pass a two-element array) — one function, parameterized by array length,
+-- rather than two near-duplicate ones.
+--
+-- security invoker (the default, stated explicitly for audit clarity): this function is only ever
+-- invoked by the backend's own service-role connection (see dataService.ts's
+-- applyTransactionSemanticRoles, its sole caller — never exposed to the authenticated/anon roles
+-- PostgREST serves directly to the frontend). The service role already has full table access
+-- (Supabase grants it BYPASSRLS), so there is no privilege this function needs to elevate to via
+-- security definer — using invoker keeps it running with exactly the caller's own (already
+-- sufficient, already audited) privileges, the smaller attack surface of the two options.
+-- search_path is pinned empty and every identifier is schema-qualified, so this function's
+-- behavior can never be altered by a schema earlier in some other role's search_path.
+create or replace function public.apply_transaction_semantic_roles(
+  p_user_id uuid,
+  p_transaction_ids uuid[],
+  p_auto_role text,
+  p_role_source text,
+  p_role_confidence text,
+  p_classifier_version smallint
+) returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_input_count integer;
+  v_distinct_count integer;
+  v_owned_count integer;
+  v_updated_count integer;
+begin
+  v_input_count := coalesce(array_length(p_transaction_ids, 1), 0);
+  if v_input_count = 0 then
+    raise exception 'apply_transaction_semantic_roles: no transaction ids supplied';
+  end if;
+
+  -- Reject duplicate ids outright — otherwise a caller passing e.g. [X, X] could satisfy a naive
+  -- "count matches" check without actually referring to two distinct rows.
+  select count(distinct x) into v_distinct_count from unnest(p_transaction_ids) as x;
+  if v_distinct_count is distinct from v_input_count then
+    raise exception 'apply_transaction_semantic_roles: duplicate transaction ids supplied (% distinct of %)',
+      v_distinct_count, v_input_count;
+  end if;
+
+  -- Verify ownership and LOCK the candidate rows inside this same transaction, before any write.
+  -- An id that doesn't come back here (wrong user, or the row no longer exists) means the whole
+  -- call fails — nothing is ever partially applied to the ids that DID resolve.
+  select count(*) into v_owned_count
+  from public.transactions t
+  join public.accounts a on a.id = t.account_id
+  join public.plaid_items pi on pi.id = a.item_id
+  where t.id = any(p_transaction_ids)
+    and pi.user_id = p_user_id
+  for update of t;
+
+  if v_owned_count is distinct from v_input_count then
+    raise exception 'apply_transaction_semantic_roles: ownership check failed (expected % owned rows, found %)',
+      v_input_count, v_owned_count;
+  end if;
+
+  update public.transactions t
+  set auto_role = p_auto_role,
+      role_source = p_role_source,
+      role_confidence = p_role_confidence,
+      classifier_version = p_classifier_version
+  where t.id = any(p_transaction_ids)
+    and exists (
+      select 1
+      from public.accounts a
+      join public.plaid_items pi on pi.id = a.item_id
+      where a.id = t.account_id
+        and pi.user_id = p_user_id
+    );
+
+  get diagnostics v_updated_count = row_count;
+
+  if v_updated_count is distinct from v_input_count then
+    raise exception 'apply_transaction_semantic_roles: update count mismatch (expected %, got %)',
+      v_input_count, v_updated_count;
+  end if;
+end;
+$$;
+
+revoke all on function public.apply_transaction_semantic_roles(uuid, uuid[], text, text, text, smallint) from public;
+grant execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text, text, text, smallint) to service_role;

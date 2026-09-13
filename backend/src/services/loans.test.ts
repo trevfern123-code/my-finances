@@ -19,9 +19,9 @@ vi.mock('./dataService', () => ({
   getUnlinkedOutflowTransactionsForUser: mockGetUnlinkedOutflowTransactionsForUser,
 }));
 
-const mockReconcileAroundTransactionChange = vi.hoisted(() => vi.fn());
+const mockReconcileAfterRelationalStateChange = vi.hoisted(() => vi.fn());
 vi.mock('./roleReconciliation', () => ({
-  reconcileAroundTransactionChange: mockReconcileAroundTransactionChange,
+  reconcileAfterRelationalStateChange: mockReconcileAfterRelationalStateChange,
 }));
 
 import {
@@ -247,8 +247,8 @@ describe('linkNewTransactionsToManualLoans', () => {
   beforeEach(() => {
     mockListManualLoans.mockReset();
     mockLinkTransactionToLoan.mockReset();
-    mockReconcileAroundTransactionChange.mockReset();
-    mockReconcileAroundTransactionChange.mockResolvedValue(undefined);
+    mockReconcileAfterRelationalStateChange.mockReset();
+    mockReconcileAfterRelationalStateChange.mockResolvedValue(undefined);
   });
 
   it('links matching inserted transactions to the matching loan', async () => {
@@ -274,7 +274,7 @@ describe('linkNewTransactionsToManualLoans', () => {
       { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
     ]);
 
-    expect(mockReconcileAroundTransactionChange).toHaveBeenCalledWith('user-1', 'txn-1');
+    expect(mockReconcileAfterRelationalStateChange).toHaveBeenCalledWith('user-1', 'txn-1');
   });
 
   it('does nothing when there are no inserted transactions', async () => {
@@ -307,8 +307,8 @@ describe('backfillMatchesForLoan', () => {
   beforeEach(() => {
     mockGetUnlinkedOutflowTransactionsForUser.mockReset();
     mockLinkTransactionToLoan.mockReset();
-    mockReconcileAroundTransactionChange.mockReset();
-    mockReconcileAroundTransactionChange.mockResolvedValue(undefined);
+    mockReconcileAfterRelationalStateChange.mockReset();
+    mockReconcileAfterRelationalStateChange.mockResolvedValue(undefined);
   });
 
   it('links unlinked transactions matching the loan match_text', async () => {
@@ -330,7 +330,7 @@ describe('backfillMatchesForLoan', () => {
 
     await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' });
 
-    expect(mockReconcileAroundTransactionChange).toHaveBeenCalledWith('user-1', 'txn-1');
+    expect(mockReconcileAfterRelationalStateChange).toHaveBeenCalledWith('user-1', 'txn-1');
   });
 
   it('does nothing when the loan has no match_text', async () => {

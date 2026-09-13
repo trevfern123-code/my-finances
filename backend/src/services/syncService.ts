@@ -1,7 +1,7 @@
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
 import * as loansService from './loans';
-import { reconcileRelationalRoles, reconcileAroundTransactionChange } from './roleReconciliation';
+import { reconcileRelationalRoles, repairExistingRelationalRoles } from './roleReconciliation';
 import { summarizeErrorSafely } from './errorSanitizer';
 
 /**
@@ -38,14 +38,13 @@ export async function syncItemTransactions(item: {
   );
 
   const accountIdByPlaidId = await dataService.getAccountIdMapForItem(item.id);
-  const { insertedTransactions, touchedTransactionIds, semanticallyChangedTransactionIds } =
-    await dataService.applyTransactionChanges({
-      userId: item.user_id,
-      added,
-      modified,
-      removed,
-      accountIdByPlaidId,
-    });
+  const { insertedTransactions, touchedTransactionIds } = await dataService.applyTransactionChanges({
+    userId: item.user_id,
+    added,
+    modified,
+    removed,
+    accountIdByPlaidId,
+  });
   await dataService.setItemStatus(item.id, 'active');
 
   // Best-effort (wrapped internally by linkNewTransactionsToManualLoans) — auto-linking loan
@@ -58,12 +57,18 @@ export async function syncItemTransactions(item: {
   // why a failure here must gate the cursor advance below rather than being swallowed).
   await reconcileRelationalRoles(item.user_id, touchedTransactionIds);
 
-  // Round 2 remediation §1/§3: any row whose semantic inputs materially changed (not just a
-  // brand-new insert) may have invalidated a PRIOR transfer/refund match it participated in —
-  // reconcileAroundTransactionChange additionally finds and resets any such stale
-  // counterpart/dependent, bounded to the same fixed windows as the pass above.
-  for (const id of semanticallyChangedTransactionIds) {
-    await reconcileAroundTransactionChange(item.user_id, id);
+  // Round 3 remediation §2/§3/§4/§6: a modified or removed transaction may invalidate an
+  // EXISTING account_pair_match/refund_match row that depended on this transaction's OLD state
+  // (or on its now-deleted existence) — re-validate every existing relational row against
+  // CURRENT data before advancing the cursor. Also deliberately NOT wrapped in try/catch, and
+  // deliberately gated on "did this batch touch anything" rather than a same-attempt
+  // before/after comparison, so a retry whose DB state already reflects the new values still
+  // re-triggers and completes the repair (see roleReconciliation.ts's own doc comment for the
+  // full retry-safety argument). A pure-insert batch can't invalidate any existing relational
+  // row (a brand-new row was never previously anything), so the sweep is skipped when neither
+  // `modified` nor `removed` is non-empty.
+  if (modified.length > 0 || removed.length > 0) {
+    await repairExistingRelationalRoles(item.user_id);
   }
 
   await dataService.updateItemCursor(item.id, cursor);

@@ -33,11 +33,55 @@ export interface SemanticEffect {
   amount: number;
 }
 
+/** Thrown by `getSemanticEffects` (Round 3 remediation §9) when a manual-loan-linked
+ *  transaction's persisted amount/principal_portion is an impossible combination (non-finite,
+ *  non-positive amount, or principal outside `[0, amount]`) — see that function's own doc comment
+ *  for why this is a throw rather than a defensive clamp. */
+export class SemanticIntegrityError extends Error {}
+
 /** Thrown by `normalizePrincipalPortion` — the WRITE boundary for `principal_portion` (see
  *  dataService.ts's `linkTransactionToLoan`/`updateLinkedPaymentPrincipal`). An invalid value is
  *  rejected outright here, before it's ever persisted — this is the one place that matters most,
  *  since it's the only place that can refuse to write bad data in the first place. */
 export class InvalidPrincipalPortionError extends Error {}
+
+/** Thrown by `assertLinkedPaymentAmountIsCompatible` (Round 3 remediation §8) — a Plaid resync
+ *  that changes a manual-loan-linked transaction's amount such that the already-stored
+ *  `principal_portion` is no longer valid for the NEW amount. This is a data-integrity failure,
+ *  not a recoverable one: dataService.ts's applyTransactionChanges throws this before persisting
+ *  the incompatible amount, which aborts the whole sync attempt (see syncService.ts) rather than
+ *  silently clamping the stored principal or corrupting loan-balance math. The user must edit or
+ *  unlink the payment (adjusting principal_portion to fit the new amount, or removing the link)
+ *  before sync can proceed for this item again. */
+export class LinkedPaymentIntegrityError extends Error {}
+
+/**
+ * Validates that an already-linked payment's stored `principal_portion` is still compatible with
+ * a NEW amount arriving via Plaid resync (Round 3 remediation §8) — the resync path has no
+ * `normalizePrincipalPortion` write boundary of its own, since it isn't the thing writing
+ * `principal_portion`. Requires: the new amount is finite and greater than 0; the stored
+ * principal is finite; and the stored principal is in `[0, newAmount]`. Throws
+ * `LinkedPaymentIntegrityError` rather than silently clamping or allowing `principal > amount` to
+ * persist — see that error's own doc comment for why.
+ */
+export function assertLinkedPaymentAmountIsCompatible(newAmount: number, principalPortion: number | null): void {
+  if (!Number.isFinite(newAmount) || newAmount <= 0) {
+    throw new LinkedPaymentIntegrityError(
+      `Resynced amount for a manual-loan-linked transaction must be finite and greater than 0 (got ${newAmount})`
+    );
+  }
+  const principal = principalPortion ?? 0;
+  if (!Number.isFinite(principal)) {
+    throw new LinkedPaymentIntegrityError('Linked transaction principal_portion must be a finite number');
+  }
+  const normalizedAmount = roundToCents(newAmount);
+  const normalizedPrincipal = roundToCents(principal);
+  if (normalizedPrincipal < 0 || normalizedPrincipal > normalizedAmount) {
+    throw new LinkedPaymentIntegrityError(
+      `Existing principal_portion (${normalizedPrincipal}) is incompatible with the resynced amount (${normalizedAmount}) — edit or unlink this payment before sync can continue`
+    );
+  }
+}
 
 /**
  * Validates and cent-normalizes a `principal_portion` value before it's persisted. Requires a
@@ -79,19 +123,37 @@ export interface SemanticEffectsInput {
  * Returns one effect for an ordinary transaction (or a loan-linked transaction with an explicit
  * user override), or two effects (debt_payment + expense) for a loan-linked transaction without
  * an override. The returned effects' amounts always sum back to exactly the cent-normalized
- * transaction amount, are never negative, and are never NaN/Infinity, regardless of what's
- * actually persisted on `principalPortion` — `normalizePrincipalPortion` is what prevents an
- * invalid value from ever being WRITTEN (dataService.ts), but this function still defensively
- * clamps whatever it's handed (e.g. data written before that validation existed) rather than
- * propagating garbage into an aggregation. A zero-amount component is omitted rather than emitted.
+ * transaction amount and are never negative or NaN/Infinity — but unlike an earlier version of
+ * this function (Round 2), an impossible persisted state is no longer silently clamped into a
+ * plausible-looking result. `normalizePrincipalPortion` (write boundary) and
+ * `assertLinkedPaymentAmountIsCompatible` (Plaid-resync boundary) are what SHOULD prevent bad data
+ * from ever being written in the first place; this function is the last line of defense for data
+ * that reached this state anyway (a bug in one of those boundaries, a manual DB edit, data written
+ * before either validation existed) — Round 3 remediation §9 requires it to THROW
+ * `SemanticIntegrityError` rather than clamp, since a clamped result (e.g. a negative amount
+ * silently becoming a positive-looking debt_payment) is actively misleading to every aggregation
+ * that calls this. A zero-amount component is omitted rather than emitted; a genuinely $0
+ * transaction is itself impossible for a real payment and so is rejected below, not specially
+ * handled.
  */
 export function getSemanticEffects(txn: SemanticEffectsInput): SemanticEffect[] {
   if (txn.manualLoanId !== null && txn.userRoleOverride === null) {
+    if (!Number.isFinite(txn.amount) || txn.amount <= 0) {
+      throw new SemanticIntegrityError(
+        `getSemanticEffects: a manual-loan-linked transaction's amount must be finite and greater than 0 (got ${txn.amount})`
+      );
+    }
     const normalizedAmount = roundToCents(txn.amount);
     const rawPrincipal = txn.principalPortion ?? 0;
-    const safePrincipal = Number.isFinite(rawPrincipal) ? rawPrincipal : 0;
-    const clampedPrincipal = Math.min(Math.max(0, safePrincipal), normalizedAmount);
-    const principal = roundToCents(clampedPrincipal);
+    if (!Number.isFinite(rawPrincipal)) {
+      throw new SemanticIntegrityError('getSemanticEffects: principal_portion must be a finite number');
+    }
+    const principal = roundToCents(rawPrincipal);
+    if (principal < 0 || principal > normalizedAmount) {
+      throw new SemanticIntegrityError(
+        `getSemanticEffects: principal_portion (${principal}) must be between 0 and the transaction amount (${normalizedAmount})`
+      );
+    }
     // The complement, not an independently-rounded value — guarantees the two components always
     // sum exactly to normalizedAmount regardless of any rounding on principal itself.
     const interest = roundToCents(normalizedAmount - principal);
@@ -99,7 +161,6 @@ export function getSemanticEffects(txn: SemanticEffectsInput): SemanticEffect[] 
     const effects: SemanticEffect[] = [];
     if (principal !== 0) effects.push({ role: 'debt_payment', amount: principal });
     if (interest !== 0) effects.push({ role: 'expense', amount: interest });
-    if (effects.length === 0) effects.push({ role: 'debt_payment', amount: 0 }); // the transaction itself was $0
     return effects;
   }
 

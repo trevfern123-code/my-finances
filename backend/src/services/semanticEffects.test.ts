@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   getSemanticEffects,
   normalizePrincipalPortion,
+  assertLinkedPaymentAmountIsCompatible,
   InvalidPrincipalPortionError,
+  LinkedPaymentIntegrityError,
+  SemanticIntegrityError,
   type SemanticEffectsInput,
 } from './semanticEffects';
 
@@ -70,7 +73,7 @@ describe('getSemanticEffects — manual-loan-linked, no override', () => {
   });
 });
 
-describe('getSemanticEffects — defensive handling of impossible persisted principal values (Round 2 remediation §7)', () => {
+describe('getSemanticEffects — throws on impossible persisted state instead of clamping (Round 3 remediation §9)', () => {
   it('amount 100 / principal 0 -> expense 100 only', () => {
     expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 0 }))).toEqual([
       { role: 'expense', amount: 100 },
@@ -90,37 +93,66 @@ describe('getSemanticEffects — defensive handling of impossible persisted prin
     ]);
   });
 
-  it('amount 100 / principal 120 (impossible, exceeds amount) -> clamped to the amount, debt_payment 100 only, never negative/overflowing components', () => {
-    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 120 }))).toEqual([
-      { role: 'debt_payment', amount: 100 },
-    ]);
+  it('amount 100 / principal 120 (impossible, exceeds amount) -> throws SemanticIntegrityError', () => {
+    expect(() => getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 120 }))).toThrow(
+      SemanticIntegrityError
+    );
   });
 
-  it('amount 100 / principal -10 (impossible, negative) -> clamped to 0, expense 100 only', () => {
-    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: -10 }))).toEqual([
-      { role: 'expense', amount: 100 },
-    ]);
+  it('amount 100 / principal -10 (impossible, negative) -> throws SemanticIntegrityError', () => {
+    expect(() => getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: -10 }))).toThrow(
+      SemanticIntegrityError
+    );
   });
 
-  it('NaN/Infinity principal never propagates -> treated as 0', () => {
-    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: NaN }))).toEqual([
-      { role: 'expense', amount: 100 },
-    ]);
-    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: Infinity }))).toEqual([
-      { role: 'expense', amount: 100 },
-    ]);
+  it('NaN/Infinity principal never propagates -> throws SemanticIntegrityError', () => {
+    expect(() => getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: NaN }))).toThrow(
+      SemanticIntegrityError
+    );
+    expect(() =>
+      getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: Infinity }))
+    ).toThrow(SemanticIntegrityError);
+  });
+
+  it('a negative or zero linked amount throws SemanticIntegrityError', () => {
+    expect(() => getSemanticEffects(txn({ amount: -100, manualLoanId: 'loan-1', principalPortion: 0 }))).toThrow(
+      SemanticIntegrityError
+    );
+    expect(() => getSemanticEffects(txn({ amount: 0, manualLoanId: 'loan-1', principalPortion: 0 }))).toThrow(
+      SemanticIntegrityError
+    );
   });
 
   it('components always sum exactly to the cent-normalized transaction amount, even with float-drift-prone inputs', () => {
-    const effects = getSemanticEffects(txn({ amount: 100.1, manualLoanId: 'loan-1', principalPortion: 33.33 }));
-    const total = effects.reduce((sum, e) => sum + e.amount, 0);
-    expect(Math.round(total * 100) / 100).toBe(100.1);
+    const effects = getSemanticEffects(txn({ amount: 100.1, manualLoanId: 'loan-1', principalPortion: 60.05 }));
+    expect(effects).toEqual([
+      { role: 'debt_payment', amount: 60.05 },
+      { role: 'expense', amount: 40.05 },
+    ]);
+  });
+});
+
+describe('assertLinkedPaymentAmountIsCompatible — Plaid-resync boundary (Round 3 remediation §8)', () => {
+  it('accepts a compatible amount/principal pair', () => {
+    expect(() => assertLinkedPaymentAmountIsCompatible(100, 60)).not.toThrow();
+    expect(() => assertLinkedPaymentAmountIsCompatible(100, 0)).not.toThrow();
+    expect(() => assertLinkedPaymentAmountIsCompatible(100, 100)).not.toThrow();
+    expect(() => assertLinkedPaymentAmountIsCompatible(100, null)).not.toThrow();
   });
 
-  it('a zero-amount transaction produces a single zero debt_payment effect rather than no effects at all', () => {
-    expect(getSemanticEffects(txn({ amount: 0, manualLoanId: 'loan-1', principalPortion: 0 }))).toEqual([
-      { role: 'debt_payment', amount: 0 },
-    ]);
+  it('rejects a resynced amount that no longer covers the stored principal', () => {
+    expect(() => assertLinkedPaymentAmountIsCompatible(50, 60)).toThrow(LinkedPaymentIntegrityError);
+  });
+
+  it('rejects a non-finite, negative, or zero resynced amount', () => {
+    expect(() => assertLinkedPaymentAmountIsCompatible(-100, 0)).toThrow(LinkedPaymentIntegrityError);
+    expect(() => assertLinkedPaymentAmountIsCompatible(0, 0)).toThrow(LinkedPaymentIntegrityError);
+    expect(() => assertLinkedPaymentAmountIsCompatible(NaN, 0)).toThrow(LinkedPaymentIntegrityError);
+  });
+
+  it('rejects a non-finite or negative stored principal', () => {
+    expect(() => assertLinkedPaymentAmountIsCompatible(100, NaN)).toThrow(LinkedPaymentIntegrityError);
+    expect(() => assertLinkedPaymentAmountIsCompatible(100, -10)).toThrow(LinkedPaymentIntegrityError);
   });
 });
 

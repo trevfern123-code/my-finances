@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
 import { roundToCents } from './money';
 import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION, type SemanticRole } from './transactionClassifier';
-import { normalizePrincipalPortion } from './semanticEffects';
+import { normalizePrincipalPortion, assertLinkedPaymentAmountIsCompatible } from './semanticEffects';
 import {
   decryptAccessToken,
   encryptAccessToken,
@@ -518,6 +518,7 @@ interface ExistingTransactionForClassification {
   personal_finance_category_confidence: string | null;
   manual_loan_id: string | null;
   auto_role: string | null;
+  principal_portion: number | null;
 }
 
 /** auto_role/role_source/role_confidence/classifier_version for a row-level classification —
@@ -564,13 +565,15 @@ function hasSemanticInputChanged(
  * accounts.id — transactions we can't match to a known account are skipped.
  *
  * Returns `insertedTransactions` (id/name/merchant_name/amount only, for the caller's existing
- * loan-payment matching), `touchedTransactionIds` (every inserted or updated row's id — the
- * ordinary forward-looking reconciliation pass runs over this whole set), and
- * `semanticallyChangedTransactionIds` (the subset of UPDATED rows whose semantic inputs actually
- * changed materially from what was stored — see hasSemanticInputChanged — for which the caller
- * additionally runs roleReconciliation.reconcileAroundTransactionChange, since a previously-valid
- * transfer/refund match involving one of these rows' OLD state may now be stale; see
- * syncService.ts's own comment at the call site).
+ * loan-payment matching) and `touchedTransactionIds` (every inserted or updated row's id — the
+ * ordinary forward-looking reconciliation pass runs over this whole set). A modified or removed
+ * transaction may ALSO invalidate an EXISTING relational row (an `account_pair_match`/
+ * `refund_match` row) that depended on this transaction's OLD state or its now-deleted existence
+ * — the caller (syncService.ts) is responsible for running roleReconciliation's bounded
+ * `repairExistingRelationalRoles` sweep whenever `modified`/`removed` were non-empty, BEFORE
+ * advancing its cursor (Round 3 remediation §2/§3/§4/§6 — see that module's own doc comment for
+ * why a sweep-based repair replaced the earlier per-row "capture old identity, search for a stale
+ * partner" approach).
  */
 export async function applyTransactionChanges(params: {
   userId: string;
@@ -581,7 +584,6 @@ export async function applyTransactionChanges(params: {
 }): Promise<{
   insertedTransactions: InsertedTransaction[];
   touchedTransactionIds: string[];
-  semanticallyChangedTransactionIds: string[];
 }> {
   const upsertCandidates = [...params.added, ...params.modified]
     .map((t) => {
@@ -592,14 +594,13 @@ export async function applyTransactionChanges(params: {
 
   let insertedRows: InsertedTransaction[] = [];
   const touchedTransactionIds: string[] = [];
-  const semanticallyChangedTransactionIds: string[] = [];
 
   if (upsertCandidates.length > 0) {
     const plaidIds = upsertCandidates.map((t) => t.plaid_transaction_id);
     const { data: existing, error: fetchError } = await supabaseAdmin
       .from('transactions')
       .select(
-        'id, plaid_transaction_id, account_id, amount, date, name, merchant_name, category, personal_finance_category_detailed, personal_finance_category_confidence, manual_loan_id, auto_role'
+        'id, plaid_transaction_id, account_id, amount, date, name, merchant_name, category, personal_finance_category_detailed, personal_finance_category_confidence, manual_loan_id, auto_role, principal_portion'
       )
       .in('plaid_transaction_id', plaidIds);
 
@@ -653,6 +654,19 @@ export async function applyTransactionChanges(params: {
       const id = existingRow.id;
       const { plaid_transaction_id: _ignored, ...fields } = row;
 
+      // Principal integrity during Plaid resync (Round 3 remediation §8): a manual-loan-linked
+      // transaction's amount can change on resync (Plaid correcting a pending amount, a merchant
+      // adjustment, etc.) — if the ALREADY-STORED principal_portion is no longer compatible with
+      // the new amount, this must fail the whole sync batch BEFORE persisting the incompatible
+      // amount and BEFORE the cursor advances, rather than silently letting principal > amount
+      // persist or corrupting loan-balance math. This is deliberately NOT caught here — it
+      // propagates out of this function (and out of syncService.ts, uncaught), leaving the
+      // cursor unadvanced so the next sync attempt re-delivers this same batch once the user has
+      // edited or unlinked the payment.
+      if (existingRow.manual_loan_id !== null) {
+        assertLinkedPaymentAmountIsCompatible(row.amount, existingRow.principal_portion);
+      }
+
       // auto_role lifecycle (Phase A contract §5, Round 2 remediation §3): an ordinary resync
       // with unchanged semantic inputs must not churn the role fields at all — only reclassify
       // when a semantic input actually changed (see hasSemanticInputChanged — amount/account/
@@ -670,12 +684,6 @@ export async function applyTransactionChanges(params: {
             manualLoanId: null,
           });
           roleFields = roleFieldsFor(classification);
-          // Only a genuine semantic-input CHANGE (not "never classified yet", which has no prior
-          // relational state that could possibly be stale) needs the fuller
-          // reconcileAroundTransactionChange treatment — see this function's own doc comment.
-          if (semanticInputChanged && existingRow.auto_role !== null) {
-            semanticallyChangedTransactionIds.push(id);
-          }
         }
       }
 
@@ -698,7 +706,7 @@ export async function applyTransactionChanges(params: {
     if (error) throw new Error(`Failed to delete removed transactions: ${error.message}`);
   }
 
-  return { insertedTransactions: insertedRows, touchedTransactionIds, semanticallyChangedTransactionIds };
+  return { insertedTransactions: insertedRows, touchedTransactionIds };
 }
 
 /** `start`/`end` are both inclusive (YYYY-MM-DD) — matches TransactionsFeed's existing client-side
@@ -1823,9 +1831,9 @@ export async function getTransactionsForReconciliation(userId: string, ids: stri
 
 /** Every credible internal-transfer counterpart candidate for `row`, filtered by an explicit
  *  `roleSourceFilter` — pass `'transfer_like_unconfirmed'` to find a fresh candidate, or
- *  `'account_pair_match'` to find an EXISTING confirmed partner (used when re-evaluating a stale
- *  match after `row` itself changed — see roleReconciliation.ts's `reconcileAroundTransactionChange`).
- *  One reusable, parameterized query rather than two near-duplicate ones (Round 2 remediation §1).
+ *  `'account_pair_match'` to re-validate an EXISTING confirmed partner against current data (used
+ *  by roleReconciliation.ts's repair sweep — see `repairExistingRelationalRoles`). One reusable,
+ *  parameterized query rather than two near-duplicate ones (Round 2 remediation §1).
  *
  *  Deliberately conservative: opposite sign, EXACT matching amount, on a DIFFERENT account owned
  *  by the same user, within the given inclusive date window. Returns every match in the window —
@@ -1885,12 +1893,14 @@ export async function findRefundOriginalCandidates(
 }
 
 /** Every negative, same-account transaction dated on/after `row` (an ordinary expense) within the
- *  refund window, filtered by `roleSourceFilter` — pass `'sign_default'` to find a dangling refund
- *  candidate a freshly-touched purchase might resolve (the purchase-arrives-after-its-refund
- *  direction), or `'refund_match'` to find an EXISTING refund match that had used `row` as its
- *  original before `row` stopped being eligible (see roleReconciliation.ts's
- *  `reconcileAroundTransactionChange`). One reusable, parameterized query (Round 2 remediation
- *  §1/§3), mirroring findTransferCounterpartCandidates' own roleSourceFilter pattern. */
+ *  refund window, filtered by `roleSourceFilter` — used with `'sign_default'` to find a dangling
+ *  refund candidate a freshly-touched purchase might resolve (the purchase-arrives-after-its-
+ *  refund direction — see roleReconciliation.ts's `resolveDanglingRefunds`). Parameterized rather
+ *  than hardcoded (Round 2 remediation §1/§3), mirroring findTransferCounterpartCandidates' own
+ *  roleSourceFilter pattern, even though `'sign_default'` is its only caller today — the repair
+ *  sweep re-validates an EXISTING refund_match row from the OPPOSITE direction instead (searching
+ *  for ITS original via `findRefundOriginalCandidates`, not searching for dependents of an
+ *  original via this function — see `repairRefundMatches`). */
 export async function findNegativeCandidatesReferencingOriginal(
   userId: string,
   row: { id: string; account_id: string; amount: number; date: string },
@@ -1917,13 +1927,18 @@ export async function findNegativeCandidatesReferencingOriginal(
 export interface BackfillCandidateRow {
   id: string;
   user_id: string;
+  account_id: string;
   amount: number;
   date: string;
+  name: string;
+  merchant_name: string | null;
   category: string | null;
   personal_finance_category_detailed: string | null;
   personal_finance_category_confidence: string | null;
   manual_loan_id: string | null;
   auto_role: string | null;
+  role_source: string | null;
+  user_role_override: string | null;
   classifier_version: number;
 }
 
@@ -1949,7 +1964,7 @@ export async function getTransactionsBackfillPage(
   let query = supabaseAdmin
     .from('transactions')
     .select(
-      'id, amount, date, category, personal_finance_category_detailed, personal_finance_category_confidence, manual_loan_id, auto_role, classifier_version, accounts!inner(plaid_items!inner(user_id))'
+      'id, account_id, amount, date, name, merchant_name, category, personal_finance_category_detailed, personal_finance_category_confidence, manual_loan_id, auto_role, role_source, user_role_override, classifier_version, accounts!inner(plaid_items!inner(user_id))'
     );
 
   if (after) {
@@ -1969,56 +1984,86 @@ export async function getTransactionsBackfillPage(
     return {
       id: row.id as string,
       user_id: accounts.plaid_items.user_id,
+      account_id: row.account_id as string,
       amount: row.amount as number,
       date: row.date as string,
+      name: row.name as string,
+      merchant_name: row.merchant_name as string | null,
       category: row.category as string | null,
       personal_finance_category_detailed: row.personal_finance_category_detailed as string | null,
       personal_finance_category_confidence: row.personal_finance_category_confidence as string | null,
       manual_loan_id: row.manual_loan_id as string | null,
       auto_role: row.auto_role as string | null,
+      role_source: row.role_source as string | null,
+      user_role_override: row.user_role_override as string | null,
       classifier_version: row.classifier_version as number,
     };
   });
 }
 
-/** Updates one row's role fields, verifying — via a re-fetched, joined ownership check on the
- *  update's own return, not merely by trusting the caller — that the affected row actually
- *  belongs to `userId` (Round 2 remediation §8). Returns `false` (no durable half-applied state;
- *  a single UPDATE either matched the row or it didn't) if the row doesn't exist or doesn't
- *  belong to this user — callers must treat that as "not resolved," never as success. */
-export async function updateTransactionRoleFields(
+/**
+ * Applies a semantic-role mutation to one or two transactions atomically and ownership-safely
+ * (Round 3 remediation §1) — the sole replacement for the old two-step "UPDATE ... WHERE id
+ * IN (...), then inspect the returned joined rows for ownership" pattern (Round 2), which checked
+ * ownership only AFTER the write had already landed: a wrong-user id, or one leg of an intended
+ * transfer pair, could already be mutated before that check ever ran.
+ *
+ * Delegates the entire verify-then-write sequence to `apply_transaction_semantic_roles` (see the
+ * Phase A migration), a single PostgreSQL function invocation — one implicit transaction — that
+ * locks and counts the OWNED candidate rows before touching anything, verifies the count matches
+ * `transactionIds` exactly, performs the update, and re-verifies the affected-row count
+ * afterward, RAISING (and so rolling back everything the call did) on any mismatch. Pass a
+ * one-element array for a single-row mutation, or a two-element array for an atomic transfer-pair
+ * mutation — there is no partial state this call can leave durable.
+ *
+ * Returns `false` (never throws for this case) when the RPC's own integrity check failed — an
+ * unowned id, a missing row, or a count mismatch (Postgres error code `P0001`, the default for an
+ * unqualified `RAISE EXCEPTION`) — which callers must treat as "not resolved," exactly like the
+ * old functions' `false`/short-array returns. Any OTHER error (a genuine infrastructure failure)
+ * is thrown, not swallowed.
+ */
+export async function applyTransactionSemanticRoles(
   userId: string,
-  id: string,
+  transactionIds: string[],
   fields: { auto_role: SemanticRole; role_source: string; role_confidence: string; classifier_version: number }
 ): Promise<boolean> {
-  const { data, error } = await supabaseAdmin
-    .from('transactions')
-    .update(fields)
-    .eq('id', id)
-    .select('id, accounts!inner(plaid_items!inner(user_id))');
-  if (error) throw new Error(`Failed to update transaction role fields: ${error.message}`);
-  const rows = (data ?? []) as unknown as { id: string; accounts: { plaid_items: { user_id: string } } }[];
-  return rows.some((r) => r.id === id && r.accounts.plaid_items.user_id === userId);
+  const { error } = await supabaseAdmin.rpc('apply_transaction_semantic_roles', {
+    p_user_id: userId,
+    p_transaction_ids: transactionIds,
+    p_auto_role: fields.auto_role,
+    p_role_source: fields.role_source,
+    p_role_confidence: fields.role_confidence,
+    p_classifier_version: fields.classifier_version,
+  });
+  if (error) {
+    if (error.code === 'P0001') return false;
+    throw new Error(`Failed to apply transaction semantic roles: ${error.message}`);
+  }
+  return true;
 }
 
-/** Updates BOTH legs of a matched transfer pair in exactly one SQL statement (Round 2 remediation
- *  §5) — never two separate requests that could leave the pair inconsistent if the second one
- *  failed. Verifies via the update's own re-fetched, joined return that BOTH ids actually belong
- *  to `userId`; returns only the ids that were genuinely affected AND owned by this user. The
- *  caller must treat anything short of both ids coming back as a failed, unresolved pair — a
- *  single UPDATE...WHERE id IN (...) statement either matches its target rows or it doesn't,
- *  so there is no partial write to roll back, only a result to check. */
-export async function updateTransferPairRoleFields(
+/**
+ * One page (keyset-paginated by id) of a user's EXISTING relationally-classified transactions —
+ * `role_source = 'account_pair_match'` or `'refund_match'` — backing roleReconciliation.ts's
+ * `repairExistingRelationalRoles` sweep (Round 3 remediation §3/§4). Bounded and same-user-scoped
+ * like every other query in this section: never a full scan, and ownership is enforced by the
+ * same `accounts!inner(plaid_items!inner(user_id))` join used throughout this file.
+ */
+export async function getRelationallyClassifiedTransactionsPage(
   userId: string,
-  ids: [string, string],
-  fields: { auto_role: SemanticRole; role_source: string; role_confidence: string; classifier_version: number }
-): Promise<string[]> {
-  const { data, error } = await supabaseAdmin
+  roleSource: 'account_pair_match' | 'refund_match',
+  limit: number,
+  afterId: string | null
+): Promise<ReconciliationRow[]> {
+  let query = supabaseAdmin
     .from('transactions')
-    .update(fields)
-    .in('id', ids)
-    .select('id, accounts!inner(plaid_items!inner(user_id))');
-  if (error) throw new Error(`Failed to update transfer pair role fields: ${error.message}`);
-  const rows = (data ?? []) as unknown as { id: string; accounts: { plaid_items: { user_id: string } } }[];
-  return rows.filter((r) => ids.includes(r.id) && r.accounts.plaid_items.user_id === userId).map((r) => r.id);
+    .select(`${RECONCILIATION_ROW_COLUMNS}, accounts!inner(plaid_items!inner(user_id))`)
+    .eq('accounts.plaid_items.user_id', userId)
+    .eq('role_source', roleSource);
+
+  if (afterId) query = query.gt('id', afterId);
+
+  const { data, error } = await query.order('id', { ascending: true }).limit(limit);
+  if (error) throw new Error(`Failed to load relationally-classified transactions: ${error.message}`);
+  return (data ?? []) as ReconciliationRowWithJoin[];
 }

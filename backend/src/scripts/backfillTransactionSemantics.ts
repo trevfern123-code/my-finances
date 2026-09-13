@@ -37,7 +37,7 @@
  */
 
 import * as dataService from '../services/dataService';
-import type { BackfillCandidateRow, BackfillPageCursor } from '../services/dataService';
+import type { BackfillCandidateRow, BackfillPageCursor, ReconciliationRow } from '../services/dataService';
 import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION } from '../services/transactionClassifier';
 import { reconcileRelationalRoles } from '../services/roleReconciliation';
 
@@ -79,6 +79,14 @@ export function parseArgs(argv: string[]): ParsedArgs {
       const parsed = Number(raw);
       if (raw === undefined || !Number.isInteger(parsed) || parsed <= 0) {
         throw new ArgError('--target-version requires a positive integer.');
+      }
+      // Round 3 remediation §10: this binary can only ever WRITE classifications produced by its
+      // own CURRENT_CLASSIFIER_VERSION — a target above that would ask the script to claim a
+      // future algorithm version it doesn't actually implement.
+      if (parsed > CURRENT_CLASSIFIER_VERSION) {
+        throw new ArgError(
+          `--target-version (${parsed}) cannot exceed the classifier's current version (${CURRENT_CLASSIFIER_VERSION}).`
+        );
       }
       targetVersion = parsed;
     } else if (arg === '--after-date') {
@@ -136,7 +144,22 @@ export function __setInterruptedForTests(value: boolean): void {
   interruptRequested = value;
 }
 
-function needsClassification(row: BackfillCandidateRow, targetVersion: number, force: boolean): boolean {
+/**
+ * Whether `row` should be (re)classified this run — Round 3 remediation §10. `currentVersion`
+ * (defaulting to the real CURRENT_CLASSIFIER_VERSION, overridable only for tests that need to
+ * simulate a future-version scenario without touching the real constant) is checked FIRST and
+ * unconditionally: a row already at a classifier_version newer than what this binary can actually
+ * produce must never be touched, even under `--force` — `--force` means "re-run the current
+ * classifier on rows it's safe to re-run it on," never "downgrade a row to an older algorithm's
+ * output."
+ */
+export function needsClassification(
+  row: BackfillCandidateRow,
+  targetVersion: number,
+  force: boolean,
+  currentVersion: number = CURRENT_CLASSIFIER_VERSION
+): boolean {
+  if (row.classifier_version > currentVersion) return false;
   if (force) return true;
   if (row.auto_role === null) return true;
   return row.classifier_version < targetVersion;
@@ -168,8 +191,16 @@ export async function processPage(
   const byRole: Record<string, number> = {};
   let classified = 0;
   const idsByUser = new Map<string, string[]>();
+  // Round 3 remediation §7: a hypothetical, freshly-computed-but-possibly-unwritten pool entry
+  // per row in this page, keyed by user — lets a truthful dry-run preview see a same-batch
+  // sibling's HYPOTHETICAL classification (its role_source, effective_role) rather than the
+  // stale/unclassified state still sitting in the DB, exactly matching what an --apply run of
+  // the same page would actually resolve. In apply mode this is redundant (the write already
+  // landed before reconcileRelationalRoles re-fetches from the DB) but harmless to pass anyway.
+  const poolByUser = new Map<string, ReconciliationRow[]>();
 
   for (const row of page) {
+    let fields: { auto_role: ReturnType<typeof classifyRowLevel>['autoRole']; role_source: string; role_confidence: string; classifier_version: number } | null = null;
     if (needsClassification(row, targetVersion, force)) {
       const classification = classifyRowLevel({
         amount: row.amount,
@@ -180,24 +211,46 @@ export async function processPage(
       });
       byRole[classification.autoRole] = (byRole[classification.autoRole] ?? 0) + 1;
       classified++;
+      fields = {
+        auto_role: classification.autoRole,
+        role_source: classification.roleSource,
+        role_confidence: classification.roleConfidence,
+        classifier_version: classification.classifierVersion,
+      };
       if (apply) {
-        await dataService.updateTransactionRoleFields(row.user_id, row.id, {
-          auto_role: classification.autoRole,
-          role_source: classification.roleSource,
-          role_confidence: classification.roleConfidence,
-          classifier_version: classification.classifierVersion,
-        });
+        await dataService.applyTransactionSemanticRoles(row.user_id, [row.id], fields);
       }
     }
     const existing = idsByUser.get(row.user_id) ?? [];
     existing.push(row.id);
     idsByUser.set(row.user_id, existing);
+
+    const autoRole = fields ? fields.auto_role : row.auto_role;
+    const poolRow: ReconciliationRow = {
+      id: row.id,
+      account_id: row.account_id,
+      amount: row.amount,
+      date: row.date,
+      name: row.name,
+      merchant_name: row.merchant_name,
+      category: row.category,
+      personal_finance_category_detailed: row.personal_finance_category_detailed,
+      personal_finance_category_confidence: row.personal_finance_category_confidence,
+      manual_loan_id: row.manual_loan_id,
+      auto_role: autoRole,
+      role_source: fields ? fields.role_source : row.role_source,
+      role_confidence: fields ? fields.role_confidence : null,
+      effective_role: row.user_role_override ?? autoRole,
+    };
+    const userPool = poolByUser.get(row.user_id) ?? [];
+    userPool.push(poolRow);
+    poolByUser.set(row.user_id, userPool);
   }
 
   let resolvedCount = 0;
   let unresolvedCount = 0;
   for (const [userId, ids] of idsByUser) {
-    const result = await reconcileRelationalRoles(userId, ids, apply);
+    const result = await reconcileRelationalRoles(userId, ids, apply, poolByUser.get(userId) ?? []);
     resolvedCount += result.resolved.length;
     unresolvedCount += result.unresolved.length;
   }

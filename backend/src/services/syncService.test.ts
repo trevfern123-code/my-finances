@@ -27,10 +27,10 @@ vi.mock('./loans', () => ({
 }));
 
 const mockReconcileRelationalRoles = vi.hoisted(() => vi.fn());
-const mockReconcileAroundTransactionChange = vi.hoisted(() => vi.fn());
+const mockRepairExistingRelationalRoles = vi.hoisted(() => vi.fn());
 vi.mock('./roleReconciliation', () => ({
   reconcileRelationalRoles: mockReconcileRelationalRoles,
-  reconcileAroundTransactionChange: mockReconcileAroundTransactionChange,
+  repairExistingRelationalRoles: mockRepairExistingRelationalRoles,
 }));
 
 const item = {
@@ -44,10 +44,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockGetAccountIdMapForItem.mockResolvedValue(new Map([['plaid-acc-1', 'account-row-1']]));
   mockSyncTransactions.mockResolvedValue({ added: [], modified: [], removed: [], cursor: 'new-cursor' });
-  mockApplyTransactionChanges.mockResolvedValue({ insertedTransactions: [], touchedTransactionIds: [], semanticallyChangedTransactionIds: [] });
+  mockApplyTransactionChanges.mockResolvedValue({ insertedTransactions: [], touchedTransactionIds: [] });
   mockGetRecurringStreams.mockResolvedValue({ inflowStreams: [], outflowStreams: [] });
   mockReconcileRelationalRoles.mockResolvedValue(undefined);
-  mockReconcileAroundTransactionChange.mockResolvedValue(undefined);
+  mockRepairExistingRelationalRoles.mockResolvedValue(undefined);
 });
 
 describe('syncItemTransactions', () => {
@@ -131,7 +131,7 @@ describe('syncItemTransactions', () => {
 
   it('links newly-inserted transactions to the user\'s manual loans', async () => {
     const insertedTransactions = [{ id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 }];
-    mockApplyTransactionChanges.mockResolvedValue({ insertedTransactions, touchedTransactionIds: ['txn-1'], semanticallyChangedTransactionIds: [] });
+    mockApplyTransactionChanges.mockResolvedValue({ insertedTransactions, touchedTransactionIds: ['txn-1'] });
 
     await syncItemTransactions(item);
 
@@ -143,7 +143,6 @@ describe('syncItemTransactions', () => {
     mockApplyTransactionChanges.mockResolvedValue({
       insertedTransactions,
       touchedTransactionIds: ['txn-1', 'txn-2'],
-      semanticallyChangedTransactionIds: [],
     });
 
     await syncItemTransactions(item);
@@ -154,18 +153,73 @@ describe('syncItemTransactions', () => {
     );
   });
 
-  it('runs reconcileAroundTransactionChange for every semantically-changed transaction id, in addition to the ordinary forward pass', async () => {
-    mockApplyTransactionChanges.mockResolvedValue({
-      insertedTransactions: [],
-      touchedTransactionIds: ['txn-1', 'txn-2'],
-      semanticallyChangedTransactionIds: ['txn-2'],
+  describe('the relational repair sweep (Round 3 remediation §2/§3/§4/§6)', () => {
+    it('runs repairExistingRelationalRoles when the batch contains a modified transaction', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [{ transaction_id: 't2' }], removed: [], cursor: 'new-cursor' });
+
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledTimes(1);
     });
 
-    await syncItemTransactions(item);
+    it('runs repairExistingRelationalRoles when the batch contains a removed transaction', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [], removed: [{ transaction_id: 't3' }], cursor: 'new-cursor' });
 
-    expect(mockReconcileRelationalRoles).toHaveBeenCalledWith('user-1', ['txn-1', 'txn-2']);
-    expect(mockReconcileAroundTransactionChange).toHaveBeenCalledWith('user-1', 'txn-2');
-    expect(mockReconcileAroundTransactionChange).toHaveBeenCalledTimes(1);
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+    });
+
+    it('does NOT run the sweep for a pure-insert batch — a brand-new row can never invalidate an existing relational row', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [{ transaction_id: 't1' }], modified: [], removed: [], cursor: 'new-cursor' });
+
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
+    });
+
+    it('does NOT run the sweep when the batch is entirely empty', async () => {
+      await syncItemTransactions(item);
+      expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
+    });
+
+    it('a sweep failure propagates (a retryable sync failure) and does NOT advance the cursor, exactly like an ordinary reconciliation failure', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [{ transaction_id: 't2' }], removed: [], cursor: 'new-cursor' });
+      mockRepairExistingRelationalRoles.mockRejectedValue(new Error('sweep failed'));
+
+      await expect(syncItemTransactions(item)).rejects.toThrow('sweep failed');
+      expect(mockUpdateItemCursor).not.toHaveBeenCalled();
+    });
+
+    it('runs the sweep AFTER the ordinary forward pass, before the cursor advances', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [{ transaction_id: 't2' }], removed: [], cursor: 'new-cursor' });
+
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles.mock.invocationCallOrder[0]).toBeGreaterThan(
+        mockReconcileRelationalRoles.mock.invocationCallOrder[0]
+      );
+      expect(mockRepairExistingRelationalRoles.mock.invocationCallOrder[0]).toBeLessThan(
+        mockUpdateItemCursor.mock.invocationCallOrder[0]
+      );
+    });
+
+    it('is retry-safe: retrying after a sweep failure re-triggers the sweep even though the DB already reflects the new values (Round 3 remediation §6)', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [{ transaction_id: 't2' }], removed: [], cursor: 'new-cursor' });
+      mockRepairExistingRelationalRoles.mockRejectedValueOnce(new Error('transient failure')).mockResolvedValueOnce(undefined);
+
+      await expect(syncItemTransactions(item)).rejects.toThrow('transient failure');
+      expect(mockUpdateItemCursor).not.toHaveBeenCalled();
+
+      // Retry: same old cursor, same Plaid batch — the sweep is gated purely on "did this batch
+      // contain a modification," not on a same-attempt before/after comparison, so it re-runs and
+      // this time succeeds, advancing the cursor exactly once.
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledTimes(2);
+      expect(mockUpdateItemCursor).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('a reconciliation failure propagates (a retryable sync failure) and does NOT advance the cursor', async () => {
@@ -180,7 +234,6 @@ describe('syncItemTransactions', () => {
     mockApplyTransactionChanges.mockResolvedValue({
       insertedTransactions: [],
       touchedTransactionIds: ['txn-1'],
-      semanticallyChangedTransactionIds: [],
     });
     let reconciled = false;
     mockReconcileRelationalRoles.mockImplementation(async () => {
@@ -201,7 +254,6 @@ describe('syncItemTransactions', () => {
     mockApplyTransactionChanges.mockResolvedValue({
       insertedTransactions: [{ id: 'txn-1', name: 'Store', merchant_name: null, amount: 10 }],
       touchedTransactionIds: ['txn-1'],
-      semanticallyChangedTransactionIds: [],
     });
     mockReconcileRelationalRoles.mockRejectedValueOnce(new Error('transient failure')).mockResolvedValueOnce(undefined);
 
