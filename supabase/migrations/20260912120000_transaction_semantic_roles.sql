@@ -49,6 +49,10 @@ alter table public.transactions
     check (user_role_override is null or user_role_override in
       ('expense', 'income', 'internal_transfer', 'credit_card_payment', 'debt_payment', 'refund'));
 
+-- Round 2 remediation: 'refund_candidate_unconfirmed' was removed — an ordinary negative
+-- transaction with no refund evidence classifies directly and finally as income/sign_default
+-- (see transactionClassifier.ts's own doc comment); reconciliation independently reconsiders any
+-- sign_default negative row against real refund evidence, with no separate speculative tag needed.
 alter table public.transactions
   add constraint transactions_role_source_check
     check (role_source is null or role_source in (
@@ -59,7 +63,6 @@ alter table public.transactions
       'account_pair_match',
       'refund_match',
       'transfer_like_unconfirmed',
-      'refund_candidate_unconfirmed',
       'sign_default'
     ));
 

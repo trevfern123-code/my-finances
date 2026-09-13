@@ -1,15 +1,29 @@
 /**
  * Financial Semantics Foundation, Phase A — the canonical, centralized semantic-role classifier.
  * See the approved Financial Semantics Foundation Design (+ corrections + pre-implementation
- * contract) for the full rationale; this file implements exactly that precedence and nothing more.
+ * contract + Round 2 remediation) for the full rationale; this file implements exactly that
+ * precedence and nothing more.
  *
  * `classifyCore` is a pure function: given one transaction's own fields (no database access), it
- * either returns a final classification (precedence steps A–D, G) or a "relational candidate" —
- * a transaction whose true role depends on evidence elsewhere in the database (an internal-transfer
- * counterpart leg, or an earlier purchase a refund might net against). A relational candidate
- * still carries a complete, safe classification of its own (the sign-based fallback) — it is never
- * left unclassified — `roleReconciliation.ts` is what may later *upgrade* it once relational
- * evidence is checked (see that module's own doc comment for the two-stage design).
+ * either returns a final classification (precedence steps A–D, F) or a "relational candidate" —
+ * a transaction whose true role depends on evidence elsewhere in the database (an
+ * internal-transfer counterpart leg). A relational candidate still carries a complete, safe
+ * classification of its own (the sign-based fallback) — it is never left unclassified —
+ * `roleReconciliation.ts` is what may later *upgrade* it once relational evidence is checked (see
+ * that module's own doc comment for the two-stage design).
+ *
+ * Round 2 remediation: an earlier version of this classifier treated EVERY negative amount not
+ * otherwise classified as a "refund candidate" (tagged `refund_candidate_unconfirmed`), even
+ * ordinary income like a paycheck with no refund evidence anywhere near it — incorrect
+ * provenance, since there was no actual evidence of a refund at that point, only a sign. An
+ * ordinary negative amount now classifies directly and finally as `income`/`sign_default` (step
+ * F below), identical in spirit to how an ordinary positive amount classifies as
+ * `expense`/`sign_default`. Refund detection is now entirely reconciliation's responsibility
+ * (see roleReconciliation.ts): it considers ANY negative, `sign_default`-classified transaction
+ * as a potential refund each time it's touched, and only ever upgrades it to `refund`/
+ * `refund_match` once real relational evidence (a matching earlier ordinary expense) is found —
+ * there is no separate "candidate" tag or classifier-level bookkeeping for this, exactly as
+ * required ("do not create another speculative refund candidate source").
  *
  * Nothing in this file is wired into any ingestion, sync, or aggregation path yet — Phase A only
  * establishes the classifier and its persistence; no existing financial calculation consumes its
@@ -34,7 +48,6 @@ export type RoleSource =
   | 'account_pair_match'
   | 'refund_match'
   | 'transfer_like_unconfirmed'
-  | 'refund_candidate_unconfirmed'
   | 'sign_default';
 
 export type RoleConfidence = 'high' | 'medium' | 'low';
@@ -63,9 +76,11 @@ export interface ClassifierRowInput {
 
 /** A row-level classification result that still needs a relational (database) check before it can
  *  be considered final — the classifier has already assigned the safe fallback role so the row is
- *  never unclassified in the meantime. */
+ *  never unclassified in the meantime. Transfers are the only kind produced at classification
+ *  time; refund evidence is checked by reconciliation against any ordinary sign_default negative
+ *  transaction directly, with no separate candidate tag (see this file's own doc comment). */
 export interface RelationalCandidate {
-  kind: 'transfer' | 'refund';
+  kind: 'transfer';
   fallback: RoleClassification;
 }
 
@@ -91,8 +106,8 @@ function signFallback(amount: number, source: RoleSource): RoleClassification {
 }
 
 /**
- * Row-level precedence (steps A–D, G of the approved design; steps E/F are relational and handled
- * by the caller via the returned candidate — see roleReconciliation.ts). Pure: no I/O, no Date.now,
+ * Row-level precedence (steps A–D, F of the approved design; step E is relational and handled by
+ * the caller via the returned candidate — see roleReconciliation.ts). Pure: no I/O, no Date.now,
  * fully deterministic from its input.
  */
 export function classifyCore(input: ClassifierRowInput): ClassifyCoreResult {
@@ -171,17 +186,13 @@ export function classifyCore(input: ClassifierRowInput): ClassifyCoreResult {
     };
   }
 
-  // F — only a negative amount can ever be a refund candidate; category/budget-mapping alone is
-  // never sufficient (see roleReconciliation.ts for the actual merchant/amount/date evidence
-  // check) — this row falls back to income in the meantime, tagged for that later check.
-  if (input.amount < 0) {
-    return {
-      status: 'relational_candidate',
-      candidate: { kind: 'refund', fallback: signFallback(input.amount, 'refund_candidate_unconfirmed') },
-    };
-  }
-
-  // G — plain sign-based fallback for anything else (ordinary positive-amount expense).
+  // F — plain sign-based fallback: a positive amount is an ordinary expense, a negative amount is
+  // ordinary income, final either way. This is a genuine, final classification, not a "candidate"
+  // — most negative amounts (paychecks, direct deposits, etc.) really are just income with no
+  // refund evidence anywhere nearby, and tagging them as speculative refund candidates would be
+  // incorrect provenance (see this file's own doc comment). Reconciliation still independently
+  // reconsiders any sign_default negative row against real refund evidence each time it's
+  // touched — it just doesn't need a classifier-level tag to know which rows are eligible.
   return { status: 'final', result: signFallback(input.amount, 'sign_default') };
 }
 

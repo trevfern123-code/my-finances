@@ -31,10 +31,12 @@ import {
   getPlaidItemByPlaidItemId,
   getPlaidItemForUser,
   getTransactionsForReconciliation,
-  findTransferCounterpartCandidate,
+  findTransferCounterpartCandidates,
   findRefundOriginalCandidates,
-  findDanglingRefundCandidates,
+  findNegativeCandidatesReferencingOriginal,
   updateTransactionRoleFields,
+  updateTransferPairRoleFields,
+  getTransactionsBackfillPage,
 } from './dataService';
 import {
   decryptAccessToken,
@@ -641,7 +643,11 @@ describe('applyTransactionChanges', () => {
       role_confidence: 'low',
       classifier_version: 1,
     });
-    expect(result).toEqual({ insertedTransactions: [insertedRow], touchedTransactionIds: [insertedRow.id] });
+    expect(result).toEqual({
+      insertedTransactions: [insertedRow],
+      touchedTransactionIds: [insertedRow.id],
+      semanticallyChangedTransactionIds: [],
+    });
   });
 
   it("auto-assigns budget_category_id from a matching category mapping when inserting", async () => {
@@ -705,7 +711,7 @@ describe('applyTransactionChanges', () => {
     });
 
     expect(mockFrom).not.toHaveBeenCalled();
-    expect(result).toEqual({ insertedTransactions: [], touchedTransactionIds: [] });
+    expect(result).toEqual({ insertedTransactions: [], touchedTransactionIds: [], semanticallyChangedTransactionIds: [] });
   });
 
   it('updates (not inserts) a transaction whose plaid_transaction_id already exists, and reclassifies since its category changed from what was stored', async () => {
@@ -750,12 +756,17 @@ describe('applyTransactionChanges', () => {
     expect(result.touchedTransactionIds).toEqual(['txn-row-1']);
   });
 
-  it("an ordinary resync with unchanged category signals does not churn the already-stored role fields", async () => {
+  it("an ordinary resync with EVERY semantic input unchanged (account/amount/date/name/merchant/category/detailed/confidence) does not churn the already-stored role fields, and is not reported as semantically changed", async () => {
     const existingQuery = createQueryBuilder({
       data: [
         {
           id: 'txn-row-1',
           plaid_transaction_id: 'txn-1',
+          account_id: 'account-row-1',
+          amount: 12.5,
+          date: '2026-08-15',
+          name: 'Coffee Shop',
+          merchant_name: 'Coffee Shop',
           category: 'FOOD_AND_DRINK',
           personal_finance_category_detailed: 'COFFEE',
           personal_finance_category_confidence: 'HIGH',
@@ -768,10 +779,10 @@ describe('applyTransactionChanges', () => {
     const updateQuery = createQueryBuilder({ data: null, error: null });
     mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
 
-    await applyTransactionChanges({
+    const result = await applyTransactionChanges({
       userId: 'user-1',
       added: [],
-      // Same category/detailed/confidence as already stored — only `pending` actually changed.
+      // Identical to what's stored in every semantic-input field — only `pending` differs.
       modified: [fakeTransaction({ pending: true })],
       removed: [],
       accountIdByPlaidId,
@@ -782,6 +793,86 @@ describe('applyTransactionChanges', () => {
     expect('role_source' in updatedFields).toBe(false);
     expect('role_confidence' in updatedFields).toBe(false);
     expect('classifier_version' in updatedFields).toBe(false);
+    expect(result.semanticallyChangedTransactionIds).toEqual([]);
+  });
+
+  it.each([
+    ['amount', { amount: 999 }],
+    ['date', { date: '2026-09-01' }],
+    ['name', { name: 'Totally Different Merchant' }],
+    ['merchant_name', { merchant_name: 'Totally Different Merchant' }],
+    ['account (via a different plaid account_id)', { account_id: 'plaid-acc-2' }],
+  ])('a resync where %s materially changed DOES reclassify and reports the row as semantically changed', async (_label, overrides) => {
+    const existingQuery = createQueryBuilder({
+      data: [
+        {
+          id: 'txn-row-1',
+          plaid_transaction_id: 'txn-1',
+          account_id: 'account-row-1',
+          amount: 12.5,
+          date: '2026-08-15',
+          name: 'Coffee Shop',
+          merchant_name: 'Coffee Shop',
+          category: 'FOOD_AND_DRINK',
+          personal_finance_category_detailed: 'COFFEE',
+          personal_finance_category_confidence: 'HIGH',
+          manual_loan_id: null,
+          auto_role: 'expense',
+        },
+      ],
+      error: null,
+    });
+    const updateQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+    const accountIdByPlaidIdWithSecond = new Map([...accountIdByPlaidId, ['plaid-acc-2', 'account-row-2']]);
+
+    const result = await applyTransactionChanges({
+      userId: 'user-1',
+      added: [],
+      modified: [fakeTransaction(overrides)],
+      removed: [],
+      accountIdByPlaidId: accountIdByPlaidIdWithSecond,
+    });
+
+    const updatedFields = updateQuery.update.mock.calls[0][0] as Record<string, unknown>;
+    expect('auto_role' in updatedFields).toBe(true);
+    expect(result.semanticallyChangedTransactionIds).toEqual(['txn-row-1']);
+  });
+
+  it('a row classified for the very first time (auto_role was null) is reclassified but NOT reported as "semantically changed" — there is no prior relational state to invalidate', async () => {
+    const existingQuery = createQueryBuilder({
+      data: [
+        {
+          id: 'txn-row-1',
+          plaid_transaction_id: 'txn-1',
+          account_id: 'account-row-1',
+          amount: 12.5,
+          date: '2026-08-15',
+          name: 'Coffee Shop',
+          merchant_name: 'Coffee Shop',
+          category: 'FOOD_AND_DRINK',
+          personal_finance_category_detailed: 'COFFEE',
+          personal_finance_category_confidence: 'HIGH',
+          manual_loan_id: null,
+          auto_role: null,
+        },
+      ],
+      error: null,
+    });
+    const updateQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+
+    const result = await applyTransactionChanges({
+      userId: 'user-1',
+      added: [],
+      modified: [fakeTransaction({ pending: true })], // identical semantic inputs, just never classified before
+      removed: [],
+      accountIdByPlaidId,
+    });
+
+    const updatedFields = updateQuery.update.mock.calls[0][0] as Record<string, unknown>;
+    expect('auto_role' in updatedFields).toBe(true);
+    expect(result.semanticallyChangedTransactionIds).toEqual([]);
   });
 
   it('a transaction already linked to a manual loan is never reclassified by an ordinary resync, regardless of category drift', async () => {
@@ -968,10 +1059,15 @@ describe('clearTransactionSplits', () => {
 
 describe('linkTransactionToLoan', () => {
   it('links the transaction and decrements the loan balance by the principal portion', async () => {
+    const txnFetchQuery = createQueryBuilder({ data: { amount: 500 }, error: null });
     const linkQuery = createQueryBuilder({ data: null, error: null });
     const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
     const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(linkQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+    mockFrom
+      .mockReturnValueOnce(txnFetchQuery)
+      .mockReturnValueOnce(linkQuery)
+      .mockReturnValueOnce(balanceQuery)
+      .mockReturnValueOnce(updateBalanceQuery);
 
     await linkTransactionToLoan('txn-1', 'loan-1', 200);
 
@@ -989,21 +1085,64 @@ describe('linkTransactionToLoan', () => {
   });
 
   it('clamps the new balance at 0 rather than going negative', async () => {
+    const txnFetchQuery = createQueryBuilder({ data: { amount: 500 }, error: null });
     const linkQuery = createQueryBuilder({ data: null, error: null });
     const balanceQuery = createQueryBuilder({ data: { current_balance: 150 }, error: null });
     const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(linkQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+    mockFrom
+      .mockReturnValueOnce(txnFetchQuery)
+      .mockReturnValueOnce(linkQuery)
+      .mockReturnValueOnce(balanceQuery)
+      .mockReturnValueOnce(updateBalanceQuery);
 
     await linkTransactionToLoan('txn-1', 'loan-1', 200);
 
     expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 0 });
+  });
+
+  it('cent-rounds the principal before persisting or adjusting the balance', async () => {
+    const txnFetchQuery = createQueryBuilder({ data: { amount: 500 }, error: null });
+    const linkQuery = createQueryBuilder({ data: null, error: null });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom
+      .mockReturnValueOnce(txnFetchQuery)
+      .mockReturnValueOnce(linkQuery)
+      .mockReturnValueOnce(balanceQuery)
+      .mockReturnValueOnce(updateBalanceQuery);
+
+    await linkTransactionToLoan('txn-1', 'loan-1', 33.333);
+
+    expect(linkQuery.update).toHaveBeenCalledWith(expect.objectContaining({ principal_portion: 33.33 }));
+  });
+
+  it('rejects (throws, never persists) a principal_portion greater than the transaction amount (Round 2 remediation §7)', async () => {
+    const txnFetchQuery = createQueryBuilder({ data: { amount: 100 }, error: null });
+    mockFrom.mockReturnValueOnce(txnFetchQuery);
+
+    await expect(linkTransactionToLoan('txn-1', 'loan-1', 150)).rejects.toThrow();
+    expect(mockFrom).toHaveBeenCalledTimes(1); // never reached the update/balance-adjustment calls
+  });
+
+  it('rejects a negative principal_portion', async () => {
+    const txnFetchQuery = createQueryBuilder({ data: { amount: 100 }, error: null });
+    mockFrom.mockReturnValueOnce(txnFetchQuery);
+
+    await expect(linkTransactionToLoan('txn-1', 'loan-1', -10)).rejects.toThrow();
+  });
+
+  it('rejects a non-finite principal_portion', async () => {
+    const txnFetchQuery = createQueryBuilder({ data: { amount: 100 }, error: null });
+    mockFrom.mockReturnValueOnce(txnFetchQuery);
+
+    await expect(linkTransactionToLoan('txn-1', 'loan-1', NaN)).rejects.toThrow();
   });
 });
 
 describe('updateLinkedPaymentPrincipal', () => {
   it('updates the principal portion and adjusts the loan balance by the difference', async () => {
     const fetchQuery = createQueryBuilder({
-      data: { principal_portion: 100, manual_loan_id: 'loan-1' },
+      data: { principal_portion: 100, manual_loan_id: 'loan-1', amount: 500 },
       error: null,
     });
     const updateTxnQuery = createQueryBuilder({ data: null, error: null });
@@ -1024,7 +1163,7 @@ describe('updateLinkedPaymentPrincipal', () => {
 
   it('throws when the transaction is not linked to the given loan', async () => {
     const fetchQuery = createQueryBuilder({
-      data: { principal_portion: 100, manual_loan_id: 'some-other-loan' },
+      data: { principal_portion: 100, manual_loan_id: 'some-other-loan', amount: 500 },
       error: null,
     });
     mockFrom.mockReturnValueOnce(fetchQuery);
@@ -1032,6 +1171,16 @@ describe('updateLinkedPaymentPrincipal', () => {
     await expect(updateLinkedPaymentPrincipal('txn-1', 'loan-1', 150)).rejects.toThrow(
       'Payment is not linked to this loan'
     );
+  });
+
+  it('rejects a new principal_portion greater than the transaction amount (Round 2 remediation §7)', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { principal_portion: 100, manual_loan_id: 'loan-1', amount: 200 },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    await expect(updateLinkedPaymentPrincipal('txn-1', 'loan-1', 250)).rejects.toThrow();
   });
 });
 
@@ -1512,31 +1661,33 @@ describe('upsertReportingRange', () => {
   });
 });
 
-describe('transaction semantic-role reconciliation queries (Financial Semantics Foundation, Phase A)', () => {
+describe('transaction semantic-role reconciliation queries (Financial Semantics Foundation, Phase A + Round 2 remediation)', () => {
   it('getTransactionsForReconciliation returns [] without querying at all for an empty id list', async () => {
-    const result = await getTransactionsForReconciliation([]);
+    const result = await getTransactionsForReconciliation('user-1', []);
     expect(mockFrom).not.toHaveBeenCalled();
     expect(result).toEqual([]);
   });
 
-  it('getTransactionsForReconciliation queries by exactly the given ids', async () => {
+  it('getTransactionsForReconciliation queries by exactly the given ids, scoped to the given user (§8 ownership)', async () => {
     const query = createQueryBuilder({ data: [{ id: 'txn-1' }], error: null });
     mockFrom.mockReturnValueOnce(query);
 
-    await getTransactionsForReconciliation(['txn-1', 'txn-2']);
+    await getTransactionsForReconciliation('user-1', ['txn-1', 'txn-2']);
 
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
     expect(query.in).toHaveBeenCalledWith('id', ['txn-1', 'txn-2']);
   });
 
-  it('findTransferCounterpartCandidate excludes the same account and the row itself, requires the opposite exact amount, the transfer_like_unconfirmed tag, and the given date window', async () => {
+  it('findTransferCounterpartCandidates excludes the same account and the row itself, requires the opposite exact amount, the given roleSourceFilter, and the given date window — no limit(1), returns everything in range', async () => {
     const query = createQueryBuilder({ data: [], error: null });
     mockFrom.mockReturnValueOnce(query);
 
-    await findTransferCounterpartCandidate(
+    await findTransferCounterpartCandidates(
       'user-1',
       { id: 'txn-1', account_id: 'acc-1', amount: 100, date: '2026-09-10' },
       '2026-09-07',
-      '2026-09-13'
+      '2026-09-13',
+      'transfer_like_unconfirmed'
     );
 
     expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
@@ -1546,23 +1697,25 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
     expect(query.eq).toHaveBeenCalledWith('role_source', 'transfer_like_unconfirmed');
     expect(query.gte).toHaveBeenCalledWith('date', '2026-09-07');
     expect(query.lte).toHaveBeenCalledWith('date', '2026-09-13');
+    expect(query.limit).not.toHaveBeenCalled();
   });
 
-  it('findTransferCounterpartCandidate returns null when nothing matches', async () => {
+  it('findTransferCounterpartCandidates can be filtered to account_pair_match to find an EXISTING confirmed partner (reused for stale-partner detection)', async () => {
     const query = createQueryBuilder({ data: [], error: null });
     mockFrom.mockReturnValueOnce(query);
 
-    const result = await findTransferCounterpartCandidate(
+    await findTransferCounterpartCandidates(
       'user-1',
       { id: 'txn-1', account_id: 'acc-1', amount: 100, date: '2026-09-10' },
       '2026-09-07',
-      '2026-09-13'
+      '2026-09-13',
+      'account_pair_match'
     );
 
-    expect(result).toBeNull();
+    expect(query.eq).toHaveBeenCalledWith('role_source', 'account_pair_match');
   });
 
-  it('findRefundOriginalCandidates requires the same account, a positive amount at least covering the refund, and the given lookback start through the refund\'s own date', async () => {
+  it('findRefundOriginalCandidates requires an eligible ordinary expense (effective_role = expense, not manual-loan-linked), the same account, a positive amount at least covering the refund, and the given lookback window through the refund\'s own date', async () => {
     const query = createQueryBuilder({ data: [], error: null });
     mockFrom.mockReturnValueOnce(query);
 
@@ -1573,35 +1726,54 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
     );
 
     expect(query.eq).toHaveBeenCalledWith('account_id', 'acc-1');
-    expect(query.gt).toHaveBeenCalledWith('amount', 0);
+    expect(query.eq).toHaveBeenCalledWith('effective_role', 'expense');
+    expect(query.is).toHaveBeenCalledWith('manual_loan_id', null);
     expect(query.gte).toHaveBeenCalledWith('amount', 50);
     expect(query.gte).toHaveBeenCalledWith('date', '2026-05-13');
     expect(query.lte).toHaveBeenCalledWith('date', '2026-09-10');
   });
 
-  it('findDanglingRefundCandidates requires the same account, a negative amount not exceeding the purchase, the refund_candidate_unconfirmed tag, and a date on/after the purchase through the window end', async () => {
+  it('findNegativeCandidatesReferencingOriginal requires the same account, a negative amount not exceeding the purchase, the given roleSourceFilter, and a date on/after the purchase through the window end', async () => {
     const query = createQueryBuilder({ data: [], error: null });
     mockFrom.mockReturnValueOnce(query);
 
-    await findDanglingRefundCandidates(
+    await findNegativeCandidatesReferencingOriginal(
       'user-1',
       { id: 'txn-orig', account_id: 'acc-1', amount: 50, date: '2026-09-10' },
-      '2027-01-08'
+      '2027-01-08',
+      'sign_default'
     );
 
     expect(query.eq).toHaveBeenCalledWith('account_id', 'acc-1');
     expect(query.lt).toHaveBeenCalledWith('amount', 0);
     expect(query.gte).toHaveBeenCalledWith('amount', -50);
-    expect(query.eq).toHaveBeenCalledWith('role_source', 'refund_candidate_unconfirmed');
+    expect(query.eq).toHaveBeenCalledWith('role_source', 'sign_default');
     expect(query.gte).toHaveBeenCalledWith('date', '2026-09-10');
     expect(query.lte).toHaveBeenCalledWith('date', '2027-01-08');
   });
 
-  it('updateTransactionRoleFields writes exactly the four role fields to the given id', async () => {
-    const query = createQueryBuilder({ data: null, error: null });
+  it('findNegativeCandidatesReferencingOriginal can be filtered to refund_match to find a STALE existing match', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
     mockFrom.mockReturnValueOnce(query);
 
-    await updateTransactionRoleFields('txn-1', {
+    await findNegativeCandidatesReferencingOriginal(
+      'user-1',
+      { id: 'txn-orig', account_id: 'acc-1', amount: 50, date: '2026-09-10' },
+      '2027-01-08',
+      'refund_match'
+    );
+
+    expect(query.eq).toHaveBeenCalledWith('role_source', 'refund_match');
+  });
+
+  it('updateTransactionRoleFields writes exactly the four role fields and verifies ownership via the update\'s own joined return', async () => {
+    const query = createQueryBuilder({
+      data: [{ id: 'txn-1', accounts: { plaid_items: { user_id: 'user-1' } } }],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await updateTransactionRoleFields('user-1', 'txn-1', {
       auto_role: 'internal_transfer',
       role_source: 'account_pair_match',
       role_confidence: 'high',
@@ -1615,5 +1787,112 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
       classifier_version: 1,
     });
     expect(query.eq).toHaveBeenCalledWith('id', 'txn-1');
+    expect(result).toBe(true);
+  });
+
+  it('updateTransactionRoleFields returns false (never true) when the returned row belongs to a different user — Round 2 remediation §8: an ID from user B must never be treated as updated while reconciling user A', async () => {
+    const query = createQueryBuilder({
+      data: [{ id: 'txn-1', accounts: { plaid_items: { user_id: 'user-B' } } }],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await updateTransactionRoleFields('user-A', 'txn-1', {
+      auto_role: 'expense',
+      role_source: 'sign_default',
+      role_confidence: 'low',
+      classifier_version: 1,
+    });
+
+    expect(result).toBe(false);
+  });
+
+  it('updateTransactionRoleFields returns false when nothing was returned at all (row doesn\'t exist)', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    const result = await updateTransactionRoleFields('user-1', 'txn-missing', {
+      auto_role: 'expense',
+      role_source: 'sign_default',
+      role_confidence: 'low',
+      classifier_version: 1,
+    });
+
+    expect(result).toBe(false);
+  });
+
+  it('updateTransferPairRoleFields updates both ids in exactly one statement and returns only the ids genuinely owned by the given user', async () => {
+    const query = createQueryBuilder({
+      data: [
+        { id: 'txn-1', accounts: { plaid_items: { user_id: 'user-1' } } },
+        { id: 'txn-2', accounts: { plaid_items: { user_id: 'user-1' } } },
+      ],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const affected = await updateTransferPairRoleFields('user-1', ['txn-1', 'txn-2'], {
+      auto_role: 'internal_transfer',
+      role_source: 'account_pair_match',
+      role_confidence: 'high',
+      classifier_version: 1,
+    });
+
+    expect(query.in).toHaveBeenCalledWith('id', ['txn-1', 'txn-2']);
+    expect(query.update).toHaveBeenCalledTimes(1); // one statement for both rows
+    expect(affected.sort()).toEqual(['txn-1', 'txn-2']);
+  });
+
+  it('updateTransferPairRoleFields excludes a row belonging to a different user from the affected result — never silently updates cross-user (§8)', async () => {
+    const query = createQueryBuilder({
+      data: [
+        { id: 'txn-1', accounts: { plaid_items: { user_id: 'user-A' } } },
+        { id: 'txn-2', accounts: { plaid_items: { user_id: 'user-B' } } }, // belongs to a different user
+      ],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+
+    const affected = await updateTransferPairRoleFields('user-A', ['txn-1', 'txn-2'], {
+      auto_role: 'internal_transfer',
+      role_source: 'account_pair_match',
+      role_confidence: 'high',
+      classifier_version: 1,
+    });
+
+    expect(affected).toEqual(['txn-1']); // only the genuinely-owned row counts as affected
+  });
+});
+
+describe('getTransactionsBackfillPage — deterministic keyset pagination (Round 2 remediation §10)', () => {
+  it('with no cursor, orders by date then id ascending and applies no lower-bound filter', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getTransactionsBackfillPage(500, null);
+
+    expect(query.order).toHaveBeenCalledWith('date', { ascending: true });
+    expect(query.order).toHaveBeenCalledWith('id', { ascending: true });
+    expect(query.limit).toHaveBeenCalledWith(500);
+    expect(query.or).not.toHaveBeenCalled();
+  });
+
+  it('with a cursor, filters strictly after (date, id) via a keyset OR expression, not OFFSET', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getTransactionsBackfillPage(500, { date: '2026-01-01', id: 'abc' });
+
+    expect(query.or).toHaveBeenCalledWith('date.gt.2026-01-01,and(date.eq.2026-01-01,id.gt.abc)');
+  });
+
+  it('does not filter by auto_role at all — returns rows regardless of classification state', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getTransactionsBackfillPage(500, null);
+
+    const isCalls = (query.is as ReturnType<typeof vi.fn>).mock.calls;
+    expect(isCalls.some((call) => call[0] === 'auto_role')).toBe(false);
   });
 });

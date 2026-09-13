@@ -1,6 +1,7 @@
 import type { CreditCardLiability, MortgageLiability, StudentLoan } from 'plaid';
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
+import { reconcileAroundTransactionChange } from './roleReconciliation';
 import { summarizeErrorSafely } from './errorSanitizer';
 import type { InsertedTransaction } from '../types';
 
@@ -145,6 +146,12 @@ export async function linkNewTransactionsToManualLoans(
       const loanId = matchTransactionToLoan(txn, matchers);
       if (loanId) {
         await dataService.linkTransactionToLoan(txn.id, loanId, txn.amount);
+        // A brand-new transaction has no prior relational state to invalidate (it can't have
+        // been someone's transfer counterpart or refund original before it existed) — but this
+        // reuses the same bounded re-evaluation call as the other link paths below for
+        // consistency and to re-evaluate the row itself immediately rather than waiting for the
+        // batch's own forward pass (see roleReconciliation.ts).
+        await reconcileAroundTransactionChange(userId, txn.id);
       }
     }
   } catch (err) {
@@ -169,6 +176,13 @@ export async function backfillMatchesForLoan(
     for (const txn of candidates) {
       if (matchTransactionToLoan(txn, [matcher])) {
         await dataService.linkTransactionToLoan(txn.id, loan.id, txn.amount);
+        // This transaction may have previously been (or been paired/matched with) something
+        // relational — e.g. an ordinary expense that some refund had matched against, or an
+        // ambiguous-transfer-shaped row — before the user set this loan's match_text. Linking it
+        // now makes it a debt_payment, which can invalidate that old relationship (Round 2
+        // remediation §1) — reconcileAroundTransactionChange finds and resets any such stale
+        // counterpart/dependent, bounded to the same fixed windows as ordinary reconciliation.
+        await reconcileAroundTransactionChange(userId, txn.id);
       }
     }
   } catch (err) {

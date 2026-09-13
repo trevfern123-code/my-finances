@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
 import { backfillMatchesForLoan, computePayoffProgressPct } from '../services/loans';
+import { reconcileAroundTransactionChange } from '../services/roleReconciliation';
 import type { ManualLoanRow } from '../types';
 
 type LifetimeTotals = { principalPaid: number; interestPaid: number };
@@ -217,6 +218,10 @@ export async function unlinkPayment(req: Request, res: Response, next: NextFunct
     }
 
     await dataService.unlinkPaymentFromLoan(req.params.transactionId, loan.id);
+    // The unlinked transaction is no longer a manual_loan_link row — it may now be, or may have
+    // previously invalidated, a transfer/refund relationship (Round 2 remediation §1). Bounded,
+    // reuses the same fixed windows as ordinary reconciliation — never a global scan.
+    await reconcileAroundTransactionChange(userId, req.params.transactionId);
     const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
     res.json({ loan: await enrichLoan(updatedLoan) });
   } catch (err) {

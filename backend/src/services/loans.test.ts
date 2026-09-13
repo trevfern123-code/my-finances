@@ -19,6 +19,11 @@ vi.mock('./dataService', () => ({
   getUnlinkedOutflowTransactionsForUser: mockGetUnlinkedOutflowTransactionsForUser,
 }));
 
+const mockReconcileAroundTransactionChange = vi.hoisted(() => vi.fn());
+vi.mock('./roleReconciliation', () => ({
+  reconcileAroundTransactionChange: mockReconcileAroundTransactionChange,
+}));
+
 import {
   backfillMatchesForLoan,
   computePayoffProgressPct,
@@ -242,6 +247,8 @@ describe('linkNewTransactionsToManualLoans', () => {
   beforeEach(() => {
     mockListManualLoans.mockReset();
     mockLinkTransactionToLoan.mockReset();
+    mockReconcileAroundTransactionChange.mockReset();
+    mockReconcileAroundTransactionChange.mockResolvedValue(undefined);
   });
 
   it('links matching inserted transactions to the matching loan', async () => {
@@ -258,6 +265,16 @@ describe('linkNewTransactionsToManualLoans', () => {
 
     expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
     expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('txn-1', 'loan-1', 250);
+  });
+
+  it('reconciles around each newly-linked transaction (Round 2 remediation §1) after linking', async () => {
+    mockListManualLoans.mockResolvedValue([{ id: 'loan-1', match_text: 'SoFi' }]);
+
+    await linkNewTransactionsToManualLoans('user-1', [
+      { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+    ]);
+
+    expect(mockReconcileAroundTransactionChange).toHaveBeenCalledWith('user-1', 'txn-1');
   });
 
   it('does nothing when there are no inserted transactions', async () => {
@@ -290,6 +307,8 @@ describe('backfillMatchesForLoan', () => {
   beforeEach(() => {
     mockGetUnlinkedOutflowTransactionsForUser.mockReset();
     mockLinkTransactionToLoan.mockReset();
+    mockReconcileAroundTransactionChange.mockReset();
+    mockReconcileAroundTransactionChange.mockResolvedValue(undefined);
   });
 
   it('links unlinked transactions matching the loan match_text', async () => {
@@ -302,6 +321,16 @@ describe('backfillMatchesForLoan', () => {
 
     expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
     expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('txn-1', 'loan-1', 250);
+  });
+
+  it('reconciles around each newly-linked transaction (Round 2 remediation §1) — a payment that was previously relational (e.g. an ordinary expense some refund had matched against) can be invalidated by this link', async () => {
+    mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([
+      { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+    ]);
+
+    await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' });
+
+    expect(mockReconcileAroundTransactionChange).toHaveBeenCalledWith('user-1', 'txn-1');
   });
 
   it('does nothing when the loan has no match_text', async () => {

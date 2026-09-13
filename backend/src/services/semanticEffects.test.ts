@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { getSemanticEffects, type SemanticEffectsInput } from './semanticEffects';
+import {
+  getSemanticEffects,
+  normalizePrincipalPortion,
+  InvalidPrincipalPortionError,
+  type SemanticEffectsInput,
+} from './semanticEffects';
 
 function txn(overrides: Partial<SemanticEffectsInput> = {}): SemanticEffectsInput {
   return {
@@ -57,14 +62,90 @@ describe('getSemanticEffects — manual-loan-linked, no override', () => {
     expect(effects).toEqual([{ role: 'debt_payment', amount: 500 }]);
   });
 
-  it('null principalPortion treats the whole amount as interest (defensive default, principal=0)', () => {
+  it('null principalPortion treats the whole amount as interest (defensive default, principal=0) with no spurious zero-amount debt_payment line', () => {
     const effects = getSemanticEffects(
       txn({ amount: 200, effectiveRole: 'debt_payment', manualLoanId: 'loan-1', principalPortion: null })
     );
-    expect(effects).toEqual([
-      { role: 'debt_payment', amount: 0 },
-      { role: 'expense', amount: 200 },
+    expect(effects).toEqual([{ role: 'expense', amount: 200 }]);
+  });
+});
+
+describe('getSemanticEffects — defensive handling of impossible persisted principal values (Round 2 remediation §7)', () => {
+  it('amount 100 / principal 0 -> expense 100 only', () => {
+    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 0 }))).toEqual([
+      { role: 'expense', amount: 100 },
     ]);
+  });
+
+  it('amount 100 / principal 100 -> debt_payment 100 only', () => {
+    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 100 }))).toEqual([
+      { role: 'debt_payment', amount: 100 },
+    ]);
+  });
+
+  it('amount 100 / principal 60 -> debt_payment 60 + expense 40', () => {
+    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 60 }))).toEqual([
+      { role: 'debt_payment', amount: 60 },
+      { role: 'expense', amount: 40 },
+    ]);
+  });
+
+  it('amount 100 / principal 120 (impossible, exceeds amount) -> clamped to the amount, debt_payment 100 only, never negative/overflowing components', () => {
+    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 120 }))).toEqual([
+      { role: 'debt_payment', amount: 100 },
+    ]);
+  });
+
+  it('amount 100 / principal -10 (impossible, negative) -> clamped to 0, expense 100 only', () => {
+    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: -10 }))).toEqual([
+      { role: 'expense', amount: 100 },
+    ]);
+  });
+
+  it('NaN/Infinity principal never propagates -> treated as 0', () => {
+    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: NaN }))).toEqual([
+      { role: 'expense', amount: 100 },
+    ]);
+    expect(getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: Infinity }))).toEqual([
+      { role: 'expense', amount: 100 },
+    ]);
+  });
+
+  it('components always sum exactly to the cent-normalized transaction amount, even with float-drift-prone inputs', () => {
+    const effects = getSemanticEffects(txn({ amount: 100.1, manualLoanId: 'loan-1', principalPortion: 33.33 }));
+    const total = effects.reduce((sum, e) => sum + e.amount, 0);
+    expect(Math.round(total * 100) / 100).toBe(100.1);
+  });
+
+  it('a zero-amount transaction produces a single zero debt_payment effect rather than no effects at all', () => {
+    expect(getSemanticEffects(txn({ amount: 0, manualLoanId: 'loan-1', principalPortion: 0 }))).toEqual([
+      { role: 'debt_payment', amount: 0 },
+    ]);
+  });
+});
+
+describe('normalizePrincipalPortion — the WRITE boundary (Round 2 remediation §7)', () => {
+  it('accepts and cent-rounds a valid value', () => {
+    expect(normalizePrincipalPortion(100, 33.333)).toBe(33.33);
+  });
+
+  it('accepts the boundaries 0 and the full amount', () => {
+    expect(normalizePrincipalPortion(100, 0)).toBe(0);
+    expect(normalizePrincipalPortion(100, 100)).toBe(100);
+  });
+
+  it('rejects a value greater than the transaction amount', () => {
+    expect(() => normalizePrincipalPortion(100, 120)).toThrow(InvalidPrincipalPortionError);
+  });
+
+  it('rejects a negative value', () => {
+    expect(() => normalizePrincipalPortion(100, -10)).toThrow(InvalidPrincipalPortionError);
+  });
+
+  it('rejects NaN and Infinity', () => {
+    expect(() => normalizePrincipalPortion(100, NaN)).toThrow(InvalidPrincipalPortionError);
+    expect(() => normalizePrincipalPortion(100, Infinity)).toThrow(InvalidPrincipalPortionError);
+    expect(() => normalizePrincipalPortion(100, -Infinity)).toThrow(InvalidPrincipalPortionError);
   });
 });
 

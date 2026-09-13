@@ -13,21 +13,11 @@ function input(overrides: Partial<ClassifierRowInput> = {}): ClassifierRowInput 
 }
 
 describe('classifyCore — core roles', () => {
-  it('paycheck: negative amount always falls to step F (refund candidate) first — final role is still income, low confidence, even though it will never actually resolve as a refund', () => {
-    // Per the approved precedence, ANY negative amount not caught by steps A-E is a refund
-    // candidate (step F) — there is no "this is obviously just income" shortcut. The row is still
-    // correctly classified as income immediately (never left unclassified); role_source just
-    // records that it's provisionally tagged for a refund-match check that a real paycheck will
-    // simply never match against (see roleReconciliation.ts) and so will permanently keep this
-    // fallback — a known, harmless labeling quirk, not a functional one.
+  it('paycheck: negative amount, no special category -> income, sign_default, low — final immediately, no speculative "refund candidate" tag (Round 2 remediation §2)', () => {
     const core = classifyCore(input({ amount: -2000, personalFinanceCategoryPrimary: 'INCOME' }));
-    expect(core.status).toBe('relational_candidate');
-    expect(core.status === 'relational_candidate' && core.candidate.kind).toBe('refund');
-    expect(core.status === 'relational_candidate' && core.candidate.fallback).toEqual({
-      autoRole: 'income',
-      roleSource: 'refund_candidate_unconfirmed',
-      roleConfidence: 'low',
-      classifierVersion: CURRENT_CLASSIFIER_VERSION,
+    expect(core).toEqual({
+      status: 'final',
+      result: { autoRole: 'income', roleSource: 'sign_default', roleConfidence: 'low', classifierVersion: CURRENT_CLASSIFIER_VERSION },
     });
   });
 
@@ -206,20 +196,30 @@ describe('classifyCore — ambiguous transfers (step E)', () => {
   });
 });
 
-describe('classifyCore — refund candidates (step F)', () => {
-  it('any negative amount not otherwise classified is a refund candidate, never auto-refund from category alone', () => {
+describe('classifyCore — ordinary negative amounts (step F, Round 2 remediation §2)', () => {
+  it('a negative amount with an ordinary category is FINAL income/sign_default, not a speculative refund candidate — never classified as refund from category/sign alone', () => {
     const core = classifyCore(input({ amount: -30, personalFinanceCategoryPrimary: 'GENERAL_MERCHANDISE' }));
-    expect(core.status).toBe('relational_candidate');
-    expect(core.status === 'relational_candidate' && core.candidate.kind).toBe('refund');
-    expect(core.status === 'relational_candidate' && core.candidate.fallback.autoRole).toBe('income');
-    expect(core.status === 'relational_candidate' && core.candidate.fallback.roleSource).toBe('refund_candidate_unconfirmed');
+    expect(core).toEqual({
+      status: 'final',
+      result: { autoRole: 'income', roleSource: 'sign_default', roleConfidence: 'low', classifierVersion: CURRENT_CLASSIFIER_VERSION },
+    });
+  });
+
+  it('the "refund_candidate_unconfirmed" role_source no longer exists anywhere in the classifier output', () => {
+    const outputs: unknown[] = [
+      classifyCore(input({ amount: -30 })),
+      classifyCore(input({ amount: -2000, personalFinanceCategoryPrimary: 'INCOME' })),
+      classifyCore(input({ amount: 5 })),
+    ];
+    expect(JSON.stringify(outputs)).not.toContain('refund_candidate_unconfirmed');
   });
 });
 
 describe('classifyRowLevel', () => {
-  it('returns the fallback role directly for a relational candidate, never leaving a row unclassified', () => {
+  it('returns the final income role directly for an ordinary negative amount', () => {
     const result = classifyRowLevel(input({ amount: -30, personalFinanceCategoryPrimary: 'GENERAL_MERCHANDISE' }));
     expect(result.autoRole).toBe('income');
+    expect(result.roleSource).toBe('sign_default');
     expect(result.roleConfidence).toBe('low');
   });
 

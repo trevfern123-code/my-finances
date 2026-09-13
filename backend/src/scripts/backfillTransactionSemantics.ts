@@ -1,34 +1,44 @@
 /**
- * Financial Semantics Foundation, Phase A — historical backfill.
+ * Financial Semantics Foundation, Phase A — historical backfill (Round 2 remediation §10-§13).
  *
- * Classifies every existing `transactions` row that doesn't have an `auto_role` yet, using the
- * exact same classifier (transactionClassifier.ts) and the exact same bounded relational
- * reconciliation pass (roleReconciliation.ts) live sync uses — no separate logic path. Processes
- * oldest-first, in bounded batches, and is trivially resumable/idempotent: each batch's rows are
- * classified before the next batch is fetched, so the same underlying query
- * (`getUnclassifiedTransactionsBatch`, `auto_role IS NULL`) naturally returns the next page on its
- * own — an interrupted run just needs to be started again with the same arguments.
+ * Classifies existing `transactions` rows using the exact same classifier
+ * (transactionClassifier.ts) and the exact same bounded reconciliation pass
+ * (roleReconciliation.ts) live sync uses — no separate logic path.
+ *
+ * Traversal is deterministic KEYSET pagination over (date, id) — never OFFSET over a mutating
+ * result set, and never gated on `auto_role IS NULL` (an earlier version of this script paged by
+ * re-querying "still unclassified" rows, which meant a page whose reconciliation step failed
+ * AFTER its rows already had `auto_role` written would silently disappear from all future runs —
+ * permanently skipped, exactly the defect this traversal is designed to make impossible). Every
+ * row in the traversal range is visited on every run; a write only happens when the row actually
+ * needs one (`auto_role IS NULL`, or `classifier_version` behind `--target-version`, or `--force`)
+ * — but reconciliation is always (re-)attempted for the whole page, so a page whose reconciliation
+ * previously failed gets retried on the next run, safely (row-level writes are idempotent no-ops
+ * the second time; reconciliation's own matching queries are read-heavy and re-running them is
+ * exactly the repair mechanism).
+ *
+ * Dry run by default (no `--apply`, no writes at all) — reuses the identical traversal and the
+ * identical reconciliation logic in preview mode (`apply: false`, see roleReconciliation.ts), so
+ * its reported classifications and relational outcomes are genuinely truthful, not a guess.
  *
  * Never touches category_mappings, transaction_splits, manual_loans, principal_portion, or
- * user_role_override — it only ever writes auto_role/role_source/role_confidence/
- * classifier_version, the same four fields ingestion and reconciliation write. A row already
- * linked to a manual loan classifies immediately via precedence step A (manual_loan_link), exactly
- * as it would have at ingestion time had this feature existed then.
+ * user_role_override. No Plaid relinking is ever required — historical rows classify from
+ * whatever is already stored (sign, .primary, manual-loan state, and relational evidence already
+ * in the database); rows synced before personal_finance_category_detailed/confidence existed
+ * simply classify at lower confidence until a future resync happens to touch them again.
  *
- * Historical rows synced before Phase A never received personal_finance_category_detailed/
- * confidence_level (that field wasn't being persisted) — this script does NOT invent them or make
- * a fresh Plaid call to backfill them; it classifies from whatever is already stored (sign,
- * .primary, manual-loan state, and — via the reconciliation pass — relational evidence already in
- * the database). Those rows simply classify at lower confidence until a future resync happens to
- * touch them again, or a user corrects one manually. No Plaid relinking is ever required.
+ * `--target-version <n>` (defaults to the classifier's own CURRENT_CLASSIFIER_VERSION, which
+ * remains 1 for Phase A) makes a FUTURE classifier-version upgrade backfill possible — rows whose
+ * `classifier_version` is behind the target get reclassified — without this ordinary run ever
+ * reclassifying current rows.
  *
- * Dry run by default (no `--apply`, no writes at all — the whole classify+reconcile pipeline still
- * runs, so a dry run's logged counts are a real preview, not a guess). Safe to interrupt
- * (SIGINT/SIGTERM) between batches; a batch already in flight finishes before stopping.
+ * A reconciliation failure during an apply run is NOT treated as success: the script logs the
+ * failure and exits non-zero. Safe to interrupt (SIGINT/SIGTERM, checked between pages) and rerun.
  */
 
 import * as dataService from '../services/dataService';
-import { classifyRowLevel } from '../services/transactionClassifier';
+import type { BackfillCandidateRow, BackfillPageCursor } from '../services/dataService';
+import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION } from '../services/transactionClassifier';
 import { reconcileRelationalRoles } from '../services/roleReconciliation';
 
 const DEFAULT_BATCH_SIZE = 500;
@@ -36,6 +46,9 @@ const DEFAULT_BATCH_SIZE = 500;
 export interface ParsedArgs {
   batchSize: number;
   apply: boolean;
+  force: boolean;
+  targetVersion: number;
+  after: BackfillPageCursor | null;
 }
 
 export class ArgError extends Error {}
@@ -43,33 +56,65 @@ export class ArgError extends Error {}
 export function parseArgs(argv: string[]): ParsedArgs {
   let batchSize = DEFAULT_BATCH_SIZE;
   let apply = false;
+  let force = false;
+  let targetVersion = CURRENT_CLASSIFIER_VERSION;
+  let afterDate: string | null = null;
+  let afterId: string | null = null;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--apply') {
       apply = true;
+    } else if (arg === '--force') {
+      force = true;
     } else if (arg === '--batch-size') {
-      const raw = argv[i + 1];
+      const raw = argv[++i];
       const parsed = Number(raw);
       if (raw === undefined || !Number.isInteger(parsed) || parsed <= 0) {
         throw new ArgError('--batch-size requires a positive integer.');
       }
       batchSize = parsed;
-      i++;
+    } else if (arg === '--target-version') {
+      const raw = argv[++i];
+      const parsed = Number(raw);
+      if (raw === undefined || !Number.isInteger(parsed) || parsed <= 0) {
+        throw new ArgError('--target-version requires a positive integer.');
+      }
+      targetVersion = parsed;
+    } else if (arg === '--after-date') {
+      afterDate = argv[++i];
+      if (afterDate === undefined) throw new ArgError('--after-date requires a value.');
+    } else if (arg === '--after-id') {
+      afterId = argv[++i];
+      if (afterId === undefined) throw new ArgError('--after-id requires a value.');
     } else {
       throw new ArgError(`Unrecognized argument: ${arg}`);
     }
   }
 
-  return { batchSize, apply };
+  if ((afterDate === null) !== (afterId === null)) {
+    throw new ArgError('--after-date and --after-id must be supplied together (a resume cursor is both or neither).');
+  }
+
+  return {
+    batchSize,
+    apply,
+    force,
+    targetVersion,
+    after: afterDate !== null && afterId !== null ? { date: afterDate, id: afterId } : null,
+  };
 }
 
 interface LogFields {
   stage: string;
   outcome: string;
-  batch?: number;
+  page?: number;
   count?: number;
+  classified?: number;
   byRole?: Record<string, number>;
+  resolved?: number;
+  unresolved?: number;
+  cursor?: BackfillPageCursor | null;
 }
 
 export function logEntry(fields: LogFields): void {
@@ -91,49 +136,81 @@ export function __setInterruptedForTests(value: boolean): void {
   interruptRequested = value;
 }
 
-/** Classifies and (if `apply`) persists one batch, then (if `apply`) runs the same reconciliation
- *  pass live sync uses, grouped per user (reconciliation is user-scoped). Returns how many rows
- *  were processed and a role-count breakdown, for logging — the caller decides whether to continue. */
-export async function processBatch(batchSize: number, apply: boolean): Promise<{ processed: number; byRole: Record<string, number> }> {
-  const batch = await dataService.getUnclassifiedTransactionsBatch(batchSize);
+function needsClassification(row: BackfillCandidateRow, targetVersion: number, force: boolean): boolean {
+  if (force) return true;
+  if (row.auto_role === null) return true;
+  return row.classifier_version < targetVersion;
+}
+
+export interface PageResult {
+  page: BackfillCandidateRow[];
+  classified: number;
+  byRole: Record<string, number>;
+  resolvedCount: number;
+  unresolvedCount: number;
+  nextCursor: BackfillPageCursor | null;
+}
+
+/** Processes exactly one page of the keyset traversal: classifies rows that need it, then runs
+ *  reconciliation over the WHOLE page's ids (grouped per user) regardless of which rows needed a
+ *  fresh classification — a page whose evidence changed (a counterpart classified in the same
+ *  page, for instance) still deserves a reconciliation attempt even for rows that didn't need
+ *  their own row-level rewrite this run. `apply: false` performs the identical reads/ranking with
+ *  no writes at all (see roleReconciliation.ts). */
+export async function processPage(
+  cursor: BackfillPageCursor | null,
+  batchSize: number,
+  apply: boolean,
+  force: boolean,
+  targetVersion: number
+): Promise<PageResult> {
+  const page = await dataService.getTransactionsBackfillPage(batchSize, cursor);
   const byRole: Record<string, number> = {};
-  const touchedIdsByUser = new Map<string, string[]>();
+  let classified = 0;
+  const idsByUser = new Map<string, string[]>();
 
-  for (const row of batch) {
-    const classification = classifyRowLevel({
-      amount: row.amount,
-      personalFinanceCategoryPrimary: row.category,
-      personalFinanceCategoryDetailed: row.personal_finance_category_detailed,
-      personalFinanceCategoryConfidence: row.personal_finance_category_confidence,
-      manualLoanId: row.manual_loan_id,
-    });
-    byRole[classification.autoRole] = (byRole[classification.autoRole] ?? 0) + 1;
-
-    if (apply) {
-      await dataService.updateTransactionRoleFields(row.id, {
-        auto_role: classification.autoRole,
-        role_source: classification.roleSource,
-        role_confidence: classification.roleConfidence,
-        classifier_version: classification.classifierVersion,
+  for (const row of page) {
+    if (needsClassification(row, targetVersion, force)) {
+      const classification = classifyRowLevel({
+        amount: row.amount,
+        personalFinanceCategoryPrimary: row.category,
+        personalFinanceCategoryDetailed: row.personal_finance_category_detailed,
+        personalFinanceCategoryConfidence: row.personal_finance_category_confidence,
+        manualLoanId: row.manual_loan_id,
       });
-      const existing = touchedIdsByUser.get(row.user_id) ?? [];
-      existing.push(row.id);
-      touchedIdsByUser.set(row.user_id, existing);
-    }
-  }
-
-  if (apply) {
-    for (const [userId, ids] of touchedIdsByUser) {
-      try {
-        await reconcileRelationalRoles(userId, ids);
-      } catch (err) {
-        logEntry({ stage: 'reconcile', outcome: 'failed_non_fatal' });
-        console.error(`Reconciliation failed for user ${userId} during backfill:`, err);
+      byRole[classification.autoRole] = (byRole[classification.autoRole] ?? 0) + 1;
+      classified++;
+      if (apply) {
+        await dataService.updateTransactionRoleFields(row.user_id, row.id, {
+          auto_role: classification.autoRole,
+          role_source: classification.roleSource,
+          role_confidence: classification.roleConfidence,
+          classifier_version: classification.classifierVersion,
+        });
       }
     }
+    const existing = idsByUser.get(row.user_id) ?? [];
+    existing.push(row.id);
+    idsByUser.set(row.user_id, existing);
   }
 
-  return { processed: batch.length, byRole };
+  let resolvedCount = 0;
+  let unresolvedCount = 0;
+  for (const [userId, ids] of idsByUser) {
+    const result = await reconcileRelationalRoles(userId, ids, apply);
+    resolvedCount += result.resolved.length;
+    unresolvedCount += result.unresolved.length;
+  }
+
+  const last = page[page.length - 1];
+  return {
+    page,
+    classified,
+    byRole,
+    resolvedCount,
+    unresolvedCount,
+    nextCursor: last ? { date: last.date, id: last.id } : cursor,
+  };
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -146,35 +223,68 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   installSignalHandlers();
-  logEntry({ stage: 'startup', outcome: args.apply ? 'apply_mode' : 'dry_run_mode' });
+  logEntry({ stage: 'startup', outcome: args.apply ? 'apply_mode' : 'dry_run_mode', cursor: args.after });
 
-  let batchNumber = 0;
-  let totalProcessed = 0;
+  let cursor = args.after;
+  let pageNumber = 0;
+  let totalRows = 0;
+  let totalClassified = 0;
+  let totalResolved = 0;
+  let totalUnresolved = 0;
   const totalByRole: Record<string, number> = {};
 
   for (;;) {
     if (interruptRequested) {
-      logEntry({ stage: 'run', outcome: 'interrupted', batch: batchNumber, count: totalProcessed });
+      logEntry({ stage: 'run', outcome: 'interrupted', page: pageNumber, cursor });
       return 1;
     }
 
-    batchNumber++;
-    const { processed, byRole } = await processBatch(args.batchSize, args.apply);
-    totalProcessed += processed;
-    for (const [role, count] of Object.entries(byRole)) {
+    pageNumber++;
+    let result: PageResult;
+    try {
+      result = await processPage(cursor, args.batchSize, args.apply, args.force, args.targetVersion);
+    } catch (err) {
+      // Round 2 remediation §12: a failure here is NOT success — `cursor` has not been advanced
+      // past this page, so rerunning (with the same --after-date/--after-id, or from scratch)
+      // safely retries exactly this work: row-level writes that already landed are idempotent
+      // no-ops, and reconciliation's own matching queries are safe to re-run.
+      logEntry({ stage: 'page', outcome: 'failed', page: pageNumber, cursor });
+      console.error(err);
+      return 1;
+    }
+
+    totalRows += result.page.length;
+    totalClassified += result.classified;
+    totalResolved += result.resolvedCount;
+    totalUnresolved += result.unresolvedCount;
+    for (const [role, count] of Object.entries(result.byRole)) {
       totalByRole[role] = (totalByRole[role] ?? 0) + count;
     }
-    logEntry({ stage: 'batch', outcome: 'processed', batch: batchNumber, count: processed, byRole });
+    logEntry({
+      stage: 'page',
+      outcome: 'processed',
+      page: pageNumber,
+      count: result.page.length,
+      classified: result.classified,
+      byRole: result.byRole,
+      resolved: result.resolvedCount,
+      unresolved: result.unresolvedCount,
+      cursor: result.nextCursor,
+    });
 
-    if (processed === 0) break; // no more unclassified rows
-    if (processed < args.batchSize) break; // last (partial) page
+    if (result.page.length === 0) break; // traversal exhausted
+    cursor = result.nextCursor;
+    if (result.page.length < args.batchSize) break; // last (partial) page
   }
 
   logEntry({
     stage: 'done',
     outcome: args.apply ? 'apply_complete' : 'dry_run_complete',
-    count: totalProcessed,
+    count: totalRows,
+    classified: totalClassified,
     byRole: totalByRole,
+    resolved: totalResolved,
+    unresolved: totalUnresolved,
   });
   return 0;
 }

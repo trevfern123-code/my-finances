@@ -25,11 +25,37 @@
  * in sync, nothing that can go stale.
  */
 
+import { roundToCents } from './money';
 import type { SemanticRole } from './transactionClassifier';
 
 export interface SemanticEffect {
   role: SemanticRole;
   amount: number;
+}
+
+/** Thrown by `normalizePrincipalPortion` — the WRITE boundary for `principal_portion` (see
+ *  dataService.ts's `linkTransactionToLoan`/`updateLinkedPaymentPrincipal`). An invalid value is
+ *  rejected outright here, before it's ever persisted — this is the one place that matters most,
+ *  since it's the only place that can refuse to write bad data in the first place. */
+export class InvalidPrincipalPortionError extends Error {}
+
+/**
+ * Validates and cent-normalizes a `principal_portion` value before it's persisted. Requires a
+ * finite number in `[0, transactionAmount]` (a payment can't apply negative or more-than-the-whole
+ * -payment principal) — anything else throws rather than silently persisting an impossible value.
+ */
+export function normalizePrincipalPortion(transactionAmount: number, principalPortion: number): number {
+  if (!Number.isFinite(principalPortion)) {
+    throw new InvalidPrincipalPortionError('principal_portion must be a finite number');
+  }
+  const normalized = roundToCents(principalPortion);
+  const normalizedAmount = roundToCents(transactionAmount);
+  if (normalized < 0 || normalized > normalizedAmount) {
+    throw new InvalidPrincipalPortionError(
+      `principal_portion (${normalized}) must be between 0 and the transaction amount (${normalizedAmount})`
+    );
+  }
+  return normalized;
 }
 
 /** The subset of a transaction's fields getSemanticEffects() needs. */
@@ -52,19 +78,30 @@ export interface SemanticEffectsInput {
 /**
  * Returns one effect for an ordinary transaction (or a loan-linked transaction with an explicit
  * user override), or two effects (debt_payment + expense) for a loan-linked transaction without
- * an override. The returned effects' amounts always sum back to exactly the transaction's own
- * `amount`.
+ * an override. The returned effects' amounts always sum back to exactly the cent-normalized
+ * transaction amount, are never negative, and are never NaN/Infinity, regardless of what's
+ * actually persisted on `principalPortion` — `normalizePrincipalPortion` is what prevents an
+ * invalid value from ever being WRITTEN (dataService.ts), but this function still defensively
+ * clamps whatever it's handed (e.g. data written before that validation existed) rather than
+ * propagating garbage into an aggregation. A zero-amount component is omitted rather than emitted.
  */
 export function getSemanticEffects(txn: SemanticEffectsInput): SemanticEffect[] {
   if (txn.manualLoanId !== null && txn.userRoleOverride === null) {
-    const principal = txn.principalPortion ?? 0;
-    const interest = txn.amount - principal;
-    const effects: SemanticEffect[] = [{ role: 'debt_payment', amount: principal }];
-    // Only add the interest/fee component if it's actually non-zero — a payment recorded as 100%
-    // principal shouldn't produce a spurious zero-amount 'expense' line in every aggregation.
+    const normalizedAmount = roundToCents(txn.amount);
+    const rawPrincipal = txn.principalPortion ?? 0;
+    const safePrincipal = Number.isFinite(rawPrincipal) ? rawPrincipal : 0;
+    const clampedPrincipal = Math.min(Math.max(0, safePrincipal), normalizedAmount);
+    const principal = roundToCents(clampedPrincipal);
+    // The complement, not an independently-rounded value — guarantees the two components always
+    // sum exactly to normalizedAmount regardless of any rounding on principal itself.
+    const interest = roundToCents(normalizedAmount - principal);
+
+    const effects: SemanticEffect[] = [];
+    if (principal !== 0) effects.push({ role: 'debt_payment', amount: principal });
     if (interest !== 0) effects.push({ role: 'expense', amount: interest });
+    if (effects.length === 0) effects.push({ role: 'debt_payment', amount: 0 }); // the transaction itself was $0
     return effects;
   }
 
-  return [{ role: txn.effectiveRole, amount: txn.amount }];
+  return [{ role: txn.effectiveRole, amount: roundToCents(txn.amount) }];
 }

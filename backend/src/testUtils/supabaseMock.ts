@@ -18,6 +18,8 @@ export function createQueryBuilder(result: { data: unknown; error: unknown }) {
     'neq',
     'in',
     'not',
+    'is',
+    'or',
     'gt',
     'gte',
     'lt',
