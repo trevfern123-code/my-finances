@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
 import { backfillMatchesForLoan, computePayoffProgressPct } from '../services/loans';
-import { reconcileAfterRelationalStateChange } from '../services/roleReconciliation';
+import { reconcileAfterRelationalStateChange, repairExistingRelationalRoles } from '../services/roleReconciliation';
 import type { ManualLoanRow } from '../types';
 
 type LifetimeTotals = { principalPaid: number; interestPaid: number };
@@ -130,7 +130,14 @@ export async function updateManualLoan(req: Request, res: Response, next: NextFu
 export async function deleteManualLoan(req: Request, res: Response, next: NextFunction) {
   try {
     const { id } = req.params;
-    await dataService.deleteManualLoan(id, req.user!.id);
+    const userId = req.user!.id;
+    const { affectedTransactionIds } = await dataService.deleteManualLoan(id, userId);
+    // Round 5 remediation (blocker 6): a transaction just reclassified off this deleted loan may
+    // have previously been (or be about to become) a transfer counterpart or refund original —
+    // the same bounded repair sweep every other relational-state change runs.
+    if (affectedTransactionIds.length > 0) {
+      await repairExistingRelationalRoles(userId);
+    }
     res.status(204).send();
   } catch (err) {
     next(err);

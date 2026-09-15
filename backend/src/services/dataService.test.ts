@@ -9,6 +9,10 @@ import {
   updateLinkedPaymentPrincipal,
   unlinkPaymentFromLoan,
   getLifetimeTotalsByLoanId,
+  createManualLoan,
+  updateManualLoan,
+  deleteManualLoan,
+  InvalidManualLoanFieldError,
   createManualLoanPayment,
   updateManualLoanPayment,
   deleteManualLoanPayment,
@@ -1369,6 +1373,148 @@ describe('getLifetimeTotalsByLoanId', () => {
     const totals = await getLifetimeTotalsByLoanId([]);
     expect(totals.size).toBe(0);
     expect(mockFrom).not.toHaveBeenCalled();
+  });
+});
+
+describe('createManualLoan / updateManualLoan — numeric field validation (Round 5 remediation, blocker 7)', () => {
+  const validParams = {
+    name: 'Car Loan',
+    loanType: 'personal',
+    currentBalance: 15000,
+    originationPrincipalAmount: 20000,
+    interestRatePercentage: 6.5,
+    originationDate: '2024-01-01',
+    termMonths: 60,
+    minimumPaymentAmount: 350,
+    nextPaymentDueDate: '2026-10-01',
+    notes: null,
+    matchText: null,
+  };
+
+  it('accepts fully valid params', async () => {
+    const insertQuery = createQueryBuilder({ data: { id: 'loan-1', ...validParams }, error: null });
+    mockFrom.mockReturnValueOnce(insertQuery);
+
+    await expect(createManualLoan('user-1', validParams)).resolves.toBeDefined();
+  });
+
+  it.each([
+    ['negative current_balance', { currentBalance: -100 }],
+    ['NaN current_balance', { currentBalance: NaN }],
+    ['non-finite current_balance', { currentBalance: Infinity }],
+    ['negative origination_principal_amount', { originationPrincipalAmount: -1 }],
+    ['negative interest_rate_percentage', { interestRatePercentage: -0.5 }],
+    ['NaN interest_rate_percentage', { interestRatePercentage: NaN }],
+    ['negative minimum_payment_amount', { minimumPaymentAmount: -10 }],
+    ['zero term_months', { termMonths: 0 }],
+    ['negative term_months', { termMonths: -12 }],
+    ['non-integer term_months', { termMonths: 36.5 }],
+  ])('rejects %s and never touches the DB', async (_label, overrides) => {
+    await expect(createManualLoan('user-1', { ...validParams, ...overrides })).rejects.toThrow(InvalidManualLoanFieldError);
+    expect(mockFrom).not.toHaveBeenCalled();
+  });
+
+  it('a null nullable field (no origination data yet) is accepted, not validated as a number', async () => {
+    const params = { ...validParams, originationPrincipalAmount: null, interestRatePercentage: null, termMonths: null, minimumPaymentAmount: null };
+    const insertQuery = createQueryBuilder({ data: { id: 'loan-1', ...params }, error: null });
+    mockFrom.mockReturnValueOnce(insertQuery);
+
+    await expect(createManualLoan('user-1', params)).resolves.toBeDefined();
+  });
+
+  it('updateManualLoan rejects an invalid field before ever touching the DB', async () => {
+    await expect(updateManualLoan('loan-1', 'user-1', { current_balance: -50 })).rejects.toThrow(InvalidManualLoanFieldError);
+    expect(mockFrom).not.toHaveBeenCalled();
+  });
+
+  it('updateManualLoan allows a partial patch that never touches numeric fields at all', async () => {
+    const updateQuery = createQueryBuilder({ data: { id: 'loan-1', name: 'Renamed' }, error: null });
+    mockFrom.mockReturnValueOnce(updateQuery);
+
+    await expect(updateManualLoan('loan-1', 'user-1', { name: 'Renamed' })).resolves.toBeDefined();
+  });
+
+  it('updateManualLoan rejects a non-positive term_months in a partial patch', async () => {
+    await expect(updateManualLoan('loan-1', 'user-1', { term_months: -1 })).rejects.toThrow(InvalidManualLoanFieldError);
+  });
+});
+
+describe('deleteManualLoan — reclassifies linked transactions before deleting (Round 5 remediation, blocker 6)', () => {
+  it('throws if the loan is not owned by this user (or does not exist) — never touches transactions', async () => {
+    const getLoanQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(getLoanQuery);
+
+    await expect(deleteManualLoan('loan-1', 'user-1')).rejects.toThrow('Manual loan not found');
+    expect(mockFrom).toHaveBeenCalledTimes(1); // only the ownership check — no transaction/loan query after
+  });
+
+  it('deletes cleanly with no linked transactions', async () => {
+    const getLoanQuery = createQueryBuilder({ data: { id: 'loan-1', user_id: 'user-1' }, error: null });
+    const linkedQuery = createQueryBuilder({ data: [], error: null });
+    const deleteQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(getLoanQuery).mockReturnValueOnce(linkedQuery).mockReturnValueOnce(deleteQuery);
+
+    const result = await deleteManualLoan('loan-1', 'user-1');
+
+    expect(result.affectedTransactionIds).toEqual([]);
+    expect(deleteQuery.delete).toHaveBeenCalled();
+  });
+
+  it('reclassifies each linked transaction (clearing manual_loan_id/principal_portion and setting fresh row-level role fields) BEFORE deleting the loan, and returns their ids', async () => {
+    const getLoanQuery = createQueryBuilder({ data: { id: 'loan-1', user_id: 'user-1' }, error: null });
+    const linkedQuery = createQueryBuilder({
+      data: [
+        { id: 'txn-1', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      ],
+      error: null,
+    });
+    const updateTxnQuery = createQueryBuilder({ data: null, error: null });
+    const deleteQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom
+      .mockReturnValueOnce(getLoanQuery)
+      .mockReturnValueOnce(linkedQuery)
+      .mockReturnValueOnce(updateTxnQuery)
+      .mockReturnValueOnce(deleteQuery);
+
+    const result = await deleteManualLoan('loan-1', 'user-1');
+
+    expect(updateTxnQuery.update).toHaveBeenCalledWith({
+      manual_loan_id: null,
+      principal_portion: null,
+      auto_role: 'expense',
+      role_source: 'sign_default',
+      role_confidence: 'low',
+      classifier_version: 1,
+    });
+    expect(result.affectedTransactionIds).toEqual(['txn-1']);
+    // The transaction update must happen before the loan delete (verified via mock call order).
+    expect(updateTxnQuery.update.mock.invocationCallOrder[0]).toBeLessThan(deleteQuery.delete.mock.invocationCallOrder[0]);
+  });
+
+  it('reclassifies MULTIPLE linked transactions, each independently from its own stored fields', async () => {
+    const getLoanQuery = createQueryBuilder({ data: { id: 'loan-1', user_id: 'user-1' }, error: null });
+    const linkedQuery = createQueryBuilder({
+      data: [
+        { id: 'txn-1', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+        { id: 'txn-2', amount: -50, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      ],
+      error: null,
+    });
+    const updateTxnQuery1 = createQueryBuilder({ data: null, error: null });
+    const updateTxnQuery2 = createQueryBuilder({ data: null, error: null });
+    const deleteQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom
+      .mockReturnValueOnce(getLoanQuery)
+      .mockReturnValueOnce(linkedQuery)
+      .mockReturnValueOnce(updateTxnQuery1)
+      .mockReturnValueOnce(updateTxnQuery2)
+      .mockReturnValueOnce(deleteQuery);
+
+    const result = await deleteManualLoan('loan-1', 'user-1');
+
+    expect(result.affectedTransactionIds).toEqual(['txn-1', 'txn-2']);
+    expect(updateTxnQuery1.update).toHaveBeenCalledWith(expect.objectContaining({ auto_role: 'expense' }));
+    expect(updateTxnQuery2.update).toHaveBeenCalledWith(expect.objectContaining({ auto_role: 'income' }));
   });
 });
 

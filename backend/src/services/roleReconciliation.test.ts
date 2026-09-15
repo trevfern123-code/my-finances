@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { reconcileRelationalRoles, repairExistingRelationalRoles, reconcileAfterRelationalStateChange } from './roleReconciliation';
+import {
+  reconcileRelationalRoles,
+  repairExistingRelationalRoles,
+  reconcileAfterRelationalStateChange,
+  RelationalRepairNotStableError,
+} from './roleReconciliation';
 import type { ReconciliationRow } from './dataService';
 
 const mockGetTransactionsForReconciliation = vi.hoisted(() => vi.fn());
@@ -376,6 +381,103 @@ describe('reconcileRelationalRoles — reciprocal one-to-one transfer matching (
   });
 });
 
+describe('reconcileRelationalRoles — traversal-order independence (Round 5 remediation, blocker 1)', () => {
+  // P1(+100, day0), P2(+100, day1), N1(-100, day0), N2(-100, day2). In isolation:
+  //  - P1's only opposite-amount candidates are N1(dist0)/N2(dist2) -> N1 uniquely closer.
+  //  - N1's candidates are P1(dist0)/P2(dist1) -> P1 uniquely closer -> P1/N1 RECIPROCALLY confirm.
+  //  - P2's candidates are N1(dist1)/N2(dist1) -> TIED -> ambiguous.
+  //  - N2's candidates are P1(dist2)/P2(dist1) -> P2 uniquely closer, but P2 itself is ambiguous,
+  //    so N2 has no confirmed reciprocal partner either.
+  // A version that persists each confirmed pair before evaluating the next anchor would see N1
+  // "consumed" once P1/N1 writes, changing what a LATER-processed P2/N2 pair could resolve to
+  // depending on visitation order. The correct, order-independent answer is always: P1/N1
+  // confirmed, P2 and N2 both left unresolved.
+  const P1 = row({ id: 'p1', account_id: 'acc-p1', amount: 100, date: '2026-09-10' });
+  const P2 = row({ id: 'p2', account_id: 'acc-p2', amount: 100, date: '2026-09-11' });
+  const N1 = row({ id: 'n1', account_id: 'acc-n1', amount: -100, date: '2026-09-10' });
+  const N2 = row({ id: 'n2', account_id: 'acc-n2', amount: -100, date: '2026-09-12' });
+
+  function installAdversarialCandidates() {
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        p1: [N1, N2],
+        n1: [P1, P2],
+        p2: [N1, N2],
+        n2: [P1, P2],
+      })
+    );
+  }
+
+  it('order P1,N1,P2,N2 confirms exactly P1/N1', async () => {
+    mockGetTransactionsForReconciliation.mockResolvedValue([P1, N1, P2, N2]);
+    installAdversarialCandidates();
+
+    const result = await reconcileRelationalRoles('user-1', ['p1', 'n1', 'p2', 'n2']);
+
+    expect(result.resolved.map((r) => r.id).sort()).toEqual(['n1', 'p1']);
+  });
+
+  it('the REVERSE order P2,N2,P1,N1 confirms the exact same pair — P1/N1, never P2/N2', async () => {
+    mockGetTransactionsForReconciliation.mockResolvedValue([P2, N2, P1, N1]);
+    installAdversarialCandidates();
+
+    const result = await reconcileRelationalRoles('user-1', ['p2', 'n2', 'p1', 'n1']);
+
+    expect(result.resolved.map((r) => r.id).sort()).toEqual(['n1', 'p1']);
+  });
+
+  it('an interleaved order N2,P1,N1,P2 also confirms the same pair', async () => {
+    mockGetTransactionsForReconciliation.mockResolvedValue([N2, P1, N1, P2]);
+    installAdversarialCandidates();
+
+    const result = await reconcileRelationalRoles('user-1', ['n2', 'p1', 'n1', 'p2']);
+
+    expect(result.resolved.map((r) => r.id).sort()).toEqual(['n1', 'p1']);
+  });
+
+  it('no candidate query is repeated for the same row within one resolution pass (memoized, not just consistent)', async () => {
+    mockGetTransactionsForReconciliation.mockResolvedValue([P1, N1, P2, N2]);
+    installAdversarialCandidates();
+
+    await reconcileRelationalRoles('user-1', ['p1', 'n1', 'p2', 'n2']);
+
+    const callsPerRow = new Map<string, number>();
+    for (const call of mockFindTransferCounterpartCandidates.mock.calls) {
+      const id = (call[1] as { id: string }).id;
+      callsPerRow.set(id, (callsPerRow.get(id) ?? 0) + 1);
+    }
+    for (const count of callsPerRow.values()) {
+      expect(count).toBe(1);
+    }
+  });
+});
+
+describe('repairAccountPairMatches — page-level snapshot order independence (Round 5 remediation, blocker 1)', () => {
+  it('the sweep resolves the SAME A/B/C outcome regardless of the order rows come back in the page', async () => {
+    // A/B are truly the closest mutual pair; C only one-sidedly sees B — same shape as the
+    // forward-pass adversarial fixture above, applied to the account_pair_match sweep.
+    const A = row({ id: 'a', amount: 500, date: '2026-09-10', role_source: 'account_pair_match' });
+    const B = row({ id: 'b', amount: -500, date: '2026-09-10', role_source: 'account_pair_match' });
+    const C = row({ id: 'c', amount: 500, date: '2026-09-15', role_source: 'account_pair_match' });
+    const candidatesById = transferCandidatesByRowId({ a: [B], b: [A], c: [B] });
+    mockFindTransferCounterpartCandidates.mockImplementation(candidatesById);
+
+    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) =>
+      roleSource === 'account_pair_match' ? [C, A, B] : []
+    );
+    const firstOrderResult = await repairExistingRelationalRoles('user-1', false);
+
+    mockApplyTransactionSemanticRoles.mockClear();
+    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) =>
+      roleSource === 'account_pair_match' ? [B, C, A] : []
+    );
+    const secondOrderResult = await repairExistingRelationalRoles('user-1', false);
+
+    expect(firstOrderResult.resolved.map((r) => r.id)).toEqual(['c']);
+    expect(secondOrderResult.resolved.map((r) => r.id)).toEqual(['c']);
+  });
+});
+
 describe('reconcileRelationalRoles — refunds', () => {
   it('exact-amount match against an earlier eligible expense -> refund, high confidence', async () => {
     const refundRow = row({
@@ -645,6 +747,52 @@ describe('reconcileRelationalRoles — dry-run hypothetical-state pool (Round 3 
     const result = await reconcileRelationalRoles('user-1', ['txn-1'], false, [anchor, candidateA, candidateB]);
 
     expect(result.unresolved).toEqual([{ id: 'txn-1', reason: 'ambiguous_transfer_candidates' }]);
+  });
+
+  it("a pool-tracked id's STALE, never-written DB row is never reused as a candidate — even when the pool's CURRENT hypothetical role no longer matches the search filter (Round 5 remediation, blocker 2)", async () => {
+    // A and B hypothetically paired on an earlier page — their pool entries now say
+    // account_pair_match. Dry run never WRITES anything, so the live DB query (mocked here) still
+    // returns A/B in their OLD transfer_like_unconfirmed state — exactly what a real, unwritten
+    // database would still show. C must NOT be able to reuse either of them.
+    const A = row({ id: 'txn-a', account_id: 'acc-1', amount: 100, date: '2026-09-10', role_source: 'account_pair_match' });
+    const B = row({ id: 'txn-b', account_id: 'acc-2', amount: -100, date: '2026-09-10', role_source: 'account_pair_match' });
+    const C = row({ id: 'txn-c', account_id: 'acc-3', amount: 100, date: '2026-09-10', role_source: 'transfer_like_unconfirmed' });
+
+    mockGetTransactionsForReconciliation.mockResolvedValue([C]);
+    // The STALE DB view: A and B still show as transfer_like_unconfirmed candidates for C.
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-c': [
+          row({ id: 'txn-a', account_id: 'acc-1', amount: -100, date: '2026-09-10', role_source: 'transfer_like_unconfirmed' }),
+          row({ id: 'txn-b', account_id: 'acc-2', amount: -100, date: '2026-09-10', role_source: 'transfer_like_unconfirmed' }),
+        ],
+      })
+    );
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-c'], false, [A, B]);
+
+    // C must find NO eligible candidate — both A and B are excluded because the pool tracks them,
+    // even though neither pool entry itself satisfies the transfer_like_unconfirmed filter.
+    expect(result.resolved).toEqual([]);
+    expect(result.unresolved).toEqual([{ id: 'txn-c', reason: 'no_transfer_evidence' }]);
+  });
+
+  it('a DB candidate whose id the pool has NO opinion about still contributes normally (the exclusion is per-id, not a blanket suppression)', async () => {
+    const anchor = row({ id: 'txn-1', account_id: 'acc-1', amount: 100, date: '2026-09-10', role_source: 'transfer_like_unconfirmed' });
+    const dbOnlyCandidate = row({ id: 'txn-db-only', account_id: 'acc-2', amount: -100, date: '2026-09-10', role_source: 'transfer_like_unconfirmed' });
+    const unrelatedPoolRow = row({ id: 'txn-unrelated', account_id: 'acc-9', amount: 999, date: '2026-01-01', role_source: 'account_pair_match' });
+
+    mockGetTransactionsForReconciliation.mockResolvedValue([anchor]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [dbOnlyCandidate],
+        'txn-db-only': [anchor],
+      })
+    );
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-1'], false, [unrelatedPoolRow]);
+
+    expect(result.resolved.map((r) => r.id).sort()).toEqual(['txn-1', 'txn-db-only']);
   });
 
   it('apply=true (ordinary sync) is unaffected by an empty default pool — behavior identical to calling without a pool argument', async () => {
@@ -928,6 +1076,29 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
     expect(second.resolved).toEqual([]);
     expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
   });
+
+  it('fails CLOSED (throws RelationalRepairNotStableError) rather than silently succeeding when the sweep never reaches a stable state within the pass cap (Round 5 remediation, HIGH — "repair cap fails open")', async () => {
+    // A page that never stops changing — e.g. a concurrent writer keeps re-tagging the same row
+    // account_pair_match after every reset, so every pass finds it invalid and resets it again.
+    // Never wire mockApplyTransactionSemanticRoles to remove it from the page (unlike
+    // fakeAccountPairMatchStore), so the page is never actually empty/stable.
+    const everInvalidRow = row({ id: 'txn-churning', amount: 100, date: '2026-09-10', role_source: 'account_pair_match' });
+    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) =>
+      roleSource === 'account_pair_match' ? [everInvalidRow] : []
+    );
+    mockFindTransferCounterpartCandidates.mockResolvedValue([]); // never valid
+
+    await expect(repairExistingRelationalRoles('user-1')).rejects.toThrow(RelationalRepairNotStableError);
+  });
+
+  it('a genuinely quiescent dataset reaches stability well within the pass cap — the cap is a safety net, not a normal outcome', async () => {
+    const A = row({ id: 'a', amount: 500, date: '2026-09-10', role_source: 'account_pair_match' });
+    const B = row({ id: 'b', amount: -500, date: '2026-09-10', role_source: 'account_pair_match' });
+    fakeAccountPairMatchStore([A, B]).install();
+    mockFindTransferCounterpartCandidates.mockImplementation(transferCandidatesByRowId({ a: [B], b: [A] }));
+
+    await expect(repairExistingRelationalRoles('user-1')).resolves.toEqual({ resolved: [], unresolved: [] });
+  });
 });
 
 describe('reconcileAfterRelationalStateChange — replaces Round 2\'s reconcileAroundTransactionChange at loan link/unlink call sites', () => {
@@ -951,10 +1122,7 @@ describe('reconcileAfterRelationalStateChange — replaces Round 2\'s reconcileA
     mockGetTransactionsForReconciliation.mockResolvedValue([linked]);
 
     const orphanedCounterpart = row({ id: 'txn-counterpart', amount: -100, date: '2026-09-10', role_source: 'account_pair_match' });
-    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) => {
-      if (roleSource === 'account_pair_match') return [orphanedCounterpart];
-      return [];
-    });
+    fakeAccountPairMatchStore([orphanedCounterpart]).install();
     mockFindTransferCounterpartCandidates.mockResolvedValue([]); // the linked row no longer qualifies as its partner
 
     await reconcileAfterRelationalStateChange('user-1', 'txn-linked');

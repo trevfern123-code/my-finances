@@ -343,17 +343,19 @@ describe('backfillMatchesForLoan', () => {
     expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
   });
 
-  it('a failure linking ONE transaction does not block linking the others, or the final sweep', async () => {
+  it('propagates (does NOT swallow) a single failed link — this is a direct, synchronous user action, and the whole operation must be reported incomplete rather than silently missing a payment (Round 5 remediation, blocker 5)', async () => {
     mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([
       { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
       { id: 'txn-2', name: 'SoFi Payment', merchant_name: null, amount: 300 },
     ]);
-    mockLinkTransactionToLoan.mockRejectedValueOnce(new Error('link failed')).mockResolvedValueOnce(undefined);
+    mockLinkTransactionToLoan.mockRejectedValueOnce(new Error('link failed'));
 
-    await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' });
+    await expect(backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' })).rejects.toThrow('link failed');
 
-    expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(2);
-    expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+    // The second candidate is never attempted, and the sweep never runs — the caller sees a
+    // clean failure and can retry the whole operation.
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
+    expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
   });
 
   it('does nothing when the loan has no match_text', async () => {

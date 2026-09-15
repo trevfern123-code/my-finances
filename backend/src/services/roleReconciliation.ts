@@ -91,8 +91,18 @@ const REPAIR_PAGE_SIZE = 200;
  *  scoped strictly to this one repair (not a general fixed-point engine), and small enough that
  *  even a genuinely pathological input can't spin unboundedly: each pass only ever resets rows
  *  that just became invalid, so real convergence in personal-finance-scale data happens in 1-2
- *  passes: this is a safety margin, not an expected count. */
+ *  passes: this is a safety margin, not an expected count. If the cap is reached while the most
+ *  recent pass still made changes, `repairAccountPairMatches` THROWS `RelationalRepairNotStableError`
+ *  (Round 5 remediation) rather than returning as if stability had been reached — see that
+ *  function's own comment. */
 const MAX_REPAIR_PASSES = 5;
+
+/** Thrown when the account_pair_match sweep exhausts MAX_REPAIR_PASSES without reaching a stable
+ *  state (Round 5 remediation, HIGH finding "repair cap fails open") — most likely a concurrent
+ *  writer is repeatedly invalidating rows faster than the sweep can settle. Propagates like any
+ *  other reconciliation failure: the caller's cursor/page is left unadvanced, so the next attempt
+ *  retries the whole sweep rather than silently accepting an unproven, possibly-still-broken state. */
+export class RelationalRepairNotStableError extends Error {}
 
 export interface RoleFieldsUpdate {
   auto_role: SemanticRole;
@@ -218,6 +228,23 @@ function isEligibleTransferParticipant(row: ReconciliationRow): boolean {
   return row.user_role_override === null || row.user_role_override === 'internal_transfer';
 }
 
+/** Removes any DB-sourced row whose id is ALSO tracked anywhere in the in-memory `pool` (Round 5
+ *  remediation, blocker 2) — regardless of whether the pool's CURRENT hypothetical state for that
+ *  id happens to satisfy the caller's own role/filter. A prior version merged the pool in only by
+ *  overwriting an id COLLISION in the final candidate list, which meant a pool row that no longer
+ *  matched the filter (e.g. it hypothetically moved from `transfer_like_unconfirmed` to
+ *  `account_pair_match` earlier in this same dry run) was simply excluded from the pool side —
+ *  but its STALE, never-written real database row (dry-run writes nothing at all) could still
+ *  independently pass through the live DB query untouched, letting an already-hypothetically-
+ *  paired row keep being offered as a candidate to someone else. The pool is authoritative for
+ *  every id it tracks: such an id must never contribute its stale DB version, whether or not the
+ *  pool's own version of it currently qualifies. */
+function excludePoolTrackedIds<T extends { id: string }>(dbRows: T[], pool: ReconciliationRow[]): T[] {
+  if (pool.length === 0) return dbRows;
+  const poolIds = new Set(pool.map((p) => p.id));
+  return dbRows.filter((r) => !poolIds.has(r.id));
+}
+
 /** Every credible transfer-counterpart candidate for `row` tagged `roleSourceFilter`, from the DB
  *  plus the in-memory `pool` (Round 3 remediation §7), filtered to only rows still eligible to
  *  participate (Round 4 remediation §3) — an overridden-away-from-transfer row is never offered
@@ -231,6 +258,7 @@ async function findEligibleTransferCandidates(
   const windowStart = addDaysUtc(row.date, -TRANSFER_WINDOW_DAYS);
   const windowEnd = addDaysUtc(row.date, TRANSFER_WINDOW_DAYS);
   const dbCandidates = await dataService.findTransferCounterpartCandidates(userId, row, windowStart, windowEnd, roleSourceFilter);
+  const freshDbCandidates = excludePoolTrackedIds(dbCandidates, pool);
   // Mirrors findTransferCounterpartCandidates' own filter, applied in-memory to the same-batch
   // pool — a pool row can't be found by the DB query above since it was never (or not yet)
   // persisted with this role_source.
@@ -243,93 +271,92 @@ async function findEligibleTransferCandidates(
       p.date >= windowStart &&
       p.date <= windowEnd
   );
-  return mergeWithPool(
-    dbCandidates.filter(isEligibleTransferParticipant),
-    poolCandidates.filter(isEligibleTransferParticipant)
-  );
+  return [...freshDbCandidates, ...poolCandidates].filter(isEligibleTransferParticipant);
 }
 
-/** `row`'s own best transfer-counterpart candidate tagged `roleSourceFilter` — a one-SIDED
- *  computation (see `resolveReciprocalTransferPartner` for the two-sided confirmation built on
- *  top of this). Returns `null` (no evidence), `'ambiguous'` (a genuine, unresolvable tie), or a
- *  unique winner with its confidence. */
-async function findBestTransferPartner(
-  userId: string,
-  row: ReconciliationRow,
-  roleSourceFilter: string,
-  pool: ReconciliationRow[]
-): Promise<{ winner: ReconciliationRow; confidence: RoleConfidence } | 'ambiguous' | null> {
-  const candidates = await findEligibleTransferCandidates(userId, row, roleSourceFilter, pool);
-  const ranked = rankTransferCandidates(row.date, candidates);
-  if (ranked === null) return null;
-  if ('ambiguous' in ranked) return 'ambiguous';
-  return ranked;
-}
+/** One row's fully-resolved transfer-matching outcome within a `computeReciprocalTransferResolution`
+ *  snapshot: either a confirmed reciprocal partner, or the reason it has none. */
+type TransferMatchOutcome =
+  | { status: 'paired'; partner: ReconciliationRow; confidence: RoleConfidence }
+  | { status: 'ambiguous' }
+  | { status: 'unmatched' };
 
 /**
- * Confirms a transfer pair only if BOTH sides independently pick each other as their unique best
- * match (Round 4 remediation §3) — a one-sided "I found a unique winner" is NOT sufficient, since
- * that winner might itself have a different, truly-closer best match elsewhere (the classic
- * A(+500)/B(-500)/C(+500) shape: both A and C see B as their sole candidate, but B's own search
- * picks whichever of A/C is actually closest — only THAT side reciprocates).
+ * Computes EVERY confirmed reciprocal transfer pair among `anchors` (plus whatever candidates
+ * they reference, even outside `anchors`) from ONE CONSISTENT SNAPSHOT — no candidate is ever
+ * re-queried after a decision has been made, and NOTHING is written while this runs (Round 5
+ * remediation, blocker 1). This is what makes the result independent of traversal order and of
+ * page/batch boundaries, which a prior version of this module was not: that version resolved one
+ * anchor at a time and PERSISTED each confirmed pair immediately, so a later anchor's own
+ * candidate query reflected however many earlier pairs had already been written — visiting
+ * P1,N1,P2,N2 versus P2,N2,P1,N1 for the same four rows could confirm different pairs, because
+ * whichever pair got evaluated (and written) FIRST shrank the candidate pool for whichever pair
+ * was evaluated SECOND. Memoizing every row's own candidate list and best-match computation here
+ * — queried at most once each, from data that never changes over the course of one computation —
+ * makes every decision a pure function of the input, not of visitation order or of how many pages
+ * a caller happens to split the work across.
  *
- * This is a pure function of the current pool/DB state — no mutation, no shared "already
- * consumed" ledger needed, and no dependence on iteration order (Round 4 remediation §4): if A and
- * B are genuinely each other's best match, both directions independently confirm it regardless of
- * which one is evaluated first; if a row's only candidate does NOT reciprocate, that row correctly
- * stays unresolved no matter how many times or in what order it's re-checked. Returns `null`
- * (including for a one-sided failure — the row simply has no CONFIRMED partner, not an ambiguous
- * tie), `'ambiguous'`, or the confirmed pair.
+ * `candidatesFor`/`bestFor` are memoized per row id; `bestFor` additionally short-circuits
+ * ineligible rows (an overridden-away-from-transfer row can never be a winner, and is filtered out
+ * of anyone else's candidate list by `findEligibleTransferCandidates` already). A pair is
+ * confirmed only when `anchor`'s best match is `winner` AND `winner`'s own independently-computed
+ * best match is `anchor` — see this module's own doc comment for why a one-sided "unique winner"
+ * is not sufficient (the A/B/C triangle).
  */
-async function resolveReciprocalTransferPartner(
+async function computeReciprocalTransferResolution(
   userId: string,
-  row: ReconciliationRow,
+  anchors: ReconciliationRow[],
   roleSourceFilter: string,
   pool: ReconciliationRow[]
-): Promise<{ winner: ReconciliationRow; confidence: RoleConfidence } | 'ambiguous' | null> {
-  if (!isEligibleTransferParticipant(row)) return null;
-
-  const best = await findBestTransferPartner(userId, row, roleSourceFilter, pool);
-  if (best === null || best === 'ambiguous') return best;
-
-  const reciprocal = await findBestTransferPartner(userId, best.winner, roleSourceFilter, pool);
-  if (reciprocal === null || reciprocal === 'ambiguous' || reciprocal.winner.id !== row.id) {
-    // One-sided: row's best match does not itself agree — not a confirmed pair. The genuine
-    // reciprocal partner (if any) will independently confirm itself when IT is evaluated.
-    return null;
-  }
-  return best;
-}
-
-async function resolveTransferCandidate(
-  userId: string,
-  row: ReconciliationRow,
-  apply: boolean,
-  pool: ReconciliationRow[]
-): Promise<ReconciliationResult> {
-  const resolved = await resolveReciprocalTransferPartner(userId, row, 'transfer_like_unconfirmed', pool);
-
-  if (resolved === null) return { resolved: [], unresolved: [{ id: row.id, reason: 'no_transfer_evidence' }] };
-  if (resolved === 'ambiguous') return { resolved: [], unresolved: [{ id: row.id, reason: 'ambiguous_transfer_candidates' }] };
-
-  const fields: RoleFieldsUpdate = {
-    auto_role: 'internal_transfer',
-    role_source: 'account_pair_match',
-    role_confidence: resolved.confidence,
-    classifier_version: CURRENT_CLASSIFIER_VERSION,
-  };
-
-  if (!apply) {
-    return { resolved: [{ id: row.id, fields }, { id: resolved.winner.id, fields }], unresolved: [] };
+): Promise<Map<string, TransferMatchOutcome>> {
+  const candidateCache = new Map<string, ReconciliationRow[]>();
+  async function candidatesFor(row: ReconciliationRow): Promise<ReconciliationRow[]> {
+    const cached = candidateCache.get(row.id);
+    if (cached) return cached;
+    const found = await findEligibleTransferCandidates(userId, row, roleSourceFilter, pool);
+    candidateCache.set(row.id, found);
+    return found;
   }
 
-  // One atomic RPC call covering both ids — Round 3 remediation §1: ownership is verified and
-  // both rows are locked and updated inside a single Postgres transaction, never two separate
-  // requests that could leave the pair half-resolved if the second one failed. Round 4
-  // remediation §6: this now THROWS on any RPC-reported failure rather than returning a boolean —
-  // deliberately not caught here, so an integrity failure aborts this whole reconciliation pass.
-  await dataService.applyTransactionSemanticRoles(userId, [row.id, resolved.winner.id], fields);
-  return { resolved: [{ id: row.id, fields }, { id: resolved.winner.id, fields }], unresolved: [] };
+  const bestCache = new Map<string, { winner: ReconciliationRow; confidence: RoleConfidence } | 'ambiguous' | null>();
+  async function bestFor(row: ReconciliationRow): Promise<{ winner: ReconciliationRow; confidence: RoleConfidence } | 'ambiguous' | null> {
+    const cached = bestCache.get(row.id);
+    if (cached !== undefined) return cached;
+    if (!isEligibleTransferParticipant(row)) {
+      bestCache.set(row.id, null);
+      return null;
+    }
+    const candidates = await candidatesFor(row);
+    const ranked = rankTransferCandidates(row.date, candidates);
+    const result = ranked === null ? null : 'ambiguous' in ranked ? 'ambiguous' : ranked;
+    bestCache.set(row.id, result);
+    return result;
+  }
+
+  const outcomes = new Map<string, TransferMatchOutcome>();
+  for (const anchor of anchors) {
+    if (outcomes.has(anchor.id)) continue; // already resolved as someone else's confirmed partner
+
+    const best = await bestFor(anchor);
+    if (best === null) {
+      outcomes.set(anchor.id, { status: 'unmatched' });
+      continue;
+    }
+    if (best === 'ambiguous') {
+      outcomes.set(anchor.id, { status: 'ambiguous' });
+      continue;
+    }
+    const reciprocal = await bestFor(best.winner);
+    if (reciprocal === null || reciprocal === 'ambiguous' || reciprocal.winner.id !== anchor.id) {
+      // One-sided: the anchor's best match does not itself agree — not a confirmed pair. The
+      // genuine reciprocal partner (if any) will independently confirm itself on its own turn.
+      outcomes.set(anchor.id, { status: 'unmatched' });
+      continue;
+    }
+    outcomes.set(anchor.id, { status: 'paired', partner: best.winner, confidence: best.confidence });
+    outcomes.set(best.winner.id, { status: 'paired', partner: anchor, confidence: best.confidence });
+  }
+  return outcomes;
 }
 
 async function resolveRefundCandidate(
@@ -340,6 +367,7 @@ async function resolveRefundCandidate(
 ): Promise<ReconciliationResult> {
   const windowStart = addDaysUtc(row.date, -REFUND_WINDOW_DAYS);
   const dbCandidates = await dataService.findRefundOriginalCandidates(userId, row, windowStart);
+  const freshDbCandidates = excludePoolTrackedIds(dbCandidates, pool);
   const poolCandidates = pool.filter(
     (p) =>
       p.id !== row.id &&
@@ -350,7 +378,7 @@ async function resolveRefundCandidate(
       p.date >= windowStart &&
       p.date <= row.date
   );
-  const candidates = mergeWithPool(dbCandidates, poolCandidates);
+  const candidates = [...freshDbCandidates, ...poolCandidates];
   const ranked = rankRefundCandidates(row, candidates);
 
   if (ranked === null) return { resolved: [], unresolved: [{ id: row.id, reason: 'no_refund_evidence' }] };
@@ -380,6 +408,7 @@ async function resolveDanglingRefunds(
 ): Promise<ReconciliationResult> {
   const windowEnd = addDaysUtc(row.date, REFUND_WINDOW_DAYS);
   const dbCandidates = await dataService.findNegativeCandidatesReferencingOriginal(userId, row, windowEnd, 'sign_default');
+  const freshDbCandidates = excludePoolTrackedIds(dbCandidates, pool);
   const poolCandidates = pool.filter(
     (p) =>
       p.id !== row.id &&
@@ -390,7 +419,7 @@ async function resolveDanglingRefunds(
       p.date >= row.date &&
       p.date <= windowEnd
   );
-  const candidates = mergeWithPool(dbCandidates, poolCandidates);
+  const candidates = [...freshDbCandidates, ...poolCandidates];
   const result: ReconciliationResult = { resolved: [], unresolved: [] };
 
   for (const candidate of candidates) {
@@ -434,18 +463,46 @@ export async function reconcileRelationalRoles(
     pool.filter((p) => touchedTransactionIds.includes(p.id))
   );
 
-  // Skips a row already confirmed as part of a resolved pair/refund earlier in THIS pass — pure
-  // deduplication/efficiency (Round 4 remediation §3's reciprocal check is correct regardless of
-  // visit order on its own; this just avoids re-deriving the same answer and issuing a redundant
-  // duplicate write for the other leg of an already-confirmed pair).
-  const alreadyResolved = new Set<string>();
+  // --- Transfers: one snapshot-based resolution over every anchor in this batch (Round 5
+  // remediation, blocker 1) — every candidate is read before anything is written, so the SET of
+  // confirmed pairs is fixed before the first write happens. The order writes are then issued in
+  // cannot change which pairs got confirmed.
+  const transferAnchors = touched.filter((row) => row.role_source === 'transfer_like_unconfirmed');
+  const transferOutcomes = await computeReciprocalTransferResolution(userId, transferAnchors, 'transfer_like_unconfirmed', pool);
+  const settledIds = new Set<string>();
+  for (const anchor of transferAnchors) {
+    const outcome = transferOutcomes.get(anchor.id);
+    if (!outcome || outcome.status === 'unmatched') {
+      result.unresolved.push({ id: anchor.id, reason: 'no_transfer_evidence' });
+      continue;
+    }
+    if (outcome.status === 'ambiguous') {
+      result.unresolved.push({ id: anchor.id, reason: 'ambiguous_transfer_candidates' });
+      continue;
+    }
+    if (settledIds.has(anchor.id)) continue; // the OTHER leg already applied this same pair
+    const fields: RoleFieldsUpdate = {
+      auto_role: 'internal_transfer',
+      role_source: 'account_pair_match',
+      role_confidence: outcome.confidence,
+      classifier_version: CURRENT_CLASSIFIER_VERSION,
+    };
+    if (apply) {
+      // One atomic RPC call covering both ids — Round 3 remediation §1. Round 4 remediation §6:
+      // throws on any RPC-reported failure rather than returning a boolean — deliberately not
+      // caught here, so an integrity failure aborts this whole reconciliation pass.
+      await dataService.applyTransactionSemanticRoles(userId, [anchor.id, outcome.partner.id], fields);
+    }
+    result.resolved.push({ id: anchor.id, fields }, { id: outcome.partner.id, fields });
+    settledIds.add(anchor.id);
+    settledIds.add(outcome.partner.id);
+  }
+
+  // --- Refunds: unchanged per-row logic — no reciprocal-uniqueness concern (multiple refunds may
+  // legitimately match one original; see this module's own doc comment). ---
+  const alreadyResolved = new Set<string>(settledIds);
   for (const row of touched) {
     if (alreadyResolved.has(row.id)) continue;
-    if (row.role_source === 'transfer_like_unconfirmed') {
-      const outcome = await resolveTransferCandidate(userId, row, apply, pool);
-      mergeResults(result, outcome);
-      for (const o of outcome.resolved) alreadyResolved.add(o.id);
-    }
     if (row.amount < 0 && row.role_source === 'sign_default') {
       const outcome = await resolveRefundCandidate(userId, row, apply, pool);
       mergeResults(result, outcome);
@@ -487,12 +544,17 @@ async function resetRowToFreshClassification(userId: string, row: Reconciliation
 }
 
 /** One pass over every page of the user's EXISTING `account_pair_match` rows, re-validating each
- *  via the SAME reciprocal one-to-one check the forward pass uses (Round 4 remediation §3) — not
- *  merely "does this row's own search still turn up a unique candidate," which cannot detect a
- *  triangle (three rows where two independently, one-sidedly, both look valid against a shared
- *  third). A row that fails the reciprocal check (no confirmed partner, or now-ambiguous) is reset
- *  to a fresh row-level classification. Returns however many rows were reset THIS pass — the
- *  caller (`repairAccountPairMatches`) uses that count to decide whether another pass is needed. */
+ *  via the SAME snapshot-based reciprocal check the forward pass uses (Round 4 remediation §3,
+ *  order-independence corrected in Round 5 remediation blocker 1) — not merely "does this row's
+ *  own search still turn up a unique candidate," which cannot detect a triangle (three rows where
+ *  two independently, one-sidedly, both look valid against a shared third), AND not resolved one
+ *  row at a time with resets interleaved, which made the OUTCOME depend on which row in the page
+ *  happened to be visited (and reset) first. Every row's validity for the WHOLE page is decided
+ *  from one consistent snapshot BEFORE any row in the page is reset, so the set of rows reset this
+ *  page is independent of iteration order. A row that fails the reciprocal check (no confirmed
+ *  partner, or now-ambiguous) is reset to a fresh row-level classification. Returns however many
+ *  rows were reset THIS pass — the caller (`repairAccountPairMatches`) uses that count to decide
+ *  whether another pass is needed. */
 async function repairAccountPairMatchesOnePass(userId: string, apply: boolean): Promise<ReconciliationResult> {
   const result: ReconciliationResult = { resolved: [], unresolved: [] };
   let afterId: string | null = null;
@@ -500,9 +562,10 @@ async function repairAccountPairMatchesOnePass(userId: string, apply: boolean): 
     const page = await dataService.getRelationallyClassifiedTransactionsPage(userId, 'account_pair_match', REPAIR_PAGE_SIZE, afterId);
     if (page.length === 0) break;
 
+    const outcomes = await computeReciprocalTransferResolution(userId, page, 'account_pair_match', []);
     for (const row of page) {
-      const reciprocal = await resolveReciprocalTransferPartner(userId, row, 'account_pair_match', []);
-      const stillValid = reciprocal !== null && reciprocal !== 'ambiguous';
+      const outcome = outcomes.get(row.id);
+      const stillValid = outcome?.status === 'paired';
       if (!stillValid) {
         result.resolved.push(await resetRowToFreshClassification(userId, row, apply));
       }
@@ -533,10 +596,17 @@ async function repairAccountPairMatches(userId: string, apply: boolean): Promise
   for (let pass = 0; pass < MAX_REPAIR_PASSES; pass++) {
     const passResult = await repairAccountPairMatchesOnePass(userId, apply);
     mergeResults(result, passResult);
-    if (passResult.resolved.length === 0) break; // stable — nothing left to fix
-    if (!apply) break; // dry-run: nothing changed, so a further pass would only duplicate this one
+    if (passResult.resolved.length === 0) return result; // stable — nothing left to fix
+    if (!apply) return result; // dry-run: nothing changed, so a further pass would only duplicate this one
   }
-  return result;
+  // Round 5 remediation (HIGH — "repair cap fails open"): exhausting MAX_REPAIR_PASSES while the
+  // MOST RECENT pass still made changes means stability was never actually reached — most likely
+  // a concurrent writer is repeatedly invalidating rows out from under this sweep. Returning
+  // normally here would let the caller treat an UNPROVEN state as a successful repair and advance
+  // its cursor/page past it. Fail closed instead.
+  throw new RelationalRepairNotStableError(
+    `repairAccountPairMatches: did not reach a stable state after ${MAX_REPAIR_PASSES} passes for user ${userId} — a concurrent writer may be repeatedly invalidating rows`
+  );
 }
 
 /** Re-validates every one of the user's EXISTING `refund_match` rows against CURRENT data (Round

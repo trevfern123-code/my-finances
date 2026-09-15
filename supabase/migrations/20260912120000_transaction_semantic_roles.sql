@@ -117,6 +117,23 @@ alter table public.transactions
 -- sufficient, already audited) privileges, the smaller attack surface of the two options.
 -- search_path is pinned empty and every identifier is schema-qualified, so this function's
 -- behavior can never be altered by a schema earlier in some other role's search_path.
+--
+-- Round 5 remediation (blocker 3, partial mitigation): candidate discovery/ranking happens in the
+-- application layer, in a SEPARATE request from this mutation — this function alone cannot make
+-- that whole read-then-decide-then-write sequence transactional. What it CAN do, and now does, is
+-- serialize concurrent writers for the SAME user: `pg_advisory_xact_lock` below blocks a second
+-- concurrent call for this user_id until the first one commits or rolls back, closing the
+-- practical race window (a sync and a manual-loan link/unlink, or two syncs, interleaving between
+-- one caller's read and its write) without requiring every reader to also hold a lock. This is a
+-- transaction-scoped lock (auto-released at COMMIT/ROLLBACK, never orphaned) keyed by user_id, so
+-- writers for DIFFERENT users never block each other.
+--
+-- Round 5 remediation (HIGH — ownership-chain rows not locked): the locking SELECT below now also
+-- locks the joined `accounts`/`plaid_items` rows (`for update of t, a, pi`), not just
+-- `transactions` — a concurrent reparenting of an account to a different plaid_item/user between
+-- this check and the UPDATE could otherwise change ownership out from under an already-"verified"
+-- row. No current application code path reparents those relationships, but locking the whole
+-- ownership chain removes the assumption entirely rather than relying on it never happening.
 create or replace function public.apply_transaction_semantic_roles(
   p_user_id uuid,
   p_transaction_ids uuid[],
@@ -136,6 +153,11 @@ declare
   v_owned_count integer;
   v_updated_count integer;
 begin
+  -- Serialize concurrent semantic writers for this user (see this function's own comment above)
+  -- before reading anything — every subsequent step in this call sees a consistent view no other
+  -- concurrent call for the same user can interleave with.
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
   v_input_count := coalesce(array_length(p_transaction_ids, 1), 0);
   if v_input_count = 0 then
     raise exception 'apply_transaction_semantic_roles: no transaction ids supplied';
@@ -149,11 +171,12 @@ begin
       v_distinct_count, v_input_count;
   end if;
 
-  -- Verify ownership and LOCK the candidate rows inside this same transaction, before any write.
-  -- The locking SELECT itself carries no aggregate (Postgres forbids that combination) — it just
-  -- locks and returns each owned row's id; the surrounding array_agg (unlocked) is what counts
-  -- them. An id that doesn't come back here (wrong user, or the row no longer exists) means the
-  -- whole call fails — nothing is ever partially applied to the ids that DID resolve.
+  -- Verify ownership and LOCK the candidate rows (and their ownership chain) inside this same
+  -- transaction, before any write. The locking SELECT itself carries no aggregate (Postgres
+  -- forbids that combination) — it just locks and returns each owned row's id; the surrounding
+  -- array_agg (unlocked) is what counts them. An id that doesn't come back here (wrong user, or
+  -- the row no longer exists) means the whole call fails — nothing is ever partially applied to
+  -- the ids that DID resolve.
   select array_agg(owned.id) into v_owned_ids
   from (
     select t.id
@@ -162,7 +185,7 @@ begin
     join public.plaid_items pi on pi.id = a.item_id
     where t.id = any(p_transaction_ids)
       and pi.user_id = p_user_id
-    for update of t
+    for update of t, a, pi
   ) owned;
 
   v_owned_count := coalesce(array_length(v_owned_ids, 1), 0);

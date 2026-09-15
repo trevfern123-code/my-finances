@@ -994,6 +994,53 @@ export async function listManualLoans(userId: string): Promise<ManualLoanRow[]> 
   return data as ManualLoanRow[];
 }
 
+/** Thrown by `assertValidManualLoanFields` (Round 5 remediation, blocker 7) — a manual loan's
+ *  core numeric fields (unlike a linked Plaid transaction, which Plaid itself already validates)
+ *  were previously accepted with no runtime check beyond `typeof === 'number'` on create, and NO
+ *  check at all on update — silently persisting a negative balance/principal/rate/payment, or a
+ *  non-positive term. */
+export class InvalidManualLoanFieldError extends Error {}
+
+function assertFiniteNonNegative(value: number, fieldName: string): void {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new InvalidManualLoanFieldError(`${fieldName} must be a finite, non-negative number (got ${value})`);
+  }
+}
+
+function assertPositiveInteger(value: number, fieldName: string): void {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new InvalidManualLoanFieldError(`${fieldName} must be a positive integer (got ${value})`);
+  }
+}
+
+/** Validates every core numeric field a manual loan write path could set, before that write ever
+ *  reaches the database (Round 5 remediation, blocker 7). Every field is optional here since
+ *  `updateManualLoan` sends a partial patch — only fields actually present are checked; a field
+ *  explicitly sent as `null` (for the nullable ones) is left alone, matching existing "clear this
+ *  field" semantics. `current_balance` is the one always-required, never-null field (both create
+ *  and every update path that touches it must supply a real number). */
+function assertValidManualLoanFields(fields: {
+  current_balance?: number;
+  origination_principal_amount?: number | null;
+  interest_rate_percentage?: number | null;
+  minimum_payment_amount?: number | null;
+  term_months?: number | null;
+}): void {
+  if (fields.current_balance !== undefined) assertFiniteNonNegative(fields.current_balance, 'current_balance');
+  if (fields.origination_principal_amount !== undefined && fields.origination_principal_amount !== null) {
+    assertFiniteNonNegative(fields.origination_principal_amount, 'origination_principal_amount');
+  }
+  if (fields.interest_rate_percentage !== undefined && fields.interest_rate_percentage !== null) {
+    assertFiniteNonNegative(fields.interest_rate_percentage, 'interest_rate_percentage');
+  }
+  if (fields.minimum_payment_amount !== undefined && fields.minimum_payment_amount !== null) {
+    assertFiniteNonNegative(fields.minimum_payment_amount, 'minimum_payment_amount');
+  }
+  if (fields.term_months !== undefined && fields.term_months !== null) {
+    assertPositiveInteger(fields.term_months, 'term_months');
+  }
+}
+
 export async function createManualLoan(
   userId: string,
   params: {
@@ -1010,6 +1057,14 @@ export async function createManualLoan(
     matchText: string | null;
   }
 ): Promise<ManualLoanRow> {
+  assertValidManualLoanFields({
+    current_balance: params.currentBalance,
+    origination_principal_amount: params.originationPrincipalAmount,
+    interest_rate_percentage: params.interestRatePercentage,
+    minimum_payment_amount: params.minimumPaymentAmount,
+    term_months: params.termMonths,
+  });
+
   const { data, error } = await supabaseAdmin
     .from('manual_loans')
     .insert({
@@ -1050,6 +1105,8 @@ export async function updateManualLoan(
     match_text: string | null;
   }>
 ): Promise<ManualLoanRow | null> {
+  assertValidManualLoanFields(fields);
+
   const { data, error } = await supabaseAdmin
     .from('manual_loans')
     .update({ ...fields, updated_at: new Date().toISOString() })
@@ -1062,9 +1119,65 @@ export async function updateManualLoan(
   return data as ManualLoanRow | null;
 }
 
-export async function deleteManualLoan(id: string, userId: string): Promise<void> {
+/**
+ * Deletes a manual loan, first reclassifying every transaction still linked to it (Round 5
+ * remediation, blocker 6). The `transactions.manual_loan_id` foreign key is `ON DELETE SET NULL`
+ * (see the base schema migration), so deleting the loan row alone would clear `manual_loan_id`
+ * automatically — but would leave `principal_portion` and the `debt_payment`/`manual_loan_link`
+ * role fields stale, silently misclassifying those rows as still being loan payments for a loan
+ * that no longer exists. Each linked transaction is reclassified via the same row-level
+ * precedence `unlinkPaymentFromLoan` uses, exactly as if it had been individually unlinked first.
+ *
+ * Returns the ids of every transaction that was reclassified, so the caller
+ * (manualLoanController.ts) can run the relational repair sweep for this user afterward — one of
+ * these rows may have been serving as an existing transfer counterpart or refund original before
+ * the loan link governed its role, which this function does not itself repair (bounded,
+ * relational work belongs in roleReconciliation.ts, not here).
+ */
+export async function deleteManualLoan(id: string, userId: string): Promise<{ affectedTransactionIds: string[] }> {
+  const loan = await getManualLoan(id, userId);
+  if (!loan) throw new Error('Manual loan not found');
+
+  const { data: linkedRows, error: fetchError } = await supabaseAdmin
+    .from('transactions')
+    .select('id, amount, category, personal_finance_category_detailed, personal_finance_category_confidence')
+    .eq('manual_loan_id', id);
+  if (fetchError) throw new Error(`Failed to load transactions linked to manual loan: ${fetchError.message}`);
+
+  const affectedTransactionIds: string[] = [];
+  for (const txn of (linkedRows ?? []) as {
+    id: string;
+    amount: number;
+    category: string | null;
+    personal_finance_category_detailed: string | null;
+    personal_finance_category_confidence: string | null;
+  }[]) {
+    const classification = classifyRowLevel({
+      amount: txn.amount,
+      personalFinanceCategoryPrimary: txn.category,
+      personalFinanceCategoryDetailed: txn.personal_finance_category_detailed,
+      personalFinanceCategoryConfidence: txn.personal_finance_category_confidence,
+      manualLoanId: null,
+    });
+    const { error: updateError } = await supabaseAdmin
+      .from('transactions')
+      .update({
+        manual_loan_id: null,
+        principal_portion: null,
+        auto_role: classification.autoRole,
+        role_source: classification.roleSource,
+        role_confidence: classification.roleConfidence,
+        classifier_version: classification.classifierVersion,
+      })
+      .eq('id', txn.id);
+    if (updateError) throw new Error(`Failed to reclassify transaction linked to deleted loan: ${updateError.message}`);
+    affectedTransactionIds.push(txn.id);
+  }
+
   const { error } = await supabaseAdmin.from('manual_loans').delete().eq('id', id).eq('user_id', userId);
   if (error) throw new Error(`Failed to delete manual loan: ${error.message}`);
+
+  return { affectedTransactionIds };
 }
 
 export async function getManualLoan(id: string, userId: string): Promise<ManualLoanRow | null> {

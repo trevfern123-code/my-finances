@@ -163,15 +163,18 @@ export async function linkNewTransactionsToManualLoans(
  * — run after creating/updating a manual loan so setting or changing match_text picks up
  * payments that were already synced before the match rule existed, not just future ones.
  *
- * Round 4 remediation §7: the per-transaction LINK attempt is best-effort (caught individually —
- * one bad match/link shouldn't block the rest), but the repair sweep at the end is NOT swallowed,
- * and runs UNCONDITIONALLY — never gated on whether THIS invocation itself linked anything new.
- * A retry after a prior successful link whose repair sweep then failed must still repair that
- * already-linked transaction even though it's no longer an "unlinked" candidate this time; gating
- * the sweep on `linkedAny` (or on `candidates.length > 0`) would silently defeat that retry, since
- * the very thing that makes a retry necessary (a linked row) is also what removes it from
- * `candidates` on the next attempt. The caller is expected to propagate a thrown failure here as
- * an incomplete operation (see manualLoanController.ts), not swallow it.
+ * Round 4 remediation §7 / Round 5 remediation (blocker 5): unlike the sync-triggered auto-link
+ * path (best-effort, piggybacking on a sync whose real job is syncing transactions), this
+ * function is invoked synchronously by a direct user action (create/update loan — see
+ * manualLoanController.ts) and is expected to report the WHOLE operation as incomplete/failed if
+ * ANY step fails, including an individual transaction's link — silently catching one link failure
+ * here would let the request "succeed" while quietly missing a payment the user has no way to
+ * discover short of manually re-checking every transaction. Nothing in this function is caught;
+ * the repair sweep at the end also runs UNCONDITIONALLY — never gated on whether THIS invocation
+ * itself linked anything new, since a retry after a prior successful link whose repair sweep then
+ * failed must still repair that already-linked transaction even though it's no longer an
+ * "unlinked" candidate this time (gating on `candidates.length > 0` would silently defeat that
+ * retry). The caller is expected to propagate any thrown failure as an incomplete operation.
  */
 export async function backfillMatchesForLoan(userId: string, loan: { id: string; match_text: string | null }): Promise<void> {
   if (!loan.match_text) return;
@@ -180,11 +183,7 @@ export async function backfillMatchesForLoan(userId: string, loan: { id: string;
   const matcher = { id: loan.id, match_text: loan.match_text };
   for (const txn of candidates) {
     if (matchTransactionToLoan(txn, [matcher])) {
-      try {
-        await dataService.linkTransactionToLoan(txn.id, loan.id, txn.amount);
-      } catch (err) {
-        console.error(`Failed to link transaction ${txn.id} to manual loan ${loan.id}:`, err);
-      }
+      await dataService.linkTransactionToLoan(txn.id, loan.id, txn.amount);
     }
   }
 
