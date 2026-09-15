@@ -102,6 +102,27 @@ export function normalizePrincipalPortion(transactionAmount: number, principalPo
   return normalized;
 }
 
+/**
+ * Validates and cent-normalizes a manually-logged loan payment's `principal_portion`/
+ * `interest_portion` at the write boundary (Round 4 remediation §9). Unlike a linked Plaid
+ * transaction, a manual payment record has no `amount` column to bound principal against —
+ * principal_portion and interest_portion are BOTH directly user-entered, together making up the
+ * payment total — so this only requires finite and non-negative (never `typeof === 'number'`
+ * alone, since that accepts NaN and negative numbers just as readily as valid ones). Reuses
+ * `InvalidPrincipalPortionError` so every principal-portion write path throws one consistent
+ * error type.
+ */
+export function normalizeNonNegativeMoneyAmount(value: number, fieldName: string): number {
+  if (!Number.isFinite(value)) {
+    throw new InvalidPrincipalPortionError(`${fieldName} must be a finite number`);
+  }
+  const normalized = roundToCents(value);
+  if (normalized < 0) {
+    throw new InvalidPrincipalPortionError(`${fieldName} must not be negative (got ${normalized})`);
+  }
+  return normalized;
+}
+
 /** The subset of a transaction's fields getSemanticEffects() needs. */
 export interface SemanticEffectsInput {
   amount: number;
@@ -135,9 +156,18 @@ export interface SemanticEffectsInput {
  * that calls this. A zero-amount component is omitted rather than emitted; a genuinely $0
  * transaction is itself impossible for a real payment and so is rejected below, not specially
  * handled.
+ *
+ * Round 4 remediation §8: the integrity validation below runs for EVERY manual-loan-linked
+ * transaction, BEFORE branching on `userRoleOverride` — an earlier version validated only inside
+ * the no-override branch, letting an override silently bypass integrity checking entirely (an
+ * overridden row with a negative amount, or a principal outside `[0, amount]`, would fall straight
+ * through to the final `return` with no validation at all). An override changes REPORTING
+ * semantics only (which single role the whole amount is reported as) — it never waives the
+ * underlying transaction/loan integrity, since that integrity describes whether the persisted
+ * data is even physically sensible, a question independent of how the user wants it reported.
  */
 export function getSemanticEffects(txn: SemanticEffectsInput): SemanticEffect[] {
-  if (txn.manualLoanId !== null && txn.userRoleOverride === null) {
+  if (txn.manualLoanId !== null) {
     if (!Number.isFinite(txn.amount) || txn.amount <= 0) {
       throw new SemanticIntegrityError(
         `getSemanticEffects: a manual-loan-linked transaction's amount must be finite and greater than 0 (got ${txn.amount})`
@@ -154,6 +184,14 @@ export function getSemanticEffects(txn: SemanticEffectsInput): SemanticEffect[] 
         `getSemanticEffects: principal_portion (${principal}) must be between 0 and the transaction amount (${normalizedAmount})`
       );
     }
+
+    if (txn.userRoleOverride !== null) {
+      // Validated above; reporting now defers entirely to the user's override, full amount,
+      // decomposition suppressed — loan-balance bookkeeping (principalPortion-driven) is a
+      // completely separate concern this function never touches either way.
+      return [{ role: txn.effectiveRole, amount: normalizedAmount }];
+    }
+
     // The complement, not an independently-rounded value — guarantees the two components always
     // sum exactly to normalizedAmount regardless of any rounding on principal itself.
     const interest = roundToCents(normalizedAmount - principal);

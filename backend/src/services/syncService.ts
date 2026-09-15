@@ -48,8 +48,13 @@ export async function syncItemTransactions(item: {
   await dataService.setItemStatus(item.id, 'active');
 
   // Best-effort (wrapped internally by linkNewTransactionsToManualLoans) — auto-linking loan
-  // payments shouldn't fail the sync that triggered it, and is naturally a no-op on a retry (see
-  // this function's own doc comment).
+  // payments shouldn't fail the sync that triggered it, and per-transaction linking is naturally
+  // idempotent on a retry (a row already linked from a prior attempt is no longer a fresh insert,
+  // so re-linking it does no work). The REPAIR SWEEP this auto-linking could necessitate is
+  // deliberately NOT this function's responsibility (see the `added.length > 0` branch below) —
+  // Round 4 remediation §7 found that gating the sweep on "did THIS invocation itself create a
+  // new link" breaks retry: once a link from attempt 1 persists, the linked transaction is no
+  // longer a fresh insert on a retry, so nothing would ever re-trigger its repair.
   await loansService.linkNewTransactionsToManualLoans(item.user_id, insertedTransactions);
 
   // Financial Semantics Foundation Phase A, stage 2 (see roleReconciliation.ts's own doc
@@ -57,17 +62,19 @@ export async function syncItemTransactions(item: {
   // why a failure here must gate the cursor advance below rather than being swallowed).
   await reconcileRelationalRoles(item.user_id, touchedTransactionIds);
 
-  // Round 3 remediation §2/§3/§4/§6: a modified or removed transaction may invalidate an
-  // EXISTING account_pair_match/refund_match row that depended on this transaction's OLD state
-  // (or on its now-deleted existence) — re-validate every existing relational row against
-  // CURRENT data before advancing the cursor. Also deliberately NOT wrapped in try/catch, and
-  // deliberately gated on "did this batch touch anything" rather than a same-attempt
-  // before/after comparison, so a retry whose DB state already reflects the new values still
-  // re-triggers and completes the repair (see roleReconciliation.ts's own doc comment for the
-  // full retry-safety argument). A pure-insert batch can't invalidate any existing relational
-  // row (a brand-new row was never previously anything), so the sweep is skipped when neither
-  // `modified` nor `removed` is non-empty.
-  if (modified.length > 0 || removed.length > 0) {
+  // Round 3 remediation §2/§3/§4/§6, retry-safety corrected in Round 4 remediation §7: a
+  // modified/removed transaction, OR a newly-added transaction that just got auto-linked to a
+  // manual loan, may invalidate an EXISTING account_pair_match/refund_match row that depended on
+  // its OLD state (or on its now-deleted existence, or on it not having been a debt_payment
+  // before) — re-validate every existing relational row against CURRENT data before advancing
+  // the cursor. Also deliberately NOT wrapped in try/catch, and deliberately gated on "did this
+  // batch contain ANY activity Plaid itself reports" rather than on our own dedup state (whether
+  // `insertedTransactions` came back non-empty) — Plaid re-reports the identical added/
+  // modified/removed composition on every retry for the same (unadvanced) cursor, so this gate is
+  // retry-safe even though our OWN insert/update classification of the same rows can change
+  // between attempts (a row inserted in attempt 1 is no longer "new" in attempt 2, but Plaid's
+  // `added` array still lists it, so the sweep still re-triggers and still repairs it).
+  if (added.length > 0 || modified.length > 0 || removed.length > 0) {
     await repairExistingRelationalRoles(item.user_id);
   }
 

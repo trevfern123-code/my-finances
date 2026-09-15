@@ -203,6 +203,54 @@ describe('getSemanticEffects — manual-loan-linked, WITH user override', () => 
   });
 });
 
+describe('getSemanticEffects — an override NEVER bypasses underlying integrity validation (Round 4 remediation §8)', () => {
+  it('linked + override + negative amount -> error, not a one-component override result', () => {
+    expect(() =>
+      getSemanticEffects(txn({ amount: -100, manualLoanId: 'loan-1', principalPortion: 0, userRoleOverride: 'expense', effectiveRole: 'expense' }))
+    ).toThrow(SemanticIntegrityError);
+  });
+
+  it('linked + override + zero amount -> error', () => {
+    expect(() =>
+      getSemanticEffects(txn({ amount: 0, manualLoanId: 'loan-1', principalPortion: 0, userRoleOverride: 'expense', effectiveRole: 'expense' }))
+    ).toThrow(SemanticIntegrityError);
+  });
+
+  it('linked + override + NaN/non-finite amount -> error', () => {
+    expect(() =>
+      getSemanticEffects(txn({ amount: NaN, manualLoanId: 'loan-1', principalPortion: 0, userRoleOverride: 'expense', effectiveRole: 'expense' }))
+    ).toThrow(SemanticIntegrityError);
+    expect(() =>
+      getSemanticEffects(txn({ amount: Infinity, manualLoanId: 'loan-1', principalPortion: 0, userRoleOverride: 'expense', effectiveRole: 'expense' }))
+    ).toThrow(SemanticIntegrityError);
+  });
+
+  it('linked + override + principal > amount -> error', () => {
+    expect(() =>
+      getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 150, userRoleOverride: 'expense', effectiveRole: 'expense' }))
+    ).toThrow(SemanticIntegrityError);
+  });
+
+  it('linked + override + principal < 0 -> error', () => {
+    expect(() =>
+      getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: -10, userRoleOverride: 'expense', effectiveRole: 'expense' }))
+    ).toThrow(SemanticIntegrityError);
+  });
+
+  it('linked + override + NaN/non-finite principal -> error', () => {
+    expect(() =>
+      getSemanticEffects(txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: NaN, userRoleOverride: 'expense', effectiveRole: 'expense' }))
+    ).toThrow(SemanticIntegrityError);
+  });
+
+  it('a genuinely valid linked+override transaction still returns exactly one full-amount override component (regression: the fix must not break the valid path)', () => {
+    const effects = getSemanticEffects(
+      txn({ amount: 100, manualLoanId: 'loan-1', principalPortion: 60, userRoleOverride: 'expense', effectiveRole: 'expense' })
+    );
+    expect(effects).toEqual([{ role: 'expense', amount: 100 }]);
+  });
+});
+
 describe('guard rail — why a naive effective_role-only filter is wrong for decomposed loan payments', () => {
   it('demonstrates the undercount/overcount a naive filter would produce on a mixed fixture', () => {
     const fixture: SemanticEffectsInput[] = [

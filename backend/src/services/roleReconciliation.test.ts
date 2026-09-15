@@ -18,6 +18,63 @@ vi.mock('./dataService', () => ({
   getRelationallyClassifiedTransactionsPage: mockGetRelationallyClassifiedTransactionsPage,
 }));
 
+/** Builds a `findTransferCounterpartCandidates` mock implementation keyed by the QUERYING row's
+ *  own id — necessary because the real reciprocal check (Round 4 remediation §3) calls this
+ *  twice per resolution attempt (once for the anchor, once to verify the winner's own best match
+ *  points back), and a naive `mockResolvedValue` returning the same list regardless of which row
+ *  is asking cannot model two DIFFERENT rows each genuinely seeing the OTHER as their candidate —
+ *  it would instead make every row see ITSELF, which the reciprocal check correctly rejects. */
+function transferCandidatesByRowId(byId: Record<string, ReconciliationRow[]>) {
+  return async (_userId: string, queryingRow: { id: string }) => byId[queryingRow.id] ?? [];
+}
+
+/**
+ * Like `fakeAccountPairMatchStore`, but pagination-aware (Round 4 remediation §12): serves pages
+ * in (sorted) id order honoring `afterId`/`limit`, and removes a row once
+ * `applyTransactionSemanticRoles` is called for it — so a test can verify that resets happening
+ * WITHIN page 1 never disrupt the keyset cursor used to fetch page 2 (never OFFSET-style
+ * skipping), and that page 2's own rows still get visited.
+ */
+function fakeAccountPairMatchStorePaginated(rows: ReconciliationRow[]) {
+  let remaining = [...rows].sort((a, b) => a.id.localeCompare(b.id));
+  mockGetRelationallyClassifiedTransactionsPage.mockImplementation(
+    async (_userId: string, roleSource: string, limit: number, afterId: string | null) => {
+      if (roleSource !== 'account_pair_match') return [];
+      const pool = afterId === null ? remaining : remaining.filter((r) => r.id > afterId);
+      return pool.slice(0, limit);
+    }
+  );
+  mockApplyTransactionSemanticRoles.mockImplementation(async (_userId: string, ids: string[]) => {
+    remaining = remaining.filter((r) => !ids.includes(r.id));
+  });
+}
+
+/**
+ * A minimal stateful fake for the `account_pair_match` repair sweep's own two mocked
+ * dependencies (`getRelationallyClassifiedTransactionsPage` and `applyTransactionSemanticRoles`)
+ * — needed because `repairAccountPairMatches` repeats its page-traversal in bounded passes until
+ * a pass resets nothing (Round 4 remediation §5). A naive `mockResolvedValue`/`mockImplementation`
+ * that always returns the SAME page regardless of what was just "written" would make every reset
+ * row get reset again on every subsequent pass, up to MAX_REPAIR_PASSES — this fake instead
+ * actually removes a row from the simulated `account_pair_match` set once
+ * `applyTransactionSemanticRoles` is called for it (simulating the real DB no longer tagging that
+ * row `account_pair_match` after the write), so tests can assert exact call counts. Wires both
+ * mocks; call `install()` once per test after configuring `rows`.
+ */
+function fakeAccountPairMatchStore(rows: ReconciliationRow[]) {
+  const remaining = new Map(rows.map((r) => [r.id, r]));
+  function install() {
+    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) => {
+      if (roleSource !== 'account_pair_match') return [];
+      return Array.from(remaining.values());
+    });
+    mockApplyTransactionSemanticRoles.mockImplementation(async (_userId: string, ids: string[]) => {
+      for (const id of ids) remaining.delete(id);
+    });
+  }
+  return { install, remaining };
+}
+
 function row(overrides: Partial<ReconciliationRow> = {}): ReconciliationRow {
   return {
     id: 'txn-1',
@@ -34,6 +91,7 @@ function row(overrides: Partial<ReconciliationRow> = {}): ReconciliationRow {
     role_source: 'transfer_like_unconfirmed',
     role_confidence: 'low',
     effective_role: 'expense',
+    user_role_override: null,
     ...overrides,
   };
 }
@@ -73,7 +131,12 @@ describe('reconcileRelationalRoles — bounded scope', () => {
 describe('reconcileRelationalRoles — transfers: deterministic, conservative ranking (Round 2 remediation §4)', () => {
   it('exactly one candidate -> resolves as a pair, atomically (one RPC call for both ids), same-day match is high confidence', async () => {
     mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-2', amount: -100, date: '2026-09-10' })]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-10' })],
+        'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+      })
+    );
 
     const result = await reconcileRelationalRoles('user-1', ['txn-1']);
 
@@ -88,7 +151,12 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
 
   it('a candidate on a different day (within window) is medium confidence, not high', async () => {
     mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-05' })]);
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-2', amount: -100, date: '2026-09-06' })]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-06' })],
+        'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-05' })],
+      })
+    );
 
     await reconcileRelationalRoles('user-1', ['txn-1']);
 
@@ -101,10 +169,13 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
 
   it('exact-date candidate beats a further, merely-compatible-amount candidate deterministically', async () => {
     mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
-    mockFindTransferCounterpartCandidates.mockResolvedValue([
-      row({ id: 'txn-far', amount: -100, date: '2026-09-08' }),
-      row({ id: 'txn-near', amount: -100, date: '2026-09-10' }),
-    ]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [row({ id: 'txn-far', amount: -100, date: '2026-09-08' }), row({ id: 'txn-near', amount: -100, date: '2026-09-10' })],
+        // The winner (txn-near) must reciprocally see txn-1 as ITS own best match too.
+        'txn-near': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+      })
+    );
 
     await reconcileRelationalRoles('user-1', ['txn-1']);
 
@@ -150,15 +221,158 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
     );
   });
 
-  it('an atomic pair mutation that fails inside the RPC (e.g. ownership mismatch) is treated as unresolved, not a half-resolved pair (Round 3 remediation §1)', async () => {
-    mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100 })]);
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-2', amount: -100, date: '2026-09-10' })]);
-    mockApplyTransactionSemanticRoles.mockResolvedValue(false); // RPC's own integrity check failed
+  it('an RPC integrity failure during a transfer-pair write propagates as a HARD failure — never silently converted into an ordinary "unresolved" outcome (Round 4 remediation §6)', async () => {
+    mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-10' })],
+        'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+      })
+    );
+    // applyTransactionSemanticRoles now THROWS on any RPC-reported failure (ownership mismatch,
+    // count mismatch, duplicate ids) rather than returning `false` — see dataService.ts's
+    // SemanticRoleMutationError for why this must be a hard failure, not a candidate-ranking
+    // outcome a caller could mistake for ordinary ambiguity.
+    mockApplyTransactionSemanticRoles.mockRejectedValue(new Error('apply_transaction_semantic_roles: ownership check failed'));
+
+    await expect(reconcileRelationalRoles('user-1', ['txn-1'])).rejects.toThrow('ownership check failed');
+  });
+
+  it('candidate ambiguity is a normal returned outcome, NOT an RPC call at all — confirms the two are genuinely distinct code paths (Round 4 remediation §6)', async () => {
+    mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
+    mockFindTransferCounterpartCandidates.mockResolvedValue([
+      row({ id: 'txn-a', amount: -100, date: '2026-09-11' }),
+      row({ id: 'txn-b', amount: -100, date: '2026-09-09' }),
+    ]);
 
     const result = await reconcileRelationalRoles('user-1', ['txn-1']);
 
-    expect(result.resolved).toEqual([]);
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
     expect(result.unresolved).toEqual([{ id: 'txn-1', reason: 'ambiguous_transfer_candidates' }]);
+  });
+});
+
+describe('reconcileRelationalRoles — reciprocal one-to-one transfer matching (Round 4 remediation §3/§4)', () => {
+  it('A/B mutual unique pair: each independently, and reciprocally, picks the other — confirmed', async () => {
+    const A = row({ id: 'txn-a', account_id: 'acc-1', amount: 500, date: '2026-09-10' });
+    const B = row({ id: 'txn-b', account_id: 'acc-2', amount: -500, date: '2026-09-10' });
+    mockGetTransactionsForReconciliation.mockResolvedValue([A, B]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-a': [B],
+        'txn-b': [A],
+      })
+    );
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-a', 'txn-b']);
+
+    expect(result.resolved.map((r) => r.id).sort()).toEqual(['txn-a', 'txn-b']);
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1); // deduped — B's own turn is skipped
+  });
+
+  it('one mutually-unique pair plus a third unmatched candidate: A(+500)/B(-500)/C(+500) — B is genuinely closer to A, so only A/B confirm; C stays unresolved', async () => {
+    const A = row({ id: 'txn-a', account_id: 'acc-1', amount: 500, date: '2026-09-10' });
+    const B = row({ id: 'txn-b', account_id: 'acc-2', amount: -500, date: '2026-09-10' });
+    const C = row({ id: 'txn-c', account_id: 'acc-3', amount: 500, date: '2026-09-11' });
+    mockGetTransactionsForReconciliation.mockResolvedValue([A, B, C]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-a': [B], // A's only opposite-sign candidate is B
+        'txn-b': [A, C], // B sees both A (same day) and C (one day away)
+        'txn-c': [B], // C's only opposite-sign candidate is B
+      })
+    );
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-a', 'txn-b', 'txn-c']);
+
+    expect(result.resolved.map((r) => r.id).sort()).toEqual(['txn-a', 'txn-b']);
+    expect(result.unresolved).toEqual([{ id: 'txn-c', reason: 'no_transfer_evidence' }]);
+    // B is never mutated twice, and never reused for a second pair.
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1);
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-a', 'txn-b'], expect.anything());
+  });
+
+  it('A/B/C tied ambiguity: B is EQUIDISTANT from A and C — none of the three relationships are confirmed', async () => {
+    const A = row({ id: 'txn-a', account_id: 'acc-1', amount: 500, date: '2026-09-09' });
+    const B = row({ id: 'txn-b', account_id: 'acc-2', amount: -500, date: '2026-09-10' });
+    const C = row({ id: 'txn-c', account_id: 'acc-3', amount: 500, date: '2026-09-11' });
+    mockGetTransactionsForReconciliation.mockResolvedValue([A, B, C]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-a': [B],
+        'txn-b': [A, C], // both exactly 1 day from B — genuinely tied
+        'txn-c': [B],
+      })
+    );
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-a', 'txn-b', 'txn-c']);
+
+    expect(result.resolved).toEqual([]);
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+  });
+
+  it('unequal-distance one-to-many: three candidates for one anchor, only the closest reciprocates', async () => {
+    const anchor = row({ id: 'txn-1', account_id: 'acc-1', amount: 100, date: '2026-09-10' });
+    const near = row({ id: 'txn-near', account_id: 'acc-2', amount: -100, date: '2026-09-10' });
+    const mid = row({ id: 'txn-mid', account_id: 'acc-3', amount: -100, date: '2026-09-11' });
+    const far = row({ id: 'txn-far', account_id: 'acc-4', amount: -100, date: '2026-09-12' });
+    mockGetTransactionsForReconciliation.mockResolvedValue([anchor]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [near, mid, far],
+        'txn-near': [anchor], // the closest candidate reciprocally agrees
+      })
+    );
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-1']);
+
+    expect(result.resolved.map((r) => r.id).sort()).toEqual(['txn-1', 'txn-near']);
+  });
+
+  it('a user override on the CANDIDATE side makes it ineligible — the anchor is left with no eligible candidate at all', async () => {
+    const anchor = row({ id: 'txn-a', amount: 100, date: '2026-09-10' });
+    const overriddenCandidate = row({ id: 'txn-b', amount: -100, date: '2026-09-10', user_role_override: 'expense' });
+    mockGetTransactionsForReconciliation.mockResolvedValue([anchor]);
+    mockFindTransferCounterpartCandidates.mockImplementation(transferCandidatesByRowId({ 'txn-a': [overriddenCandidate] }));
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-a']);
+
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+    expect(result.unresolved).toEqual([{ id: 'txn-a', reason: 'no_transfer_evidence' }]);
+  });
+
+  it('a user override on the ANCHOR itself disqualifies it immediately, without even querying candidates', async () => {
+    const overriddenAnchor = row({ id: 'txn-a', amount: 100, date: '2026-09-10', user_role_override: 'expense' });
+    mockGetTransactionsForReconciliation.mockResolvedValue([overriddenAnchor]);
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-a']);
+
+    expect(mockFindTransferCounterpartCandidates).not.toHaveBeenCalled();
+    expect(result.unresolved).toEqual([{ id: 'txn-a', reason: 'no_transfer_evidence' }]);
+  });
+
+  it('an override that already AGREES (internal_transfer) does not disqualify the row', async () => {
+    const anchor = row({ id: 'txn-a', amount: 100, date: '2026-09-10', user_role_override: 'internal_transfer' });
+    const candidate = row({ id: 'txn-b', amount: -100, date: '2026-09-10' });
+    mockGetTransactionsForReconciliation.mockResolvedValue([anchor]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({ 'txn-a': [candidate], 'txn-b': [anchor] })
+    );
+
+    const result = await reconcileRelationalRoles('user-1', ['txn-a']);
+
+    expect(result.resolved.map((r) => r.id).sort()).toEqual(['txn-a', 'txn-b']);
+  });
+
+  it('a candidate resolved as part of one pair is never re-processed (or re-mutated) when its own turn comes up later in the same pass', async () => {
+    const A = row({ id: 'txn-a', amount: 100, date: '2026-09-10' });
+    const B = row({ id: 'txn-b', amount: -100, date: '2026-09-10' });
+    mockGetTransactionsForReconciliation.mockResolvedValue([A, B]);
+    mockFindTransferCounterpartCandidates.mockImplementation(transferCandidatesByRowId({ 'txn-a': [B], 'txn-b': [A] }));
+
+    await reconcileRelationalRoles('user-1', ['txn-a', 'txn-b']);
+
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -340,7 +554,12 @@ describe('reconcileRelationalRoles — refunds', () => {
 describe('reconcileRelationalRoles — dry-run preview mode (apply = false)', () => {
   it('previews a transfer pair resolution with zero writes', async () => {
     mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-2', amount: -100, date: '2026-09-10' })]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-10' })],
+        'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+      })
+    );
 
     const result = await reconcileRelationalRoles('user-1', ['txn-1'], false);
 
@@ -430,7 +649,12 @@ describe('reconcileRelationalRoles — dry-run hypothetical-state pool (Round 3 
 
   it('apply=true (ordinary sync) is unaffected by an empty default pool — behavior identical to calling without a pool argument', async () => {
     mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-2', amount: -100, date: '2026-09-10' })]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-10' })],
+        'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+      })
+    );
 
     await reconcileRelationalRoles('user-1', ['txn-1'], true);
 
@@ -442,13 +666,19 @@ describe('reconcileRelationalRoles — dry-run hypothetical-state pool (Round 3 
   });
 });
 
-describe('user_role_override is never read or written by this module', () => {
+describe('user_role_override is never WRITTEN by this module (it IS read, for transfer eligibility — Round 4 remediation §3)', () => {
   it('only auto_role/source/confidence/version fields ever appear in a write', async () => {
-    mockGetTransactionsForReconciliation.mockResolvedValue([row()]);
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-2', amount: -100 })]);
+    mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-10' })],
+        'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+      })
+    );
 
     await reconcileRelationalRoles('user-1', ['txn-1']);
 
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1); // sanity: the loop below isn't vacuous
     for (const call of mockApplyTransactionSemanticRoles.mock.calls) {
       const fields = call[2] as object;
       expect(Object.keys(fields).sort()).toEqual(['auto_role', 'classifier_version', 'role_confidence', 'role_source'].sort());
@@ -459,10 +689,7 @@ describe('user_role_override is never read or written by this module', () => {
 describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round 3 remediation §2/§3/§4/§6)', () => {
   it('re-validates every account_pair_match row against current data and resets one whose unique counterpart no longer exists', async () => {
     const staleRow = row({ id: 'txn-stale', amount: 100, date: '2026-09-10', category: 'TRANSFER_OUT', role_source: 'account_pair_match' });
-    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) => {
-      if (roleSource === 'account_pair_match') return [staleRow];
-      return [];
-    });
+    fakeAccountPairMatchStore([staleRow]).install();
     // The counterpart the row was originally paired against no longer exists (deleted, or its
     // amount/date/account changed) — the re-run candidate query finds nothing.
     mockFindTransferCounterpartCandidates.mockResolvedValue([]);
@@ -476,21 +703,24 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
       '2026-09-13',
       'account_pair_match'
     );
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1);
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-stale'],
       expect.objectContaining({ role_source: 'transfer_like_unconfirmed' }) // fresh row-level classification
     );
-    expect(result.resolved.map((r) => r.id)).toContain('txn-stale');
+    expect(result.resolved.map((r) => r.id)).toEqual(['txn-stale']);
   });
 
-  it('leaves an account_pair_match row untouched when its unique counterpart still validates', async () => {
+  it('leaves an account_pair_match row untouched when its unique, RECIPROCALLY-confirmed counterpart still validates', async () => {
     const stillPaired = row({ id: 'txn-a', amount: 100, date: '2026-09-10', role_source: 'account_pair_match' });
-    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) => {
-      if (roleSource === 'account_pair_match') return [stillPaired];
-      return [];
-    });
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-b', amount: -100, date: '2026-09-10' })]);
+    fakeAccountPairMatchStore([stillPaired]).install();
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-a': [row({ id: 'txn-b', amount: -100, date: '2026-09-10' })],
+        'txn-b': [row({ id: 'txn-a', amount: 100, date: '2026-09-10' })],
+      })
+    );
 
     const result = await repairExistingRelationalRoles('user-1');
 
@@ -498,13 +728,27 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
     expect(result.resolved).toEqual([]);
   });
 
+  it('one row LOOKS valid on its own (unique candidate) but is reset anyway because that candidate does not reciprocate (Round 4 remediation §3 applied to the sweep)', async () => {
+    // txn-a's own search finds txn-c as its sole opposite-amount candidate, but txn-c's own true
+    // best match is txn-b (closer) — txn-a must NOT be left as a falsely-confirmed pair.
+    const A = row({ id: 'txn-a', amount: 500, date: '2026-09-11', role_source: 'account_pair_match' });
+    fakeAccountPairMatchStore([A]).install();
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-a': [row({ id: 'txn-c', amount: -500, date: '2026-09-10' })],
+        'txn-c': [row({ id: 'txn-b', amount: 500, date: '2026-09-10' })], // txn-c's real best is txn-b, not txn-a
+      })
+    );
+
+    const result = await repairExistingRelationalRoles('user-1');
+
+    expect(result.resolved.map((r) => r.id)).toEqual(['txn-a']);
+  });
+
   it('BOTH legs of a broken pair are independently caught on their own turn through the sweep — no need to locate "the former partner"', async () => {
     const legA = row({ id: 'txn-a', amount: 300, date: '2026-09-10', role_source: 'account_pair_match' }); // amount just changed from 500
     const legB = row({ id: 'txn-b', amount: -500, date: '2026-09-01', role_source: 'account_pair_match' }); // unchanged, now orphaned
-    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) => {
-      if (roleSource === 'account_pair_match') return [legA, legB];
-      return [];
-    });
+    fakeAccountPairMatchStore([legA, legB]).install();
     // Neither leg's own re-run query finds the other any more (amount mismatch on both sides).
     mockFindTransferCounterpartCandidates.mockResolvedValue([]);
 
@@ -512,6 +756,38 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
 
     const resetIds = result.resolved.map((r) => r.id).sort();
     expect(resetIds).toEqual(['txn-a', 'txn-b']);
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(2); // exactly once per leg, no repeated resets
+  });
+
+  it('A/B/C sweep regression: A/B are a genuine mutual pair, C only one-sidedly sees A — after the sweep, C is reset and NO stale A remains (Round 4 remediation §5)', async () => {
+    const A = row({ id: 'txn-a', amount: 500, date: '2026-09-10', role_source: 'account_pair_match' });
+    const B = row({ id: 'txn-b', amount: -500, date: '2026-09-10', role_source: 'account_pair_match' });
+    const C = row({ id: 'txn-c', amount: 500, date: '2026-09-15', role_source: 'account_pair_match' });
+    fakeAccountPairMatchStore([A, B, C]).install();
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-a': [B],
+        'txn-b': [A], // B's true best is A (same day) — C is 5 days away, never even offered here
+        'txn-c': [B],
+      })
+    );
+
+    const result = await repairExistingRelationalRoles('user-1');
+
+    expect(result.resolved.map((r) => r.id)).toEqual(['txn-c']);
+    // A and B were never touched — they remain correctly paired, not stale.
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalledWith('user-1', expect.arrayContaining(['txn-a']), expect.anything());
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalledWith('user-1', expect.arrayContaining(['txn-b']), expect.anything());
+  });
+
+  it('an override moving one leg away from internal_transfer invalidates the pair cleanly — the overridden leg is reset without even being queried', async () => {
+    const overridden = row({ id: 'txn-a', amount: 500, date: '2026-09-10', role_source: 'account_pair_match', user_role_override: 'expense' });
+    fakeAccountPairMatchStore([overridden]).install();
+
+    const result = await repairExistingRelationalRoles('user-1');
+
+    expect(mockFindTransferCounterpartCandidates).not.toHaveBeenCalled();
+    expect(result.resolved.map((r) => r.id)).toEqual(['txn-a']);
   });
 
   it('re-validates every refund_match row and resets one whose eligible original no longer exists (e.g. the original was deleted, or overridden away from expense)', async () => {
@@ -538,24 +814,25 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
     // is no "old vs new" to compare, only "this batch had a modification" — and the sweep must
     // still find and repair the now-orphaned counterpart.
     const orphanedCounterpart = row({ id: 'txn-b', amount: -500, date: '2026-09-01', role_source: 'account_pair_match' });
-    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) => {
-      if (roleSource === 'account_pair_match') return [orphanedCounterpart];
-      return [];
-    });
+    fakeAccountPairMatchStore([orphanedCounterpart]).install();
     mockFindTransferCounterpartCandidates.mockResolvedValue([]); // its old $500 partner is gone (now $300)
 
     const result = await repairExistingRelationalRoles('user-1');
 
-    expect(result.resolved.map((r) => r.id)).toContain('txn-b');
+    expect(result.resolved.map((r) => r.id)).toEqual(['txn-b']);
   });
 
   it('a page shorter than the page size stops pagination after one request (no unbounded/extra page fetch)', async () => {
-    const pageOne = [row({ id: 'txn-1', role_source: 'account_pair_match' })];
-    mockGetRelationallyClassifiedTransactionsPage.mockImplementation(async (_userId: string, roleSource: string) => {
-      if (roleSource === 'account_pair_match') return pageOne;
-      return [];
-    });
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-2', amount: -100 })]); // still valid, no reset
+    const pageOne = [row({ id: 'txn-1', amount: 100, date: '2026-09-10', role_source: 'account_pair_match' })];
+    fakeAccountPairMatchStore(pageOne).install();
+    // A reciprocally-valid pair (txn-1 <-> txn-2) — nothing gets reset, so the multi-pass loop
+    // correctly stops after its first (and only) stable pass, isolating pagination behavior.
+    mockFindTransferCounterpartCandidates.mockImplementation(
+      transferCandidatesByRowId({
+        'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-10' })],
+        'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+      })
+    );
 
     await repairExistingRelationalRoles('user-1');
 
@@ -566,7 +843,7 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
 
   it('a full page advances the cursor to the last row\'s id for the next page request', async () => {
     const fullPage = Array.from({ length: 200 }, (_, i) =>
-      row({ id: `txn-${String(i).padStart(3, '0')}`, role_source: 'account_pair_match' })
+      row({ id: `txn-${String(i).padStart(3, '0')}`, amount: 100, date: '2026-09-10', role_source: 'account_pair_match' })
     );
     mockGetRelationallyClassifiedTransactionsPage.mockImplementation(
       async (_userId: string, roleSource: string, _limit: number, afterId: string | null) => {
@@ -574,13 +851,44 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
         return afterId === null ? fullPage : [];
       }
     );
-    mockFindTransferCounterpartCandidates.mockResolvedValue([row({ id: 'txn-counterpart', amount: -100 })]);
+    // Every row in the page gets its own reciprocally-valid synthetic counterpart, so NOTHING in
+    // this page gets reset — isolating pagination-cursor behavior from the multi-pass
+    // reset-until-stable loop (Round 4 remediation §5), which would otherwise re-fetch and
+    // re-process the page repeatedly.
+    const candidatesById: Record<string, ReconciliationRow[]> = {};
+    for (const r of fullPage) {
+      const counterpart = row({ id: `counterpart-${r.id}`, amount: -100, date: '2026-09-10' });
+      candidatesById[r.id] = [counterpart];
+      candidatesById[counterpart.id] = [r];
+    }
+    mockFindTransferCounterpartCandidates.mockImplementation(transferCandidatesByRowId(candidatesById));
 
     await repairExistingRelationalRoles('user-1');
 
     const accountPairCalls = mockGetRelationallyClassifiedTransactionsPage.mock.calls.filter((c) => c[1] === 'account_pair_match');
     expect(accountPairCalls).toHaveLength(2);
     expect(accountPairCalls[1][3]).toBe('txn-199'); // resumes strictly after the previous page's last id
+  });
+
+  it('a SHRINKING predicate (every row in page 1 gets reset mid-page) never causes OFFSET-style skipping — page 2 is still fetched with the correct keyset cursor and its own row is still visited (Round 4 remediation §12)', async () => {
+    const page1Rows = Array.from({ length: 200 }, (_, i) =>
+      row({ id: `txn-${String(i).padStart(3, '0')}`, amount: 100, date: '2026-09-10', role_source: 'account_pair_match' })
+    );
+    const page2Row = row({ id: 'txn-200', amount: 500, date: '2026-09-10', role_source: 'account_pair_match' });
+    fakeAccountPairMatchStorePaginated([...page1Rows, page2Row]);
+    // Every row (both pages) has no candidates at all — everything gets reset, maximally
+    // shrinking the underlying `account_pair_match` set as the sweep proceeds.
+    mockFindTransferCounterpartCandidates.mockResolvedValue([]);
+
+    const result = await repairExistingRelationalRoles('user-1');
+
+    const accountPairCalls = mockGetRelationallyClassifiedTransactionsPage.mock.calls.filter((c) => c[1] === 'account_pair_match');
+    expect(accountPairCalls[0][3]).toBeNull(); // page 1: no cursor
+    expect(accountPairCalls[1][3]).toBe('txn-199'); // page 2: resumes after page 1's ORIGINAL last id, unaffected by mid-page resets
+    // Both page 1's 200 rows AND page 2's row were actually visited and reset.
+    expect(result.resolved.map((r) => r.id)).toContain('txn-000');
+    expect(result.resolved.map((r) => r.id)).toContain('txn-199');
+    expect(result.resolved.map((r) => r.id)).toContain('txn-200');
   });
 
   it('never scans beyond this user — every page request is scoped to the given userId', async () => {
@@ -603,6 +911,22 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
 
     expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
     expect(result.resolved.map((r) => r.id)).toContain('txn-stale');
+  });
+
+  it('is idempotent: calling the sweep again after it already reset a row makes no further change', async () => {
+    const staleRow = row({ id: 'txn-stale', amount: 100, date: '2026-09-10', role_source: 'account_pair_match' });
+    const store = fakeAccountPairMatchStore([staleRow]);
+    store.install();
+    mockFindTransferCounterpartCandidates.mockResolvedValue([]);
+
+    const first = await repairExistingRelationalRoles('user-1');
+    expect(first.resolved.map((r) => r.id)).toEqual(['txn-stale']);
+
+    mockApplyTransactionSemanticRoles.mockClear();
+    const second = await repairExistingRelationalRoles('user-1');
+
+    expect(second.resolved).toEqual([]);
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
   });
 });
 

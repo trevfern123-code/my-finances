@@ -174,30 +174,42 @@ export interface PageResult {
   nextCursor: BackfillPageCursor | null;
 }
 
+/** Per-user hypothetical-state pool, keyed by transaction id, that survives across MULTIPLE
+ *  `processPage` calls for the same dry run (Round 4 remediation §10) — `main` owns one of these
+ *  for the whole traversal and threads it through every page. Never populated/consulted in apply
+ *  mode: the DB already reflects every prior page's writes by the time reconciliation re-fetches
+ *  it there, so an accumulating in-memory pool would be redundant (and, over a large backfill,
+ *  needlessly growing) — see `processPage`'s own doc comment. */
+export type CumulativeDryRunPool = Map<string, Map<string, ReconciliationRow>>;
+
 /** Processes exactly one page of the keyset traversal: classifies rows that need it, then runs
  *  reconciliation over the WHOLE page's ids (grouped per user) regardless of which rows needed a
  *  fresh classification — a page whose evidence changed (a counterpart classified in the same
  *  page, for instance) still deserves a reconciliation attempt even for rows that didn't need
  *  their own row-level rewrite this run. `apply: false` performs the identical reads/ranking with
- *  no writes at all (see roleReconciliation.ts). */
+ *  no writes at all (see roleReconciliation.ts).
+ *
+ *  Round 3 remediation §7 / Round 4 remediation §10: in dry-run mode, `cumulativePool` supplies
+ *  (and accumulates) a hypothetical, freshly-computed-but-never-written classification per row
+ *  visited so far in THIS ENTIRE RUN, not just this one page — a truthful preview needs a
+ *  same-batch sibling's hypothetical state to survive page boundaries (leg A on page 1, leg B on
+ *  page 2 must still preview as a resolved pair), and needs an EARLIER page's resolved outcome
+ *  (a relational match, or a repair-sweep reset) to be visible to a LATER page's own candidate
+ *  search, not just its initial row-level classification. `main` owns one `cumulativePool` for
+ *  the whole traversal and passes it to every `processPage` call; omit it (or pass a fresh empty
+ *  map) to preview a single page in isolation, e.g. in a test. */
 export async function processPage(
   cursor: BackfillPageCursor | null,
   batchSize: number,
   apply: boolean,
   force: boolean,
-  targetVersion: number
+  targetVersion: number,
+  cumulativePool: CumulativeDryRunPool = new Map()
 ): Promise<PageResult> {
   const page = await dataService.getTransactionsBackfillPage(batchSize, cursor);
   const byRole: Record<string, number> = {};
   let classified = 0;
   const idsByUser = new Map<string, string[]>();
-  // Round 3 remediation §7: a hypothetical, freshly-computed-but-possibly-unwritten pool entry
-  // per row in this page, keyed by user — lets a truthful dry-run preview see a same-batch
-  // sibling's HYPOTHETICAL classification (its role_source, effective_role) rather than the
-  // stale/unclassified state still sitting in the DB, exactly matching what an --apply run of
-  // the same page would actually resolve. In apply mode this is redundant (the write already
-  // landed before reconcileRelationalRoles re-fetches from the DB) but harmless to pass anyway.
-  const poolByUser = new Map<string, ReconciliationRow[]>();
 
   for (const row of page) {
     let fields: { auto_role: ReturnType<typeof classifyRowLevel>['autoRole']; role_source: string; role_confidence: string; classifier_version: number } | null = null;
@@ -225,32 +237,60 @@ export async function processPage(
     existing.push(row.id);
     idsByUser.set(row.user_id, existing);
 
-    const autoRole = fields ? fields.auto_role : row.auto_role;
-    const poolRow: ReconciliationRow = {
-      id: row.id,
-      account_id: row.account_id,
-      amount: row.amount,
-      date: row.date,
-      name: row.name,
-      merchant_name: row.merchant_name,
-      category: row.category,
-      personal_finance_category_detailed: row.personal_finance_category_detailed,
-      personal_finance_category_confidence: row.personal_finance_category_confidence,
-      manual_loan_id: row.manual_loan_id,
-      auto_role: autoRole,
-      role_source: fields ? fields.role_source : row.role_source,
-      role_confidence: fields ? fields.role_confidence : null,
-      effective_role: row.user_role_override ?? autoRole,
-    };
-    const userPool = poolByUser.get(row.user_id) ?? [];
-    userPool.push(poolRow);
-    poolByUser.set(row.user_id, userPool);
+    // Round 4 remediation §11 (dry-run strictly zero-write): nothing below this line ever calls
+    // a mutation boundary — it only ever builds/updates the in-memory `cumulativePool`, and only
+    // when `!apply` (apply mode never touches or grows this map at all — see this function's own
+    // doc comment for why it would be redundant there).
+    if (!apply) {
+      const autoRole = fields ? fields.auto_role : row.auto_role;
+      const poolRow: ReconciliationRow = {
+        id: row.id,
+        account_id: row.account_id,
+        amount: row.amount,
+        date: row.date,
+        name: row.name,
+        merchant_name: row.merchant_name,
+        category: row.category,
+        personal_finance_category_detailed: row.personal_finance_category_detailed,
+        personal_finance_category_confidence: row.personal_finance_category_confidence,
+        manual_loan_id: row.manual_loan_id,
+        auto_role: autoRole,
+        role_source: fields ? fields.role_source : row.role_source,
+        role_confidence: fields ? fields.role_confidence : null,
+        effective_role: row.user_role_override ?? autoRole,
+        user_role_override: row.user_role_override,
+      };
+      const userPool = cumulativePool.get(row.user_id) ?? new Map<string, ReconciliationRow>();
+      userPool.set(row.id, poolRow);
+      cumulativePool.set(row.user_id, userPool);
+    }
   }
 
   let resolvedCount = 0;
   let unresolvedCount = 0;
   for (const [userId, ids] of idsByUser) {
-    const result = await reconcileRelationalRoles(userId, ids, apply, poolByUser.get(userId) ?? []);
+    const userPoolMap = apply ? undefined : cumulativePool.get(userId);
+    const pool = userPoolMap ? Array.from(userPoolMap.values()) : [];
+    const result = await reconcileRelationalRoles(userId, ids, apply, pool);
+
+    // Round 4 remediation §10: feed this page's relational outcome back into the cumulative pool
+    // so a LATER page's own candidate search sees the RESOLVED hypothetical state (e.g. now
+    // internal_transfer/refund) rather than the pre-resolution row-level snapshot recorded above.
+    if (userPoolMap) {
+      for (const outcome of result.resolved) {
+        const existing = userPoolMap.get(outcome.id);
+        if (existing) {
+          userPoolMap.set(outcome.id, {
+            ...existing,
+            auto_role: outcome.fields.auto_role,
+            role_source: outcome.fields.role_source,
+            role_confidence: outcome.fields.role_confidence,
+            effective_role: existing.user_role_override ?? outcome.fields.auto_role,
+          });
+        }
+      }
+    }
+
     resolvedCount += result.resolved.length;
     unresolvedCount += result.unresolved.length;
   }
@@ -285,6 +325,9 @@ export async function main(argv: string[]): Promise<number> {
   let totalResolved = 0;
   let totalUnresolved = 0;
   const totalByRole: Record<string, number> = {};
+  // Round 4 remediation §10: one cumulative hypothetical-state pool for the WHOLE traversal,
+  // threaded through every processPage call — see CumulativeDryRunPool's own doc comment.
+  const cumulativePool: CumulativeDryRunPool = new Map();
 
   for (;;) {
     if (interruptRequested) {
@@ -295,7 +338,7 @@ export async function main(argv: string[]): Promise<number> {
     pageNumber++;
     let result: PageResult;
     try {
-      result = await processPage(cursor, args.batchSize, args.apply, args.force, args.targetVersion);
+      result = await processPage(cursor, args.batchSize, args.apply, args.force, args.targetVersion, cumulativePool);
     } catch (err) {
       // Round 2 remediation §12: a failure here is NOT success — `cursor` has not been advanced
       // past this page, so rerunning (with the same --after-date/--after-id, or from scratch)

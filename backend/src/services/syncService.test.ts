@@ -171,12 +171,12 @@ describe('syncItemTransactions', () => {
       expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
     });
 
-    it('does NOT run the sweep for a pure-insert batch — a brand-new row can never invalidate an existing relational row', async () => {
+    it('DOES run the sweep for a pure-insert batch (Round 4 remediation §7) — a newly-inserted row can get auto-linked to a manual loan, and gating the sweep on our OWN insert/update dedup (rather than on Plaid\'s own added/modified/removed report) breaks retry: an already-linked row is no longer "inserted" on a retry, so a narrower gate would never re-trigger its repair', async () => {
       mockSyncTransactions.mockResolvedValue({ added: [{ transaction_id: 't1' }], modified: [], removed: [], cursor: 'new-cursor' });
 
       await syncItemTransactions(item);
 
-      expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
     });
 
     it('does NOT run the sweep when the batch is entirely empty', async () => {

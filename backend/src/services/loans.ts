@@ -1,7 +1,7 @@
 import type { CreditCardLiability, MortgageLiability, StudentLoan } from 'plaid';
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
-import { reconcileAfterRelationalStateChange } from './roleReconciliation';
+import { repairExistingRelationalRoles } from './roleReconciliation';
 import { summarizeErrorSafely } from './errorSanitizer';
 import type { InsertedTransaction } from '../types';
 
@@ -127,7 +127,12 @@ export function matchTransactionToLoan(
 /**
  * Best-effort by design (wrapped internally, not just by callers) — runs after every
  * transaction sync so newly-synced payments auto-link to the user's manual loans, but a failure
- * here shouldn't fail the sync it's piggybacking on.
+ * here shouldn't fail the sync it's piggybacking on. Per-transaction linking is the only thing
+ * wrapped in the try/catch below — the REPAIR SWEEP a new link could necessitate is deliberately
+ * NOT this function's responsibility (Round 4 remediation §7): syncService.ts runs it centrally,
+ * gated on Plaid's own `added` count rather than on whether THIS call linked anything, which is
+ * what makes the sweep retry-safe (see syncService.ts's own comment for why gating on this
+ * function's own success/failure/no-op breaks that).
  */
 export async function linkNewTransactionsToManualLoans(
   userId: string,
@@ -146,12 +151,6 @@ export async function linkNewTransactionsToManualLoans(
       const loanId = matchTransactionToLoan(txn, matchers);
       if (loanId) {
         await dataService.linkTransactionToLoan(txn.id, loanId, txn.amount);
-        // A brand-new transaction has no prior relational state to invalidate (it can't have
-        // been someone's transfer counterpart or refund original before it existed) — but this
-        // reuses the same bounded re-evaluation call as the other link paths below for
-        // consistency and to re-evaluate the row itself immediately rather than waiting for the
-        // batch's own forward pass (see roleReconciliation.ts).
-        await reconcileAfterRelationalStateChange(userId, txn.id);
       }
     }
   } catch (err) {
@@ -163,32 +162,33 @@ export async function linkNewTransactionsToManualLoans(
  * Scans a user's not-yet-linked outflow transactions for matches against one loan's match_text
  * — run after creating/updating a manual loan so setting or changing match_text picks up
  * payments that were already synced before the match rule existed, not just future ones.
+ *
+ * Round 4 remediation §7: the per-transaction LINK attempt is best-effort (caught individually —
+ * one bad match/link shouldn't block the rest), but the repair sweep at the end is NOT swallowed,
+ * and runs UNCONDITIONALLY — never gated on whether THIS invocation itself linked anything new.
+ * A retry after a prior successful link whose repair sweep then failed must still repair that
+ * already-linked transaction even though it's no longer an "unlinked" candidate this time; gating
+ * the sweep on `linkedAny` (or on `candidates.length > 0`) would silently defeat that retry, since
+ * the very thing that makes a retry necessary (a linked row) is also what removes it from
+ * `candidates` on the next attempt. The caller is expected to propagate a thrown failure here as
+ * an incomplete operation (see manualLoanController.ts), not swallow it.
  */
-export async function backfillMatchesForLoan(
-  userId: string,
-  loan: { id: string; match_text: string | null }
-): Promise<void> {
+export async function backfillMatchesForLoan(userId: string, loan: { id: string; match_text: string | null }): Promise<void> {
   if (!loan.match_text) return;
 
-  try {
-    const candidates = await dataService.getUnlinkedOutflowTransactionsForUser(userId);
-    const matcher = { id: loan.id, match_text: loan.match_text };
-    for (const txn of candidates) {
-      if (matchTransactionToLoan(txn, [matcher])) {
+  const candidates = await dataService.getUnlinkedOutflowTransactionsForUser(userId);
+  const matcher = { id: loan.id, match_text: loan.match_text };
+  for (const txn of candidates) {
+    if (matchTransactionToLoan(txn, [matcher])) {
+      try {
         await dataService.linkTransactionToLoan(txn.id, loan.id, txn.amount);
-        // This transaction may have previously been (or been paired/matched with) something
-        // relational — e.g. an ordinary expense that some refund had matched against, or an
-        // ambiguous-transfer-shaped row — before the user set this loan's match_text. Linking it
-        // now makes it a debt_payment, which can invalidate that old relationship (Round 3
-        // remediation §2/§3) — reconcileAfterRelationalStateChange's repair sweep finds and
-        // resets any such stale counterpart/dependent, bounded to the same fixed windows as
-        // ordinary reconciliation.
-        await reconcileAfterRelationalStateChange(userId, txn.id);
+      } catch (err) {
+        console.error(`Failed to link transaction ${txn.id} to manual loan ${loan.id}:`, err);
       }
     }
-  } catch (err) {
-    console.error(`Failed to backfill matches for manual loan ${loan.id}:`, err);
   }
+
+  await repairExistingRelationalRoles(userId);
 }
 
 /**

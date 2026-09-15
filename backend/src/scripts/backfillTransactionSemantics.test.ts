@@ -253,6 +253,88 @@ describe('processPage — classification', () => {
       expect(pool[0].effective_role).toBe('internal_transfer');
     });
   });
+
+  describe('cumulative dry-run pool across pages (Round 4 remediation §10)', () => {
+    it('a hypothetical row classified on page 1 is still visible in the pool passed to page 2 (a same-batch pair split across a page boundary)', async () => {
+      const cumulativePool = new Map();
+      mockGetTransactionsBackfillPage.mockResolvedValueOnce([
+        fakeRow({ id: 'txn-a', account_id: 'acc-1', amount: 100, date: '2026-01-01', category: 'TRANSFER_OUT' }),
+      ]);
+      await processPage(null, 1, false, false, 1, cumulativePool);
+
+      mockGetTransactionsBackfillPage.mockResolvedValueOnce([
+        fakeRow({ id: 'txn-b', account_id: 'acc-2', amount: -100, date: '2026-01-01', category: 'TRANSFER_IN' }),
+      ]);
+      await processPage({ date: '2026-01-01', id: 'txn-a' }, 1, false, false, 1, cumulativePool);
+
+      const secondCallPool = mockReconcileRelationalRoles.mock.calls[1][3] as { id: string }[];
+      expect(secondCallPool.map((p) => p.id).sort()).toEqual(['txn-a', 'txn-b']);
+    });
+
+    it("an earlier page's RESOLVED outcome (e.g. a relational match) updates the pool entry seen by a later page, not just its initial row-level classification", async () => {
+      const cumulativePool = new Map();
+      mockGetTransactionsBackfillPage.mockResolvedValueOnce([
+        fakeRow({ id: 'txn-a', account_id: 'acc-1', amount: 100, date: '2026-01-01', category: 'TRANSFER_OUT' }),
+      ]);
+      // Page 1's reconciliation call resolves txn-a into a confirmed internal_transfer pair.
+      mockReconcileRelationalRoles.mockResolvedValueOnce({
+        resolved: [{ id: 'txn-a', fields: { auto_role: 'internal_transfer', role_source: 'account_pair_match', role_confidence: 'high', classifier_version: 1 } }],
+        unresolved: [],
+      });
+      await processPage(null, 1, false, false, 1, cumulativePool);
+
+      mockGetTransactionsBackfillPage.mockResolvedValueOnce([fakeRow({ id: 'txn-c', amount: 5 })]);
+      mockReconcileRelationalRoles.mockResolvedValueOnce({ resolved: [], unresolved: [] });
+      await processPage({ date: '2026-01-01', id: 'txn-a' }, 1, false, false, 1, cumulativePool);
+
+      const secondCallPool = mockReconcileRelationalRoles.mock.calls[1][3] as { id: string; auto_role: string; role_source: string }[];
+      const txnA = secondCallPool.find((p) => p.id === 'txn-a');
+      expect(txnA).toMatchObject({ auto_role: 'internal_transfer', role_source: 'account_pair_match' });
+    });
+
+    it('apply mode never grows or consults the cumulative pool — every reconcileRelationalRoles call gets an empty pool array', async () => {
+      const cumulativePool = new Map();
+      mockGetTransactionsBackfillPage.mockResolvedValueOnce([fakeRow({ id: 'txn-a', auto_role: null })]);
+      await processPage(null, 1, true, false, 1, cumulativePool);
+
+      expect(cumulativePool.size).toBe(0);
+      expect(mockReconcileRelationalRoles.mock.calls[0][3]).toEqual([]);
+    });
+  });
+
+  describe('dry-run strictly zero-write (Round 4 remediation §11)', () => {
+    it('a multi-page dry run never calls applyTransactionSemanticRoles, even when rows would need classification or reconciliation reports resolved outcomes', async () => {
+      const cumulativePool = new Map();
+      mockGetTransactionsBackfillPage.mockResolvedValueOnce([
+        fakeRow({ id: 'txn-a', account_id: 'acc-1', amount: 100, date: '2026-01-01', category: 'TRANSFER_OUT', auto_role: null }),
+      ]);
+      mockReconcileRelationalRoles.mockResolvedValueOnce({
+        resolved: [{ id: 'txn-a', fields: { auto_role: 'internal_transfer', role_source: 'account_pair_match', role_confidence: 'high', classifier_version: 1 } }],
+        unresolved: [],
+      });
+      await processPage(null, 1, false, false, 1, cumulativePool);
+
+      mockGetTransactionsBackfillPage.mockResolvedValueOnce([fakeRow({ id: 'txn-b', amount: 5, auto_role: null })]);
+      mockReconcileRelationalRoles.mockResolvedValueOnce({ resolved: [], unresolved: [] });
+      await processPage({ date: '2026-01-01', id: 'txn-a' }, 1, false, false, 1, cumulativePool);
+
+      expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+    });
+
+    it('main() end-to-end: a dry run across multiple pages makes zero calls to applyTransactionSemanticRoles', async () => {
+      mockGetTransactionsBackfillPage
+        .mockResolvedValueOnce([
+          fakeRow({ id: 'a', date: '2026-01-01', auto_role: null }),
+          fakeRow({ id: 'b', date: '2026-01-02', auto_role: null }),
+        ])
+        .mockResolvedValueOnce([fakeRow({ id: 'c', date: '2026-01-03', auto_role: null })]); // partial page -> stop
+
+      const code = await main(['--batch-size', '2']);
+
+      expect(code).toBe(0);
+      expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('main — keyset traversal terminates correctly (Round 2 remediation §11)', () => {
@@ -329,6 +411,15 @@ describe('main — apply-mode failure and retry (Round 2 remediation §12)', () 
   it('a reconciliation failure during apply is reported as an incomplete run (nonzero), not success, and does not advance past the failed page', async () => {
     mockGetTransactionsBackfillPage.mockResolvedValue([fakeRow({ id: 'a', date: '2026-01-01' })]);
     mockReconcileRelationalRoles.mockRejectedValueOnce(new Error('transient failure'));
+
+    const code = await main(['--apply']);
+
+    expect(code).toBe(1);
+  });
+
+  it('an RPC integrity failure (applyTransactionSemanticRoles itself throwing) during the row-level write fails the page/run just like a reconciliation failure — the traversal never reports it as processed (Round 4 remediation §6)', async () => {
+    mockGetTransactionsBackfillPage.mockResolvedValue([fakeRow({ id: 'a', date: '2026-01-01', auto_role: null })]);
+    mockApplyTransactionSemanticRoles.mockRejectedValueOnce(new Error('apply_transaction_semantic_roles: ownership check failed'));
 
     const code = await main(['--apply']);
 

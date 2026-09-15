@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
 import { roundToCents } from './money';
 import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION, type SemanticRole } from './transactionClassifier';
-import { normalizePrincipalPortion, assertLinkedPaymentAmountIsCompatible } from './semanticEffects';
+import {
+  normalizePrincipalPortion,
+  normalizeNonNegativeMoneyAmount,
+  assertLinkedPaymentAmountIsCompatible,
+} from './semanticEffects';
 import {
   decryptAccessToken,
   encryptAccessToken,
@@ -1174,8 +1178,18 @@ export async function updateLinkedPaymentPrincipal(
 }
 
 /** Reverses a payment link — restores the loan's balance by the portion that had been applied
- *  and clears the link, e.g. to correct a false-positive text match. */
-export async function unlinkPaymentFromLoan(transactionId: string, loanId: string): Promise<void> {
+ *  and clears the link, e.g. to correct a false-positive text match.
+ *
+ *  Round 4 remediation §7: returns `true` if this call performed the actual unlink, or `false`
+ *  if the transaction was ALREADY unlinked (from this or a different loan) — an idempotent
+ *  no-op, not an error. This matters for retry safety: if a PRIOR call already persisted the
+ *  unlink but the caller's subsequent semantic-repair step then failed (see
+ *  manualLoanController.ts's `unlinkPayment`), a retry of the same request must be able to reach
+ *  the repair step again rather than failing here on a stale "still linked" precondition — the
+ *  request identifies the same transaction/loan relationship that was just removed, and that is
+ *  a completed, not a failed, unlink. Only a genuine mismatch (linked to a DIFFERENT loan than
+ *  the one named in the request, or the transaction not existing at all) is a real error. */
+export async function unlinkPaymentFromLoan(transactionId: string, loanId: string): Promise<boolean> {
   const { data: txn, error: fetchError } = await supabaseAdmin
     .from('transactions')
     .select(
@@ -1185,7 +1199,9 @@ export async function unlinkPaymentFromLoan(transactionId: string, loanId: strin
     .maybeSingle();
 
   if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
-  if (!txn || txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
+  if (!txn) throw new Error('Payment not found');
+  if (txn.manual_loan_id === null) return false; // already unlinked — idempotent no-op
+  if (txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
 
   const oldPortion = (txn.principal_portion as number | null) ?? 0;
 
@@ -1216,6 +1232,7 @@ export async function unlinkPaymentFromLoan(transactionId: string, loanId: strin
 
   if (updateError) throw new Error(`Failed to unlink payment: ${updateError.message}`);
   await adjustManualLoanBalance(loanId, oldPortion);
+  return true;
 }
 
 /** Sums how much principal and interest have been paid on each of the given loans, combining
@@ -1275,21 +1292,29 @@ export async function createManualLoanPayment(
   loanId: string,
   params: { date: string; principalPortion: number; interestPortion: number; notes: string | null }
 ): Promise<ManualLoanPaymentRow> {
+  // WRITE-boundary validation (Round 4 remediation §9) — BEFORE the insert and BEFORE any loan
+  // balance adjustment, so an invalid value can never partially persist or corrupt
+  // manual_loans.current_balance. A manual payment has no `amount` column to bound principal
+  // against (see normalizeNonNegativeMoneyAmount's own doc comment) — both portions are
+  // independently required to be finite and non-negative.
+  const normalizedPrincipal = normalizeNonNegativeMoneyAmount(params.principalPortion, 'principal_portion');
+  const normalizedInterest = normalizeNonNegativeMoneyAmount(params.interestPortion, 'interest_portion');
+
   const { data, error } = await supabaseAdmin
     .from('manual_loan_payments')
     .insert({
       user_id: userId,
       loan_id: loanId,
       date: params.date,
-      principal_portion: params.principalPortion,
-      interest_portion: params.interestPortion,
+      principal_portion: normalizedPrincipal,
+      interest_portion: normalizedInterest,
       notes: params.notes,
     })
     .select()
     .single();
 
   if (error) throw new Error(`Failed to create manual payment: ${error.message}`);
-  await adjustManualLoanBalance(loanId, -params.principalPortion);
+  await adjustManualLoanBalance(loanId, -normalizedPrincipal);
   return data as ManualLoanPaymentRow;
 }
 
@@ -1298,6 +1323,16 @@ export async function updateManualLoanPayment(
   loanId: string,
   fields: Partial<{ date: string; principal_portion: number; interest_portion: number; notes: string | null }>
 ): Promise<ManualLoanPaymentRow | null> {
+  // WRITE-boundary validation (Round 4 remediation §9) — validated BEFORE fetching/updating
+  // anything, so an invalid value never reaches the DB and never triggers a balance adjustment.
+  const normalizedFields = { ...fields };
+  if (normalizedFields.principal_portion !== undefined) {
+    normalizedFields.principal_portion = normalizeNonNegativeMoneyAmount(normalizedFields.principal_portion, 'principal_portion');
+  }
+  if (normalizedFields.interest_portion !== undefined) {
+    normalizedFields.interest_portion = normalizeNonNegativeMoneyAmount(normalizedFields.interest_portion, 'interest_portion');
+  }
+
   const { data: existing, error: fetchError } = await supabaseAdmin
     .from('manual_loan_payments')
     .select('principal_portion')
@@ -1310,7 +1345,7 @@ export async function updateManualLoanPayment(
 
   const { data, error } = await supabaseAdmin
     .from('manual_loan_payments')
-    .update(fields)
+    .update(normalizedFields)
     .eq('id', id)
     .eq('loan_id', loanId)
     .select()
@@ -1319,9 +1354,9 @@ export async function updateManualLoanPayment(
   if (error) throw new Error(`Failed to update manual payment: ${error.message}`);
   if (!data) return null;
 
-  if (fields.principal_portion !== undefined) {
+  if (normalizedFields.principal_portion !== undefined) {
     const oldPortion = existing.principal_portion as number;
-    await adjustManualLoanBalance(loanId, oldPortion - fields.principal_portion);
+    await adjustManualLoanBalance(loanId, oldPortion - normalizedFields.principal_portion);
   }
 
   return data as ManualLoanPaymentRow;
@@ -1811,10 +1846,15 @@ export interface ReconciliationRow {
   role_source: string | null;
   role_confidence: string | null;
   effective_role: string | null;
+  /** Round 4 remediation §3: needed to tell a genuinely un-overridden row apart from one whose
+   *  effective_role happens to already equal its auto_role — see roleReconciliation.ts's
+   *  `isEligibleTransferParticipant`, which must disqualify a row the user has explicitly
+   *  overridden away from `internal_transfer` from ever being auto-paired again. */
+  user_role_override: string | null;
 }
 
 const RECONCILIATION_ROW_COLUMNS =
-  'id, account_id, amount, date, name, merchant_name, category, personal_finance_category_detailed, personal_finance_category_confidence, manual_loan_id, auto_role, role_source, role_confidence, effective_role';
+  'id, account_id, amount, date, name, merchant_name, category, personal_finance_category_detailed, personal_finance_category_confidence, manual_loan_id, auto_role, role_source, role_confidence, effective_role, user_role_override';
 
 type ReconciliationRowWithJoin = ReconciliationRow & { accounts: unknown };
 
@@ -2001,6 +2041,20 @@ export async function getTransactionsBackfillPage(
   });
 }
 
+/** Thrown by `applyTransactionSemanticRoles` for ANY failure the RPC reports — an ownership
+ *  mismatch, a row-count mismatch, duplicate ids, a missing row, or a genuine infrastructure
+ *  error. Round 4 remediation §6: a prior version of this function converted the RPC's own
+ *  integrity failure (Postgres error code `P0001`) into a `false` return, which callers could
+ *  (and did) treat as an ordinary "not resolved" outcome — indistinguishable from candidate
+ *  ambiguity. That is wrong: candidate ambiguity is a legitimate semantic OUTCOME (no relational
+ *  evidence was strong enough to confirm a match) discovered BEFORE ever calling this function,
+ *  whereas a failure reported BY this function means the mutation we asked for did not happen at
+ *  all — ownership didn't check out, or the rows we thought we could see are gone. That is a hard
+ *  persistence-integrity failure, not a candidate-ranking outcome, and must abort the calling
+ *  sync/backfill operation (leaving its cursor/page unadvanced) exactly like any other
+ *  reconciliation failure — never be silently absorbed into a per-row "unresolved" result. */
+export class SemanticRoleMutationError extends Error {}
+
 /**
  * Applies a semantic-role mutation to one or two transactions atomically and ownership-safely
  * (Round 3 remediation §1) — the sole replacement for the old two-step "UPDATE ... WHERE id
@@ -2010,23 +2064,23 @@ export async function getTransactionsBackfillPage(
  *
  * Delegates the entire verify-then-write sequence to `apply_transaction_semantic_roles` (see the
  * Phase A migration), a single PostgreSQL function invocation — one implicit transaction — that
- * locks and counts the OWNED candidate rows before touching anything, verifies the count matches
- * `transactionIds` exactly, performs the update, and re-verifies the affected-row count
- * afterward, RAISING (and so rolling back everything the call did) on any mismatch. Pass a
- * one-element array for a single-row mutation, or a two-element array for an atomic transfer-pair
- * mutation — there is no partial state this call can leave durable.
+ * locks the OWNED candidate rows before touching anything, verifies the count matches
+ * `transactionIds` exactly, performs the update restricted to exactly that verified set, and
+ * re-verifies the affected-row count afterward, RAISING (and so rolling back everything the call
+ * did) on any mismatch. Pass a one-element array for a single-row mutation, or a two-element
+ * array for an atomic transfer-pair mutation — there is no partial state this call can leave
+ * durable.
  *
- * Returns `false` (never throws for this case) when the RPC's own integrity check failed — an
- * unowned id, a missing row, or a count mismatch (Postgres error code `P0001`, the default for an
- * unqualified `RAISE EXCEPTION`) — which callers must treat as "not resolved," exactly like the
- * old functions' `false`/short-array returns. Any OTHER error (a genuine infrastructure failure)
- * is thrown, not swallowed.
+ * Round 4 remediation §6: throws `SemanticRoleMutationError` for ANY error the RPC reports —
+ * ownership/count-mismatch integrity failures included, not just genuine infrastructure errors.
+ * See that error's own doc comment for why this must be a hard failure rather than a `false`
+ * return callers could mistake for ordinary candidate ambiguity.
  */
 export async function applyTransactionSemanticRoles(
   userId: string,
   transactionIds: string[],
   fields: { auto_role: SemanticRole; role_source: string; role_confidence: string; classifier_version: number }
-): Promise<boolean> {
+): Promise<void> {
   const { error } = await supabaseAdmin.rpc('apply_transaction_semantic_roles', {
     p_user_id: userId,
     p_transaction_ids: transactionIds,
@@ -2036,10 +2090,8 @@ export async function applyTransactionSemanticRoles(
     p_classifier_version: fields.classifier_version,
   });
   if (error) {
-    if (error.code === 'P0001') return false;
-    throw new Error(`Failed to apply transaction semantic roles: ${error.message}`);
+    throw new SemanticRoleMutationError(`Failed to apply transaction semantic roles: ${error.message}`);
   }
-  return true;
 }
 
 /**

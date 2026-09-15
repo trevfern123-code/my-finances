@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AccountBase, RemovedTransaction, Transaction as PlaidTransaction } from 'plaid';
 import { createQueryBuilder } from '../testUtils/supabaseMock';
+import { InvalidPrincipalPortionError } from './semanticEffects';
 import {
   upsertAccountsForItem,
   applyTransactionChanges,
@@ -35,6 +36,7 @@ import {
   findRefundOriginalCandidates,
   findNegativeCandidatesReferencingOriginal,
   applyTransactionSemanticRoles,
+  SemanticRoleMutationError,
   getRelationallyClassifiedTransactionsPage,
   getTransactionsBackfillPage,
 } from './dataService';
@@ -1292,6 +1294,51 @@ describe('unlinkPaymentFromLoan', () => {
     });
     expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 1000 });
   });
+
+  it('returns true when it performed the actual unlink', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { principal_portion: 200, manual_loan_id: 'loan-1', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      error: null,
+    });
+    const updateTxnQuery = createQueryBuilder({ data: null, error: null });
+    const balanceQuery = createQueryBuilder({ data: { current_balance: 800 }, error: null });
+    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(fetchQuery).mockReturnValueOnce(updateTxnQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+
+    const result = await unlinkPaymentFromLoan('txn-1', 'loan-1');
+
+    expect(result).toBe(true);
+  });
+
+  it('is idempotent: returns false (not an error) when the transaction is ALREADY unlinked, and performs no write at all (Round 4 remediation §7)', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { principal_portion: null, manual_loan_id: null, amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    const result = await unlinkPaymentFromLoan('txn-1', 'loan-1');
+
+    expect(result).toBe(false);
+    expect(mockFrom).toHaveBeenCalledTimes(1); // only the read — no update, no balance adjustment
+  });
+
+  it('still throws for a genuine mismatch — linked to a DIFFERENT loan than the one named in the request', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { principal_portion: 200, manual_loan_id: 'loan-OTHER', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    await expect(unlinkPaymentFromLoan('txn-1', 'loan-1')).rejects.toThrow('Payment is not linked to this loan');
+  });
+
+  it('throws when the transaction does not exist at all', async () => {
+    const fetchQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    await expect(unlinkPaymentFromLoan('txn-missing', 'loan-1')).rejects.toThrow('Payment not found');
+  });
 });
 
 describe('getLifetimeTotalsByLoanId', () => {
@@ -1352,6 +1399,32 @@ describe('createManualLoanPayment', () => {
     });
     expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 700 });
   });
+
+  describe('write-boundary validation (Round 4 remediation §9) — a manual payment has no `amount` to bound against, so only finite/non-negative is required', () => {
+    it.each([
+      ['negative principal_portion', { principalPortion: -50, interestPortion: 10 }],
+      ['NaN principal_portion', { principalPortion: NaN, interestPortion: 10 }],
+      ['non-finite principal_portion', { principalPortion: Infinity, interestPortion: 10 }],
+      ['negative interest_portion', { principalPortion: 50, interestPortion: -10 }],
+      ['NaN interest_portion', { principalPortion: 50, interestPortion: NaN }],
+    ])('rejects %s and never touches the DB or the loan balance', async (_label, overrides) => {
+      await expect(
+        createManualLoanPayment('user-1', 'loan-1', { date: '2026-08-01', notes: null, ...overrides })
+      ).rejects.toThrow(InvalidPrincipalPortionError);
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
+    it('accepts a zero principal_portion (an all-interest payment)', async () => {
+      const insertQuery = createQueryBuilder({ data: { id: 'payment-1', principal_portion: 0, interest_portion: 50 }, error: null });
+      const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
+      const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
+      mockFrom.mockReturnValueOnce(insertQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+
+      await expect(
+        createManualLoanPayment('user-1', 'loan-1', { date: '2026-08-01', principalPortion: 0, interestPortion: 50, notes: null })
+      ).resolves.toBeDefined();
+    });
+  });
 });
 
 describe('updateManualLoanPayment', () => {
@@ -1391,6 +1464,18 @@ describe('updateManualLoanPayment', () => {
     await updateManualLoanPayment('payment-1', 'loan-1', { notes: 'Updated note' });
 
     expect(mockFrom).toHaveBeenCalledTimes(2);
+  });
+
+  describe('write-boundary validation (Round 4 remediation §9)', () => {
+    it.each([
+      ['negative principal_portion', { principal_portion: -50 }],
+      ['NaN principal_portion', { principal_portion: NaN }],
+      ['negative interest_portion', { interest_portion: -10 }],
+      ['non-finite interest_portion', { interest_portion: Infinity }],
+    ])('rejects %s BEFORE fetching/updating anything, or adjusting the balance', async (_label, fields) => {
+      await expect(updateManualLoanPayment('payment-1', 'loan-1', fields)).rejects.toThrow(InvalidPrincipalPortionError);
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -1840,7 +1925,7 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
     expect(query.eq).toHaveBeenCalledWith('role_source', 'refund_match');
   });
 
-  describe('applyTransactionSemanticRoles — atomic, ownership-safe RPC mutation (Round 3 remediation §1)', () => {
+  describe('applyTransactionSemanticRoles — atomic, ownership-safe RPC mutation (Round 3 remediation §1, hard-failure contract in Round 4 remediation §6)', () => {
     beforeEach(() => {
       mockRpc.mockReset();
     });
@@ -1848,12 +1933,14 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
     it('invokes the RPC with the exact expected parameter shape for a single-row mutation', async () => {
       mockRpc.mockResolvedValueOnce({ data: null, error: null });
 
-      const result = await applyTransactionSemanticRoles('user-1', ['txn-1'], {
-        auto_role: 'refund',
-        role_source: 'refund_match',
-        role_confidence: 'high',
-        classifier_version: 1,
-      });
+      await expect(
+        applyTransactionSemanticRoles('user-1', ['txn-1'], {
+          auto_role: 'refund',
+          role_source: 'refund_match',
+          role_confidence: 'high',
+          classifier_version: 1,
+        })
+      ).resolves.toBeUndefined();
 
       expect(mockRpc).toHaveBeenCalledWith('apply_transaction_semantic_roles', {
         p_user_id: 'user-1',
@@ -1863,7 +1950,6 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
         p_role_confidence: 'high',
         p_classifier_version: 1,
       });
-      expect(result).toBe(true);
     });
 
     it('invokes the RPC with both ids for a transfer-pair mutation, one call, never two', async () => {
@@ -1883,39 +1969,39 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
       );
     });
 
-    it('returns false (never throws) when the RPC raises its own integrity error (SQLSTATE P0001) — an unowned id, a missing row, or a count mismatch inside the atomic function', async () => {
+    it('THROWS SemanticRoleMutationError (never resolves, never returns a boolean) when the RPC raises its own integrity error (SQLSTATE P0001) — an unowned id, a missing row, or a count mismatch inside the atomic function (Round 4 remediation §6)', async () => {
       mockRpc.mockResolvedValueOnce({
         data: null,
         error: { code: 'P0001', message: 'apply_transaction_semantic_roles: ownership check failed' },
       });
 
-      const result = await applyTransactionSemanticRoles('user-A', ['txn-owned-by-user-B'], {
-        auto_role: 'expense',
-        role_source: 'sign_default',
-        role_confidence: 'low',
-        classifier_version: 1,
-      });
-
-      expect(result).toBe(false);
+      await expect(
+        applyTransactionSemanticRoles('user-A', ['txn-owned-by-user-B'], {
+          auto_role: 'expense',
+          role_source: 'sign_default',
+          role_confidence: 'low',
+          classifier_version: 1,
+        })
+      ).rejects.toThrow(SemanticRoleMutationError);
     });
 
-    it('a mismatched-pair failure (only one of two intended transfer-pair ids resolves) is treated identically to a single-row ownership failure — false, not partial success', async () => {
+    it('a mismatched-pair failure (only one of two intended transfer-pair ids resolves) THROWS identically to a single-row ownership failure — never a partial success', async () => {
       mockRpc.mockResolvedValueOnce({
         data: null,
         error: { code: 'P0001', message: 'apply_transaction_semantic_roles: ownership check failed (expected 2 owned rows, found 1)' },
       });
 
-      const result = await applyTransactionSemanticRoles('user-1', ['txn-1', 'txn-missing'], {
-        auto_role: 'internal_transfer',
-        role_source: 'account_pair_match',
-        role_confidence: 'high',
-        classifier_version: 1,
-      });
-
-      expect(result).toBe(false);
+      await expect(
+        applyTransactionSemanticRoles('user-1', ['txn-1', 'txn-missing'], {
+          auto_role: 'internal_transfer',
+          role_source: 'account_pair_match',
+          role_confidence: 'high',
+          classifier_version: 1,
+        })
+      ).rejects.toThrow(SemanticRoleMutationError);
     });
 
-    it('rethrows a genuine infrastructure error rather than treating it as an ownership failure', async () => {
+    it('a genuine infrastructure error is ALSO thrown as SemanticRoleMutationError — every RPC error is now a hard failure, none silently absorbed', async () => {
       mockRpc.mockResolvedValueOnce({ data: null, error: { code: '08000', message: 'connection failure' } });
 
       await expect(
