@@ -129,13 +129,18 @@ describe('syncItemTransactions', () => {
     expect(mockSetItemStatus).toHaveBeenCalledWith('item-row-1', 'active');
   });
 
-  it('links newly-inserted transactions to the user\'s manual loans', async () => {
-    const insertedTransactions = [{ id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 }];
-    mockApplyTransactionChanges.mockResolvedValue({ insertedTransactions, touchedTransactionIds: ['txn-1'] });
+  it("passes Plaid's own added+modified transaction ids to linkNewTransactionsToManualLoans (Round 6 remediation, blocker 5) — not our own insertedTransactions dedup, which changes between sync attempts", async () => {
+    const added = [{ transaction_id: 'plaid-txn-1' }];
+    const modified = [{ transaction_id: 'plaid-txn-2' }];
+    mockSyncTransactions.mockResolvedValue({ added, modified, removed: [], cursor: 'new-cursor' });
+    mockApplyTransactionChanges.mockResolvedValue({
+      insertedTransactions: [{ id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 }],
+      touchedTransactionIds: ['txn-1'],
+    });
 
     await syncItemTransactions(item);
 
-    expect(mockLinkNewTransactionsToManualLoans).toHaveBeenCalledWith('user-1', insertedTransactions);
+    expect(mockLinkNewTransactionsToManualLoans).toHaveBeenCalledWith('user-1', ['plaid-txn-1', 'plaid-txn-2']);
   });
 
   it('runs relational role reconciliation over exactly the transactions touched by this batch, after loan auto-linking', async () => {

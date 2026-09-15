@@ -124,8 +124,8 @@ describe('processPage — classification', () => {
 
     // Only the two rows lacking auto_role actually get written.
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(2);
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-a', ['txn-1'], expect.any(Object));
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-b', ['txn-3'], expect.any(Object));
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-a', ['txn-1'], expect.any(Array), expect.any(Object));
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-b', ['txn-3'], expect.any(Array), expect.any(Object));
     // Reconciliation runs per user over the FULL page's ids for that user, including the
     // already-classified txn-2 — a page's evidence can still matter even for rows that didn't
     // need a fresh row-level write this run.
@@ -176,7 +176,7 @@ describe('processPage — classification', () => {
     const result = await processPage(null, 500, true, false, 1);
 
     expect(result.byRole).toEqual({ debt_payment: 1 });
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-1'], {
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-1'], expect.any(Array), {
       auto_role: 'debt_payment',
       role_source: 'manual_loan_link',
       role_confidence: 'high',
@@ -187,7 +187,7 @@ describe('processPage — classification', () => {
   it('never touches category_mappings/transaction_splits/manual_loans/principal_portion/user_role_override — only ever writes the four role fields', async () => {
     mockGetTransactionsBackfillPage.mockResolvedValue([fakeRow()]);
     await processPage(null, 500, true, false, 1);
-    const written = mockApplyTransactionSemanticRoles.mock.calls[0][2];
+    const written = mockApplyTransactionSemanticRoles.mock.calls[0][3];
     expect(Object.keys(written).sort()).toEqual(['auto_role', 'classifier_version', 'role_confidence', 'role_source'].sort());
   });
 

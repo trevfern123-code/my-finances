@@ -148,6 +148,7 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-1', 'txn-2'],
+      expect.anything(),
       expect.objectContaining({ auto_role: 'internal_transfer', role_confidence: 'high' })
     );
     expect(result.resolved).toHaveLength(2);
@@ -168,6 +169,7 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       expect.anything(),
+      expect.anything(),
       expect.objectContaining({ role_confidence: 'medium' })
     );
   });
@@ -187,6 +189,7 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-1', 'txn-near'],
+      expect.anything(),
       expect.objectContaining({ role_confidence: 'high' })
     );
   });
@@ -294,7 +297,7 @@ describe('reconcileRelationalRoles — reciprocal one-to-one transfer matching (
     expect(result.unresolved).toEqual([{ id: 'txn-c', reason: 'no_transfer_evidence' }]);
     // B is never mutated twice, and never reused for a second pair.
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1);
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-a', 'txn-b'], expect.anything());
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-a', 'txn-b'], expect.anything(), expect.anything());
   });
 
   it('A/B/C tied ambiguity: B is EQUIDISTANT from A and C — none of the three relationships are confirmed', async () => {
@@ -496,7 +499,7 @@ describe('reconcileRelationalRoles — refunds', () => {
 
     await reconcileRelationalRoles('user-1', ['txn-refund']);
 
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-refund'], {
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-refund'], ['sign_default'], {
       auto_role: 'refund',
       role_source: 'refund_match',
       role_confidence: 'high',
@@ -514,6 +517,7 @@ describe('reconcileRelationalRoles — refunds', () => {
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-refund'],
+      expect.anything(),
       expect.objectContaining({ auto_role: 'refund', role_confidence: 'medium' })
     );
   });
@@ -531,6 +535,7 @@ describe('reconcileRelationalRoles — refunds', () => {
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-refund'],
+      expect.anything(),
       expect.objectContaining({ role_confidence: 'high' })
     );
   });
@@ -577,7 +582,12 @@ describe('reconcileRelationalRoles — refunds', () => {
 
     await reconcileRelationalRoles('user-1', ['txn-orig', 'txn-refund']);
 
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-refund'], expect.objectContaining({ auto_role: 'refund' }));
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
+      'user-1',
+      ['txn-refund'],
+      expect.anything(),
+      expect.objectContaining({ auto_role: 'refund' })
+    );
   });
 
   it('the purchase syncs AFTER its own refund — a freshly-touched positive expense resolves a dangling older sign_default refund candidate', async () => {
@@ -595,14 +605,14 @@ describe('reconcileRelationalRoles — refunds', () => {
       expect.any(String),
       'sign_default'
     );
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-refund'], {
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-refund'], ['sign_default'], {
       auto_role: 'refund',
       role_source: 'refund_match',
       role_confidence: 'high',
       classifier_version: 1,
     });
     // The purchase row's own fields are never touched by this direction.
-    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalledWith('user-1', ['txn-orig'], expect.anything());
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalledWith('user-1', ['txn-orig'], expect.anything(), expect.anything());
   });
 
   it('a positive expense with no dangling refund candidate causes no update at all', async () => {
@@ -809,6 +819,7 @@ describe('reconcileRelationalRoles — dry-run hypothetical-state pool (Round 3 
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-1', 'txn-2'],
+      expect.anything(),
       expect.objectContaining({ auto_role: 'internal_transfer' })
     );
   });
@@ -828,7 +839,7 @@ describe('user_role_override is never WRITTEN by this module (it IS read, for tr
 
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1); // sanity: the loop below isn't vacuous
     for (const call of mockApplyTransactionSemanticRoles.mock.calls) {
-      const fields = call[2] as object;
+      const fields = call[3] as object;
       expect(Object.keys(fields).sort()).toEqual(['auto_role', 'classifier_version', 'role_confidence', 'role_source'].sort());
     }
   });
@@ -855,6 +866,7 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-stale'],
+      ['account_pair_match'],
       expect.objectContaining({ role_source: 'transfer_like_unconfirmed' }) // fresh row-level classification
     );
     expect(result.resolved.map((r) => r.id)).toEqual(['txn-stale']);
@@ -924,8 +936,8 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
 
     expect(result.resolved.map((r) => r.id)).toEqual(['txn-c']);
     // A and B were never touched — they remain correctly paired, not stale.
-    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalledWith('user-1', expect.arrayContaining(['txn-a']), expect.anything());
-    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalledWith('user-1', expect.arrayContaining(['txn-b']), expect.anything());
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalledWith('user-1', expect.arrayContaining(['txn-a']), expect.anything(), expect.anything());
+    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalledWith('user-1', expect.arrayContaining(['txn-b']), expect.anything(), expect.anything());
   });
 
   it('an override moving one leg away from internal_transfer invalidates the pair cleanly — the overridden leg is reset without even being queried', async () => {
@@ -951,6 +963,7 @@ describe('repairExistingRelationalRoles — sweep-based retry-safe repair (Round
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-refund'],
+      ['refund_match'],
       expect.objectContaining({ role_source: expect.not.stringMatching('refund_match') })
     );
     expect(result.resolved.map((r) => r.id)).toContain('txn-refund');
@@ -1130,6 +1143,7 @@ describe('reconcileAfterRelationalStateChange — replaces Round 2\'s reconcileA
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-counterpart'],
+      ['account_pair_match'],
       expect.not.objectContaining({ role_source: 'account_pair_match' })
     );
   });
@@ -1147,6 +1161,7 @@ describe('reconcileAfterRelationalStateChange — replaces Round 2\'s reconcileA
     expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
       'user-1',
       ['txn-unlinked'],
+      expect.anything(),
       expect.objectContaining({ auto_role: 'refund' })
     );
     expect(result.resolved.some((r) => r.id === 'txn-unlinked' && r.fields.auto_role === 'refund')).toBe(true);

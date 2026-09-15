@@ -19,8 +19,10 @@ import { summarizeErrorSafely } from './errorSanitizer';
  * delivery for this item — naturally re-requests and reprocesses this exact batch from Plaid,
  * with no new retry machinery needed: `applyTransactionChanges` already upserts by
  * `plaid_transaction_id` (a retry updates the same rows rather than duplicating them), and
- * `linkNewTransactionsToManualLoans` is a no-op on a retry (the rows are no longer new inserts,
- * so it does no work) — the retry is safe purely because both of those were already idempotent.
+ * `linkNewTransactionsToManualLoans` re-derives its candidates from Plaid's own `added` ids fresh
+ * on every attempt (Round 6 remediation, blocker 5) rather than from our own insert/update
+ * classification, so a link that failed in an earlier attempt is retried rather than silently
+ * skipped once the row is no longer a "new insert."
  * A reconciliation failure here is intentionally NOT caught — it propagates to the caller (the
  * manual-sync endpoint surfaces it as a failed, retryable request; the webhook receiver logs it
  * and lets the next natural webhook/manual sync for this item retry, per its own existing
@@ -38,7 +40,7 @@ export async function syncItemTransactions(item: {
   );
 
   const accountIdByPlaidId = await dataService.getAccountIdMapForItem(item.id);
-  const { insertedTransactions, touchedTransactionIds } = await dataService.applyTransactionChanges({
+  const { touchedTransactionIds } = await dataService.applyTransactionChanges({
     userId: item.user_id,
     added,
     modified,
@@ -48,14 +50,19 @@ export async function syncItemTransactions(item: {
   await dataService.setItemStatus(item.id, 'active');
 
   // Best-effort (wrapped internally by linkNewTransactionsToManualLoans) — auto-linking loan
-  // payments shouldn't fail the sync that triggered it, and per-transaction linking is naturally
-  // idempotent on a retry (a row already linked from a prior attempt is no longer a fresh insert,
-  // so re-linking it does no work). The REPAIR SWEEP this auto-linking could necessitate is
+  // payments shouldn't fail the sync that triggered it. Candidates are re-derived from Plaid's own
+  // `added` ids (Round 6 remediation, blocker 5), not from `insertedTransactions` — a link that
+  // fails in one attempt is retried on the next, since Plaid keeps reporting the same `added`
+  // composition for an unadvanced cursor even though our OWN insert/update classification of the
+  // same rows changes between attempts. The REPAIR SWEEP this auto-linking could necessitate is
   // deliberately NOT this function's responsibility (see the `added.length > 0` branch below) —
   // Round 4 remediation §7 found that gating the sweep on "did THIS invocation itself create a
   // new link" breaks retry: once a link from attempt 1 persists, the linked transaction is no
   // longer a fresh insert on a retry, so nothing would ever re-trigger its repair.
-  await loansService.linkNewTransactionsToManualLoans(item.user_id, insertedTransactions);
+  await loansService.linkNewTransactionsToManualLoans(
+    item.user_id,
+    [...added, ...modified].map((t) => t.transaction_id)
+  );
 
   // Financial Semantics Foundation Phase A, stage 2 (see roleReconciliation.ts's own doc
   // comment) — deliberately NOT wrapped in try/catch (see this function's own doc comment for

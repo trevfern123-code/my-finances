@@ -134,9 +134,23 @@ alter table public.transactions
 -- this check and the UPDATE could otherwise change ownership out from under an already-"verified"
 -- row. No current application code path reparents those relationships, but locking the whole
 -- ownership chain removes the assumption entirely rather than relying on it never happening.
+--
+-- Round 6 remediation (blocker 3, completing the mitigation): the advisory lock above prevents
+-- two concurrent WRITES for the same user from interleaving with each other, but it does nothing
+-- about a write that was DECIDED (candidate ranked, pair confirmed) against a READ that happened
+-- moments earlier, outside any lock, in the application layer — by the time this function
+-- actually runs, a different concurrent operation could already have changed the very rows this
+-- call is about to write over. `p_expected_role_sources` (parallel to `p_transaction_ids`, same
+-- length and order) closes that gap with an explicit compare-and-swap: the caller passes the
+-- role_source each row was observed to have AT THE MOMENT candidate selection decided to write
+-- it, and this function verifies every owned row's CURRENT role_source still matches before
+-- writing anything. A mismatch means the semantic state this call's decision was based on is
+-- already stale — RAISE and roll back, exactly like any other integrity failure, rather than
+-- commit a decision made from data that's no longer true.
 create or replace function public.apply_transaction_semantic_roles(
   p_user_id uuid,
   p_transaction_ids uuid[],
+  p_expected_role_sources text[],
   p_auto_role text,
   p_role_source text,
   p_role_confidence text,
@@ -152,6 +166,7 @@ declare
   v_owned_ids uuid[];
   v_owned_count integer;
   v_updated_count integer;
+  v_stale_count integer;
 begin
   -- Serialize concurrent semantic writers for this user (see this function's own comment above)
   -- before reading anything — every subsequent step in this call sees a consistent view no other
@@ -161,6 +176,11 @@ begin
   v_input_count := coalesce(array_length(p_transaction_ids, 1), 0);
   if v_input_count = 0 then
     raise exception 'apply_transaction_semantic_roles: no transaction ids supplied';
+  end if;
+
+  if coalesce(array_length(p_expected_role_sources, 1), 0) is distinct from v_input_count then
+    raise exception 'apply_transaction_semantic_roles: expected_role_sources length (%) must match transaction_ids length (%)',
+      coalesce(array_length(p_expected_role_sources, 1), 0), v_input_count;
   end if;
 
   -- Reject duplicate ids outright — otherwise a caller passing e.g. [X, X] could satisfy a naive
@@ -195,6 +215,21 @@ begin
       v_input_count, v_owned_count;
   end if;
 
+  -- Compare-and-swap check (Round 6 remediation, blocker 3): every owned row's CURRENT
+  -- role_source, now locked, must still match what the caller expected when it decided to write
+  -- this mutation. Multi-argument unnest() pairs the two arrays strictly by position (the array
+  -- length check above already guarantees they're the same length, so there's no padding/
+  -- misalignment risk) — this is a positional pairing, not a join that could reorder anything.
+  select count(*) into v_stale_count
+  from unnest(p_transaction_ids, p_expected_role_sources) as expected(id, role_source)
+  join public.transactions t on t.id = expected.id
+  where t.role_source is distinct from expected.role_source;
+
+  if v_stale_count > 0 then
+    raise exception 'apply_transaction_semantic_roles: % row(s) no longer have the expected role_source — a concurrent modification changed the semantic state this decision was based on',
+      v_stale_count;
+  end if;
+
   -- Restricted to v_owned_ids (the exact set just locked and verified above) rather than
   -- re-derived via a second ownership join — there is no window in which "the rows this UPDATE
   -- touches" could differ from "the rows we just proved are owned and holding a row lock".
@@ -227,7 +262,433 @@ $$;
 -- user attempt (and have rejected, but still attempt) an arbitrary semantic-role mutation via a
 -- direct RPC call. Explicitly revoking from anon and authenticated (in addition to PUBLIC) closes
 -- that gap; only service_role — the backend's own connection — may ever execute this function.
-revoke execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text, text, text, smallint) from public;
-revoke execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text, text, text, smallint) from anon;
-revoke execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text, text, text, smallint) from authenticated;
-grant execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text, text, text, smallint) to service_role;
+revoke execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text[], text, text, text, smallint) from public;
+revoke execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text[], text, text, text, smallint) from anon;
+revoke execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text[], text, text, text, smallint) from authenticated;
+grant execute on function public.apply_transaction_semantic_roles(uuid, uuid[], text[], text, text, text, smallint) to service_role;
+
+-- Round 6 remediation (blocker 4): every manual-loan-balance-affecting mutation below was
+-- previously two separate requests — one write to the linked row (a transaction or a manual
+-- payment), one write to manual_loans.current_balance — with no way to make them succeed or fail
+-- together. A failure between the two (network blip, process restart, a concurrent request) could
+-- durably split them: the link/payment persists but the balance never moves, or vice versa, and a
+-- retry of the ORIGINAL request could then double-apply or skip the delta entirely, since the
+-- retry re-reads whatever half-applied state was left behind. Each function below performs its
+-- row mutation AND its balance adjustment inside one PL/pgSQL function invocation — one implicit
+-- Postgres transaction — so there is no window in which one could persist without the other.
+--
+-- All follow the same shape already established by apply_transaction_semantic_roles: a per-user
+-- pg_advisory_xact_lock taken first (serializing every semantic/balance-affecting write for one
+-- user against every other, across ALL of these functions AND apply_transaction_semantic_roles —
+-- they share the same lock key), explicit ownership verification with FOR UPDATE row locks on
+-- every row touched (transactions via its accounts/plaid_items chain, manual_loans and
+-- manual_loan_payments directly), and RAISE EXCEPTION (rolling back the whole call) on any
+-- integrity failure. security invoker, empty search_path, and public-qualified identifiers
+-- throughout, exactly as audited for apply_transaction_semantic_roles above — same rationale, not
+-- repeated per function.
+
+-- Atomically links a transaction to a manual loan and decrements the loan's balance by
+-- principal_portion. Replaces dataService.ts's old two-step linkTransactionToLoan (an UPDATE to
+-- transactions, then a separate read-modify-write to manual_loans.current_balance).
+create or replace function public.link_transaction_to_manual_loan(
+  p_user_id uuid,
+  p_transaction_id uuid,
+  p_loan_id uuid,
+  p_principal_portion numeric,
+  p_classifier_version smallint
+) returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_amount numeric;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  select t.amount into v_amount
+  from public.transactions t
+  join public.accounts a on a.id = t.account_id
+  join public.plaid_items pi on pi.id = a.item_id
+  where t.id = p_transaction_id
+    and pi.user_id = p_user_id
+  for update of t, a, pi;
+
+  if not found then
+    raise exception 'link_transaction_to_manual_loan: transaction not found or not owned by user';
+  end if;
+
+  if p_principal_portion is null or p_principal_portion < 0 or p_principal_portion > v_amount then
+    raise exception 'link_transaction_to_manual_loan: principal_portion (%) must be between 0 and the transaction amount (%)',
+      p_principal_portion, v_amount;
+  end if;
+
+  perform 1 from public.manual_loans where id = p_loan_id and user_id = p_user_id for update;
+  if not found then
+    raise exception 'link_transaction_to_manual_loan: manual loan not found or not owned by user';
+  end if;
+
+  update public.transactions
+  set manual_loan_id = p_loan_id,
+      principal_portion = p_principal_portion,
+      auto_role = 'debt_payment',
+      role_source = 'manual_loan_link',
+      role_confidence = 'high',
+      classifier_version = p_classifier_version
+  where id = p_transaction_id;
+
+  update public.manual_loans
+  set current_balance = greatest(0, round((current_balance - p_principal_portion)::numeric, 2)),
+      updated_at = now()
+  where id = p_loan_id;
+end;
+$$;
+
+revoke execute on function public.link_transaction_to_manual_loan(uuid, uuid, uuid, numeric, smallint) from public;
+revoke execute on function public.link_transaction_to_manual_loan(uuid, uuid, uuid, numeric, smallint) from anon;
+revoke execute on function public.link_transaction_to_manual_loan(uuid, uuid, uuid, numeric, smallint) from authenticated;
+grant execute on function public.link_transaction_to_manual_loan(uuid, uuid, uuid, numeric, smallint) to service_role;
+
+-- Atomically reverses a payment link, restoring the loan's balance and reclassifying the
+-- transaction. Idempotent (Round 5 remediation §7): returns FALSE without any write at all if the
+-- transaction is already unlinked (from any loan), which a retry after a persisted-unlink-but-
+-- failed-caller-side-step can safely rely on. Returns TRUE if it performed the unlink.
+create or replace function public.unlink_transaction_from_manual_loan(
+  p_user_id uuid,
+  p_transaction_id uuid,
+  p_loan_id uuid,
+  p_auto_role text,
+  p_role_source text,
+  p_role_confidence text,
+  p_classifier_version smallint
+) returns boolean
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_manual_loan_id uuid;
+  v_principal_portion numeric;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  select t.manual_loan_id, t.principal_portion into v_manual_loan_id, v_principal_portion
+  from public.transactions t
+  join public.accounts a on a.id = t.account_id
+  join public.plaid_items pi on pi.id = a.item_id
+  where t.id = p_transaction_id
+    and pi.user_id = p_user_id
+  for update of t, a, pi;
+
+  if not found then
+    raise exception 'unlink_transaction_from_manual_loan: transaction not found or not owned by user';
+  end if;
+
+  if v_manual_loan_id is null then
+    return false;
+  end if;
+
+  if v_manual_loan_id is distinct from p_loan_id then
+    raise exception 'unlink_transaction_from_manual_loan: transaction is linked to a different loan';
+  end if;
+
+  perform 1 from public.manual_loans where id = p_loan_id and user_id = p_user_id for update;
+  if not found then
+    raise exception 'unlink_transaction_from_manual_loan: manual loan not found or not owned by user';
+  end if;
+
+  update public.transactions
+  set manual_loan_id = null,
+      principal_portion = null,
+      auto_role = p_auto_role,
+      role_source = p_role_source,
+      role_confidence = p_role_confidence,
+      classifier_version = p_classifier_version
+  where id = p_transaction_id;
+
+  update public.manual_loans
+  set current_balance = round((current_balance + coalesce(v_principal_portion, 0))::numeric, 2),
+      updated_at = now()
+  where id = p_loan_id;
+
+  return true;
+end;
+$$;
+
+revoke execute on function public.unlink_transaction_from_manual_loan(uuid, uuid, uuid, text, text, text, smallint) from public;
+revoke execute on function public.unlink_transaction_from_manual_loan(uuid, uuid, uuid, text, text, text, smallint) from anon;
+revoke execute on function public.unlink_transaction_from_manual_loan(uuid, uuid, uuid, text, text, text, smallint) from authenticated;
+grant execute on function public.unlink_transaction_from_manual_loan(uuid, uuid, uuid, text, text, text, smallint) to service_role;
+
+-- Atomically edits how much of an already-linked payment counts toward principal, adjusting the
+-- loan's balance by the difference in the SAME transaction — replaces the old fetch-old-value,
+-- write-new-value, then separately read-modify-write-balance sequence.
+create or replace function public.update_linked_payment_principal(
+  p_user_id uuid,
+  p_transaction_id uuid,
+  p_loan_id uuid,
+  p_new_principal_portion numeric
+) returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_manual_loan_id uuid;
+  v_old_principal numeric;
+  v_amount numeric;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  select t.manual_loan_id, t.principal_portion, t.amount into v_manual_loan_id, v_old_principal, v_amount
+  from public.transactions t
+  join public.accounts a on a.id = t.account_id
+  join public.plaid_items pi on pi.id = a.item_id
+  where t.id = p_transaction_id
+    and pi.user_id = p_user_id
+  for update of t, a, pi;
+
+  if not found then
+    raise exception 'update_linked_payment_principal: transaction not found or not owned by user';
+  end if;
+
+  if v_manual_loan_id is distinct from p_loan_id then
+    raise exception 'update_linked_payment_principal: transaction is not linked to this loan';
+  end if;
+
+  if p_new_principal_portion is null or p_new_principal_portion < 0 or p_new_principal_portion > v_amount then
+    raise exception 'update_linked_payment_principal: principal_portion (%) must be between 0 and the transaction amount (%)',
+      p_new_principal_portion, v_amount;
+  end if;
+
+  perform 1 from public.manual_loans where id = p_loan_id and user_id = p_user_id for update;
+  if not found then
+    raise exception 'update_linked_payment_principal: manual loan not found or not owned by user';
+  end if;
+
+  update public.transactions
+  set principal_portion = p_new_principal_portion
+  where id = p_transaction_id;
+
+  update public.manual_loans
+  set current_balance = greatest(0, round((current_balance + coalesce(v_old_principal, 0) - p_new_principal_portion)::numeric, 2)),
+      updated_at = now()
+  where id = p_loan_id;
+end;
+$$;
+
+revoke execute on function public.update_linked_payment_principal(uuid, uuid, uuid, numeric) from public;
+revoke execute on function public.update_linked_payment_principal(uuid, uuid, uuid, numeric) from anon;
+revoke execute on function public.update_linked_payment_principal(uuid, uuid, uuid, numeric) from authenticated;
+grant execute on function public.update_linked_payment_principal(uuid, uuid, uuid, numeric) to service_role;
+
+-- Atomically inserts a manually-logged payment and decrements the loan's balance.
+create or replace function public.create_manual_loan_payment(
+  p_user_id uuid,
+  p_loan_id uuid,
+  p_date date,
+  p_principal_portion numeric,
+  p_interest_portion numeric,
+  p_notes text
+) returns uuid
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_payment_id uuid;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  perform 1 from public.manual_loans where id = p_loan_id and user_id = p_user_id for update;
+  if not found then
+    raise exception 'create_manual_loan_payment: manual loan not found or not owned by user';
+  end if;
+
+  if p_principal_portion is null or p_principal_portion < 0 then
+    raise exception 'create_manual_loan_payment: principal_portion must be a non-negative number';
+  end if;
+  if p_interest_portion is null or p_interest_portion < 0 then
+    raise exception 'create_manual_loan_payment: interest_portion must be a non-negative number';
+  end if;
+
+  insert into public.manual_loan_payments (user_id, loan_id, date, principal_portion, interest_portion, notes)
+  values (p_user_id, p_loan_id, p_date, p_principal_portion, p_interest_portion, p_notes)
+  returning id into v_payment_id;
+
+  update public.manual_loans
+  set current_balance = greatest(0, round((current_balance - p_principal_portion)::numeric, 2)),
+      updated_at = now()
+  where id = p_loan_id;
+
+  return v_payment_id;
+end;
+$$;
+
+revoke execute on function public.create_manual_loan_payment(uuid, uuid, date, numeric, numeric, text) from public;
+revoke execute on function public.create_manual_loan_payment(uuid, uuid, date, numeric, numeric, text) from anon;
+revoke execute on function public.create_manual_loan_payment(uuid, uuid, date, numeric, numeric, text) from authenticated;
+grant execute on function public.create_manual_loan_payment(uuid, uuid, date, numeric, numeric, text) to service_role;
+
+-- Atomically applies a partial patch to a manually-logged payment, adjusting the loan's balance
+-- ONLY when principal_portion is part of the patch. The four `p_set_*` flags distinguish "field
+-- not part of this patch" from "field explicitly set to its SQL NULL value" (`notes` legitimately
+-- accepts null) — a plain NULL parameter alone can't express that distinction.
+create or replace function public.update_manual_loan_payment(
+  p_user_id uuid,
+  p_payment_id uuid,
+  p_loan_id uuid,
+  p_set_date boolean,
+  p_date date,
+  p_set_principal_portion boolean,
+  p_principal_portion numeric,
+  p_set_interest_portion boolean,
+  p_interest_portion numeric,
+  p_set_notes boolean,
+  p_notes text
+) returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_old_principal numeric;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  perform 1 from public.manual_loans where id = p_loan_id and user_id = p_user_id for update;
+  if not found then
+    raise exception 'update_manual_loan_payment: manual loan not found or not owned by user';
+  end if;
+
+  select principal_portion into v_old_principal
+  from public.manual_loan_payments
+  where id = p_payment_id and loan_id = p_loan_id
+  for update;
+
+  if not found then
+    raise exception 'update_manual_loan_payment: payment not found for this loan';
+  end if;
+
+  if p_set_principal_portion and (p_principal_portion is null or p_principal_portion < 0) then
+    raise exception 'update_manual_loan_payment: principal_portion must be a non-negative number';
+  end if;
+  if p_set_interest_portion and (p_interest_portion is null or p_interest_portion < 0) then
+    raise exception 'update_manual_loan_payment: interest_portion must be a non-negative number';
+  end if;
+
+  update public.manual_loan_payments
+  set date = case when p_set_date then p_date else date end,
+      principal_portion = case when p_set_principal_portion then p_principal_portion else principal_portion end,
+      interest_portion = case when p_set_interest_portion then p_interest_portion else interest_portion end,
+      notes = case when p_set_notes then p_notes else notes end
+  where id = p_payment_id;
+
+  if p_set_principal_portion then
+    update public.manual_loans
+    set current_balance = greatest(0, round((current_balance + coalesce(v_old_principal, 0) - p_principal_portion)::numeric, 2)),
+        updated_at = now()
+    where id = p_loan_id;
+  end if;
+end;
+$$;
+
+revoke execute on function public.update_manual_loan_payment(uuid, uuid, uuid, boolean, date, boolean, numeric, boolean, numeric, boolean, text) from public;
+revoke execute on function public.update_manual_loan_payment(uuid, uuid, uuid, boolean, date, boolean, numeric, boolean, numeric, boolean, text) from anon;
+revoke execute on function public.update_manual_loan_payment(uuid, uuid, uuid, boolean, date, boolean, numeric, boolean, numeric, boolean, text) from authenticated;
+grant execute on function public.update_manual_loan_payment(uuid, uuid, uuid, boolean, date, boolean, numeric, boolean, numeric, boolean, text) to service_role;
+
+-- Atomically deletes a manually-logged payment and restores its principal to the loan's balance.
+-- Idempotent: a payment already gone (id not found for this loan) is a silent no-op, matching the
+-- pre-existing dataService.ts contract for this operation.
+create or replace function public.delete_manual_loan_payment(
+  p_user_id uuid,
+  p_payment_id uuid,
+  p_loan_id uuid
+) returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_principal numeric;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  perform 1 from public.manual_loans where id = p_loan_id and user_id = p_user_id for update;
+  if not found then
+    raise exception 'delete_manual_loan_payment: manual loan not found or not owned by user';
+  end if;
+
+  select principal_portion into v_principal
+  from public.manual_loan_payments
+  where id = p_payment_id and loan_id = p_loan_id
+  for update;
+
+  if not found then
+    return;
+  end if;
+
+  delete from public.manual_loan_payments where id = p_payment_id;
+
+  update public.manual_loans
+  set current_balance = round((current_balance + coalesce(v_principal, 0))::numeric, 2),
+      updated_at = now()
+  where id = p_loan_id;
+end;
+$$;
+
+revoke execute on function public.delete_manual_loan_payment(uuid, uuid, uuid) from public;
+revoke execute on function public.delete_manual_loan_payment(uuid, uuid, uuid) from anon;
+revoke execute on function public.delete_manual_loan_payment(uuid, uuid, uuid) from authenticated;
+grant execute on function public.delete_manual_loan_payment(uuid, uuid, uuid) to service_role;
+
+-- Atomically deletes Plaid-removed transactions AND restores the manual-loan balance for any of
+-- them that were still linked (Round 6 remediation, blocker 4's Plaid-removal gap) — a linked
+-- transaction Plaid reports as removed (e.g. a pending row replaced by its posted counterpart)
+-- previously vanished via a plain DELETE with no balance restoration at all, permanently
+-- overstating how much principal had been paid down. Scoped to the given user via the same
+-- accounts/plaid_items ownership chain as every other function here, even though
+-- plaid_transaction_id is already effectively unique, for defense in depth and audit consistency.
+create or replace function public.delete_transactions_and_restore_loan_balances(
+  p_user_id uuid,
+  p_plaid_transaction_ids text[]
+) returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  r record;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  for r in
+    select t.id, t.manual_loan_id, t.principal_portion
+    from public.transactions t
+    join public.accounts a on a.id = t.account_id
+    join public.plaid_items pi on pi.id = a.item_id
+    where t.plaid_transaction_id = any(p_plaid_transaction_ids)
+      and pi.user_id = p_user_id
+      and t.manual_loan_id is not null
+    for update of t
+  loop
+    update public.manual_loans
+    set current_balance = round((current_balance + coalesce(r.principal_portion, 0))::numeric, 2),
+        updated_at = now()
+    where id = r.manual_loan_id;
+  end loop;
+
+  delete from public.transactions t
+  using public.accounts a, public.plaid_items pi
+  where t.account_id = a.id
+    and a.item_id = pi.id
+    and t.plaid_transaction_id = any(p_plaid_transaction_ids)
+    and pi.user_id = p_user_id;
+end;
+$$;
+
+revoke execute on function public.delete_transactions_and_restore_loan_balances(uuid, text[]) from public;
+revoke execute on function public.delete_transactions_and_restore_loan_balances(uuid, text[]) from anon;
+revoke execute on function public.delete_transactions_and_restore_loan_balances(uuid, text[]) from authenticated;
+grant execute on function public.delete_transactions_and_restore_loan_balances(uuid, text[]) to service_role;

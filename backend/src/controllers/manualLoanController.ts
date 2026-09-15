@@ -207,7 +207,7 @@ export async function updateLinkedPayment(req: Request, res: Response, next: Nex
       return;
     }
 
-    await dataService.updateLinkedPaymentPrincipal(req.params.transactionId, loan.id, principalPortion);
+    await dataService.updateLinkedPaymentPrincipal(userId, req.params.transactionId, loan.id, principalPortion);
     const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
     res.json({ loan: await enrichLoan(updatedLoan) });
   } catch (err) {
@@ -224,7 +224,7 @@ export async function unlinkPayment(req: Request, res: Response, next: NextFunct
       return;
     }
 
-    await dataService.unlinkPaymentFromLoan(req.params.transactionId, loan.id);
+    await dataService.unlinkPaymentFromLoan(userId, req.params.transactionId, loan.id);
     // The unlinked transaction is no longer a manual_loan_link row — it may now be, or may have
     // previously invalidated, a transfer/refund relationship (Round 3 remediation §2/§3).
     // Bounded, reuses the same fixed windows as ordinary reconciliation — never a global scan.
@@ -288,7 +288,7 @@ export async function updateManualPayment(req: Request, res: Response, next: Nex
     if (body.interest_portion !== undefined) fields.interest_portion = body.interest_portion;
     if (body.notes !== undefined) fields.notes = body.notes;
 
-    const payment = await dataService.updateManualLoanPayment(req.params.paymentId, loan.id, fields);
+    const payment = await dataService.updateManualLoanPayment(userId, req.params.paymentId, loan.id, fields);
     if (!payment) {
       res.status(404).json({ error: 'Manual payment not found' });
       return;
@@ -310,7 +310,7 @@ export async function deleteManualPayment(req: Request, res: Response, next: Nex
       return;
     }
 
-    await dataService.deleteManualLoanPayment(req.params.paymentId, loan.id);
+    await dataService.deleteManualLoanPayment(userId, req.params.paymentId, loan.id);
     const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
     res.json({ loan: await enrichLoan(updatedLoan) });
   } catch (err) {

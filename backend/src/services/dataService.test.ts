@@ -12,6 +12,7 @@ import {
   createManualLoan,
   updateManualLoan,
   deleteManualLoan,
+  getUnlinkedTransactionsByPlaidIds,
   InvalidManualLoanFieldError,
   createManualLoanPayment,
   updateManualLoanPayment,
@@ -539,6 +540,7 @@ function fakeAccount(overrides: Partial<AccountBase> = {}): AccountBase {
 
 beforeEach(() => {
   mockFrom.mockReset();
+  mockRpc.mockReset();
 });
 
 describe('upsertAccountsForItem', () => {
@@ -985,9 +987,9 @@ describe('applyTransactionChanges', () => {
     });
   });
 
-  it('deletes removed transactions by their plaid_transaction_id', async () => {
-    const deleteQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(deleteQuery);
+  it('deletes removed transactions via the atomic delete-and-restore-balances RPC (Round 6 remediation, blocker 4)', async () => {
+    mockRpc.mockReset();
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
 
     await applyTransactionChanges({
       userId: 'user-1',
@@ -997,13 +999,25 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
-    expect(deleteQuery.delete).toHaveBeenCalled();
-    expect(deleteQuery.in).toHaveBeenCalledWith('plaid_transaction_id', ['txn-removed']);
+    expect(mockRpc).toHaveBeenCalledWith('delete_transactions_and_restore_loan_balances', {
+      p_user_id: 'user-1',
+      p_plaid_transaction_ids: ['txn-removed'],
+    });
+  });
+
+  it('propagates a failure from the removal RPC', async () => {
+    mockRpc.mockReset();
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+
+    await expect(
+      applyTransactionChanges({ userId: 'user-1', added: [], modified: [], removed: [fakeRemoved], accountIdByPlaidId })
+    ).rejects.toThrow('Failed to delete removed transactions');
   });
 
   it('does nothing when there are no changes at all', async () => {
     await applyTransactionChanges({ userId: 'user-1', added: [], modified: [], removed: [], accountIdByPlaidId });
     expect(mockFrom).not.toHaveBeenCalled();
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 });
 
@@ -1137,138 +1151,117 @@ describe('clearTransactionSplits', () => {
   });
 });
 
-describe('linkTransactionToLoan', () => {
-  it('links the transaction and decrements the loan balance by the principal portion', async () => {
+describe('linkTransactionToLoan — atomic link + balance decrement (Round 6 remediation, blocker 4)', () => {
+  beforeEach(() => {
+    mockRpc.mockReset();
+    mockRpc.mockResolvedValue({ data: null, error: null });
+  });
+
+  it('validates against the transaction amount, then calls the atomic RPC with the normalized principal', async () => {
     const txnFetchQuery = createQueryBuilder({ data: { amount: 500 }, error: null });
-    const linkQuery = createQueryBuilder({ data: null, error: null });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(txnFetchQuery)
-      .mockReturnValueOnce(linkQuery)
-      .mockReturnValueOnce(balanceQuery)
-      .mockReturnValueOnce(updateBalanceQuery);
+    mockFrom.mockReturnValueOnce(txnFetchQuery);
 
-    await linkTransactionToLoan('txn-1', 'loan-1', 200);
+    await linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 200);
 
-    expect(linkQuery.update).toHaveBeenCalledWith({
-      manual_loan_id: 'loan-1',
-      principal_portion: 200,
-      auto_role: 'debt_payment',
-      role_source: 'manual_loan_link',
-      role_confidence: 'high',
-      classifier_version: 1,
+    expect(mockRpc).toHaveBeenCalledWith('link_transaction_to_manual_loan', {
+      p_user_id: 'user-1',
+      p_transaction_id: 'txn-1',
+      p_loan_id: 'loan-1',
+      p_principal_portion: 200,
+      p_classifier_version: 1,
     });
-    expect(linkQuery.eq).toHaveBeenCalledWith('id', 'txn-1');
-    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 800 });
-    expect(updateBalanceQuery.eq).toHaveBeenCalledWith('id', 'loan-1');
   });
 
-  it('clamps the new balance at 0 rather than going negative', async () => {
+  it('cent-rounds the principal before calling the RPC', async () => {
     const txnFetchQuery = createQueryBuilder({ data: { amount: 500 }, error: null });
-    const linkQuery = createQueryBuilder({ data: null, error: null });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 150 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(txnFetchQuery)
-      .mockReturnValueOnce(linkQuery)
-      .mockReturnValueOnce(balanceQuery)
-      .mockReturnValueOnce(updateBalanceQuery);
+    mockFrom.mockReturnValueOnce(txnFetchQuery);
 
-    await linkTransactionToLoan('txn-1', 'loan-1', 200);
+    await linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 33.333);
 
-    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 0 });
+    expect(mockRpc).toHaveBeenCalledWith(
+      'link_transaction_to_manual_loan',
+      expect.objectContaining({ p_principal_portion: 33.33 })
+    );
   });
 
-  it('cent-rounds the principal before persisting or adjusting the balance', async () => {
-    const txnFetchQuery = createQueryBuilder({ data: { amount: 500 }, error: null });
-    const linkQuery = createQueryBuilder({ data: null, error: null });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(txnFetchQuery)
-      .mockReturnValueOnce(linkQuery)
-      .mockReturnValueOnce(balanceQuery)
-      .mockReturnValueOnce(updateBalanceQuery);
-
-    await linkTransactionToLoan('txn-1', 'loan-1', 33.333);
-
-    expect(linkQuery.update).toHaveBeenCalledWith(expect.objectContaining({ principal_portion: 33.33 }));
-  });
-
-  it('rejects (throws, never persists) a principal_portion greater than the transaction amount (Round 2 remediation §7)', async () => {
+  it('rejects (throws, never calls the RPC) a principal_portion greater than the transaction amount (Round 2 remediation §7)', async () => {
     const txnFetchQuery = createQueryBuilder({ data: { amount: 100 }, error: null });
     mockFrom.mockReturnValueOnce(txnFetchQuery);
 
-    await expect(linkTransactionToLoan('txn-1', 'loan-1', 150)).rejects.toThrow();
-    expect(mockFrom).toHaveBeenCalledTimes(1); // never reached the update/balance-adjustment calls
+    await expect(linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 150)).rejects.toThrow();
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 
   it('rejects a negative principal_portion', async () => {
     const txnFetchQuery = createQueryBuilder({ data: { amount: 100 }, error: null });
     mockFrom.mockReturnValueOnce(txnFetchQuery);
 
-    await expect(linkTransactionToLoan('txn-1', 'loan-1', -10)).rejects.toThrow();
+    await expect(linkTransactionToLoan('user-1', 'txn-1', 'loan-1', -10)).rejects.toThrow();
   });
 
   it('rejects a non-finite principal_portion', async () => {
     const txnFetchQuery = createQueryBuilder({ data: { amount: 100 }, error: null });
     mockFrom.mockReturnValueOnce(txnFetchQuery);
 
-    await expect(linkTransactionToLoan('txn-1', 'loan-1', NaN)).rejects.toThrow();
+    await expect(linkTransactionToLoan('user-1', 'txn-1', 'loan-1', NaN)).rejects.toThrow();
+  });
+
+  it('propagates an RPC failure (e.g. ownership mismatch) rather than silently succeeding', async () => {
+    const txnFetchQuery = createQueryBuilder({ data: { amount: 500 }, error: null });
+    mockFrom.mockReturnValueOnce(txnFetchQuery);
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'not found or not owned' } });
+
+    await expect(linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 200)).rejects.toThrow('Failed to link transaction to loan');
   });
 });
 
-describe('updateLinkedPaymentPrincipal', () => {
-  it('updates the principal portion and adjusts the loan balance by the difference', async () => {
-    const fetchQuery = createQueryBuilder({
-      data: { principal_portion: 100, manual_loan_id: 'loan-1', amount: 500 },
-      error: null,
-    });
-    const updateTxnQuery = createQueryBuilder({ data: null, error: null });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 900 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(fetchQuery)
-      .mockReturnValueOnce(updateTxnQuery)
-      .mockReturnValueOnce(balanceQuery)
-      .mockReturnValueOnce(updateBalanceQuery);
-
-    await updateLinkedPaymentPrincipal('txn-1', 'loan-1', 150);
-
-    expect(updateTxnQuery.update).toHaveBeenCalledWith({ principal_portion: 150 });
-    // Old portion (100) applied 100 to balance; new portion (150) should apply 50 more.
-    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 850 });
+describe('updateLinkedPaymentPrincipal — atomic principal edit + balance sync (Round 6 remediation, blocker 4)', () => {
+  beforeEach(() => {
+    mockRpc.mockReset();
+    mockRpc.mockResolvedValue({ data: null, error: null });
   });
 
-  it('throws when the transaction is not linked to the given loan', async () => {
-    const fetchQuery = createQueryBuilder({
-      data: { principal_portion: 100, manual_loan_id: 'some-other-loan', amount: 500 },
-      error: null,
-    });
+  it('validates ownership/linkage and the amount bound, then calls the atomic RPC', async () => {
+    const fetchQuery = createQueryBuilder({ data: { manual_loan_id: 'loan-1', amount: 500 }, error: null });
     mockFrom.mockReturnValueOnce(fetchQuery);
 
-    await expect(updateLinkedPaymentPrincipal('txn-1', 'loan-1', 150)).rejects.toThrow(
+    await updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 150);
+
+    expect(mockRpc).toHaveBeenCalledWith('update_linked_payment_principal', {
+      p_user_id: 'user-1',
+      p_transaction_id: 'txn-1',
+      p_loan_id: 'loan-1',
+      p_new_principal_portion: 150,
+    });
+  });
+
+  it('throws when the transaction is not linked to the given loan, never calling the RPC', async () => {
+    const fetchQuery = createQueryBuilder({ data: { manual_loan_id: 'some-other-loan', amount: 500 }, error: null });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 150)).rejects.toThrow(
       'Payment is not linked to this loan'
     );
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 
   it('rejects a new principal_portion greater than the transaction amount (Round 2 remediation §7)', async () => {
-    const fetchQuery = createQueryBuilder({
-      data: { principal_portion: 100, manual_loan_id: 'loan-1', amount: 200 },
-      error: null,
-    });
+    const fetchQuery = createQueryBuilder({ data: { manual_loan_id: 'loan-1', amount: 200 }, error: null });
     mockFrom.mockReturnValueOnce(fetchQuery);
 
-    await expect(updateLinkedPaymentPrincipal('txn-1', 'loan-1', 250)).rejects.toThrow();
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 250)).rejects.toThrow();
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 });
 
-describe('unlinkPaymentFromLoan', () => {
-  it('clears the link, restores the loan balance, and reclassifies the transaction via the normal (non-loan) precedence', async () => {
+describe('unlinkPaymentFromLoan — atomic unlink + balance restoration (Round 6 remediation, blocker 4)', () => {
+  beforeEach(() => {
+    mockRpc.mockReset();
+  });
+
+  it('reclassifies via row-level precedence and calls the atomic unlink RPC', async () => {
     const fetchQuery = createQueryBuilder({
       data: {
-        principal_portion: 200,
         manual_loan_id: 'loan-1',
         amount: 200,
         category: null,
@@ -1277,71 +1270,63 @@ describe('unlinkPaymentFromLoan', () => {
       },
       error: null,
     });
-    const updateTxnQuery = createQueryBuilder({ data: null, error: null });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 800 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(fetchQuery)
-      .mockReturnValueOnce(updateTxnQuery)
-      .mockReturnValueOnce(balanceQuery)
-      .mockReturnValueOnce(updateBalanceQuery);
+    mockFrom.mockReturnValueOnce(fetchQuery);
+    mockRpc.mockResolvedValueOnce({ data: true, error: null });
 
-    await unlinkPaymentFromLoan('txn-1', 'loan-1');
+    const result = await unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1');
 
-    expect(updateTxnQuery.update).toHaveBeenCalledWith({
-      manual_loan_id: null,
-      principal_portion: null,
-      auto_role: 'expense',
-      role_source: 'sign_default',
-      role_confidence: 'low',
-      classifier_version: 1,
+    expect(mockRpc).toHaveBeenCalledWith('unlink_transaction_from_manual_loan', {
+      p_user_id: 'user-1',
+      p_transaction_id: 'txn-1',
+      p_loan_id: 'loan-1',
+      p_auto_role: 'expense',
+      p_role_source: 'sign_default',
+      p_role_confidence: 'low',
+      p_classifier_version: 1,
     });
-    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 1000 });
-  });
-
-  it('returns true when it performed the actual unlink', async () => {
-    const fetchQuery = createQueryBuilder({
-      data: { principal_portion: 200, manual_loan_id: 'loan-1', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
-      error: null,
-    });
-    const updateTxnQuery = createQueryBuilder({ data: null, error: null });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 800 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(fetchQuery).mockReturnValueOnce(updateTxnQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
-
-    const result = await unlinkPaymentFromLoan('txn-1', 'loan-1');
-
     expect(result).toBe(true);
   });
 
-  it('is idempotent: returns false (not an error) when the transaction is ALREADY unlinked, and performs no write at all (Round 4 remediation §7)', async () => {
+  it('is idempotent: returns false (not an error) when the transaction is ALREADY unlinked, and never calls the RPC at all (Round 4 remediation §7)', async () => {
     const fetchQuery = createQueryBuilder({
-      data: { principal_portion: null, manual_loan_id: null, amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      data: { manual_loan_id: null, amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
       error: null,
     });
     mockFrom.mockReturnValueOnce(fetchQuery);
 
-    const result = await unlinkPaymentFromLoan('txn-1', 'loan-1');
+    const result = await unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1');
 
     expect(result).toBe(false);
-    expect(mockFrom).toHaveBeenCalledTimes(1); // only the read — no update, no balance adjustment
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 
   it('still throws for a genuine mismatch — linked to a DIFFERENT loan than the one named in the request', async () => {
     const fetchQuery = createQueryBuilder({
-      data: { principal_portion: 200, manual_loan_id: 'loan-OTHER', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      data: { manual_loan_id: 'loan-OTHER', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
       error: null,
     });
     mockFrom.mockReturnValueOnce(fetchQuery);
 
-    await expect(unlinkPaymentFromLoan('txn-1', 'loan-1')).rejects.toThrow('Payment is not linked to this loan');
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toThrow('Payment is not linked to this loan');
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 
   it('throws when the transaction does not exist at all', async () => {
     const fetchQuery = createQueryBuilder({ data: null, error: null });
     mockFrom.mockReturnValueOnce(fetchQuery);
 
-    await expect(unlinkPaymentFromLoan('txn-missing', 'loan-1')).rejects.toThrow('Payment not found');
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-missing', 'loan-1')).rejects.toThrow('Payment not found');
+  });
+
+  it('propagates an RPC failure', async () => {
+    const fetchQuery = createQueryBuilder({
+      data: { manual_loan_id: 'loan-1', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(fetchQuery);
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toThrow('Failed to unlink payment');
   });
 });
 
@@ -1372,6 +1357,26 @@ describe('getLifetimeTotalsByLoanId', () => {
   it('returns an empty map without querying when given no loan ids', async () => {
     const totals = await getLifetimeTotalsByLoanId([]);
     expect(totals.size).toBe(0);
+    expect(mockFrom).not.toHaveBeenCalled();
+  });
+});
+
+describe('getUnlinkedTransactionsByPlaidIds (Round 6 remediation, blocker 5)', () => {
+  it('scopes by user, filters to the given plaid ids, still-unlinked, and outflow-only', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await getUnlinkedTransactionsByPlaidIds('user-1', ['plaid-1', 'plaid-2']);
+
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+    expect(query.in).toHaveBeenCalledWith('plaid_transaction_id', ['plaid-1', 'plaid-2']);
+    expect(query.is).toHaveBeenCalledWith('manual_loan_id', null);
+    expect(query.gt).toHaveBeenCalledWith('amount', 0);
+  });
+
+  it('returns an empty array without querying when given no plaid ids', async () => {
+    const result = await getUnlinkedTransactionsByPlaidIds('user-1', []);
+    expect(result).toEqual([]);
     expect(mockFrom).not.toHaveBeenCalled();
   });
 });
@@ -1518,32 +1523,41 @@ describe('deleteManualLoan — reclassifies linked transactions before deleting 
   });
 });
 
-describe('createManualLoanPayment', () => {
-  it('inserts the payment and decrements the loan balance by its principal portion', async () => {
-    const insertQuery = createQueryBuilder({
-      data: { id: 'payment-1', principal_portion: 300, interest_portion: 50 },
-      error: null,
-    });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(insertQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+describe('createManualLoanPayment — atomic insert + balance decrement (Round 6 remediation, blocker 4)', () => {
+  beforeEach(() => {
+    mockRpc.mockReset();
+  });
 
-    await createManualLoanPayment('user-1', 'loan-1', {
+  it('calls the atomic create RPC with the normalized fields, then re-fetches the created row', async () => {
+    mockRpc.mockResolvedValueOnce({ data: 'payment-1', error: null });
+    const refetchQuery = createQueryBuilder({ data: { id: 'payment-1', principal_portion: 300, interest_portion: 50 }, error: null });
+    mockFrom.mockReturnValueOnce(refetchQuery);
+
+    const result = await createManualLoanPayment('user-1', 'loan-1', {
       date: '2026-08-01',
       principalPortion: 300,
       interestPortion: 50,
       notes: 'Cash payment',
     });
 
-    expect(insertQuery.insert).toHaveBeenCalledWith({
-      user_id: 'user-1',
-      loan_id: 'loan-1',
-      date: '2026-08-01',
-      principal_portion: 300,
-      interest_portion: 50,
-      notes: 'Cash payment',
+    expect(mockRpc).toHaveBeenCalledWith('create_manual_loan_payment', {
+      p_user_id: 'user-1',
+      p_loan_id: 'loan-1',
+      p_date: '2026-08-01',
+      p_principal_portion: 300,
+      p_interest_portion: 50,
+      p_notes: 'Cash payment',
     });
-    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 700 });
+    expect(result).toMatchObject({ id: 'payment-1' });
+  });
+
+  it('propagates an RPC failure (e.g. loan not owned) without a re-fetch', async () => {
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'manual loan not found or not owned by user' } });
+
+    await expect(
+      createManualLoanPayment('user-1', 'loan-1', { date: '2026-08-01', principalPortion: 50, interestPortion: 10, notes: null })
+    ).rejects.toThrow('Failed to create manual payment');
+    expect(mockFrom).not.toHaveBeenCalled();
   });
 
   describe('write-boundary validation (Round 4 remediation §9) — a manual payment has no `amount` to bound against, so only finite/non-negative is required', () => {
@@ -1553,18 +1567,18 @@ describe('createManualLoanPayment', () => {
       ['non-finite principal_portion', { principalPortion: Infinity, interestPortion: 10 }],
       ['negative interest_portion', { principalPortion: 50, interestPortion: -10 }],
       ['NaN interest_portion', { principalPortion: 50, interestPortion: NaN }],
-    ])('rejects %s and never touches the DB or the loan balance', async (_label, overrides) => {
+    ])('rejects %s and never calls the RPC or touches the DB', async (_label, overrides) => {
       await expect(
         createManualLoanPayment('user-1', 'loan-1', { date: '2026-08-01', notes: null, ...overrides })
       ).rejects.toThrow(InvalidPrincipalPortionError);
+      expect(mockRpc).not.toHaveBeenCalled();
       expect(mockFrom).not.toHaveBeenCalled();
     });
 
     it('accepts a zero principal_portion (an all-interest payment)', async () => {
-      const insertQuery = createQueryBuilder({ data: { id: 'payment-1', principal_portion: 0, interest_portion: 50 }, error: null });
-      const balanceQuery = createQueryBuilder({ data: { current_balance: 1000 }, error: null });
-      const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-      mockFrom.mockReturnValueOnce(insertQuery).mockReturnValueOnce(balanceQuery).mockReturnValueOnce(updateBalanceQuery);
+      mockRpc.mockResolvedValueOnce({ data: 'payment-1', error: null });
+      const refetchQuery = createQueryBuilder({ data: { id: 'payment-1', principal_portion: 0, interest_portion: 50 }, error: null });
+      mockFrom.mockReturnValueOnce(refetchQuery);
 
       await expect(
         createManualLoanPayment('user-1', 'loan-1', { date: '2026-08-01', principalPortion: 0, interestPortion: 50, notes: null })
@@ -1573,43 +1587,56 @@ describe('createManualLoanPayment', () => {
   });
 });
 
-describe('updateManualLoanPayment', () => {
-  it('updates the payment and adjusts the balance by the principal difference', async () => {
-    const fetchQuery = createQueryBuilder({ data: { principal_portion: 300 }, error: null });
-    const updateQuery = createQueryBuilder({ data: { id: 'payment-1', principal_portion: 250 }, error: null });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 700 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(fetchQuery)
-      .mockReturnValueOnce(updateQuery)
-      .mockReturnValueOnce(balanceQuery)
-      .mockReturnValueOnce(updateBalanceQuery);
-
-    await updateManualLoanPayment('payment-1', 'loan-1', { principal_portion: 250, interest_portion: 100 });
-
-    expect(updateQuery.update).toHaveBeenCalledWith({ principal_portion: 250, interest_portion: 100 });
-    // Old portion (300) applied 300 to balance; new portion (250) should give 50 back.
-    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 750 });
+describe('updateManualLoanPayment — atomic partial patch + balance sync (Round 6 remediation, blocker 4)', () => {
+  beforeEach(() => {
+    mockRpc.mockReset();
   });
 
-  it('returns null without adjusting balance when the payment does not exist', async () => {
-    const fetchQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(fetchQuery);
+  it('calls the atomic update RPC with p_set_* flags reflecting exactly which fields were part of the patch', async () => {
+    const existsQuery = createQueryBuilder({ data: { id: 'payment-1' }, error: null });
+    const refetchQuery = createQueryBuilder({ data: { id: 'payment-1', principal_portion: 250, interest_portion: 100 }, error: null });
+    mockFrom.mockReturnValueOnce(existsQuery).mockReturnValueOnce(refetchQuery);
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
 
-    const result = await updateManualLoanPayment('payment-1', 'loan-1', { principal_portion: 250 });
+    await updateManualLoanPayment('user-1', 'payment-1', 'loan-1', { principal_portion: 250, interest_portion: 100 });
+
+    expect(mockRpc).toHaveBeenCalledWith('update_manual_loan_payment', {
+      p_user_id: 'user-1',
+      p_payment_id: 'payment-1',
+      p_loan_id: 'loan-1',
+      p_set_date: false,
+      p_date: null,
+      p_set_principal_portion: true,
+      p_principal_portion: 250,
+      p_set_interest_portion: true,
+      p_interest_portion: 100,
+      p_set_notes: false,
+      p_notes: null,
+    });
+  });
+
+  it('returns null without calling the RPC at all when the payment does not exist', async () => {
+    const existsQuery = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(existsQuery);
+
+    const result = await updateManualLoanPayment('user-1', 'payment-1', 'loan-1', { principal_portion: 250 });
 
     expect(result).toBeNull();
-    expect(mockFrom).toHaveBeenCalledTimes(1);
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 
-  it('does not touch the balance when principal_portion is not part of the update', async () => {
-    const fetchQuery = createQueryBuilder({ data: { principal_portion: 300 }, error: null });
-    const updateQuery = createQueryBuilder({ data: { id: 'payment-1', notes: 'Updated note' }, error: null });
-    mockFrom.mockReturnValueOnce(fetchQuery).mockReturnValueOnce(updateQuery);
+  it('a patch that never touches principal_portion still correctly reports p_set_principal_portion: false', async () => {
+    const existsQuery = createQueryBuilder({ data: { id: 'payment-1' }, error: null });
+    const refetchQuery = createQueryBuilder({ data: { id: 'payment-1', notes: 'Updated note' }, error: null });
+    mockFrom.mockReturnValueOnce(existsQuery).mockReturnValueOnce(refetchQuery);
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
 
-    await updateManualLoanPayment('payment-1', 'loan-1', { notes: 'Updated note' });
+    await updateManualLoanPayment('user-1', 'payment-1', 'loan-1', { notes: 'Updated note' });
 
-    expect(mockFrom).toHaveBeenCalledTimes(2);
+    expect(mockRpc).toHaveBeenCalledWith(
+      'update_manual_loan_payment',
+      expect.objectContaining({ p_set_principal_portion: false, p_set_notes: true, p_notes: 'Updated note' })
+    );
   });
 
   describe('write-boundary validation (Round 4 remediation §9)', () => {
@@ -1619,37 +1646,32 @@ describe('updateManualLoanPayment', () => {
       ['negative interest_portion', { interest_portion: -10 }],
       ['non-finite interest_portion', { interest_portion: Infinity }],
     ])('rejects %s BEFORE fetching/updating anything, or adjusting the balance', async (_label, fields) => {
-      await expect(updateManualLoanPayment('payment-1', 'loan-1', fields)).rejects.toThrow(InvalidPrincipalPortionError);
+      await expect(updateManualLoanPayment('user-1', 'payment-1', 'loan-1', fields)).rejects.toThrow(InvalidPrincipalPortionError);
       expect(mockFrom).not.toHaveBeenCalled();
+      expect(mockRpc).not.toHaveBeenCalled();
     });
   });
 });
 
-describe('deleteManualLoanPayment', () => {
-  it('deletes the payment and restores the loan balance by its principal portion', async () => {
-    const fetchQuery = createQueryBuilder({ data: { principal_portion: 300 }, error: null });
-    const deleteQuery = createQueryBuilder({ data: null, error: null });
-    const balanceQuery = createQueryBuilder({ data: { current_balance: 700 }, error: null });
-    const updateBalanceQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(fetchQuery)
-      .mockReturnValueOnce(deleteQuery)
-      .mockReturnValueOnce(balanceQuery)
-      .mockReturnValueOnce(updateBalanceQuery);
+describe('deleteManualLoanPayment — atomic delete + balance restoration (Round 6 remediation, blocker 4)', () => {
+  it('calls the atomic delete RPC (idempotent no-op for an already-gone payment is handled entirely inside the RPC)', async () => {
+    mockRpc.mockReset();
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
 
-    await deleteManualLoanPayment('payment-1', 'loan-1');
+    await deleteManualLoanPayment('user-1', 'payment-1', 'loan-1');
 
-    expect(deleteQuery.delete).toHaveBeenCalled();
-    expect(updateBalanceQuery.update.mock.calls[0][0]).toMatchObject({ current_balance: 1000 });
+    expect(mockRpc).toHaveBeenCalledWith('delete_manual_loan_payment', {
+      p_user_id: 'user-1',
+      p_payment_id: 'payment-1',
+      p_loan_id: 'loan-1',
+    });
   });
 
-  it('does nothing when the payment does not exist', async () => {
-    const fetchQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(fetchQuery);
+  it('propagates an RPC failure', async () => {
+    mockRpc.mockReset();
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'manual loan not found or not owned by user' } });
 
-    await deleteManualLoanPayment('payment-1', 'loan-1');
-
-    expect(mockFrom).toHaveBeenCalledTimes(1);
+    await expect(deleteManualLoanPayment('user-1', 'payment-1', 'loan-1')).rejects.toThrow('Failed to delete manual payment');
   });
 });
 
@@ -2076,11 +2098,11 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
       mockRpc.mockReset();
     });
 
-    it('invokes the RPC with the exact expected parameter shape for a single-row mutation', async () => {
+    it('invokes the RPC with the exact expected parameter shape for a single-row mutation, including the expected-role-source CAS array', async () => {
       mockRpc.mockResolvedValueOnce({ data: null, error: null });
 
       await expect(
-        applyTransactionSemanticRoles('user-1', ['txn-1'], {
+        applyTransactionSemanticRoles('user-1', ['txn-1'], ['sign_default'], {
           auto_role: 'refund',
           role_source: 'refund_match',
           role_confidence: 'high',
@@ -2091,6 +2113,7 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
       expect(mockRpc).toHaveBeenCalledWith('apply_transaction_semantic_roles', {
         p_user_id: 'user-1',
         p_transaction_ids: ['txn-1'],
+        p_expected_role_sources: ['sign_default'],
         p_auto_role: 'refund',
         p_role_source: 'refund_match',
         p_role_confidence: 'high',
@@ -2098,31 +2121,39 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
       });
     });
 
-    it('invokes the RPC with both ids for a transfer-pair mutation, one call, never two', async () => {
+    it('invokes the RPC with both ids (and both expected role sources) for a transfer-pair mutation, one call, never two', async () => {
       mockRpc.mockResolvedValueOnce({ data: null, error: null });
 
-      await applyTransactionSemanticRoles('user-1', ['txn-1', 'txn-2'], {
-        auto_role: 'internal_transfer',
-        role_source: 'account_pair_match',
-        role_confidence: 'high',
-        classifier_version: 1,
-      });
+      await applyTransactionSemanticRoles(
+        'user-1',
+        ['txn-1', 'txn-2'],
+        ['transfer_like_unconfirmed', 'transfer_like_unconfirmed'],
+        {
+          auto_role: 'internal_transfer',
+          role_source: 'account_pair_match',
+          role_confidence: 'high',
+          classifier_version: 1,
+        }
+      );
 
       expect(mockRpc).toHaveBeenCalledTimes(1);
       expect(mockRpc).toHaveBeenCalledWith(
         'apply_transaction_semantic_roles',
-        expect.objectContaining({ p_transaction_ids: ['txn-1', 'txn-2'] })
+        expect.objectContaining({
+          p_transaction_ids: ['txn-1', 'txn-2'],
+          p_expected_role_sources: ['transfer_like_unconfirmed', 'transfer_like_unconfirmed'],
+        })
       );
     });
 
-    it('THROWS SemanticRoleMutationError (never resolves, never returns a boolean) when the RPC raises its own integrity error (SQLSTATE P0001) — an unowned id, a missing row, or a count mismatch inside the atomic function (Round 4 remediation §6)', async () => {
+    it('THROWS SemanticRoleMutationError (never resolves, never returns a boolean) when the RPC raises its own integrity error (SQLSTATE P0001) — an unowned id, a missing row, a count mismatch, or a stale expected-role-source CAS check inside the atomic function (Round 4 remediation §6, Round 6 remediation blocker 3)', async () => {
       mockRpc.mockResolvedValueOnce({
         data: null,
         error: { code: 'P0001', message: 'apply_transaction_semantic_roles: ownership check failed' },
       });
 
       await expect(
-        applyTransactionSemanticRoles('user-A', ['txn-owned-by-user-B'], {
+        applyTransactionSemanticRoles('user-A', ['txn-owned-by-user-B'], ['sign_default'], {
           auto_role: 'expense',
           role_source: 'sign_default',
           role_confidence: 'low',
@@ -2138,12 +2169,17 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
       });
 
       await expect(
-        applyTransactionSemanticRoles('user-1', ['txn-1', 'txn-missing'], {
-          auto_role: 'internal_transfer',
-          role_source: 'account_pair_match',
-          role_confidence: 'high',
-          classifier_version: 1,
-        })
+        applyTransactionSemanticRoles(
+          'user-1',
+          ['txn-1', 'txn-missing'],
+          ['transfer_like_unconfirmed', 'transfer_like_unconfirmed'],
+          {
+            auto_role: 'internal_transfer',
+            role_source: 'account_pair_match',
+            role_confidence: 'high',
+            classifier_version: 1,
+          }
+        )
       ).rejects.toThrow(SemanticRoleMutationError);
     });
 
@@ -2151,7 +2187,7 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
       mockRpc.mockResolvedValueOnce({ data: null, error: { code: '08000', message: 'connection failure' } });
 
       await expect(
-        applyTransactionSemanticRoles('user-1', ['txn-1'], {
+        applyTransactionSemanticRoles('user-1', ['txn-1'], ['sign_default'], {
           auto_role: 'expense',
           role_source: 'sign_default',
           role_confidence: 'low',

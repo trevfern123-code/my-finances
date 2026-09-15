@@ -702,10 +702,16 @@ export async function applyTransactionChanges(params: {
 
   if (params.removed.length > 0) {
     const removedIds = params.removed.map((t) => t.transaction_id);
-    const { error } = await supabaseAdmin
-      .from('transactions')
-      .delete()
-      .in('plaid_transaction_id', removedIds);
+    // Round 6 remediation (blocker 4's Plaid-removal gap): a removed transaction that was linked
+    // to a manual loan (e.g. a pending row Plaid replaces with its posted counterpart) must have
+    // its principal restored to the loan's balance as part of the SAME atomic operation as the
+    // delete — a plain DELETE here would silently overstate how much principal had been paid
+    // down, permanently. See delete_transactions_and_restore_loan_balances in the Phase A
+    // migration; it is a no-op balance-wise for any removed row that wasn't loan-linked.
+    const { error } = await supabaseAdmin.rpc('delete_transactions_and_restore_loan_balances', {
+      p_user_id: params.userId,
+      p_plaid_transaction_ids: removedIds,
+    });
 
     if (error) throw new Error(`Failed to delete removed transactions: ${error.message}`);
   }
@@ -844,6 +850,32 @@ export async function getUnlinkedOutflowTransactionsForUser(
     .gt('amount', 0);
 
   if (error) throw new Error(`Failed to load unlinked transactions: ${error.message}`);
+  return data as unknown as InsertedTransaction[];
+}
+
+/** Not-yet-linked transactions matching a specific set of Plaid transaction ids (Round 6
+ *  remediation, blocker 5) — used by loans.ts's `linkNewTransactionsToManualLoans` to re-derive
+ *  auto-link candidates from Plaid's OWN `added` report on every sync attempt, rather than from
+ *  `applyTransactionChanges`'s own insert/update classification (which changes between a first
+ *  attempt and a retry: a row inserted in attempt 1 is no longer "new" in attempt 2, so relying on
+ *  that as the candidate set would mean a link that failed in attempt 1 is never retried). Plaid
+ *  redelivers the identical `added` composition on every retry for an unadvanced cursor, so this
+ *  query — scoped to exactly those plaid ids, filtered to still-unlinked — naturally retries a
+ *  failed link and is a no-op for one that already succeeded. */
+export async function getUnlinkedTransactionsByPlaidIds(
+  userId: string,
+  plaidTransactionIds: string[]
+): Promise<InsertedTransaction[]> {
+  if (plaidTransactionIds.length === 0) return [];
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select('id, name, merchant_name, amount, plaid_transaction_id, accounts!inner(plaid_items!inner(user_id))')
+    .eq('accounts.plaid_items.user_id', userId)
+    .in('plaid_transaction_id', plaidTransactionIds)
+    .is('manual_loan_id', null)
+    .gt('amount', 0);
+
+  if (error) throw new Error(`Failed to load unlinked transactions by plaid id: ${error.message}`);
   return data as unknown as InsertedTransaction[];
 }
 
@@ -1192,37 +1224,27 @@ export async function getManualLoan(id: string, userId: string): Promise<ManualL
   return data as ManualLoanRow | null;
 }
 
-async function adjustManualLoanBalance(loanId: string, delta: number): Promise<void> {
-  const { data: loan, error: fetchError } = await supabaseAdmin
-    .from('manual_loans')
-    .select('current_balance')
-    .eq('id', loanId)
-    .single();
-
-  if (fetchError) throw new Error(`Failed to load manual loan balance: ${fetchError.message}`);
-
-  const newBalance = Math.max(0, roundToCents((loan.current_balance as number) + delta));
-  const { error: updateError } = await supabaseAdmin
-    .from('manual_loans')
-    .update({ current_balance: newBalance, updated_at: new Date().toISOString() })
-    .eq('id', loanId);
-
-  if (updateError) throw new Error(`Failed to update manual loan balance: ${updateError.message}`);
-}
-
 /** Links a transaction to a manual loan and decrements the loan's balance by principalPortion
- *  (the part of the payment that reduces principal, as opposed to interest). Also sets this
- *  transaction's semantic role to debt_payment (manual_loan_link, high confidence) — precedence
- *  step A always wins regardless of the transaction's own Plaid category once a manual-loan link
- *  exists (see transactionClassifier.ts). This never touches user_role_override. */
+ *  (the part of the payment that reduces principal, as opposed to interest), atomically (Round 6
+ *  remediation, blocker 4) — delegates to `link_transaction_to_manual_loan` (see the Phase A
+ *  migration), which performs the transaction update and the balance adjustment inside one
+ *  Postgres transaction, so the two can never durably split (a failure partway through a
+ *  two-request version could leave a link with no matching balance decrement, or vice versa).
+ *  Also sets this transaction's semantic role to debt_payment (manual_loan_link, high confidence)
+ *  — precedence step A always wins regardless of the transaction's own Plaid category once a
+ *  manual-loan link exists (see transactionClassifier.ts). This never touches
+ *  user_role_override. */
 export async function linkTransactionToLoan(
+  userId: string,
   transactionId: string,
   loanId: string,
   principalPortion: number
 ): Promise<void> {
   // WRITE-boundary validation (Round 2 remediation §7) — first fetch the transaction's own amount
   // so an impossible principal (negative, or exceeding the payment itself) is rejected outright
-  // rather than ever persisted.
+  // rather than ever persisted. The RPC re-validates this bound itself too (defense in depth,
+  // since it's the one place that can actually refuse to write bad data atomically), but failing
+  // fast here avoids a round trip for the common case.
   const { data: txnRow, error: txnFetchError } = await supabaseAdmin
     .from('transactions')
     .select('amount')
@@ -1232,20 +1254,14 @@ export async function linkTransactionToLoan(
   if (!txnRow) throw new Error('Transaction not found');
   const normalizedPrincipal = normalizePrincipalPortion(txnRow.amount as number, principalPortion);
 
-  const { error } = await supabaseAdmin
-    .from('transactions')
-    .update({
-      manual_loan_id: loanId,
-      principal_portion: normalizedPrincipal,
-      auto_role: 'debt_payment' satisfies SemanticRole,
-      role_source: 'manual_loan_link',
-      role_confidence: 'high',
-      classifier_version: CURRENT_CLASSIFIER_VERSION,
-    })
-    .eq('id', transactionId);
-
+  const { error } = await supabaseAdmin.rpc('link_transaction_to_manual_loan', {
+    p_user_id: userId,
+    p_transaction_id: transactionId,
+    p_loan_id: loanId,
+    p_principal_portion: normalizedPrincipal,
+    p_classifier_version: CURRENT_CLASSIFIER_VERSION,
+  });
   if (error) throw new Error(`Failed to link transaction to loan: ${error.message}`);
-  await adjustManualLoanBalance(loanId, -normalizedPrincipal);
 }
 
 export async function getLinkedPaymentsForLoan(
@@ -1262,36 +1278,39 @@ export async function getLinkedPaymentsForLoan(
 }
 
 /** Edits how much of an already-linked payment counts toward principal, adjusting the loan's
- *  balance by the difference so it stays consistent with the new value. */
+ *  balance by the difference in the SAME atomic operation (Round 6 remediation, blocker 4) — see
+ *  `update_linked_payment_principal` in the Phase A migration. */
 export async function updateLinkedPaymentPrincipal(
+  userId: string,
   transactionId: string,
   loanId: string,
   newPrincipalPortion: number
 ): Promise<void> {
   const { data: txn, error: fetchError } = await supabaseAdmin
     .from('transactions')
-    .select('principal_portion, manual_loan_id, amount')
+    .select('manual_loan_id, amount')
     .eq('id', transactionId)
     .maybeSingle();
 
   if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
   if (!txn || txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
 
-  // WRITE-boundary validation (Round 2 remediation §7) — same rule as linkTransactionToLoan.
+  // WRITE-boundary validation (Round 2 remediation §7) — same rule as linkTransactionToLoan; the
+  // RPC re-validates this bound again itself (defense in depth).
   const normalizedPrincipal = normalizePrincipalPortion(txn.amount as number, newPrincipalPortion);
-  const oldPortion = (txn.principal_portion as number | null) ?? 0;
 
-  const { error: updateError } = await supabaseAdmin
-    .from('transactions')
-    .update({ principal_portion: normalizedPrincipal })
-    .eq('id', transactionId);
-
-  if (updateError) throw new Error(`Failed to update payment: ${updateError.message}`);
-  await adjustManualLoanBalance(loanId, oldPortion - normalizedPrincipal);
+  const { error } = await supabaseAdmin.rpc('update_linked_payment_principal', {
+    p_user_id: userId,
+    p_transaction_id: transactionId,
+    p_loan_id: loanId,
+    p_new_principal_portion: normalizedPrincipal,
+  });
+  if (error) throw new Error(`Failed to update payment: ${error.message}`);
 }
 
 /** Reverses a payment link — restores the loan's balance by the portion that had been applied
- *  and clears the link, e.g. to correct a false-positive text match.
+ *  and clears the link atomically (Round 6 remediation, blocker 4), e.g. to correct a
+ *  false-positive text match. See `unlink_transaction_from_manual_loan` in the Phase A migration.
  *
  *  Round 4 remediation §7: returns `true` if this call performed the actual unlink, or `false`
  *  if the transaction was ALREADY unlinked (from this or a different loan) — an idempotent
@@ -1302,21 +1321,17 @@ export async function updateLinkedPaymentPrincipal(
  *  request identifies the same transaction/loan relationship that was just removed, and that is
  *  a completed, not a failed, unlink. Only a genuine mismatch (linked to a DIFFERENT loan than
  *  the one named in the request, or the transaction not existing at all) is a real error. */
-export async function unlinkPaymentFromLoan(transactionId: string, loanId: string): Promise<boolean> {
+export async function unlinkPaymentFromLoan(userId: string, transactionId: string, loanId: string): Promise<boolean> {
   const { data: txn, error: fetchError } = await supabaseAdmin
     .from('transactions')
-    .select(
-      'principal_portion, manual_loan_id, amount, category, personal_finance_category_detailed, personal_finance_category_confidence'
-    )
+    .select('manual_loan_id, amount, category, personal_finance_category_detailed, personal_finance_category_confidence')
     .eq('id', transactionId)
     .maybeSingle();
 
   if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
   if (!txn) throw new Error('Payment not found');
-  if (txn.manual_loan_id === null) return false; // already unlinked — idempotent no-op
+  if (txn.manual_loan_id === null) return false; // already unlinked — idempotent no-op, no RPC call needed
   if (txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
-
-  const oldPortion = (txn.principal_portion as number | null) ?? 0;
 
   // manual_loan_link no longer governs this row's role once unlinked — reclassify via the normal
   // (non-loan) precedence immediately. If this lands on a relational candidate (an ambiguous
@@ -1331,21 +1346,17 @@ export async function unlinkPaymentFromLoan(transactionId: string, loanId: strin
     manualLoanId: null,
   });
 
-  const { error: updateError } = await supabaseAdmin
-    .from('transactions')
-    .update({
-      manual_loan_id: null,
-      principal_portion: null,
-      auto_role: classification.autoRole,
-      role_source: classification.roleSource,
-      role_confidence: classification.roleConfidence,
-      classifier_version: classification.classifierVersion,
-    })
-    .eq('id', transactionId);
-
-  if (updateError) throw new Error(`Failed to unlink payment: ${updateError.message}`);
-  await adjustManualLoanBalance(loanId, oldPortion);
-  return true;
+  const { data, error } = await supabaseAdmin.rpc('unlink_transaction_from_manual_loan', {
+    p_user_id: userId,
+    p_transaction_id: transactionId,
+    p_loan_id: loanId,
+    p_auto_role: classification.autoRole,
+    p_role_source: classification.roleSource,
+    p_role_confidence: classification.roleConfidence,
+    p_classifier_version: classification.classifierVersion,
+  });
+  if (error) throw new Error(`Failed to unlink payment: ${error.message}`);
+  return data as boolean;
 }
 
 /** Sums how much principal and interest have been paid on each of the given loans, combining
@@ -1413,25 +1424,29 @@ export async function createManualLoanPayment(
   const normalizedPrincipal = normalizeNonNegativeMoneyAmount(params.principalPortion, 'principal_portion');
   const normalizedInterest = normalizeNonNegativeMoneyAmount(params.interestPortion, 'interest_portion');
 
-  const { data, error } = await supabaseAdmin
-    .from('manual_loan_payments')
-    .insert({
-      user_id: userId,
-      loan_id: loanId,
-      date: params.date,
-      principal_portion: normalizedPrincipal,
-      interest_portion: normalizedInterest,
-      notes: params.notes,
-    })
-    .select()
-    .single();
-
+  // Insert + balance decrement happen atomically (Round 6 remediation, blocker 4) — see
+  // `create_manual_loan_payment` in the Phase A migration.
+  const { data: paymentId, error } = await supabaseAdmin.rpc('create_manual_loan_payment', {
+    p_user_id: userId,
+    p_loan_id: loanId,
+    p_date: params.date,
+    p_principal_portion: normalizedPrincipal,
+    p_interest_portion: normalizedInterest,
+    p_notes: params.notes,
+  });
   if (error) throw new Error(`Failed to create manual payment: ${error.message}`);
-  await adjustManualLoanBalance(loanId, -normalizedPrincipal);
+
+  const { data, error: refetchError } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .select()
+    .eq('id', paymentId as string)
+    .single();
+  if (refetchError) throw new Error(`Failed to load created manual payment: ${refetchError.message}`);
   return data as ManualLoanPaymentRow;
 }
 
 export async function updateManualLoanPayment(
+  userId: string,
   id: string,
   loanId: string,
   fields: Partial<{ date: string; principal_portion: number; interest_portion: number; notes: string | null }>
@@ -1448,7 +1463,7 @@ export async function updateManualLoanPayment(
 
   const { data: existing, error: fetchError } = await supabaseAdmin
     .from('manual_loan_payments')
-    .select('principal_portion')
+    .select('id')
     .eq('id', id)
     .eq('loan_id', loanId)
     .maybeSingle();
@@ -1456,44 +1471,44 @@ export async function updateManualLoanPayment(
   if (fetchError) throw new Error(`Failed to load manual payment: ${fetchError.message}`);
   if (!existing) return null;
 
-  const { data, error } = await supabaseAdmin
-    .from('manual_loan_payments')
-    .update(normalizedFields)
-    .eq('id', id)
-    .eq('loan_id', loanId)
-    .select()
-    .maybeSingle();
-
+  // The patch/update + any balance adjustment happen atomically (Round 6 remediation, blocker 4)
+  // — see `update_manual_loan_payment` in the Phase A migration. The p_set_* flags distinguish
+  // "not part of this patch" from "explicitly set to null" (notes legitimately accepts null).
+  const { error } = await supabaseAdmin.rpc('update_manual_loan_payment', {
+    p_user_id: userId,
+    p_payment_id: id,
+    p_loan_id: loanId,
+    p_set_date: normalizedFields.date !== undefined,
+    p_date: normalizedFields.date ?? null,
+    p_set_principal_portion: normalizedFields.principal_portion !== undefined,
+    p_principal_portion: normalizedFields.principal_portion ?? null,
+    p_set_interest_portion: normalizedFields.interest_portion !== undefined,
+    p_interest_portion: normalizedFields.interest_portion ?? null,
+    p_set_notes: normalizedFields.notes !== undefined,
+    p_notes: normalizedFields.notes ?? null,
+  });
   if (error) throw new Error(`Failed to update manual payment: ${error.message}`);
-  if (!data) return null;
 
-  if (normalizedFields.principal_portion !== undefined) {
-    const oldPortion = existing.principal_portion as number;
-    await adjustManualLoanBalance(loanId, oldPortion - normalizedFields.principal_portion);
-  }
-
-  return data as ManualLoanPaymentRow;
+  const { data, error: refetchError } = await supabaseAdmin
+    .from('manual_loan_payments')
+    .select()
+    .eq('id', id)
+    .maybeSingle();
+  if (refetchError) throw new Error(`Failed to load updated manual payment: ${refetchError.message}`);
+  return data as ManualLoanPaymentRow | null;
 }
 
-export async function deleteManualLoanPayment(id: string, loanId: string): Promise<void> {
-  const { data: existing, error: fetchError } = await supabaseAdmin
-    .from('manual_loan_payments')
-    .select('principal_portion')
-    .eq('id', id)
-    .eq('loan_id', loanId)
-    .maybeSingle();
-
-  if (fetchError) throw new Error(`Failed to load manual payment: ${fetchError.message}`);
-  if (!existing) return;
-
-  const { error } = await supabaseAdmin
-    .from('manual_loan_payments')
-    .delete()
-    .eq('id', id)
-    .eq('loan_id', loanId);
-
+/** Deletes a manually-logged payment and restores its principal to the loan's balance atomically
+ *  (Round 6 remediation, blocker 4) — see `delete_manual_loan_payment` in the Phase A migration,
+ *  which is itself idempotent (a no-op if the payment is already gone), matching this function's
+ *  pre-existing contract. */
+export async function deleteManualLoanPayment(userId: string, id: string, loanId: string): Promise<void> {
+  const { error } = await supabaseAdmin.rpc('delete_manual_loan_payment', {
+    p_user_id: userId,
+    p_payment_id: id,
+    p_loan_id: loanId,
+  });
   if (error) throw new Error(`Failed to delete manual payment: ${error.message}`);
-  await adjustManualLoanBalance(loanId, existing.principal_portion as number);
 }
 
 // ---- Budget categories ---------------------------------------------------------
@@ -2188,15 +2203,26 @@ export class SemanticRoleMutationError extends Error {}
  * ownership/count-mismatch integrity failures included, not just genuine infrastructure errors.
  * See that error's own doc comment for why this must be a hard failure rather than a `false`
  * return callers could mistake for ordinary candidate ambiguity.
+ *
+ * Round 6 remediation (blocker 3, completing the mitigation): `expectedRoleSources` (parallel to
+ * `transactionIds`, same length and order) is a compare-and-swap check — the role_source each row
+ * was observed to have at the moment the caller's candidate-selection logic decided to write this
+ * mutation. The RPC verifies every row's CURRENT role_source still matches before writing
+ * anything, and raises (rolling back) if not — closing the window between "this row was ranked
+ * from a read that happened moments ago, outside any lock" and "this row is about to be
+ * overwritten," which the per-user advisory lock alone cannot close (it only prevents two WRITES
+ * from interleaving with each other, not a write from proceeding on a since-invalidated read).
  */
 export async function applyTransactionSemanticRoles(
   userId: string,
   transactionIds: string[],
+  expectedRoleSources: (string | null)[],
   fields: { auto_role: SemanticRole; role_source: string; role_confidence: string; classifier_version: number }
 ): Promise<void> {
   const { error } = await supabaseAdmin.rpc('apply_transaction_semantic_roles', {
     p_user_id: userId,
     p_transaction_ids: transactionIds,
+    p_expected_role_sources: expectedRoleSources,
     p_auto_role: fields.auto_role,
     p_role_source: fields.role_source,
     p_role_confidence: fields.role_confidence,

@@ -391,7 +391,7 @@ async function resolveRefundCandidate(
     classifier_version: CURRENT_CLASSIFIER_VERSION,
   };
   if (apply) {
-    await dataService.applyTransactionSemanticRoles(userId, [row.id], fields);
+    await dataService.applyTransactionSemanticRoles(userId, [row.id], [row.role_source], fields);
   }
   return { resolved: [{ id: row.id, fields }], unresolved: [] };
 }
@@ -433,7 +433,7 @@ async function resolveDanglingRefunds(
       classifier_version: CURRENT_CLASSIFIER_VERSION,
     };
     if (apply) {
-      await dataService.applyTransactionSemanticRoles(userId, [candidate.id], fields);
+      await dataService.applyTransactionSemanticRoles(userId, [candidate.id], [candidate.role_source], fields);
     }
     result.resolved.push({ id: candidate.id, fields });
   }
@@ -490,8 +490,16 @@ export async function reconcileRelationalRoles(
     if (apply) {
       // One atomic RPC call covering both ids — Round 3 remediation §1. Round 4 remediation §6:
       // throws on any RPC-reported failure rather than returning a boolean — deliberately not
-      // caught here, so an integrity failure aborts this whole reconciliation pass.
-      await dataService.applyTransactionSemanticRoles(userId, [anchor.id, outcome.partner.id], fields);
+      // caught here, so an integrity failure aborts this whole reconciliation pass. Round 6
+      // remediation (blocker 3): passes each row's own currently-observed role_source as the
+      // expected-state CAS check — if either row changed between this snapshot's read and this
+      // write, the RPC rejects rather than committing a decision based on stale data.
+      await dataService.applyTransactionSemanticRoles(
+        userId,
+        [anchor.id, outcome.partner.id],
+        [anchor.role_source, outcome.partner.role_source],
+        fields
+      );
     }
     result.resolved.push({ id: anchor.id, fields }, { id: outcome.partner.id, fields });
     settledIds.add(anchor.id);
@@ -537,8 +545,10 @@ async function resetRowToFreshClassification(userId: string, row: Reconciliation
   if (apply) {
     // Round 4 remediation §6: throws (SemanticRoleMutationError) rather than returning false on
     // an RPC integrity failure — deliberately not caught, so a failure here aborts the whole
-    // repair sweep rather than silently skipping this row.
-    await dataService.applyTransactionSemanticRoles(userId, [row.id], fields);
+    // repair sweep rather than silently skipping this row. Round 6 remediation (blocker 3):
+    // row.role_source is the expected-state CAS check — the value observed when this reset
+    // decision was made.
+    await dataService.applyTransactionSemanticRoles(userId, [row.id], [row.role_source], fields);
   }
   return { id: row.id, fields };
 }

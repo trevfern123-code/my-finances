@@ -230,7 +230,9 @@ export async function processPage(
         classifier_version: classification.classifierVersion,
       };
       if (apply) {
-        await dataService.applyTransactionSemanticRoles(row.user_id, [row.id], fields);
+        // Round 6 remediation (blocker 3): row.role_source is the expected-state CAS check — the
+        // value observed on this page fetch, when this classification decision was made.
+        await dataService.applyTransactionSemanticRoles(row.user_id, [row.id], [row.role_source], fields);
       }
     }
     const existing = idsByUser.get(row.user_id) ?? [];

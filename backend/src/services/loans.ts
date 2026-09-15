@@ -3,7 +3,6 @@ import * as plaidService from './plaidService';
 import * as dataService from './dataService';
 import { repairExistingRelationalRoles } from './roleReconciliation';
 import { summarizeErrorSafely } from './errorSanitizer';
-import type { InsertedTransaction } from '../types';
 
 export type LoanType = 'student' | 'mortgage' | 'credit';
 
@@ -133,12 +132,18 @@ export function matchTransactionToLoan(
  * gated on Plaid's own `added` count rather than on whether THIS call linked anything, which is
  * what makes the sweep retry-safe (see syncService.ts's own comment for why gating on this
  * function's own success/failure/no-op breaks that).
+ *
+ * Round 6 remediation (blocker 5's remaining gap): candidates are re-derived from Plaid's OWN
+ * `plaidTransactionIds` (its `added` report for this batch) on every call, not taken from
+ * `applyTransactionChanges`'s own insert/update classification — a link that fails in attempt 1
+ * leaves the row persisted but unlinked; on a retry that row is no longer a fresh INSERT (so the
+ * old `insertedTransactions`-based candidate set would never include it again), but Plaid still
+ * reports the identical `added` composition for the same unadvanced cursor, and
+ * `getUnlinkedTransactionsByPlaidIds` re-queries fresh each time, filtered to still-unlinked —
+ * naturally retrying the failed link and no-op-ing for whatever already succeeded.
  */
-export async function linkNewTransactionsToManualLoans(
-  userId: string,
-  insertedTransactions: InsertedTransaction[]
-): Promise<void> {
-  if (insertedTransactions.length === 0) return;
+export async function linkNewTransactionsToManualLoans(userId: string, plaidTransactionIds: string[]): Promise<void> {
+  if (plaidTransactionIds.length === 0) return;
 
   try {
     const loans = await dataService.listManualLoans(userId);
@@ -147,10 +152,11 @@ export async function linkNewTransactionsToManualLoans(
       .map((l) => ({ id: l.id, match_text: l.match_text }));
     if (matchers.length === 0) return;
 
-    for (const txn of insertedTransactions) {
+    const candidates = await dataService.getUnlinkedTransactionsByPlaidIds(userId, plaidTransactionIds);
+    for (const txn of candidates) {
       const loanId = matchTransactionToLoan(txn, matchers);
       if (loanId) {
-        await dataService.linkTransactionToLoan(txn.id, loanId, txn.amount);
+        await dataService.linkTransactionToLoan(userId, txn.id, loanId, txn.amount);
       }
     }
   } catch (err) {
@@ -183,7 +189,7 @@ export async function backfillMatchesForLoan(userId: string, loan: { id: string;
   const matcher = { id: loan.id, match_text: loan.match_text };
   for (const txn of candidates) {
     if (matchTransactionToLoan(txn, [matcher])) {
-      await dataService.linkTransactionToLoan(txn.id, loan.id, txn.amount);
+      await dataService.linkTransactionToLoan(userId, txn.id, loan.id, txn.amount);
     }
   }
 
