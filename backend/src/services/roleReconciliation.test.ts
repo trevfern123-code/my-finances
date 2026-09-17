@@ -12,6 +12,7 @@ const mockFindTransferCounterpartCandidates = vi.hoisted(() => vi.fn());
 const mockFindRefundOriginalCandidates = vi.hoisted(() => vi.fn());
 const mockFindNegativeCandidatesReferencingOriginal = vi.hoisted(() => vi.fn());
 const mockApplyTransactionSemanticRoles = vi.hoisted(() => vi.fn());
+const mockConfirmTransferPair = vi.hoisted(() => vi.fn());
 const mockGetRelationallyClassifiedTransactionsPage = vi.hoisted(() => vi.fn());
 
 vi.mock('./dataService', () => ({
@@ -20,6 +21,7 @@ vi.mock('./dataService', () => ({
   findRefundOriginalCandidates: mockFindRefundOriginalCandidates,
   findNegativeCandidatesReferencingOriginal: mockFindNegativeCandidatesReferencingOriginal,
   applyTransactionSemanticRoles: mockApplyTransactionSemanticRoles,
+  confirmTransferPair: mockConfirmTransferPair,
   getRelationallyClassifiedTransactionsPage: mockGetRelationallyClassifiedTransactionsPage,
 }));
 
@@ -29,6 +31,19 @@ vi.mock('./dataService', () => ({
  *  points back), and a naive `mockResolvedValue` returning the same list regardless of which row
  *  is asking cannot model two DIFFERENT rows each genuinely seeing the OTHER as their candidate —
  *  it would instead make every row see ITSELF, which the reciprocal check correctly rejects. */
+/** Confirming a transfer pair now goes through `confirmTransferPair(userId, rowAId, rowBId, ...)`
+ *  — order-agnostic from the test's point of view, since either row can end up as "A" depending
+ *  on iteration order (see `computeReciprocalTransferResolution`'s own doc comment: the RESULT is
+ *  order-independent, but which specific row is passed first to the RPC is an implementation
+ *  detail). Checks that some call confirms exactly this unordered pair. */
+function expectConfirmTransferPairCalledWithPair(idA: string, idB: string) {
+  const found = mockConfirmTransferPair.mock.calls.some((call) => {
+    const [, callA, callB] = call as [string, string, string, ...unknown[]];
+    return [callA, callB].sort().join(',') === [idA, idB].sort().join(',');
+  });
+  expect(found).toBe(true);
+}
+
 function transferCandidatesByRowId(byId: Record<string, ReconciliationRow[]>) {
   return async (_userId: string, queryingRow: { id: string }) => byId[queryingRow.id] ?? [];
 }
@@ -107,6 +122,7 @@ beforeEach(() => {
   mockFindRefundOriginalCandidates.mockResolvedValue([]);
   mockFindNegativeCandidatesReferencingOriginal.mockResolvedValue([]);
   mockApplyTransactionSemanticRoles.mockResolvedValue(true);
+  mockConfirmTransferPair.mockResolvedValue(undefined);
   mockGetRelationallyClassifiedTransactionsPage.mockResolvedValue([]);
 });
 
@@ -145,14 +161,12 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
 
     const result = await reconcileRelationalRoles('user-1', ['txn-1']);
 
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
-      'user-1',
-      ['txn-1', 'txn-2'],
-      expect.anything(),
-      expect.objectContaining({ auto_role: 'internal_transfer', role_confidence: 'high' })
-    );
+    expectConfirmTransferPairCalledWithPair('txn-1', 'txn-2');
     expect(result.resolved).toHaveLength(2);
     expect(result.resolved.map((r) => r.id).sort()).toEqual(['txn-1', 'txn-2']);
+    expect(result.resolved[0].fields).toEqual(
+      expect.objectContaining({ auto_role: 'internal_transfer', role_confidence: 'high' })
+    );
   });
 
   it('a candidate on a different day (within window) is medium confidence, not high', async () => {
@@ -164,14 +178,10 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
       })
     );
 
-    await reconcileRelationalRoles('user-1', ['txn-1']);
+    const result = await reconcileRelationalRoles('user-1', ['txn-1']);
 
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
-      'user-1',
-      expect.anything(),
-      expect.anything(),
-      expect.objectContaining({ role_confidence: 'medium' })
-    );
+    expectConfirmTransferPairCalledWithPair('txn-1', 'txn-2');
+    expect(result.resolved[0].fields).toEqual(expect.objectContaining({ role_confidence: 'medium' }));
   });
 
   it('exact-date candidate beats a further, merely-compatible-amount candidate deterministically', async () => {
@@ -184,14 +194,10 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
       })
     );
 
-    await reconcileRelationalRoles('user-1', ['txn-1']);
+    const result = await reconcileRelationalRoles('user-1', ['txn-1']);
 
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
-      'user-1',
-      ['txn-1', 'txn-near'],
-      expect.anything(),
-      expect.objectContaining({ role_confidence: 'high' })
-    );
+    expectConfirmTransferPairCalledWithPair('txn-1', 'txn-near');
+    expect(result.resolved[0].fields).toEqual(expect.objectContaining({ role_confidence: 'high' }));
   });
 
   it('two equally plausible candidates (same date distance) -> ambiguous, NEVER guessed, no update at all', async () => {
@@ -203,7 +209,7 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
 
     const result = await reconcileRelationalRoles('user-1', ['txn-1']);
 
-    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+    expect(mockConfirmTransferPair).not.toHaveBeenCalled();
     expect(result.unresolved).toEqual([{ id: 'txn-1', reason: 'ambiguous_transfer_candidates' }]);
   });
 
@@ -213,7 +219,7 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
 
     const result = await reconcileRelationalRoles('user-1', ['txn-1']);
 
-    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+    expect(mockConfirmTransferPair).not.toHaveBeenCalled();
     expect(result.unresolved).toEqual([{ id: 'txn-1', reason: 'no_transfer_evidence' }]);
   });
 
@@ -237,11 +243,11 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
         'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
       })
     );
-    // applyTransactionSemanticRoles now THROWS on any RPC-reported failure (ownership mismatch,
-    // count mismatch, duplicate ids) rather than returning `false` — see dataService.ts's
-    // SemanticRoleMutationError for why this must be a hard failure, not a candidate-ranking
-    // outcome a caller could mistake for ordinary ambiguity.
-    mockApplyTransactionSemanticRoles.mockRejectedValue(new Error('apply_transaction_semantic_roles: ownership check failed'));
+    // confirmTransferPair now THROWS on any RPC-reported failure (ownership mismatch, a
+    // re-ranked candidate no longer confirming the pair, etc.) rather than returning a boolean —
+    // see dataService.ts's TransferPairConfirmationError for why this must be a hard failure, not
+    // a candidate-ranking outcome a caller could mistake for ordinary ambiguity.
+    mockConfirmTransferPair.mockRejectedValue(new Error('confirm_transfer_pair: ownership check failed'));
 
     await expect(reconcileRelationalRoles('user-1', ['txn-1'])).rejects.toThrow('ownership check failed');
   });
@@ -255,8 +261,67 @@ describe('reconcileRelationalRoles — transfers: deterministic, conservative ra
 
     const result = await reconcileRelationalRoles('user-1', ['txn-1']);
 
-    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+    expect(mockConfirmTransferPair).not.toHaveBeenCalled();
     expect(result.unresolved).toEqual([{ id: 'txn-1', reason: 'ambiguous_transfer_candidates' }]);
+  });
+
+  describe('phantom-candidate concurrency (Round 7 remediation, completing blocker 3)', () => {
+    // A row-only CAS check (Round 6) re-verifies that the two TARGET rows haven't changed, but
+    // cannot detect a THIRD row that appeared or changed after ranking, which would outrank or
+    // tie with the already-picked candidate if re-ranked. confirmTransferPair closes this by
+    // re-running candidate discovery AND ranking inside the same locked transaction as the write
+    // (see confirm_transfer_pair in the Phase A migration, and its own extensive doc comment).
+    //
+    // This module always delegates the FULL decision — re-discover, re-rank, verify reciprocity,
+    // write — to that single RPC call; there is no separate "verify" step in TypeScript to unit
+    // test here, so the two cases below assert this module's OWN contract at the boundary: it
+    // must call confirmTransferPair with the pair it ranked, and it must propagate that RPC's
+    // rejection as a hard failure rather than silently downgrading it to "unresolved". The SQL
+    // function's own phantom-candidate-detection logic was additionally verified against a real,
+    // disposable PostgreSQL instance in this round: two genuinely concurrent psql sessions, one
+    // blocked on the per-user advisory lock while the other committed a competing candidate row,
+    // proved the blocked session's re-discovery (after unblocking) correctly caught the
+    // now-ambiguous/no-longer-unique state and rejected rather than committing — see this round's
+    // remediation report for the exact scenario and output.
+    it('a pair the application ranked is submitted to confirmTransferPair exactly as ranked — the RPC, not this module, is what re-verifies against phantom candidates', async () => {
+      mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
+      mockFindTransferCounterpartCandidates.mockImplementation(
+        transferCandidatesByRowId({
+          'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-10' })],
+          'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+        })
+      );
+
+      await reconcileRelationalRoles('user-1', ['txn-1']);
+
+      expectConfirmTransferPairCalledWithPair('txn-1', 'txn-2');
+      expect(mockConfirmTransferPair).toHaveBeenCalledWith(
+        'user-1',
+        expect.any(String),
+        expect.any(String),
+        'transfer_like_unconfirmed',
+        expect.any(Number),
+        expect.any(Number)
+      );
+    });
+
+    it('when the RPC detects a phantom candidate (rejects a pair this module ranked as still valid), the failure propagates as a hard error, never as an ordinary unresolved outcome', async () => {
+      mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
+      mockFindTransferCounterpartCandidates.mockImplementation(
+        transferCandidatesByRowId({
+          'txn-1': [row({ id: 'txn-2', amount: -100, date: '2026-09-10' })],
+          'txn-2': [row({ id: 'txn-1', amount: 100, date: '2026-09-10' })],
+        })
+      );
+      // Simulates the RPC's own re-discovery finding a third row (inserted or modified after
+      // this module's own ranking) that ties with or outranks the candidate this module picked —
+      // confirm_transfer_pair raises rather than committing a decision based on stale ranking.
+      mockConfirmTransferPair.mockRejectedValue(
+        new Error("confirm_transfer_pair: row_a's candidates are now ambiguous (a tie exists at the best distance)")
+      );
+
+      await expect(reconcileRelationalRoles('user-1', ['txn-1'])).rejects.toThrow('now ambiguous');
+    });
   });
 });
 
@@ -275,7 +340,7 @@ describe('reconcileRelationalRoles — reciprocal one-to-one transfer matching (
     const result = await reconcileRelationalRoles('user-1', ['txn-a', 'txn-b']);
 
     expect(result.resolved.map((r) => r.id).sort()).toEqual(['txn-a', 'txn-b']);
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1); // deduped — B's own turn is skipped
+    expect(mockConfirmTransferPair).toHaveBeenCalledTimes(1); // deduped — B's own turn is skipped
   });
 
   it('one mutually-unique pair plus a third unmatched candidate: A(+500)/B(-500)/C(+500) — B is genuinely closer to A, so only A/B confirm; C stays unresolved', async () => {
@@ -296,8 +361,8 @@ describe('reconcileRelationalRoles — reciprocal one-to-one transfer matching (
     expect(result.resolved.map((r) => r.id).sort()).toEqual(['txn-a', 'txn-b']);
     expect(result.unresolved).toEqual([{ id: 'txn-c', reason: 'no_transfer_evidence' }]);
     // B is never mutated twice, and never reused for a second pair.
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1);
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith('user-1', ['txn-a', 'txn-b'], expect.anything(), expect.anything());
+    expect(mockConfirmTransferPair).toHaveBeenCalledTimes(1);
+    expectConfirmTransferPairCalledWithPair('txn-a', 'txn-b');
   });
 
   it('A/B/C tied ambiguity: B is EQUIDISTANT from A and C — none of the three relationships are confirmed', async () => {
@@ -316,7 +381,7 @@ describe('reconcileRelationalRoles — reciprocal one-to-one transfer matching (
     const result = await reconcileRelationalRoles('user-1', ['txn-a', 'txn-b', 'txn-c']);
 
     expect(result.resolved).toEqual([]);
-    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+    expect(mockConfirmTransferPair).not.toHaveBeenCalled();
   });
 
   it('unequal-distance one-to-many: three candidates for one anchor, only the closest reciprocates', async () => {
@@ -345,7 +410,7 @@ describe('reconcileRelationalRoles — reciprocal one-to-one transfer matching (
 
     const result = await reconcileRelationalRoles('user-1', ['txn-a']);
 
-    expect(mockApplyTransactionSemanticRoles).not.toHaveBeenCalled();
+    expect(mockConfirmTransferPair).not.toHaveBeenCalled();
     expect(result.unresolved).toEqual([{ id: 'txn-a', reason: 'no_transfer_evidence' }]);
   });
 
@@ -380,7 +445,7 @@ describe('reconcileRelationalRoles — reciprocal one-to-one transfer matching (
 
     await reconcileRelationalRoles('user-1', ['txn-a', 'txn-b']);
 
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1);
+    expect(mockConfirmTransferPair).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -816,17 +881,35 @@ describe('reconcileRelationalRoles — dry-run hypothetical-state pool (Round 3 
 
     await reconcileRelationalRoles('user-1', ['txn-1'], true);
 
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledWith(
-      'user-1',
-      ['txn-1', 'txn-2'],
-      expect.anything(),
-      expect.objectContaining({ auto_role: 'internal_transfer' })
-    );
+    expectConfirmTransferPairCalledWithPair('txn-1', 'txn-2');
   });
 });
 
 describe('user_role_override is never WRITTEN by this module (it IS read, for transfer eligibility — Round 4 remediation §3)', () => {
-  it('only auto_role/source/confidence/version fields ever appear in a write', async () => {
+  it('only auto_role/source/confidence/version fields ever appear in an applyTransactionSemanticRoles write (the refund/reset path — transfer-pair confirmation has no `fields` object at all, see confirmTransferPair)', async () => {
+    const refundRow = row({
+      id: 'txn-refund',
+      amount: -50,
+      name: 'Store',
+      merchant_name: 'Store',
+      role_source: 'sign_default',
+      user_role_override: null,
+    });
+    mockGetTransactionsForReconciliation.mockResolvedValue([refundRow]);
+    mockFindRefundOriginalCandidates.mockResolvedValue([
+      row({ id: 'txn-orig', amount: 50, name: 'Store', merchant_name: 'Store', effective_role: 'expense' }),
+    ]);
+
+    await reconcileRelationalRoles('user-1', ['txn-refund']);
+
+    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1); // sanity: the loop below isn't vacuous
+    for (const call of mockApplyTransactionSemanticRoles.mock.calls) {
+      const fields = call[3] as object;
+      expect(Object.keys(fields).sort()).toEqual(['auto_role', 'classifier_version', 'role_confidence', 'role_source'].sort());
+    }
+  });
+
+  it('confirmTransferPair never receives a user_role_override — its signature carries no fields object to leak one through', async () => {
     mockGetTransactionsForReconciliation.mockResolvedValue([row({ id: 'txn-1', amount: 100, date: '2026-09-10' })]);
     mockFindTransferCounterpartCandidates.mockImplementation(
       transferCandidatesByRowId({
@@ -837,11 +920,9 @@ describe('user_role_override is never WRITTEN by this module (it IS read, for tr
 
     await reconcileRelationalRoles('user-1', ['txn-1']);
 
-    expect(mockApplyTransactionSemanticRoles).toHaveBeenCalledTimes(1); // sanity: the loop below isn't vacuous
-    for (const call of mockApplyTransactionSemanticRoles.mock.calls) {
-      const fields = call[3] as object;
-      expect(Object.keys(fields).sort()).toEqual(['auto_role', 'classifier_version', 'role_confidence', 'role_source'].sort());
-    }
+    expect(mockConfirmTransferPair).toHaveBeenCalledTimes(1);
+    const [, , , ...rest] = mockConfirmTransferPair.mock.calls[0];
+    expect(rest.every((arg: unknown) => typeof arg !== 'object' || arg === null)).toBe(true);
   });
 });
 

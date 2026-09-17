@@ -42,6 +42,8 @@ import {
   findNegativeCandidatesReferencingOriginal,
   applyTransactionSemanticRoles,
   SemanticRoleMutationError,
+  confirmTransferPair,
+  TransferPairConfirmationError,
   getRelationallyClassifiedTransactionsPage,
   getTransactionsBackfillPage,
 } from './dataService';
@@ -1381,6 +1383,34 @@ describe('getUnlinkedTransactionsByPlaidIds (Round 6 remediation, blocker 5)', (
   });
 });
 
+function toSnakeCaseLoanRow(params: {
+  name: string;
+  loanType: string;
+  currentBalance: number;
+  originationPrincipalAmount: number | null;
+  interestRatePercentage: number | null;
+  originationDate: string | null;
+  termMonths: number | null;
+  minimumPaymentAmount: number | null;
+  nextPaymentDueDate: string | null;
+  notes: string | null;
+  matchText: string | null;
+}) {
+  return {
+    name: params.name,
+    loan_type: params.loanType,
+    current_balance: params.currentBalance,
+    origination_principal_amount: params.originationPrincipalAmount,
+    interest_rate_percentage: params.interestRatePercentage,
+    origination_date: params.originationDate,
+    term_months: params.termMonths,
+    minimum_payment_amount: params.minimumPaymentAmount,
+    next_payment_due_date: params.nextPaymentDueDate,
+    notes: params.notes,
+    match_text: params.matchText,
+  };
+}
+
 describe('createManualLoan / updateManualLoan — numeric field validation (Round 5 remediation, blocker 7)', () => {
   const validParams = {
     name: 'Car Loan',
@@ -1397,8 +1427,9 @@ describe('createManualLoan / updateManualLoan — numeric field validation (Roun
   };
 
   it('accepts fully valid params', async () => {
+    const dedupQuery = createQueryBuilder({ data: [], error: null });
     const insertQuery = createQueryBuilder({ data: { id: 'loan-1', ...validParams }, error: null });
-    mockFrom.mockReturnValueOnce(insertQuery);
+    mockFrom.mockReturnValueOnce(dedupQuery).mockReturnValueOnce(insertQuery);
 
     await expect(createManualLoan('user-1', validParams)).resolves.toBeDefined();
   });
@@ -1421,10 +1452,46 @@ describe('createManualLoan / updateManualLoan — numeric field validation (Roun
 
   it('a null nullable field (no origination data yet) is accepted, not validated as a number', async () => {
     const params = { ...validParams, originationPrincipalAmount: null, interestRatePercentage: null, termMonths: null, minimumPaymentAmount: null };
+    const dedupQuery = createQueryBuilder({ data: [], error: null });
     const insertQuery = createQueryBuilder({ data: { id: 'loan-1', ...params }, error: null });
-    mockFrom.mockReturnValueOnce(insertQuery);
+    mockFrom.mockReturnValueOnce(dedupQuery).mockReturnValueOnce(insertQuery);
 
     await expect(createManualLoan('user-1', params)).resolves.toBeDefined();
+  });
+
+  describe('createManualLoan retry-idempotency (Round 7 remediation, blocker 5\'s remaining gap)', () => {
+    it('a retry with EXACTLY the same params within the window returns the existing row instead of inserting a duplicate', async () => {
+      const existingLoan = { id: 'loan-1', user_id: 'user-1', created_at: new Date().toISOString(), ...toSnakeCaseLoanRow(validParams) };
+      const dedupQuery = createQueryBuilder({ data: [existingLoan], error: null });
+      mockFrom.mockReturnValueOnce(dedupQuery);
+
+      const result = await createManualLoan('user-1', validParams);
+
+      expect(result).toEqual(existingLoan);
+      expect(mockFrom).toHaveBeenCalledTimes(1); // only the dedup check — no insert
+    });
+
+    it('a genuinely different loan (different current_balance) for the same user/name is NOT treated as a duplicate — inserts normally', async () => {
+      const existingLoan = { id: 'loan-1', user_id: 'user-1', created_at: new Date().toISOString(), ...toSnakeCaseLoanRow(validParams) };
+      const dedupQuery = createQueryBuilder({ data: [existingLoan], error: null });
+      const insertQuery = createQueryBuilder({ data: { id: 'loan-2', ...validParams, current_balance: 9999 }, error: null });
+      mockFrom.mockReturnValueOnce(dedupQuery).mockReturnValueOnce(insertQuery);
+
+      const result = await createManualLoan('user-1', { ...validParams, currentBalance: 9999 });
+
+      expect((result as { id: string }).id).toBe('loan-2');
+      expect(mockFrom).toHaveBeenCalledTimes(2);
+    });
+
+    it('no recent match at all — inserts normally', async () => {
+      const dedupQuery = createQueryBuilder({ data: [], error: null });
+      const insertQuery = createQueryBuilder({ data: { id: 'loan-1', ...validParams }, error: null });
+      mockFrom.mockReturnValueOnce(dedupQuery).mockReturnValueOnce(insertQuery);
+
+      await createManualLoan('user-1', validParams);
+
+      expect(mockFrom).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('updateManualLoan rejects an invalid field before ever touching the DB', async () => {
@@ -2193,6 +2260,48 @@ describe('transaction semantic-role reconciliation queries (Financial Semantics 
           role_confidence: 'low',
           classifier_version: 1,
         })
+      ).rejects.toThrow('connection failure');
+    });
+  });
+
+  describe('confirmTransferPair — atomic candidate re-discovery + ranking + write (Round 7 remediation, completing blocker 3)', () => {
+    beforeEach(() => {
+      mockRpc.mockReset();
+    });
+
+    it('invokes confirm_transfer_pair with the exact expected parameter shape', async () => {
+      mockRpc.mockResolvedValueOnce({ data: null, error: null });
+
+      await expect(
+        confirmTransferPair('user-1', 'txn-1', 'txn-2', 'transfer_like_unconfirmed', 3, 1)
+      ).resolves.toBeUndefined();
+
+      expect(mockRpc).toHaveBeenCalledWith('confirm_transfer_pair', {
+        p_user_id: 'user-1',
+        p_row_a_id: 'txn-1',
+        p_row_b_id: 'txn-2',
+        p_role_source_filter: 'transfer_like_unconfirmed',
+        p_window_days: 3,
+        p_classifier_version: 1,
+      });
+    });
+
+    it('THROWS TransferPairConfirmationError (never resolves) when the RPC rejects the pair — a stale ranking, a phantom candidate re-discovered inside the locked transaction, an ownership mismatch, or any other integrity failure', async () => {
+      mockRpc.mockResolvedValueOnce({
+        data: null,
+        error: { message: "confirm_transfer_pair: row_a's best current candidate is no longer row_b" },
+      });
+
+      await expect(
+        confirmTransferPair('user-1', 'txn-1', 'txn-2', 'transfer_like_unconfirmed', 3, 1)
+      ).rejects.toThrow(TransferPairConfirmationError);
+    });
+
+    it('a genuine infrastructure error is also thrown as TransferPairConfirmationError', async () => {
+      mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'connection failure' } });
+
+      await expect(
+        confirmTransferPair('user-1', 'txn-1', 'txn-2', 'transfer_like_unconfirmed', 3, 1)
       ).rejects.toThrow('connection failure');
     });
   });

@@ -692,3 +692,285 @@ revoke execute on function public.delete_transactions_and_restore_loan_balances(
 revoke execute on function public.delete_transactions_and_restore_loan_balances(uuid, text[]) from anon;
 revoke execute on function public.delete_transactions_and_restore_loan_balances(uuid, text[]) from authenticated;
 grant execute on function public.delete_transactions_and_restore_loan_balances(uuid, text[]) to service_role;
+
+-- Round 7 remediation (blocker 3, completing the transactional-unification ask): the
+-- p_expected_role_sources CAS check added in Round 6 detects a row that CHANGED between
+-- candidate ranking (in the application) and this write, but it cannot detect a THIRD row that
+-- was inserted or modified in that same window such that, if re-ranked now, it would outrank or
+-- tie with the candidate the application already picked — a "phantom candidate." Closing that
+-- requires candidate discovery and ranking to happen INSIDE the same locked transaction as the
+-- write, not merely re-validating the two target rows. This function does exactly that: under
+-- the same per-user advisory lock every other function here uses, it re-runs the transfer-
+-- counterpart discovery query and the same deterministic ranking rule (closest date wins, a tie
+-- at the best distance is ambiguous) FOR BOTH candidate rows, from CURRENT locked data, and only
+-- commits if each row's own freshly-computed best match is still the other one. The application
+-- layer's own ranking (roleReconciliation.ts's computeReciprocalTransferResolution) is still what
+-- decides WHICH pair looks worth attempting — that stays outside the database, since it also
+-- drives dry-run preview and pool-based same-batch lookahead, neither of which apply once we're
+-- actually about to write — but this function is the sole authority on whether a candidate pair
+-- is still correct at the moment of commit, and never trusts the application's ranking alone.
+--
+-- Residual (disclosed, not closed by this function): a row matching the search criteria that is
+-- INSERTED by a concurrent transaction after this function's own discovery query runs, but before
+-- this function commits, is not locked by us (there is no row to lock until it exists) and so
+-- cannot be detected by FOR UPDATE alone — only SERIALIZABLE isolation (or locking the entire
+-- candidate keyspace some other way) closes that specific sub-case, and this function intentionally
+-- does not attempt that: this project's other functions all rely on Postgres's default READ
+-- COMMITTED isolation, changing it for one function only was judged a bigger, harder-to-verify
+-- change than the risk it removes at this app's single-primary-user, personal-finance scale. Every
+-- modification to an EXISTING row (the concrete scenario the review's own example describes — "a
+-- concurrent request links B to a loan or changes B's amount") is fully closed, because that row
+-- IS locked and re-read by this function's own discovery query.
+create or replace function public.confirm_transfer_pair(
+  p_user_id uuid,
+  p_row_a_id uuid,
+  p_row_b_id uuid,
+  p_role_source_filter text,
+  p_window_days integer,
+  p_classifier_version smallint
+) returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_a record;
+  v_b record;
+  v_a_best_id uuid;
+  v_a_best_distance integer;
+  v_a_tie_count integer;
+  v_b_best_id uuid;
+  v_b_tie_count integer;
+  v_confidence text;
+  v_updated_count integer;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  if p_row_a_id = p_row_b_id then
+    raise exception 'confirm_transfer_pair: row_a and row_b must be distinct ids';
+  end if;
+  if p_window_days is null or p_window_days < 0 then
+    raise exception 'confirm_transfer_pair: window_days must be a non-negative integer';
+  end if;
+
+  -- Lock and load both candidate rows (and their ownership chain) inside this transaction —
+  -- everything from here on sees a consistent, locked view no other writer for this user can
+  -- interleave with (thanks to the advisory lock above).
+  select t.id, t.account_id, t.amount, t.date, t.role_source, t.user_role_override
+  into v_a
+  from public.transactions t
+  join public.accounts a on a.id = t.account_id
+  join public.plaid_items pi on pi.id = a.item_id
+  where t.id = p_row_a_id and pi.user_id = p_user_id
+  for update of t, a, pi;
+
+  if not found then
+    raise exception 'confirm_transfer_pair: row_a not found or not owned by user';
+  end if;
+
+  select t.id, t.account_id, t.amount, t.date, t.role_source, t.user_role_override
+  into v_b
+  from public.transactions t
+  join public.accounts a on a.id = t.account_id
+  join public.plaid_items pi on pi.id = a.item_id
+  where t.id = p_row_b_id and pi.user_id = p_user_id
+  for update of t, a, pi;
+
+  if not found then
+    raise exception 'confirm_transfer_pair: row_b not found or not owned by user';
+  end if;
+
+  if v_a.role_source is distinct from p_role_source_filter or v_b.role_source is distinct from p_role_source_filter then
+    raise exception 'confirm_transfer_pair: one or both rows no longer have the expected role_source (concurrent modification)';
+  end if;
+
+  if not (v_a.user_role_override is null or v_a.user_role_override = 'internal_transfer') then
+    raise exception 'confirm_transfer_pair: row_a is no longer eligible (overridden away from internal_transfer)';
+  end if;
+  if not (v_b.user_role_override is null or v_b.user_role_override = 'internal_transfer') then
+    raise exception 'confirm_transfer_pair: row_b is no longer eligible (overridden away from internal_transfer)';
+  end if;
+
+  if v_a.account_id = v_b.account_id then
+    raise exception 'confirm_transfer_pair: row_a and row_b are on the same account';
+  end if;
+  if v_a.amount is distinct from (-v_b.amount) then
+    raise exception 'confirm_transfer_pair: row_a and row_b are not exact opposite amounts';
+  end if;
+
+  -- Re-run candidate discovery + ranking for row_a from CURRENT locked data — the step that
+  -- actually closes the phantom-candidate gap (see this function's own doc comment above). Every
+  -- candidate this discovers is itself locked (FOR UPDATE), so it cannot be mutated by a
+  -- concurrent writer between this check and our own write below.
+  select c.id, c.distance into v_a_best_id, v_a_best_distance
+  from (
+    select t.id, t.date, abs(t.date - v_a.date) as distance
+    from public.transactions t
+    join public.accounts a on a.id = t.account_id
+    join public.plaid_items pi on pi.id = a.item_id
+    where pi.user_id = p_user_id
+      and t.id <> v_a.id
+      and t.account_id <> v_a.account_id
+      and t.amount = -v_a.amount
+      and t.role_source = p_role_source_filter
+      and (t.user_role_override is null or t.user_role_override = 'internal_transfer')
+      and t.date between v_a.date - p_window_days and v_a.date + p_window_days
+    for update of t
+  ) c
+  order by c.distance asc, c.id asc
+  limit 1;
+
+  if v_a_best_id is distinct from v_b.id then
+    raise exception 'confirm_transfer_pair: row_a''s best current candidate is no longer row_b (a competing candidate exists, or the prior candidate changed/vanished)';
+  end if;
+
+  select count(*) into v_a_tie_count
+  from (
+    select t.id, abs(t.date - v_a.date) as distance
+    from public.transactions t
+    join public.accounts a on a.id = t.account_id
+    join public.plaid_items pi on pi.id = a.item_id
+    where pi.user_id = p_user_id
+      and t.id <> v_a.id
+      and t.account_id <> v_a.account_id
+      and t.amount = -v_a.amount
+      and t.role_source = p_role_source_filter
+      and (t.user_role_override is null or t.user_role_override = 'internal_transfer')
+      and t.date between v_a.date - p_window_days and v_a.date + p_window_days
+  ) c
+  where c.distance = v_a_best_distance;
+
+  if v_a_tie_count > 1 then
+    raise exception 'confirm_transfer_pair: row_a''s candidates are now ambiguous (a tie exists at the best distance)';
+  end if;
+
+  -- Symmetric re-check from row_b's side — reciprocity, not just a one-sided unique winner, is
+  -- what makes a pairing correct (see roleReconciliation.ts's own doc comment for the A/B/C
+  -- triangle this guards against).
+  select c.id into v_b_best_id
+  from (
+    select t.id, abs(t.date - v_b.date) as distance
+    from public.transactions t
+    join public.accounts a on a.id = t.account_id
+    join public.plaid_items pi on pi.id = a.item_id
+    where pi.user_id = p_user_id
+      and t.id <> v_b.id
+      and t.account_id <> v_b.account_id
+      and t.amount = -v_b.amount
+      and t.role_source = p_role_source_filter
+      and (t.user_role_override is null or t.user_role_override = 'internal_transfer')
+      and t.date between v_b.date - p_window_days and v_b.date + p_window_days
+    for update of t
+  ) c
+  order by c.distance asc, c.id asc
+  limit 1;
+
+  if v_b_best_id is distinct from v_a.id then
+    raise exception 'confirm_transfer_pair: row_b''s best current candidate is no longer row_a (a competing candidate exists, or the prior candidate changed/vanished)';
+  end if;
+
+  select count(*) into v_b_tie_count
+  from (
+    select t.id, abs(t.date - v_b.date) as distance
+    from public.transactions t
+    join public.accounts a on a.id = t.account_id
+    join public.plaid_items pi on pi.id = a.item_id
+    where pi.user_id = p_user_id
+      and t.id <> v_b.id
+      and t.account_id <> v_b.account_id
+      and t.amount = -v_b.amount
+      and t.role_source = p_role_source_filter
+      and (t.user_role_override is null or t.user_role_override = 'internal_transfer')
+      and t.date between v_b.date - p_window_days and v_b.date + p_window_days
+  ) c
+  where c.distance = abs(v_a.date - v_b.date);
+
+  if v_b_tie_count > 1 then
+    raise exception 'confirm_transfer_pair: row_b''s candidates are now ambiguous (a tie exists at the best distance)';
+  end if;
+
+  v_confidence := case when v_a.date = v_b.date then 'high' else 'medium' end;
+
+  update public.transactions t
+  set auto_role = 'internal_transfer',
+      role_source = 'account_pair_match',
+      role_confidence = v_confidence,
+      classifier_version = p_classifier_version
+  where t.id in (v_a.id, v_b.id);
+
+  get diagnostics v_updated_count = row_count;
+  if v_updated_count is distinct from 2 then
+    raise exception 'confirm_transfer_pair: update count mismatch (expected 2, got %)', v_updated_count;
+  end if;
+end;
+$$;
+
+revoke execute on function public.confirm_transfer_pair(uuid, uuid, uuid, text, integer, smallint) from public;
+revoke execute on function public.confirm_transfer_pair(uuid, uuid, uuid, text, integer, smallint) from anon;
+revoke execute on function public.confirm_transfer_pair(uuid, uuid, uuid, text, integer, smallint) from authenticated;
+grant execute on function public.confirm_transfer_pair(uuid, uuid, uuid, text, integer, smallint) to service_role;
+
+-- Round 7 remediation (blocker 7, completing the enforcement ask): dataService.ts's
+-- assertValidManualLoanFields validates current_balance/origination_principal_amount/
+-- interest_rate_percentage/minimum_payment_amount/term_months at the application boundary, but
+-- the database itself — every manual_loans row's actual, final guarantee, independent of which
+-- application code path writes to it — only ever checked loan_type. These five CHECK constraints
+-- close that gap.
+--
+-- Every one is added `NOT VALID`, a deliberate two-stage rollout rather than an ordinary CHECK
+-- (verified against a disposable PostgreSQL instance for this round, not assumed):
+--
+--  1. `ALTER TABLE ... ADD CONSTRAINT ... CHECK (...) NOT VALID` takes only a brief metadata lock
+--     and does NOT scan or lock existing rows at all — confirmed live: a row already violating
+--     `current_balance >= 0` remained readable and untouched immediately after adding that exact
+--     constraint NOT VALID. This is safe to apply to this table regardless of what unknown
+--     existing production data it holds, which a same-migration ordinary (always-validated)
+--     CHECK constraint is NOT — that variant scans and would abort the whole migration on the
+--     first violating row, with no visibility into whether one exists before running it.
+--  2. From the moment it's added, though, a NOT VALID constraint is FULLY enforced for every new
+--     INSERT and every UPDATE that touches the constrained column — confirmed live: an insert of
+--     a second violating row was rejected immediately after the NOT VALID constraint above was
+--     added, well before anything validated existing rows. So this migration alone already closes
+--     the write-path gap (Round 5 remediation, blocker 7's "database only checks loan_type"
+--     finding) — no unvalidated new bad data can land, regardless of validation status.
+--  3. Validating the constraint against whatever rows already exist (`ALTER TABLE ...
+--     VALIDATE CONSTRAINT ...`) is intentionally a SEPARATE, LATER, MANUAL step — never run as
+--     part of this migration, and never against production from this session (this project's
+--     standing rule: never touch production Supabase directly). Confirmed live: VALIDATE
+--     CONSTRAINT correctly refuses to complete while a violating row exists, and succeeds (flips
+--     `pg_constraint.convalidated` to true) once none remain — a safe, non-destructive operation
+--     that only ever reads and reports, never rewrites data. Before ever running it against
+--     production, run this read-only preflight against the SAME database first (safe to run
+--     anytime, changes nothing):
+--
+--       select id, user_id, name, current_balance, origination_principal_amount,
+--              interest_rate_percentage, minimum_payment_amount, term_months
+--       from public.manual_loans
+--       where current_balance < 0
+--          or (origination_principal_amount is not null and origination_principal_amount < 0)
+--          or (interest_rate_percentage is not null and interest_rate_percentage < 0)
+--          or (minimum_payment_amount is not null and minimum_payment_amount < 0)
+--          or (term_months is not null and term_months <= 0);
+--
+--     An empty result means `VALIDATE CONSTRAINT` (run separately, once this migration itself has
+--     been applied) will succeed immediately. Any returned row means that row needs a decision —
+--     correct it or knowingly except it — before validating; the constraint keeps protecting every
+--     NEW write in the meantime regardless of when (or whether) that validation step happens.
+alter table public.manual_loans
+  add constraint manual_loans_current_balance_check check (current_balance >= 0) not valid;
+
+alter table public.manual_loans
+  add constraint manual_loans_origination_principal_amount_check
+    check (origination_principal_amount is null or origination_principal_amount >= 0) not valid;
+
+alter table public.manual_loans
+  add constraint manual_loans_interest_rate_percentage_check
+    check (interest_rate_percentage is null or interest_rate_percentage >= 0) not valid;
+
+alter table public.manual_loans
+  add constraint manual_loans_minimum_payment_amount_check
+    check (minimum_payment_amount is null or minimum_payment_amount >= 0) not valid;
+
+alter table public.manual_loans
+  add constraint manual_loans_term_months_check
+    check (term_months is null or term_months > 0) not valid;

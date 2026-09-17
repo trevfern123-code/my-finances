@@ -467,8 +467,9 @@ export async function reconcileRelationalRoles(
   // remediation, blocker 1) — every candidate is read before anything is written, so the SET of
   // confirmed pairs is fixed before the first write happens. The order writes are then issued in
   // cannot change which pairs got confirmed.
-  const transferAnchors = touched.filter((row) => row.role_source === 'transfer_like_unconfirmed');
-  const transferOutcomes = await computeReciprocalTransferResolution(userId, transferAnchors, 'transfer_like_unconfirmed', pool);
+  const transferRoleSourceFilter = 'transfer_like_unconfirmed';
+  const transferAnchors = touched.filter((row) => row.role_source === transferRoleSourceFilter);
+  const transferOutcomes = await computeReciprocalTransferResolution(userId, transferAnchors, transferRoleSourceFilter, pool);
   const settledIds = new Set<string>();
   for (const anchor of transferAnchors) {
     const outcome = transferOutcomes.get(anchor.id);
@@ -488,17 +489,21 @@ export async function reconcileRelationalRoles(
       classifier_version: CURRENT_CLASSIFIER_VERSION,
     };
     if (apply) {
-      // One atomic RPC call covering both ids — Round 3 remediation §1. Round 4 remediation §6:
-      // throws on any RPC-reported failure rather than returning a boolean — deliberately not
-      // caught here, so an integrity failure aborts this whole reconciliation pass. Round 6
-      // remediation (blocker 3): passes each row's own currently-observed role_source as the
-      // expected-state CAS check — if either row changed between this snapshot's read and this
-      // write, the RPC rejects rather than committing a decision based on stale data.
-      await dataService.applyTransactionSemanticRoles(
+      // Round 7 remediation (blocker 3, completing the transactional-unification ask): a
+      // row-only CAS check (Round 6) cannot detect a THIRD row that appeared or changed after
+      // this pair was ranked and would now outrank or tie with it — closing that requires
+      // candidate discovery and ranking to happen INSIDE the same locked transaction as the
+      // write, not just re-verifying the two rows already picked. confirmTransferPair does
+      // exactly that (see its own doc comment and confirm_transfer_pair in the Phase A
+      // migration) — deliberately not caught here, so a rejection aborts this whole
+      // reconciliation pass exactly like any other integrity failure.
+      await dataService.confirmTransferPair(
         userId,
-        [anchor.id, outcome.partner.id],
-        [anchor.role_source, outcome.partner.role_source],
-        fields
+        anchor.id,
+        outcome.partner.id,
+        transferRoleSourceFilter,
+        TRANSFER_WINDOW_DAYS,
+        CURRENT_CLASSIFIER_VERSION
       );
     }
     result.resolved.push({ id: anchor.id, fields }, { id: outcome.partner.id, fields });

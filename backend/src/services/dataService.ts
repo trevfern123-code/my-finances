@@ -1073,6 +1073,57 @@ function assertValidManualLoanFields(fields: {
   }
 }
 
+/** Round 7 remediation (blocker 5's remaining gap): `createManualLoan` is invoked synchronously
+ *  by `manualLoanController.ts`'s create handler, which ALSO runs `backfillMatchesForLoan`
+ *  immediately afterward and (per Round 5) no longer swallows that step's failure — meaning a
+ *  loan can persist successfully while the overall request still reports failure. A client that
+ *  retries the identical "create loan" request in that situation would otherwise insert a SECOND,
+ *  duplicate loan row, while any transactions the first attempt's backfill already linked stay
+ *  attached to the first (now orphaned from the client's point of view) row.
+ *
+ *  This project has no client-supplied idempotency-key mechanism (adding one would require a
+ *  frontend change, out of scope here), so this uses a narrow, disclosed heuristic instead: if a
+ *  loan for this user with EVERY field identical to `params` was inserted within the last
+ *  `CREATE_RETRY_WINDOW_MS`, treat this call as a retry of that same logical request and return
+ *  the EXISTING row rather than inserting a new one — the caller (createManualLoan's own
+ *  controller) can then safely re-attempt backfillMatchesForLoan against it. The window is
+ *  short and the match is exact-field, not fuzzy, to minimize (not eliminate) the chance of
+ *  conflating two genuinely distinct loans a user creates in quick succession with identical
+ *  values — a real risk this heuristic accepts as the cost of not having a proper idempotency key.
+ */
+const CREATE_MANUAL_LOAN_RETRY_WINDOW_MS = 30_000;
+
+function manualLoanParamsMatch(
+  existing: ManualLoanRow,
+  params: {
+    name: string;
+    loanType: string;
+    currentBalance: number;
+    originationPrincipalAmount: number | null;
+    interestRatePercentage: number | null;
+    originationDate: string | null;
+    termMonths: number | null;
+    minimumPaymentAmount: number | null;
+    nextPaymentDueDate: string | null;
+    notes: string | null;
+    matchText: string | null;
+  }
+): boolean {
+  return (
+    existing.name === params.name &&
+    existing.loan_type === params.loanType &&
+    existing.current_balance === params.currentBalance &&
+    existing.origination_principal_amount === params.originationPrincipalAmount &&
+    existing.interest_rate_percentage === params.interestRatePercentage &&
+    existing.origination_date === params.originationDate &&
+    existing.term_months === params.termMonths &&
+    existing.minimum_payment_amount === params.minimumPaymentAmount &&
+    existing.next_payment_due_date === params.nextPaymentDueDate &&
+    existing.notes === params.notes &&
+    existing.match_text === params.matchText
+  );
+}
+
 export async function createManualLoan(
   userId: string,
   params: {
@@ -1096,6 +1147,19 @@ export async function createManualLoan(
     minimum_payment_amount: params.minimumPaymentAmount,
     term_months: params.termMonths,
   });
+
+  const since = new Date(Date.now() - CREATE_MANUAL_LOAN_RETRY_WINDOW_MS).toISOString();
+  const { data: recent, error: recentError } = await supabaseAdmin
+    .from('manual_loans')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('name', params.name)
+    .gte('created_at', since)
+    .order('created_at', { ascending: false })
+    .limit(5);
+  if (recentError) throw new Error(`Failed to check for a recent duplicate loan: ${recentError.message}`);
+  const duplicate = (recent as ManualLoanRow[] | null)?.find((row) => manualLoanParamsMatch(row, params));
+  if (duplicate) return duplicate;
 
   const { data, error } = await supabaseAdmin
     .from('manual_loans')
@@ -2230,6 +2294,49 @@ export async function applyTransactionSemanticRoles(
   });
   if (error) {
     throw new SemanticRoleMutationError(`Failed to apply transaction semantic roles: ${error.message}`);
+  }
+}
+
+/** Thrown by `confirmTransferPair` for any failure the RPC reports — ownership, eligibility,
+ *  amount/account mismatch, or (the case this function exists to catch) a candidate re-ranked
+ *  from current data no longer confirming the intended pair. See that function's own doc comment. */
+export class TransferPairConfirmationError extends Error {}
+
+/**
+ * Confirms a transfer pair ATOMICALLY WITH re-verification of its candidate ranking (Round 7
+ * remediation, completing blocker 3) — the sole write path for turning two
+ * `transfer_like_unconfirmed` rows into a confirmed `account_pair_match` pair. Unlike
+ * `applyTransactionSemanticRoles`'s CAS check (which only re-verifies that the two TARGET rows
+ * haven't themselves changed), this delegates to `confirm_transfer_pair` (see the Phase A
+ * migration), which re-runs candidate DISCOVERY and RANKING for both rows from current, locked
+ * data — under the same per-user advisory lock as every other write — and only commits if each
+ * row's own freshly-computed best match is still the other. This is what catches a "phantom
+ * candidate": a third row inserted or modified after the application (roleReconciliation.ts's
+ * `computeReciprocalTransferResolution`) ranked this pair, which a row-only CAS check cannot see
+ * because it never re-examines the candidate SET, only the two rows already selected from it.
+ *
+ * The application's own ranking still decides WHICH pair is worth attempting (it also drives
+ * dry-run preview and same-batch pool lookahead, neither of which apply here) — this function is
+ * the sole authority on whether that pair is still correct at the moment of commit.
+ */
+export async function confirmTransferPair(
+  userId: string,
+  rowAId: string,
+  rowBId: string,
+  roleSourceFilter: string,
+  windowDays: number,
+  classifierVersion: number
+): Promise<void> {
+  const { error } = await supabaseAdmin.rpc('confirm_transfer_pair', {
+    p_user_id: userId,
+    p_row_a_id: rowAId,
+    p_row_b_id: rowBId,
+    p_role_source_filter: roleSourceFilter,
+    p_window_days: windowDays,
+    p_classifier_version: classifierVersion,
+  });
+  if (error) {
+    throw new TransferPairConfirmationError(`Failed to confirm transfer pair: ${error.message}`);
   }
 }
 
