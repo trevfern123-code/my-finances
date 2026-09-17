@@ -1221,6 +1221,17 @@ export async function updateManualLoan(
  * that no longer exists. Each linked transaction is reclassified via the same row-level
  * precedence `unlinkPaymentFromLoan` uses, exactly as if it had been individually unlinked first.
  *
+ * Round 9 remediation (candidate-affecting-writer audit): this reclassification now goes through
+ * `unlink_transaction_from_manual_loan` — the SAME atomic, per-user-locked RPC
+ * `unlinkPaymentFromLoan` itself calls — rather than a plain, unlocked `.update()`. An earlier
+ * version wrote `auto_role`/`role_source` directly, making it a candidate-affecting writer (it
+ * can turn a row from `manual_loan_link` back into `transfer_like_unconfirmed`, a brand-new
+ * transfer candidate) that never contended for the per-user advisory lock every other such writer
+ * uses — closing exactly the class of gap this round's audit was checking for. Reusing this RPC
+ * also restores the loan's balance per transaction, which is immediately moot once the loan
+ * itself is deleted below, but harmless — it is the same call `unlinkPaymentFromLoan` makes for a
+ * single payment, just looped here for every payment linked to the loan being removed.
+ *
  * Returns the ids of every transaction that was reclassified, so the caller
  * (manualLoanController.ts) can run the relational repair sweep for this user afterward — one of
  * these rows may have been serving as an existing transfer counterpart or refund original before
@@ -1252,18 +1263,16 @@ export async function deleteManualLoan(id: string, userId: string): Promise<{ af
       personalFinanceCategoryConfidence: txn.personal_finance_category_confidence,
       manualLoanId: null,
     });
-    const { error: updateError } = await supabaseAdmin
-      .from('transactions')
-      .update({
-        manual_loan_id: null,
-        principal_portion: null,
-        auto_role: classification.autoRole,
-        role_source: classification.roleSource,
-        role_confidence: classification.roleConfidence,
-        classifier_version: classification.classifierVersion,
-      })
-      .eq('id', txn.id);
-    if (updateError) throw new Error(`Failed to reclassify transaction linked to deleted loan: ${updateError.message}`);
+    const { error: rpcError } = await supabaseAdmin.rpc('unlink_transaction_from_manual_loan', {
+      p_user_id: userId,
+      p_transaction_id: txn.id,
+      p_loan_id: id,
+      p_auto_role: classification.autoRole,
+      p_role_source: classification.roleSource,
+      p_role_confidence: classification.roleConfidence,
+      p_classifier_version: classification.classifierVersion,
+    });
+    if (rpcError) throw new Error(`Failed to reclassify transaction linked to deleted loan: ${rpcError.message}`);
     affectedTransactionIds.push(txn.id);
   }
 

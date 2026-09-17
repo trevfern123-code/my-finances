@@ -710,17 +710,50 @@ grant execute on function public.delete_transactions_and_restore_loan_balances(u
 -- actually about to write — but this function is the sole authority on whether a candidate pair
 -- is still correct at the moment of commit, and never trusts the application's ranking alone.
 --
--- Residual (disclosed, not closed by this function): a row matching the search criteria that is
--- INSERTED by a concurrent transaction after this function's own discovery query runs, but before
--- this function commits, is not locked by us (there is no row to lock until it exists) and so
--- cannot be detected by FOR UPDATE alone — only SERIALIZABLE isolation (or locking the entire
--- candidate keyspace some other way) closes that specific sub-case, and this function intentionally
--- does not attempt that: this project's other functions all rely on Postgres's default READ
--- COMMITTED isolation, changing it for one function only was judged a bigger, harder-to-verify
--- change than the risk it removes at this app's single-primary-user, personal-finance scale. Every
--- modification to an EXISTING row (the concrete scenario the review's own example describes — "a
--- concurrent request links B to a loan or changes B's amount") is fully closed, because that row
--- IS locked and re-read by this function's own discovery query.
+-- Residual, re-examined and resolved (Round 9 final audit): earlier rounds disclosed, but did not
+-- close, a theoretical gap — a row matching the search criteria INSERTED by a concurrent
+-- transaction strictly after this function's own discovery query runs but before this function
+-- commits is not itself lockable (there is no row to lock until it exists), so FOR UPDATE alone
+-- cannot detect it; only SERIALIZABLE isolation (or locking the entire candidate keyspace some
+-- other way) closes that specific sub-case in the abstract, general case, and a live test against
+-- disposable Postgres 15 confirmed SET TRANSACTION ISOLATION LEVEL SERIALIZABLE cannot even be
+-- issued as the first statement of a function invoked via a top-level RPC call (the call itself
+-- already counts as a preceding query by the time the function body runs) — so that route was
+-- never viable here regardless.
+--
+-- The actual resolution is structural, not isolation-level: EVERY function in this migration that
+-- can insert, update, delete, link, unlink, or otherwise mutate a row that candidate discovery
+-- would consider — apply_synced_transaction_batch, apply_transaction_semantic_roles,
+-- link_transaction_to_manual_loan, unlink_transaction_from_manual_loan,
+-- update_linked_payment_principal, delete_transactions_and_restore_loan_balances, and this
+-- function itself — acquires the exact same pg_advisory_xact_lock(hashtext(p_user_id::text)) as
+-- its OWN first statement, before touching any row, and holds it (a Postgres guarantee for the
+-- xact-scoped variant) until its own transaction commits or rolls back. A Round 9 writer-inventory
+-- audit of the whole backend (grepped across services/, controllers/, and scripts/) confirmed this
+-- function's advisory lock is the ONLY per-user lock of its kind anywhere in the codebase and that
+-- every direct write to the transactions table outside these RPCs (dataService.ts's
+-- setTransactionCategory, approveTransaction, backfillCategoryMapping) touches only
+-- budget_category_id/needs_review, never amount/date/account_id/role_source/auto_role/
+-- role_confidence/classifier_version/user_role_override/manual_loan_id/principal_portion — so none
+-- of them can produce or alter a transfer candidate. The one remaining unlocked writer this audit
+-- found, deleteManualLoan's direct .update() on linked transactions, was fixed in this same round
+-- to route through the already-locked unlink_transaction_from_manual_loan RPC instead.
+--
+-- Given that inventory, this function's OWN advisory-lock acquisition (its first statement,
+-- before its discovery query even runs) is sufficient by itself: any concurrent attempt to insert
+-- a new candidate row must first acquire that identical lock, which blocks until this function's
+-- transaction ends — before that concurrent writer's INSERT statement can even execute, let alone
+-- commit. There is therefore no window, for any in-scope writer, in which a phantom row can be
+-- inserted between this function's discovery query and its own commit: the lock this function
+-- already holds prevents such a writer from starting, not merely from finishing unnoticed. This is
+-- PROVEN for every application writer inventoried above, not merely argued — it is NOT a guarantee
+-- against a write issued outside the application (e.g. an ad hoc SQL session connecting directly
+-- as a role that bypasses this same advisory-lock convention, or a future function added to this
+-- schema without adopting it); that residual is inherent to any advisory-lock-based scheme and
+-- would apply equally to a SERIALIZABLE-based design. Every modification to an EXISTING row (the
+-- concrete scenario the original review's own example described — "a concurrent request links B to
+-- a loan or changes B's amount") was already fully closed in Round 7, because that row IS locked
+-- and re-read by this function's own discovery query.
 create or replace function public.confirm_transfer_pair(
   p_user_id uuid,
   p_row_a_id uuid,
@@ -1021,12 +1054,45 @@ declare
   v_update_count integer;
   v_distinct_count integer;
   v_owned_count integer;
+  v_affected_count integer;
   v_inserted jsonb;
 begin
   perform pg_advisory_xact_lock(hashtext(p_user_id::text));
 
   v_insert_count := coalesce(jsonb_array_length(p_inserts), 0);
   v_update_count := coalesce(jsonb_array_length(p_updates), 0);
+
+  -- Reject duplicate plaid_transaction_ids outright (Round 9 remediation) — the table's own
+  -- UNIQUE constraint would eventually catch a genuine collision at INSERT time anyway, but
+  -- checking here fails fast with a clear message before locking or touching anything, exactly
+  -- mirroring apply_transaction_semantic_roles's own duplicate-id rejection.
+  if v_insert_count > 0 then
+    select count(distinct x.plaid_transaction_id) into v_distinct_count
+    from jsonb_to_recordset(p_inserts) as x(plaid_transaction_id text);
+    if v_distinct_count is distinct from v_insert_count then
+      raise exception 'apply_synced_transaction_batch: duplicate plaid_transaction_id supplied in p_inserts (% distinct of %)',
+        v_distinct_count, v_insert_count;
+    end if;
+  end if;
+
+  -- Reject duplicate update ids outright (Round 9 remediation, found via adversarial testing): an
+  -- earlier version of this function computed `v_distinct_count` for the ownership check below
+  -- but never compared it against `v_update_count` itself, so two objects in p_updates sharing
+  -- the same `id` (different field values) passed ownership verification silently — the
+  -- OWNED,DISTINCT count still matched. The actual `UPDATE ... FROM` statement further down would
+  -- then have matched the same target row against BOTH source rows, and which one's values
+  -- "won" is unspecified per Postgres's own multiple-match UPDATE...FROM behavior — confirmed
+  -- live: it is not a documented, reliable choice. Rejecting the duplicate before anything is
+  -- locked or written removes the ambiguity entirely rather than leaving it to be resolved by
+  -- unspecified engine behavior.
+  if v_update_count > 0 then
+    select count(distinct x.id) into v_distinct_count
+    from jsonb_to_recordset(p_updates) as x(id uuid);
+    if v_distinct_count is distinct from v_update_count then
+      raise exception 'apply_synced_transaction_batch: duplicate id supplied in p_updates (% distinct of %)',
+        v_distinct_count, v_update_count;
+    end if;
+  end if;
 
   -- Verify ownership of every account referenced by an insert row BEFORE inserting anything.
   if v_insert_count > 0 then
@@ -1047,11 +1113,9 @@ begin
   -- Verify ownership of (and lock) every transaction referenced by an update row BEFORE updating
   -- anything. The locking SELECT carries no aggregate (Postgres forbids that combination — see
   -- apply_transaction_semantic_roles's own doc comment for the same fix), so counting happens in
-  -- an outer, unlocked query over the already-locked set.
+  -- an outer, unlocked query over the already-locked set. Duplicates were already rejected above,
+  -- so `v_distinct_count` here is exactly `v_update_count`.
   if v_update_count > 0 then
-    select count(*) into v_distinct_count
-    from (select distinct x.id from jsonb_to_recordset(p_updates) as x(id uuid)) d;
-
     select count(*) into v_owned_count
     from (
       select t.id
@@ -1063,7 +1127,7 @@ begin
       for update of t
     ) locked;
 
-    if v_owned_count is distinct from v_distinct_count then
+    if v_owned_count is distinct from v_update_count then
       raise exception 'apply_synced_transaction_batch: one or more update rows reference a transaction not owned by this user';
     end if;
   end if;
@@ -1093,6 +1157,11 @@ begin
     select jsonb_agg(jsonb_build_object('id', id, 'name', name, 'merchant_name', merchant_name, 'amount', amount))
     into v_inserted
     from ins;
+
+    get diagnostics v_affected_count = row_count;
+    if v_affected_count is distinct from v_insert_count then
+      raise exception 'apply_synced_transaction_batch: insert count mismatch (expected %, got %)', v_insert_count, v_affected_count;
+    end if;
   end if;
 
   if v_update_count > 0 then
@@ -1119,6 +1188,11 @@ begin
       auto_role text, role_source text, role_confidence text, classifier_version smallint
     )
     where t.id = x.id;
+
+    get diagnostics v_affected_count = row_count;
+    if v_affected_count is distinct from v_update_count then
+      raise exception 'apply_synced_transaction_batch: update count mismatch (expected %, got %)', v_update_count, v_affected_count;
+    end if;
   end if;
 
   return coalesce(v_inserted, '[]'::jsonb);
@@ -1137,25 +1211,48 @@ grant execute on function public.apply_synced_transaction_batch(uuid, jsonb, jso
 -- delayed retry past its window, nor tell a genuine duplicate loan apart from a retry that
 -- happened to reuse identical values). One row per (user, idempotency_key) the caller has ever
 -- used for a loan creation; `loan_id` is what a replayed request re-fetches and returns.
+--
+-- Round 9 remediation (idempotency-key audit): `request_fingerprint` closes a gap the original
+-- design left open — reusing the same key with a genuinely DIFFERENT payload (a client bug, or a
+-- key collision) previously replayed the FIRST payload's loan silently, discarding whatever the
+-- second, different request actually asked for with no error at all. A deterministic fingerprint
+-- of every field the caller supplied is stored alongside the key; a replay must match it exactly,
+-- or the call fails loudly (see create_manual_loan_idempotent below) rather than silently
+-- returning a loan that doesn't reflect what was just asked for.
 create table public.manual_loan_creation_requests (
   user_id uuid not null,
   idempotency_key text not null,
   loan_id uuid not null references public.manual_loans(id) on delete cascade,
+  request_fingerprint text not null,
   created_at timestamp with time zone not null default now(),
   primary key (user_id, idempotency_key)
 );
 
 alter table public.manual_loan_creation_requests enable row level security;
 
--- Atomically replays an existing loan for a (user, idempotency_key) pair already seen, or creates
--- a new one and records the key — the whole check-then-act sequence happens inside one locked
--- transaction, so two concurrent requests carrying the SAME key can never both pass the "does
--- this key exist yet" check and both insert: the per-(user,key) advisory lock (a finer grain than
--- the per-user lock used elsewhere in this migration, since loan creation never touches
--- `transactions` and so has no need to contend with those writers) serializes them, and the
--- second one simply reads back what the first one already committed. A genuinely different key
--- always creates a genuinely new loan, however similar its fields are to an existing one — this
--- function never compares field VALUES, only the key.
+-- Round 9 remediation: this table is new (unlike manual_loans/manual_loan_payments, which predate
+-- this migration and already carry whatever table-level grants the base schema set up for them),
+-- and RLS-enabled-with-no-policies only blocks row access for roles WITHOUT bypassrls — it does
+-- nothing about the separate, more basic table-level GRANT system. Without an explicit grant here,
+-- create_manual_loan_idempotent (security invoker, run as service_role) gets a bare "permission
+-- denied for table manual_loan_creation_requests" the moment it touches this table — caught live
+-- against a disposable Postgres instance, not by static review. No UPDATE/DELETE grant is given
+-- because the function only ever SELECTs and INSERTs into this table.
+revoke all on public.manual_loan_creation_requests from public;
+revoke all on public.manual_loan_creation_requests from anon;
+revoke all on public.manual_loan_creation_requests from authenticated;
+grant select, insert on public.manual_loan_creation_requests to service_role;
+
+-- Atomically replays an existing loan for a (user, idempotency_key) pair already seen — but ONLY
+-- if the payload matches what was originally stored for that key — or creates a new one and
+-- records the key + a fingerprint of its payload. The whole check-then-act sequence happens
+-- inside one locked transaction, so two concurrent requests carrying the SAME key can never both
+-- pass the "does this key exist yet" check and both insert: the per-(user,key) advisory lock (a
+-- finer grain than the per-user lock used elsewhere in this migration, since loan creation never
+-- touches `transactions` and so has no need to contend with those writers) serializes them, and
+-- the second one simply reads back what the first one already committed. A genuinely different
+-- key always creates a genuinely new loan, however similar its fields are to an existing one —
+-- key REUSE is what this function keys off of, never field-value similarity.
 create or replace function public.create_manual_loan_idempotent(
   p_user_id uuid,
   p_idempotency_key text,
@@ -1177,6 +1274,8 @@ set search_path = ''
 as $$
 declare
   v_existing_loan_id uuid;
+  v_existing_fingerprint text;
+  v_fingerprint text;
   v_new_loan_id uuid;
 begin
   if p_idempotency_key is null or length(btrim(p_idempotency_key)) = 0 then
@@ -1185,11 +1284,31 @@ begin
 
   perform pg_advisory_xact_lock(hashtext(p_user_id::text || ':' || p_idempotency_key));
 
-  select loan_id into v_existing_loan_id
+  -- A single deterministic fingerprint of every field the caller supplied — '\x01'-separated so a
+  -- field boundary can never be forged by a value that happens to contain the separator itself
+  -- (e.g. a name containing a literal '|'), unlike a naive '|'-joined string.
+  v_fingerprint := md5(
+    coalesce(p_name, E'\x02') || E'\x01' ||
+    coalesce(p_loan_type, E'\x02') || E'\x01' ||
+    coalesce(p_current_balance::text, E'\x02') || E'\x01' ||
+    coalesce(p_origination_principal_amount::text, E'\x02') || E'\x01' ||
+    coalesce(p_interest_rate_percentage::text, E'\x02') || E'\x01' ||
+    coalesce(p_origination_date::text, E'\x02') || E'\x01' ||
+    coalesce(p_term_months::text, E'\x02') || E'\x01' ||
+    coalesce(p_minimum_payment_amount::text, E'\x02') || E'\x01' ||
+    coalesce(p_next_payment_due_date::text, E'\x02') || E'\x01' ||
+    coalesce(p_notes, E'\x02') || E'\x01' ||
+    coalesce(p_match_text, E'\x02')
+  );
+
+  select loan_id, request_fingerprint into v_existing_loan_id, v_existing_fingerprint
   from public.manual_loan_creation_requests
   where user_id = p_user_id and idempotency_key = p_idempotency_key;
 
   if v_existing_loan_id is not null then
+    if v_existing_fingerprint is distinct from v_fingerprint then
+      raise exception 'create_manual_loan_idempotent: idempotency_key % was already used for a different request payload', p_idempotency_key;
+    end if;
     return v_existing_loan_id;
   end if;
 
@@ -1204,8 +1323,8 @@ begin
   )
   returning id into v_new_loan_id;
 
-  insert into public.manual_loan_creation_requests (user_id, idempotency_key, loan_id)
-  values (p_user_id, p_idempotency_key, v_new_loan_id);
+  insert into public.manual_loan_creation_requests (user_id, idempotency_key, loan_id, request_fingerprint)
+  values (p_user_id, p_idempotency_key, v_new_loan_id, v_fingerprint);
 
   return v_new_loan_id;
 end;

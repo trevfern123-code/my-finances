@@ -1904,6 +1904,41 @@ describe('Round 8 remediation: createManualLoan idempotency-key generation', () 
 
     expect(secondKey).not.toBe(firstKey);
   });
+
+  it('Round 9 verification: a genuinely SUCCESSFUL creation is followed by a new key on the next form mount (not merely an abandoned one)', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Succeeded Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '100' } });
+    // Unlike the two tests above (both use a never-resolving promise), this one actually resolves
+    // the create — the form's own onSubmit closes it synchronously regardless of outcome (see
+    // LoanProgress.tsx's handleCreate), so resolving here isolates "a request that truly
+    // succeeded" from "one merely abandoned mid-flight," confirming the key-per-mount mechanism
+    // doesn't accidentally special-case success.
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Succeeded Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const firstKey = mockCreateManualLoan.mock.calls[0][1];
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Next Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '200' } });
+    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const secondKey = mockCreateManualLoan.mock.calls[1][1];
+
+    expect(secondKey).not.toBe(firstKey);
+  });
 });
 
 describe('42. createManualLoan mutation cross-lifecycle ownership: A -> B (Blocker 1)', () => {

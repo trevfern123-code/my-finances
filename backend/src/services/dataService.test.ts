@@ -1495,6 +1495,18 @@ describe('createManualLoan / updateManualLoan — numeric field validation (Roun
       expect(mockFrom).not.toHaveBeenCalled();
     });
 
+    it('Round 9 remediation: propagates the RPC\'s fingerprint-conflict error (same idempotency key reused with a different payload) verbatim, not a silent replay', async () => {
+      mockRpc.mockResolvedValueOnce({
+        data: null,
+        error: { message: 'create_manual_loan_idempotent: idempotency_key key-1 was already used for a different request payload' },
+      });
+
+      await expect(createManualLoan('user-1', validParams, 'key-1')).rejects.toThrow(
+        /idempotency_key key-1 was already used for a different request payload/,
+      );
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
     it('a replayed loan_id (delayed retry — the RPC itself has no time window) is simply re-fetched and returned like any other', async () => {
       // From this function's own point of view a "replay" and a "fresh create" look identical —
       // both are just "the RPC returned a loan_id, fetch and return that row" — the actual
@@ -1549,7 +1561,8 @@ describe('deleteManualLoan — reclassifies linked transactions before deleting 
     expect(deleteQuery.delete).toHaveBeenCalled();
   });
 
-  it('reclassifies each linked transaction (clearing manual_loan_id/principal_portion and setting fresh row-level role fields) BEFORE deleting the loan, and returns their ids', async () => {
+  it('reclassifies each linked transaction via the atomic, locked unlink_transaction_from_manual_loan RPC (Round 9 remediation — closes a candidate-affecting writer that bypassed the per-user lock) BEFORE deleting the loan, and returns their ids', async () => {
+    mockRpc.mockReset();
     const getLoanQuery = createQueryBuilder({ data: { id: 'loan-1', user_id: 'user-1' }, error: null });
     const linkedQuery = createQueryBuilder({
       data: [
@@ -1557,30 +1570,28 @@ describe('deleteManualLoan — reclassifies linked transactions before deleting 
       ],
       error: null,
     });
-    const updateTxnQuery = createQueryBuilder({ data: null, error: null });
     const deleteQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(getLoanQuery)
-      .mockReturnValueOnce(linkedQuery)
-      .mockReturnValueOnce(updateTxnQuery)
-      .mockReturnValueOnce(deleteQuery);
+    mockFrom.mockReturnValueOnce(getLoanQuery).mockReturnValueOnce(linkedQuery).mockReturnValueOnce(deleteQuery);
+    mockRpc.mockResolvedValueOnce({ data: true, error: null });
 
     const result = await deleteManualLoan('loan-1', 'user-1');
 
-    expect(updateTxnQuery.update).toHaveBeenCalledWith({
-      manual_loan_id: null,
-      principal_portion: null,
-      auto_role: 'expense',
-      role_source: 'sign_default',
-      role_confidence: 'low',
-      classifier_version: 1,
+    expect(mockRpc).toHaveBeenCalledWith('unlink_transaction_from_manual_loan', {
+      p_user_id: 'user-1',
+      p_transaction_id: 'txn-1',
+      p_loan_id: 'loan-1',
+      p_auto_role: 'expense',
+      p_role_source: 'sign_default',
+      p_role_confidence: 'low',
+      p_classifier_version: 1,
     });
     expect(result.affectedTransactionIds).toEqual(['txn-1']);
-    // The transaction update must happen before the loan delete (verified via mock call order).
-    expect(updateTxnQuery.update.mock.invocationCallOrder[0]).toBeLessThan(deleteQuery.delete.mock.invocationCallOrder[0]);
+    // The RPC call must happen before the loan delete (verified via mock call order).
+    expect(mockRpc.mock.invocationCallOrder[0]).toBeLessThan(deleteQuery.delete.mock.invocationCallOrder[0]);
   });
 
   it('reclassifies MULTIPLE linked transactions, each independently from its own stored fields', async () => {
+    mockRpc.mockReset();
     const getLoanQuery = createQueryBuilder({ data: { id: 'loan-1', user_id: 'user-1' }, error: null });
     const linkedQuery = createQueryBuilder({
       data: [
@@ -1589,21 +1600,29 @@ describe('deleteManualLoan — reclassifies linked transactions before deleting 
       ],
       error: null,
     });
-    const updateTxnQuery1 = createQueryBuilder({ data: null, error: null });
-    const updateTxnQuery2 = createQueryBuilder({ data: null, error: null });
     const deleteQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom
-      .mockReturnValueOnce(getLoanQuery)
-      .mockReturnValueOnce(linkedQuery)
-      .mockReturnValueOnce(updateTxnQuery1)
-      .mockReturnValueOnce(updateTxnQuery2)
-      .mockReturnValueOnce(deleteQuery);
+    mockFrom.mockReturnValueOnce(getLoanQuery).mockReturnValueOnce(linkedQuery).mockReturnValueOnce(deleteQuery);
+    mockRpc.mockResolvedValue({ data: true, error: null });
 
     const result = await deleteManualLoan('loan-1', 'user-1');
 
     expect(result.affectedTransactionIds).toEqual(['txn-1', 'txn-2']);
-    expect(updateTxnQuery1.update).toHaveBeenCalledWith(expect.objectContaining({ auto_role: 'expense' }));
-    expect(updateTxnQuery2.update).toHaveBeenCalledWith(expect.objectContaining({ auto_role: 'income' }));
+    expect(mockRpc).toHaveBeenCalledWith('unlink_transaction_from_manual_loan', expect.objectContaining({ p_transaction_id: 'txn-1', p_auto_role: 'expense' }));
+    expect(mockRpc).toHaveBeenCalledWith('unlink_transaction_from_manual_loan', expect.objectContaining({ p_transaction_id: 'txn-2', p_auto_role: 'income' }));
+  });
+
+  it('propagates a failure from the reclassification RPC without deleting the loan', async () => {
+    mockRpc.mockReset();
+    const getLoanQuery = createQueryBuilder({ data: { id: 'loan-1', user_id: 'user-1' }, error: null });
+    const linkedQuery = createQueryBuilder({
+      data: [{ id: 'txn-1', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null }],
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(getLoanQuery).mockReturnValueOnce(linkedQuery);
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+
+    await expect(deleteManualLoan('loan-1', 'user-1')).rejects.toThrow('Failed to reclassify transaction linked to deleted loan');
+    expect(mockFrom).toHaveBeenCalledTimes(2); // never reached the loan delete
   });
 });
 
