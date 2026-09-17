@@ -493,14 +493,19 @@ function ManualLoanForm({
 }: {
   initial: ManualLoanInput;
   onCancel: () => void;
-  onSubmit: (input: ManualLoanInput) => void;
+  onSubmit: (input: ManualLoanInput, idempotencyKey: string) => void;
 }) {
   const [form, setForm] = useState(initial);
+  // Minted once per form mount (a fresh "add loan"/"edit loan" session), not per submit attempt —
+  // a double-click on Save before this form closes, or any future retry-on-error, resubmits with
+  // the SAME key, so the backend can tell "the same attempt, sent twice" apart from "the user
+  // opened the form again to add a genuinely different loan" (a remount, which mints a new key).
+  const [idempotencyKey] = useState(() => crypto.randomUUID());
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!form.name || form.current_balance === null) return;
-    onSubmit(form);
+    onSubmit(form, idempotencyKey);
   }
 
   return (
@@ -647,7 +652,7 @@ export function LoanProgress({
   manualLoans: ManualLoan[];
   totalDebt: number;
   totalMinimumPayment: number;
-  onCreateManualLoan: (input: ManualLoanInput) => void;
+  onCreateManualLoan: (input: ManualLoanInput, idempotencyKey: string) => void;
   onUpdateManualLoan: (id: string, input: ManualLoanInput) => Promise<void>;
   onDeleteManualLoan: (id: string) => void;
   onFetchPayments: (loanId: string) => Promise<LoanPayment[]>;
@@ -674,8 +679,8 @@ export function LoanProgress({
 
   const editingLoan = manualLoans.find((l) => l.id === editingLoanId) ?? null;
 
-  function handleCreate(input: ManualLoanInput) {
-    onCreateManualLoan(input);
+  function handleCreate(input: ManualLoanInput, idempotencyKey: string) {
+    onCreateManualLoan(input, idempotencyKey);
     setShowAddForm(false);
   }
 

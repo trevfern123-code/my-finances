@@ -44,6 +44,7 @@ import {
   SemanticRoleMutationError,
   confirmTransferPair,
   TransferPairConfirmationError,
+  ManualLoanCreationError,
   getRelationallyClassifiedTransactionsPage,
   getTransactionsBackfillPage,
 } from './dataService';
@@ -623,12 +624,17 @@ describe('applyTransactionChanges', () => {
 
   const fakeRemoved: RemovedTransaction = { transaction_id: 'txn-removed' } as RemovedTransaction;
 
+  beforeEach(() => {
+    mockRpc.mockReset();
+    mockRpc.mockResolvedValue({ data: [], error: null });
+  });
+
   it('inserts added transactions that map to a known account, and returns the inserted rows', async () => {
     const existingQuery = createQueryBuilder({ data: [], error: null });
     const mappingsQuery = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery);
     const insertedRow = { id: 'txn-row-new', name: 'Coffee Shop', merchant_name: 'Coffee Shop', amount: 12.5 };
-    const insertQuery = createQueryBuilder({ data: [insertedRow], error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery).mockReturnValueOnce(insertQuery);
+    mockRpc.mockResolvedValueOnce({ data: [insertedRow], error: null });
 
     const result = await applyTransactionChanges({
       userId: 'user-1',
@@ -638,22 +644,30 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
-    const inserted = insertQuery.insert.mock.calls[0][0] as Record<string, unknown>[];
-    expect(inserted).toHaveLength(1);
-    expect(inserted[0]).toMatchObject({
-      account_id: 'account-row-1',
-      plaid_transaction_id: 'txn-1',
-      category: 'FOOD_AND_DRINK',
-      personal_finance_category_detailed: 'COFFEE',
-      personal_finance_category_confidence: 'HIGH',
-      plaid_category: 'Food and Drink > Coffee',
-      // Row-level classification (Financial Semantics Foundation Phase A) runs at insert time —
-      // an ordinary FOOD_AND_DRINK purchase falls all the way to the sign-based fallback.
-      auto_role: 'expense',
-      role_source: 'sign_default',
-      role_confidence: 'low',
-      classifier_version: 1,
-    });
+    expect(mockRpc).toHaveBeenCalledWith(
+      'apply_synced_transaction_batch',
+      expect.objectContaining({
+        p_user_id: 'user-1',
+        p_inserts: expect.arrayContaining([
+          expect.objectContaining({
+            account_id: 'account-row-1',
+            plaid_transaction_id: 'txn-1',
+            category: 'FOOD_AND_DRINK',
+            personal_finance_category_detailed: 'COFFEE',
+            personal_finance_category_confidence: 'HIGH',
+            plaid_category: 'Food and Drink > Coffee',
+            // Row-level classification (Financial Semantics Foundation Phase A) runs at insert
+            // time — an ordinary FOOD_AND_DRINK purchase falls all the way to the sign-based
+            // fallback.
+            auto_role: 'expense',
+            role_source: 'sign_default',
+            role_confidence: 'low',
+            classifier_version: 1,
+          }),
+        ]),
+        p_updates: [],
+      })
+    );
     expect(result).toEqual({
       insertedTransactions: [insertedRow],
       touchedTransactionIds: [insertedRow.id],
@@ -674,9 +688,9 @@ describe('applyTransactionChanges', () => {
       ],
       error: null,
     });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery);
     const insertedRow = { id: 'txn-row-new', name: 'Coffee Shop', merchant_name: 'Coffee Shop', amount: 12.5 };
-    const insertQuery = createQueryBuilder({ data: [insertedRow], error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery).mockReturnValueOnce(insertQuery);
+    mockRpc.mockResolvedValueOnce({ data: [insertedRow], error: null });
 
     await applyTransactionChanges({
       userId: 'user-1',
@@ -686,16 +700,17 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
-    const inserted = insertQuery.insert.mock.calls[0][0] as Record<string, unknown>[];
+    const [, callArgs] = mockRpc.mock.calls[0];
+    const inserted = (callArgs as { p_inserts: Record<string, unknown>[] }).p_inserts;
     expect(inserted[0]).toMatchObject({ category: 'FOOD_AND_DRINK', budget_category_id: 'cat-dining' });
   });
 
   it("leaves budget_category_id null when no mapping matches the transaction's category", async () => {
     const existingQuery = createQueryBuilder({ data: [], error: null });
     const mappingsQuery = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery);
     const insertedRow = { id: 'txn-row-new', name: 'Coffee Shop', merchant_name: 'Coffee Shop', amount: 12.5 };
-    const insertQuery = createQueryBuilder({ data: [insertedRow], error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery).mockReturnValueOnce(insertQuery);
+    mockRpc.mockResolvedValueOnce({ data: [insertedRow], error: null });
 
     await applyTransactionChanges({
       userId: 'user-1',
@@ -705,7 +720,8 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
-    const inserted = insertQuery.insert.mock.calls[0][0] as Record<string, unknown>[];
+    const [, callArgs] = mockRpc.mock.calls[0];
+    const inserted = (callArgs as { p_inserts: Record<string, unknown>[] }).p_inserts;
     expect(inserted[0].budget_category_id).toBeNull();
   });
 
@@ -721,10 +737,11 @@ describe('applyTransactionChanges', () => {
     });
 
     expect(mockFrom).not.toHaveBeenCalled();
+    expect(mockRpc).not.toHaveBeenCalled();
     expect(result).toEqual({ insertedTransactions: [], touchedTransactionIds: [] });
   });
 
-  it('updates (not inserts) a transaction whose plaid_transaction_id already exists, and reclassifies since its category changed from what was stored', async () => {
+  it('updates (not inserts) a transaction whose plaid_transaction_id already exists, and reclassifies since its category changed from what was stored, via the SAME locked batch RPC (Round 8 remediation)', async () => {
     const existingQuery = createQueryBuilder({
       data: [
         {
@@ -739,8 +756,7 @@ describe('applyTransactionChanges', () => {
       ],
       error: null,
     });
-    const updateQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+    mockFrom.mockReturnValueOnce(existingQuery);
 
     const result = await applyTransactionChanges({
       userId: 'user-1',
@@ -752,21 +768,26 @@ describe('applyTransactionChanges', () => {
 
     // The incoming category (FOOD_AND_DRINK, from fakeTransaction) differs from what was stored
     // (GENERAL_MERCHANDISE) — the stored category signal materially changed, so this reclassifies.
-    expect(updateQuery.update.mock.calls[0][0]).toMatchObject({
+    const [, callArgs] = mockRpc.mock.calls[0];
+    const updates = (callArgs as { p_updates: Record<string, unknown>[] }).p_updates;
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toMatchObject({
+      id: 'txn-row-1',
       pending: true,
       auto_role: 'expense',
       role_source: 'sign_default',
       role_confidence: 'low',
       classifier_version: 1,
     });
-    expect(updateQuery.eq).toHaveBeenCalledWith('id', 'txn-row-1');
     // Only the existence-check select happened on the table — no separate insert call, and no
-    // category-mapping lookup either (that only runs when there's something to insert).
-    expect(mockFrom).toHaveBeenCalledTimes(2);
+    // category-mapping lookup either (that only runs when there's something to insert); the
+    // actual write is the ONE apply_synced_transaction_batch RPC call.
+    expect(mockFrom).toHaveBeenCalledTimes(1);
+    expect(mockRpc).toHaveBeenCalledTimes(1);
     expect(result.touchedTransactionIds).toEqual(['txn-row-1']);
   });
 
-  it("an ordinary resync with EVERY semantic input unchanged (account/amount/date/name/merchant/category/detailed/confidence) does not churn the already-stored role fields, and is not reported as semantically changed", async () => {
+  it("an ordinary resync with EVERY semantic input unchanged (account/amount/date/name/merchant/category/detailed/confidence) does not churn the already-stored role fields (sent as JSON null, COALESCEd server-side)", async () => {
     const existingQuery = createQueryBuilder({
       data: [
         {
@@ -786,8 +807,7 @@ describe('applyTransactionChanges', () => {
       ],
       error: null,
     });
-    const updateQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+    mockFrom.mockReturnValueOnce(existingQuery);
 
     await applyTransactionChanges({
       userId: 'user-1',
@@ -798,11 +818,12 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
-    const updatedFields = updateQuery.update.mock.calls[0][0] as Record<string, unknown>;
-    expect('auto_role' in updatedFields).toBe(false);
-    expect('role_source' in updatedFields).toBe(false);
-    expect('role_confidence' in updatedFields).toBe(false);
-    expect('classifier_version' in updatedFields).toBe(false);
+    const [, callArgs] = mockRpc.mock.calls[0];
+    const updatedFields = (callArgs as { p_updates: Record<string, unknown>[] }).p_updates[0];
+    expect(updatedFields.auto_role).toBeNull();
+    expect(updatedFields.role_source).toBeNull();
+    expect(updatedFields.role_confidence).toBeNull();
+    expect(updatedFields.classifier_version).toBeNull();
   });
 
   it.each([
@@ -831,8 +852,7 @@ describe('applyTransactionChanges', () => {
       ],
       error: null,
     });
-    const updateQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+    mockFrom.mockReturnValueOnce(existingQuery);
     const accountIdByPlaidIdWithSecond = new Map([...accountIdByPlaidId, ['plaid-acc-2', 'account-row-2']]);
 
     await applyTransactionChanges({
@@ -843,8 +863,9 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId: accountIdByPlaidIdWithSecond,
     });
 
-    const updatedFields = updateQuery.update.mock.calls[0][0] as Record<string, unknown>;
-    expect('auto_role' in updatedFields).toBe(true);
+    const [, callArgs] = mockRpc.mock.calls[0];
+    const updatedFields = (callArgs as { p_updates: Record<string, unknown>[] }).p_updates[0];
+    expect(updatedFields.auto_role).not.toBeNull();
   });
 
   it('a row classified for the very first time (auto_role was null) is reclassified', async () => {
@@ -867,8 +888,7 @@ describe('applyTransactionChanges', () => {
       ],
       error: null,
     });
-    const updateQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+    mockFrom.mockReturnValueOnce(existingQuery);
 
     await applyTransactionChanges({
       userId: 'user-1',
@@ -878,8 +898,9 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
-    const updatedFields = updateQuery.update.mock.calls[0][0] as Record<string, unknown>;
-    expect('auto_role' in updatedFields).toBe(true);
+    const [, callArgs] = mockRpc.mock.calls[0];
+    const updatedFields = (callArgs as { p_updates: Record<string, unknown>[] }).p_updates[0];
+    expect(updatedFields.auto_role).not.toBeNull();
   });
 
   it('a transaction already linked to a manual loan is never reclassified by an ordinary resync, regardless of category drift', async () => {
@@ -897,8 +918,7 @@ describe('applyTransactionChanges', () => {
       ],
       error: null,
     });
-    const updateQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+    mockFrom.mockReturnValueOnce(existingQuery);
 
     await applyTransactionChanges({
       userId: 'user-1',
@@ -908,8 +928,9 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
-    const updatedFields = updateQuery.update.mock.calls[0][0] as Record<string, unknown>;
-    expect('auto_role' in updatedFields).toBe(false);
+    const [, callArgs] = mockRpc.mock.calls[0];
+    const updatedFields = (callArgs as { p_updates: Record<string, unknown>[] }).p_updates[0];
+    expect(updatedFields.auto_role).toBeNull();
   });
 
   describe('principal integrity on Plaid resync of a manual-loan-linked transaction (Round 3 remediation §8)', () => {
@@ -934,8 +955,7 @@ describe('applyTransactionChanges', () => {
         ],
         error: null,
       });
-      const updateQuery = createQueryBuilder({ data: null, error: null });
-      mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+      mockFrom.mockReturnValueOnce(existingQuery);
 
       // Plaid resync drops the amount to $50 — the stored $80 principal is no longer valid.
       await expect(
@@ -948,7 +968,7 @@ describe('applyTransactionChanges', () => {
         })
       ).rejects.toThrow(/incompatible/i);
 
-      expect(updateQuery.update).not.toHaveBeenCalled();
+      expect(mockRpc).not.toHaveBeenCalled();
     });
 
     it('allows a resynced amount that still covers the stored principal_portion', async () => {
@@ -972,8 +992,7 @@ describe('applyTransactionChanges', () => {
         ],
         error: null,
       });
-      const updateQuery = createQueryBuilder({ data: null, error: null });
-      mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(updateQuery);
+      mockFrom.mockReturnValueOnce(existingQuery);
 
       await expect(
         applyTransactionChanges({
@@ -985,7 +1004,7 @@ describe('applyTransactionChanges', () => {
         })
       ).resolves.toBeDefined();
 
-      expect(updateQuery.update).toHaveBeenCalled();
+      expect(mockRpc).toHaveBeenCalledWith('apply_synced_transaction_batch', expect.anything());
     });
   });
 
@@ -1383,34 +1402,6 @@ describe('getUnlinkedTransactionsByPlaidIds (Round 6 remediation, blocker 5)', (
   });
 });
 
-function toSnakeCaseLoanRow(params: {
-  name: string;
-  loanType: string;
-  currentBalance: number;
-  originationPrincipalAmount: number | null;
-  interestRatePercentage: number | null;
-  originationDate: string | null;
-  termMonths: number | null;
-  minimumPaymentAmount: number | null;
-  nextPaymentDueDate: string | null;
-  notes: string | null;
-  matchText: string | null;
-}) {
-  return {
-    name: params.name,
-    loan_type: params.loanType,
-    current_balance: params.currentBalance,
-    origination_principal_amount: params.originationPrincipalAmount,
-    interest_rate_percentage: params.interestRatePercentage,
-    origination_date: params.originationDate,
-    term_months: params.termMonths,
-    minimum_payment_amount: params.minimumPaymentAmount,
-    next_payment_due_date: params.nextPaymentDueDate,
-    notes: params.notes,
-    match_text: params.matchText,
-  };
-}
-
 describe('createManualLoan / updateManualLoan — numeric field validation (Round 5 remediation, blocker 7)', () => {
   const validParams = {
     name: 'Car Loan',
@@ -1426,12 +1417,16 @@ describe('createManualLoan / updateManualLoan — numeric field validation (Roun
     matchText: null,
   };
 
-  it('accepts fully valid params', async () => {
-    const dedupQuery = createQueryBuilder({ data: [], error: null });
-    const insertQuery = createQueryBuilder({ data: { id: 'loan-1', ...validParams }, error: null });
-    mockFrom.mockReturnValueOnce(dedupQuery).mockReturnValueOnce(insertQuery);
+  beforeEach(() => {
+    mockRpc.mockReset();
+  });
 
-    await expect(createManualLoan('user-1', validParams)).resolves.toBeDefined();
+  it('accepts fully valid params', async () => {
+    mockRpc.mockResolvedValueOnce({ data: 'loan-1', error: null });
+    const refetchQuery = createQueryBuilder({ data: { id: 'loan-1', ...validParams }, error: null });
+    mockFrom.mockReturnValueOnce(refetchQuery);
+
+    await expect(createManualLoan('user-1', validParams, 'key-1')).resolves.toBeDefined();
   });
 
   it.each([
@@ -1446,51 +1441,73 @@ describe('createManualLoan / updateManualLoan — numeric field validation (Roun
     ['negative term_months', { termMonths: -12 }],
     ['non-integer term_months', { termMonths: 36.5 }],
   ])('rejects %s and never touches the DB', async (_label, overrides) => {
-    await expect(createManualLoan('user-1', { ...validParams, ...overrides })).rejects.toThrow(InvalidManualLoanFieldError);
+    await expect(createManualLoan('user-1', { ...validParams, ...overrides }, 'key-1')).rejects.toThrow(
+      InvalidManualLoanFieldError
+    );
     expect(mockFrom).not.toHaveBeenCalled();
+    expect(mockRpc).not.toHaveBeenCalled();
   });
 
   it('a null nullable field (no origination data yet) is accepted, not validated as a number', async () => {
     const params = { ...validParams, originationPrincipalAmount: null, interestRatePercentage: null, termMonths: null, minimumPaymentAmount: null };
-    const dedupQuery = createQueryBuilder({ data: [], error: null });
-    const insertQuery = createQueryBuilder({ data: { id: 'loan-1', ...params }, error: null });
-    mockFrom.mockReturnValueOnce(dedupQuery).mockReturnValueOnce(insertQuery);
+    mockRpc.mockResolvedValueOnce({ data: 'loan-1', error: null });
+    const refetchQuery = createQueryBuilder({ data: { id: 'loan-1', ...params }, error: null });
+    mockFrom.mockReturnValueOnce(refetchQuery);
 
-    await expect(createManualLoan('user-1', params)).resolves.toBeDefined();
+    await expect(createManualLoan('user-1', params, 'key-1')).resolves.toBeDefined();
   });
 
-  describe('createManualLoan retry-idempotency (Round 7 remediation, blocker 5\'s remaining gap)', () => {
-    it('a retry with EXACTLY the same params within the window returns the existing row instead of inserting a duplicate', async () => {
-      const existingLoan = { id: 'loan-1', user_id: 'user-1', created_at: new Date().toISOString(), ...toSnakeCaseLoanRow(validParams) };
-      const dedupQuery = createQueryBuilder({ data: [existingLoan], error: null });
-      mockFrom.mockReturnValueOnce(dedupQuery);
-
-      const result = await createManualLoan('user-1', validParams);
-
-      expect(result).toEqual(existingLoan);
-      expect(mockFrom).toHaveBeenCalledTimes(1); // only the dedup check — no insert
+  describe('createManualLoan idempotency-key contract (Round 8 remediation, replacing the Round 7 time-window heuristic)', () => {
+    it('rejects a missing/empty idempotency key BEFORE calling the RPC', async () => {
+      await expect(createManualLoan('user-1', validParams, '')).rejects.toThrow(ManualLoanCreationError);
+      await expect(createManualLoan('user-1', validParams, '   ')).rejects.toThrow(ManualLoanCreationError);
+      expect(mockRpc).not.toHaveBeenCalled();
     });
 
-    it('a genuinely different loan (different current_balance) for the same user/name is NOT treated as a duplicate — inserts normally', async () => {
-      const existingLoan = { id: 'loan-1', user_id: 'user-1', created_at: new Date().toISOString(), ...toSnakeCaseLoanRow(validParams) };
-      const dedupQuery = createQueryBuilder({ data: [existingLoan], error: null });
-      const insertQuery = createQueryBuilder({ data: { id: 'loan-2', ...validParams, current_balance: 9999 }, error: null });
-      mockFrom.mockReturnValueOnce(dedupQuery).mockReturnValueOnce(insertQuery);
+    it('calls create_manual_loan_idempotent with every field plus the key, then re-fetches the resulting row', async () => {
+      mockRpc.mockResolvedValueOnce({ data: 'loan-1', error: null });
+      const refetchQuery = createQueryBuilder({ data: { id: 'loan-1', ...validParams }, error: null });
+      mockFrom.mockReturnValueOnce(refetchQuery);
 
-      const result = await createManualLoan('user-1', { ...validParams, currentBalance: 9999 });
+      await createManualLoan('user-1', validParams, 'client-key-abc');
 
-      expect((result as { id: string }).id).toBe('loan-2');
-      expect(mockFrom).toHaveBeenCalledTimes(2);
+      expect(mockRpc).toHaveBeenCalledWith('create_manual_loan_idempotent', {
+        p_user_id: 'user-1',
+        p_idempotency_key: 'client-key-abc',
+        p_name: validParams.name,
+        p_loan_type: validParams.loanType,
+        p_current_balance: validParams.currentBalance,
+        p_origination_principal_amount: validParams.originationPrincipalAmount,
+        p_interest_rate_percentage: validParams.interestRatePercentage,
+        p_origination_date: validParams.originationDate,
+        p_term_months: validParams.termMonths,
+        p_minimum_payment_amount: validParams.minimumPaymentAmount,
+        p_next_payment_due_date: validParams.nextPaymentDueDate,
+        p_notes: validParams.notes,
+        p_match_text: validParams.matchText,
+      });
     });
 
-    it('no recent match at all — inserts normally', async () => {
-      const dedupQuery = createQueryBuilder({ data: [], error: null });
-      const insertQuery = createQueryBuilder({ data: { id: 'loan-1', ...validParams }, error: null });
-      mockFrom.mockReturnValueOnce(dedupQuery).mockReturnValueOnce(insertQuery);
+    it('propagates an RPC failure as ManualLoanCreationError without ever re-fetching', async () => {
+      mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
 
-      await createManualLoan('user-1', validParams);
+      await expect(createManualLoan('user-1', validParams, 'key-1')).rejects.toThrow(ManualLoanCreationError);
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
 
-      expect(mockFrom).toHaveBeenCalledTimes(2);
+    it('a replayed loan_id (delayed retry — the RPC itself has no time window) is simply re-fetched and returned like any other', async () => {
+      // From this function's own point of view a "replay" and a "fresh create" look identical —
+      // both are just "the RPC returned a loan_id, fetch and return that row" — the actual
+      // dedup-vs-create decision (and the fact that it has no expiry) lives entirely inside
+      // create_manual_loan_idempotent, verified separately against a real Postgres instance (see
+      // this round's remediation report for the exact concurrent-request transcript).
+      mockRpc.mockResolvedValueOnce({ data: 'loan-1-original', error: null });
+      const refetchQuery = createQueryBuilder({ data: { id: 'loan-1-original', ...validParams }, error: null });
+      mockFrom.mockReturnValueOnce(refetchQuery);
+
+      const result = await createManualLoan('user-1', validParams, 'same-key-used-again');
+
+      expect((result as { id: string }).id).toBe('loan-1-original');
     });
   });
 

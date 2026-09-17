@@ -60,22 +60,39 @@ export async function createManualLoan(req: Request, res: Response, next: NextFu
       return;
     }
 
-    const loan = await dataService.createManualLoan(userId, {
-      name: body.name,
-      loanType: body.loan_type ?? 'personal',
-      currentBalance: body.current_balance,
-      originationPrincipalAmount: body.origination_principal_amount ?? null,
-      interestRatePercentage: body.interest_rate_percentage ?? null,
-      originationDate: body.origination_date ?? null,
-      termMonths: body.term_months ?? null,
-      minimumPaymentAmount: body.minimum_payment_amount ?? null,
-      nextPaymentDueDate: body.next_payment_due_date ?? null,
-      notes: body.notes ?? null,
-      matchText: body.match_text ?? null,
-    });
+    // Round 8 remediation: replaces the earlier time-window/exact-field-match heuristic with a
+    // genuine client-supplied idempotency key (see api.ts's createManualLoan and
+    // ManualLoanForm — one key is minted per form mount and resent unchanged on any resubmission
+    // of that same attempt). Required, not optional: a fallback for a missing key would just
+    // reintroduce the exact ambiguity this replaces. dataService.createManualLoan enforces the
+    // actual uniqueness/replay guarantee at the database layer.
+    const idempotencyKey = req.header('Idempotency-Key');
+    if (!idempotencyKey || idempotencyKey.trim() === '') {
+      res.status(400).json({ error: 'Idempotency-Key header is required' });
+      return;
+    }
 
-    // Best-effort (wrapped internally) — picks up already-synced payments that predate this
-    // loan's match_text, so response can just await it rather than racing a background call.
+    const loan = await dataService.createManualLoan(
+      userId,
+      {
+        name: body.name,
+        loanType: body.loan_type ?? 'personal',
+        currentBalance: body.current_balance,
+        originationPrincipalAmount: body.origination_principal_amount ?? null,
+        interestRatePercentage: body.interest_rate_percentage ?? null,
+        originationDate: body.origination_date ?? null,
+        termMonths: body.term_months ?? null,
+        minimumPaymentAmount: body.minimum_payment_amount ?? null,
+        nextPaymentDueDate: body.next_payment_due_date ?? null,
+        notes: body.notes ?? null,
+        matchText: body.match_text ?? null,
+      },
+      idempotencyKey
+    );
+
+    // Round 5 remediation: NOT best-effort/swallowed — a failure here must be reported as a
+    // failed request (the client can safely resend the identical request, idempotency key
+    // included, and it will replay the already-created loan above rather than duplicating it).
     await backfillMatchesForLoan(userId, loan);
     const refreshed = (await dataService.getManualLoan(loan.id, userId)) ?? loan;
 

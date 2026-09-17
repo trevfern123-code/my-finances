@@ -578,6 +578,17 @@ function hasSemanticInputChanged(
  * advancing its cursor (Round 3 remediation §2/§3/§4/§6 — see that module's own doc comment for
  * why a sweep-based repair replaced the earlier per-row "capture old identity, search for a stale
  * partner" approach).
+ *
+ * Round 8 remediation (blocker 3, closing the candidate-insertion phantom): the actual INSERT/
+ * UPDATE of `transactions` rows below goes through ONE call to `apply_synced_transaction_batch`
+ * (see the Phase A migration) rather than plain, unlocked `.insert()`/`.update()` calls —
+ * classification (which role a row gets) still happens in TypeScript exactly as before, but the
+ * ACT of persisting the decided rows now happens inside the same per-user advisory lock every
+ * other semantic-role-affecting write in this codebase uses. This is what makes a newly-synced
+ * transaction — a brand-new transfer candidate — unable to become durable in the middle of a
+ * concurrent `confirm_transfer_pair`/`apply_transaction_semantic_roles` call for the same user;
+ * see that migration function's own doc comment for the real two-process test this was verified
+ * against.
  */
 export async function applyTransactionChanges(params: {
   userId: string;
@@ -617,6 +628,11 @@ export async function applyTransactionChanges(params: {
     const toInsert = upsertCandidates.filter((t) => !existingByPlaidId.has(t.plaid_transaction_id));
     const toUpdate = upsertCandidates.filter((t) => existingByPlaidId.has(t.plaid_transaction_id));
 
+    let rowsToInsert: (ReturnType<typeof mapPlaidTransaction> & {
+      needs_review: boolean;
+      budget_category_id: string | null;
+    } & ReturnType<typeof roleFieldsFor>)[] = [];
+
     if (toInsert.length > 0) {
       // needs_review and budget_category_id (via any matching category mapping) only apply at
       // insert time — added here rather than in mapPlaidTransaction so a later "modified" update
@@ -626,7 +642,7 @@ export async function applyTransactionChanges(params: {
       const budgetCategoryIdByPlaidCategory = new Map(
         mappings.map((m) => [m.plaid_category, m.budget_category_id])
       );
-      const rowsToInsert = toInsert.map((t) => {
+      rowsToInsert = toInsert.map((t) => {
         // A brand-new row is never already linked to a manual loan (that only ever happens via
         // an explicit later mutation — linkTransactionToLoan — which sets its own role fields),
         // so step A of the classifier never applies here.
@@ -644,14 +660,14 @@ export async function applyTransactionChanges(params: {
           ...roleFieldsFor(classification),
         };
       });
-      const { data, error } = await supabaseAdmin
-        .from('transactions')
-        .insert(rowsToInsert)
-        .select('id, name, merchant_name, amount');
-      if (error) throw new Error(`Failed to insert transactions: ${error.message}`);
-      insertedRows = (data ?? []) as InsertedTransaction[];
-      touchedTransactionIds.push(...insertedRows.map((r) => r.id));
     }
+
+    const rowsToUpdate: ({ id: string } & Omit<ReturnType<typeof mapPlaidTransaction>, 'plaid_transaction_id'> & {
+      auto_role: string | null;
+      role_source: string | null;
+      role_confidence: string | null;
+      classifier_version: number | null;
+    })[] = [];
 
     for (const row of toUpdate) {
       const existingRow = existingByPlaidId.get(row.plaid_transaction_id)!;
@@ -691,12 +707,30 @@ export async function applyTransactionChanges(params: {
         }
       }
 
-      const { error } = await supabaseAdmin
-        .from('transactions')
-        .update({ ...fields, ...roleFields })
-        .eq('id', id);
-      if (error) throw new Error(`Failed to update transaction: ${error.message}`);
+      // A role field left out of roleFields (unchanged) is sent as an explicit JSON null, which
+      // apply_synced_transaction_batch's UPDATE COALESCEs against the row's current DB value —
+      // never overwriting it — exactly mirroring the Phase A "unchanged semantic inputs never
+      // churn role fields" contract.
+      rowsToUpdate.push({
+        id,
+        ...fields,
+        auto_role: roleFields.auto_role ?? null,
+        role_source: roleFields.role_source ?? null,
+        role_confidence: roleFields.role_confidence ?? null,
+        classifier_version: roleFields.classifier_version ?? null,
+      });
       touchedTransactionIds.push(id);
+    }
+
+    if (rowsToInsert.length > 0 || rowsToUpdate.length > 0) {
+      const { data: batchResult, error: batchError } = await supabaseAdmin.rpc('apply_synced_transaction_batch', {
+        p_user_id: params.userId,
+        p_inserts: rowsToInsert,
+        p_updates: rowsToUpdate,
+      });
+      if (batchError) throw new Error(`Failed to apply synced transaction batch: ${batchError.message}`);
+      insertedRows = (batchResult ?? []) as InsertedTransaction[];
+      touchedTransactionIds.push(...insertedRows.map((r) => r.id));
     }
   }
 
@@ -1073,57 +1107,29 @@ function assertValidManualLoanFields(fields: {
   }
 }
 
-/** Round 7 remediation (blocker 5's remaining gap): `createManualLoan` is invoked synchronously
- *  by `manualLoanController.ts`'s create handler, which ALSO runs `backfillMatchesForLoan`
- *  immediately afterward and (per Round 5) no longer swallows that step's failure — meaning a
- *  loan can persist successfully while the overall request still reports failure. A client that
- *  retries the identical "create loan" request in that situation would otherwise insert a SECOND,
- *  duplicate loan row, while any transactions the first attempt's backfill already linked stay
- *  attached to the first (now orphaned from the client's point of view) row.
+/** Thrown by `createManualLoan` for any failure the idempotent-create RPC reports. */
+export class ManualLoanCreationError extends Error {}
+
+/**
+ * `createManualLoan` is invoked synchronously by `manualLoanController.ts`'s create handler,
+ * which ALSO runs `backfillMatchesForLoan` immediately afterward and (per Round 5) no longer
+ * swallows that step's failure — meaning a loan can persist successfully while the overall
+ * request still reports failure. A client that resends the identical "create loan" request in
+ * that situation must not insert a second, duplicate loan row, while any transactions the first
+ * attempt's backfill already linked stay attached to the first (now orphaned from the client's
+ * point of view) row.
  *
- *  This project has no client-supplied idempotency-key mechanism (adding one would require a
- *  frontend change, out of scope here), so this uses a narrow, disclosed heuristic instead: if a
- *  loan for this user with EVERY field identical to `params` was inserted within the last
- *  `CREATE_RETRY_WINDOW_MS`, treat this call as a retry of that same logical request and return
- *  the EXISTING row rather than inserting a new one — the caller (createManualLoan's own
- *  controller) can then safely re-attempt backfillMatchesForLoan against it. The window is
- *  short and the match is exact-field, not fuzzy, to minimize (not eliminate) the chance of
- *  conflating two genuinely distinct loans a user creates in quick succession with identical
- *  values — a real risk this heuristic accepts as the cost of not having a proper idempotency key.
+ * Round 8 remediation: replaces an earlier time-window/exact-field-match heuristic (which could
+ * neither survive a delayed retry past its window nor tell a genuine duplicate loan apart from a
+ * retry) with a real client-supplied idempotency key, enforced by a database UNIQUE constraint —
+ * see `create_manual_loan_idempotent` and `manual_loan_creation_requests` in the Phase A
+ * migration. The whole "does a loan for this key already exist, and if not, create one" sequence
+ * runs inside that single locked function call, so two concurrent requests carrying the SAME key
+ * can never both insert — the second always replays the first's result. A DIFFERENT key always
+ * creates a genuinely new loan, no matter how similar its fields are to an existing one, and a
+ * retry replays correctly no matter how much later it arrives — neither of which the old
+ * heuristic could guarantee.
  */
-const CREATE_MANUAL_LOAN_RETRY_WINDOW_MS = 30_000;
-
-function manualLoanParamsMatch(
-  existing: ManualLoanRow,
-  params: {
-    name: string;
-    loanType: string;
-    currentBalance: number;
-    originationPrincipalAmount: number | null;
-    interestRatePercentage: number | null;
-    originationDate: string | null;
-    termMonths: number | null;
-    minimumPaymentAmount: number | null;
-    nextPaymentDueDate: string | null;
-    notes: string | null;
-    matchText: string | null;
-  }
-): boolean {
-  return (
-    existing.name === params.name &&
-    existing.loan_type === params.loanType &&
-    existing.current_balance === params.currentBalance &&
-    existing.origination_principal_amount === params.originationPrincipalAmount &&
-    existing.interest_rate_percentage === params.interestRatePercentage &&
-    existing.origination_date === params.originationDate &&
-    existing.term_months === params.termMonths &&
-    existing.minimum_payment_amount === params.minimumPaymentAmount &&
-    existing.next_payment_due_date === params.nextPaymentDueDate &&
-    existing.notes === params.notes &&
-    existing.match_text === params.matchText
-  );
-}
-
 export async function createManualLoan(
   userId: string,
   params: {
@@ -1138,8 +1144,13 @@ export async function createManualLoan(
     nextPaymentDueDate: string | null;
     notes: string | null;
     matchText: string | null;
-  }
+  },
+  idempotencyKey: string
 ): Promise<ManualLoanRow> {
+  if (!idempotencyKey || idempotencyKey.trim() === '') {
+    throw new ManualLoanCreationError('idempotencyKey is required');
+  }
+
   assertValidManualLoanFields({
     current_balance: params.currentBalance,
     origination_principal_amount: params.originationPrincipalAmount,
@@ -1148,39 +1159,25 @@ export async function createManualLoan(
     term_months: params.termMonths,
   });
 
-  const since = new Date(Date.now() - CREATE_MANUAL_LOAN_RETRY_WINDOW_MS).toISOString();
-  const { data: recent, error: recentError } = await supabaseAdmin
-    .from('manual_loans')
-    .select('*')
-    .eq('user_id', userId)
-    .eq('name', params.name)
-    .gte('created_at', since)
-    .order('created_at', { ascending: false })
-    .limit(5);
-  if (recentError) throw new Error(`Failed to check for a recent duplicate loan: ${recentError.message}`);
-  const duplicate = (recent as ManualLoanRow[] | null)?.find((row) => manualLoanParamsMatch(row, params));
-  if (duplicate) return duplicate;
+  const { data: loanId, error: rpcError } = await supabaseAdmin.rpc('create_manual_loan_idempotent', {
+    p_user_id: userId,
+    p_idempotency_key: idempotencyKey,
+    p_name: params.name,
+    p_loan_type: params.loanType,
+    p_current_balance: params.currentBalance,
+    p_origination_principal_amount: params.originationPrincipalAmount,
+    p_interest_rate_percentage: params.interestRatePercentage,
+    p_origination_date: params.originationDate,
+    p_term_months: params.termMonths,
+    p_minimum_payment_amount: params.minimumPaymentAmount,
+    p_next_payment_due_date: params.nextPaymentDueDate,
+    p_notes: params.notes,
+    p_match_text: params.matchText,
+  });
+  if (rpcError) throw new ManualLoanCreationError(`Failed to create manual loan: ${rpcError.message}`);
 
-  const { data, error } = await supabaseAdmin
-    .from('manual_loans')
-    .insert({
-      user_id: userId,
-      name: params.name,
-      loan_type: params.loanType,
-      current_balance: params.currentBalance,
-      origination_principal_amount: params.originationPrincipalAmount,
-      interest_rate_percentage: params.interestRatePercentage,
-      origination_date: params.originationDate,
-      term_months: params.termMonths,
-      minimum_payment_amount: params.minimumPaymentAmount,
-      next_payment_due_date: params.nextPaymentDueDate,
-      notes: params.notes,
-      match_text: params.matchText,
-    })
-    .select()
-    .single();
-
-  if (error) throw new Error(`Failed to create manual loan: ${error.message}`);
+  const { data, error } = await supabaseAdmin.from('manual_loans').select('*').eq('id', loanId as string).single();
+  if (error) throw new Error(`Failed to load created manual loan: ${error.message}`);
   return data as ManualLoanRow;
 }
 

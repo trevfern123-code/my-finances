@@ -974,3 +974,244 @@ alter table public.manual_loans
 alter table public.manual_loans
   add constraint manual_loans_term_months_check
     check (term_months is null or term_months > 0) not valid;
+
+-- Round 8 remediation (blocker 3, closing the candidate-insertion phantom): confirm_transfer_pair
+-- (Round 7) re-discovers candidates from inside its own locked transaction, but that protection
+-- only holds if EVERY writer that can create or change a transfer candidate — not just the
+-- functions in this migration — takes the SAME per-user advisory lock before mutating. Until now,
+-- the one writer that did NOT was the Plaid-sync ingestion path itself: dataService.ts's
+-- applyTransactionChanges issued plain, unlocked INSERT/UPDATE statements for newly-synced
+-- transactions. A row inserted that way could become durable at ANY moment — including exactly
+-- inside another locked function's own discovery-to-commit window — without ever contending for
+-- the lock that's supposed to serialize every candidate-affecting writer for that user.
+--
+-- apply_synced_transaction_batch closes this by being the ONLY way applyTransactionChanges (see
+-- its Round 8 rewrite) ever writes to `transactions`: it takes the per-user advisory lock FIRST,
+-- verifies ownership of every account/transaction referenced, and only then performs the insert
+-- and update. Classification itself (which role a row gets) still happens in TypeScript — this
+-- function is a mechanical bulk write of already-decided rows, not a port of the classifier —
+-- keeping the well-tested classifyRowLevel precedence logic exactly where it is; only the ACT of
+-- persisting the result moves inside the lock.
+--
+-- Verified against a disposable PostgreSQL instance with the real two-process scenario this
+-- exists to prevent: a session holding this function's lock (simulating an in-flight sync
+-- inserting a new transaction) blocks a concurrent confirm_transfer_pair call for the same user;
+-- once the sync commits and the lock releases, confirm_transfer_pair's own re-discovery correctly
+-- sees the newly-synced row as a competing candidate and rejects the now-ambiguous pairing rather
+-- than committing a decision made before that row existed. See this round's remediation report
+-- for the exact transcript.
+--
+-- p_inserts / p_updates: JSONB arrays of complete row objects — see dataService.ts's
+-- applyTransactionChanges for the exact shape each array element carries. auto_role/role_source/
+-- role_confidence/classifier_version in an UPDATE element may be JSON null, meaning "this row's
+-- semantic inputs didn't change, leave its role fields alone" (COALESCEd against the current
+-- value) — mirroring the Phase A contract that an ordinary resync with unchanged semantic inputs
+-- must not churn role fields at all.
+create or replace function public.apply_synced_transaction_batch(
+  p_user_id uuid,
+  p_inserts jsonb,
+  p_updates jsonb
+) returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_insert_count integer;
+  v_update_count integer;
+  v_distinct_count integer;
+  v_owned_count integer;
+  v_inserted jsonb;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  v_insert_count := coalesce(jsonb_array_length(p_inserts), 0);
+  v_update_count := coalesce(jsonb_array_length(p_updates), 0);
+
+  -- Verify ownership of every account referenced by an insert row BEFORE inserting anything.
+  if v_insert_count > 0 then
+    select count(*) into v_distinct_count
+    from (select distinct x.account_id from jsonb_to_recordset(p_inserts) as x(account_id uuid)) d;
+
+    select count(*) into v_owned_count
+    from (select distinct x.account_id from jsonb_to_recordset(p_inserts) as x(account_id uuid)) d
+    join public.accounts a on a.id = d.account_id
+    join public.plaid_items pi on pi.id = a.item_id
+    where pi.user_id = p_user_id;
+
+    if v_owned_count is distinct from v_distinct_count then
+      raise exception 'apply_synced_transaction_batch: one or more insert rows reference an account not owned by this user';
+    end if;
+  end if;
+
+  -- Verify ownership of (and lock) every transaction referenced by an update row BEFORE updating
+  -- anything. The locking SELECT carries no aggregate (Postgres forbids that combination — see
+  -- apply_transaction_semantic_roles's own doc comment for the same fix), so counting happens in
+  -- an outer, unlocked query over the already-locked set.
+  if v_update_count > 0 then
+    select count(*) into v_distinct_count
+    from (select distinct x.id from jsonb_to_recordset(p_updates) as x(id uuid)) d;
+
+    select count(*) into v_owned_count
+    from (
+      select t.id
+      from (select distinct x.id from jsonb_to_recordset(p_updates) as x(id uuid)) d
+      join public.transactions t on t.id = d.id
+      join public.accounts a on a.id = t.account_id
+      join public.plaid_items pi on pi.id = a.item_id
+      where pi.user_id = p_user_id
+      for update of t
+    ) locked;
+
+    if v_owned_count is distinct from v_distinct_count then
+      raise exception 'apply_synced_transaction_batch: one or more update rows reference a transaction not owned by this user';
+    end if;
+  end if;
+
+  if v_insert_count > 0 then
+    with ins as (
+      insert into public.transactions (
+        plaid_transaction_id, account_id, amount, iso_currency_code, date, name, merchant_name,
+        category, personal_finance_category_detailed, personal_finance_category_confidence,
+        plaid_category, pending, needs_review, budget_category_id, auto_role, role_source,
+        role_confidence, classifier_version
+      )
+      select
+        x.plaid_transaction_id, x.account_id, x.amount, x.iso_currency_code, x.date, x.name,
+        x.merchant_name, x.category, x.personal_finance_category_detailed,
+        x.personal_finance_category_confidence, x.plaid_category, x.pending, x.needs_review,
+        x.budget_category_id, x.auto_role, x.role_source, x.role_confidence, x.classifier_version
+      from jsonb_to_recordset(p_inserts) as x(
+        plaid_transaction_id text, account_id uuid, amount numeric, iso_currency_code text,
+        date date, name text, merchant_name text, category text,
+        personal_finance_category_detailed text, personal_finance_category_confidence text,
+        plaid_category text, pending boolean, needs_review boolean, budget_category_id uuid,
+        auto_role text, role_source text, role_confidence text, classifier_version smallint
+      )
+      returning id, name, merchant_name, amount
+    )
+    select jsonb_agg(jsonb_build_object('id', id, 'name', name, 'merchant_name', merchant_name, 'amount', amount))
+    into v_inserted
+    from ins;
+  end if;
+
+  if v_update_count > 0 then
+    update public.transactions t
+    set account_id = x.account_id,
+        amount = x.amount,
+        iso_currency_code = x.iso_currency_code,
+        date = x.date,
+        name = x.name,
+        merchant_name = x.merchant_name,
+        category = x.category,
+        personal_finance_category_detailed = x.personal_finance_category_detailed,
+        personal_finance_category_confidence = x.personal_finance_category_confidence,
+        plaid_category = x.plaid_category,
+        pending = x.pending,
+        auto_role = coalesce(x.auto_role, t.auto_role),
+        role_source = coalesce(x.role_source, t.role_source),
+        role_confidence = coalesce(x.role_confidence, t.role_confidence),
+        classifier_version = coalesce(x.classifier_version, t.classifier_version)
+    from jsonb_to_recordset(p_updates) as x(
+      id uuid, account_id uuid, amount numeric, iso_currency_code text, date date, name text,
+      merchant_name text, category text, personal_finance_category_detailed text,
+      personal_finance_category_confidence text, plaid_category text, pending boolean,
+      auto_role text, role_source text, role_confidence text, classifier_version smallint
+    )
+    where t.id = x.id;
+  end if;
+
+  return coalesce(v_inserted, '[]'::jsonb);
+end;
+$$;
+
+revoke execute on function public.apply_synced_transaction_batch(uuid, jsonb, jsonb) from public;
+revoke execute on function public.apply_synced_transaction_batch(uuid, jsonb, jsonb) from anon;
+revoke execute on function public.apply_synced_transaction_batch(uuid, jsonb, jsonb) from authenticated;
+grant execute on function public.apply_synced_transaction_batch(uuid, jsonb, jsonb) to service_role;
+
+-- Round 8 remediation (createManualLoan retry-duplication, replacing the Round 7 time-window
+-- heuristic): a genuine client-supplied idempotency key, backed by a real database uniqueness
+-- guarantee and a replay-safe response — the exact "prove it, don't approximate it" fix the
+-- earlier exact-field/30-second-window heuristic could not provide (it could neither survive a
+-- delayed retry past its window, nor tell a genuine duplicate loan apart from a retry that
+-- happened to reuse identical values). One row per (user, idempotency_key) the caller has ever
+-- used for a loan creation; `loan_id` is what a replayed request re-fetches and returns.
+create table public.manual_loan_creation_requests (
+  user_id uuid not null,
+  idempotency_key text not null,
+  loan_id uuid not null references public.manual_loans(id) on delete cascade,
+  created_at timestamp with time zone not null default now(),
+  primary key (user_id, idempotency_key)
+);
+
+alter table public.manual_loan_creation_requests enable row level security;
+
+-- Atomically replays an existing loan for a (user, idempotency_key) pair already seen, or creates
+-- a new one and records the key — the whole check-then-act sequence happens inside one locked
+-- transaction, so two concurrent requests carrying the SAME key can never both pass the "does
+-- this key exist yet" check and both insert: the per-(user,key) advisory lock (a finer grain than
+-- the per-user lock used elsewhere in this migration, since loan creation never touches
+-- `transactions` and so has no need to contend with those writers) serializes them, and the
+-- second one simply reads back what the first one already committed. A genuinely different key
+-- always creates a genuinely new loan, however similar its fields are to an existing one — this
+-- function never compares field VALUES, only the key.
+create or replace function public.create_manual_loan_idempotent(
+  p_user_id uuid,
+  p_idempotency_key text,
+  p_name text,
+  p_loan_type text,
+  p_current_balance numeric,
+  p_origination_principal_amount numeric,
+  p_interest_rate_percentage numeric,
+  p_origination_date date,
+  p_term_months integer,
+  p_minimum_payment_amount numeric,
+  p_next_payment_due_date date,
+  p_notes text,
+  p_match_text text
+) returns uuid
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_existing_loan_id uuid;
+  v_new_loan_id uuid;
+begin
+  if p_idempotency_key is null or length(btrim(p_idempotency_key)) = 0 then
+    raise exception 'create_manual_loan_idempotent: idempotency_key is required';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text || ':' || p_idempotency_key));
+
+  select loan_id into v_existing_loan_id
+  from public.manual_loan_creation_requests
+  where user_id = p_user_id and idempotency_key = p_idempotency_key;
+
+  if v_existing_loan_id is not null then
+    return v_existing_loan_id;
+  end if;
+
+  insert into public.manual_loans (
+    user_id, name, loan_type, current_balance, origination_principal_amount,
+    interest_rate_percentage, origination_date, term_months, minimum_payment_amount,
+    next_payment_due_date, notes, match_text
+  ) values (
+    p_user_id, p_name, p_loan_type, p_current_balance, p_origination_principal_amount,
+    p_interest_rate_percentage, p_origination_date, p_term_months, p_minimum_payment_amount,
+    p_next_payment_due_date, p_notes, p_match_text
+  )
+  returning id into v_new_loan_id;
+
+  insert into public.manual_loan_creation_requests (user_id, idempotency_key, loan_id)
+  values (p_user_id, p_idempotency_key, v_new_loan_id);
+
+  return v_new_loan_id;
+end;
+$$;
+
+revoke execute on function public.create_manual_loan_idempotent(uuid, text, text, text, numeric, numeric, numeric, date, integer, numeric, date, text, text) from public;
+revoke execute on function public.create_manual_loan_idempotent(uuid, text, text, text, numeric, numeric, numeric, date, integer, numeric, date, text, text) from anon;
+revoke execute on function public.create_manual_loan_idempotent(uuid, text, text, text, numeric, numeric, numeric, date, integer, numeric, date, text, text) from authenticated;
+grant execute on function public.create_manual_loan_idempotent(uuid, text, text, text, numeric, numeric, numeric, date, integer, numeric, date, text, text) to service_role;

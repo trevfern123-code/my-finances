@@ -1841,6 +1841,71 @@ describe('41. A1 -> A3 (same user, new session): ad-hoc ownership uses session_i
 // other kind had already committed something newer. `resourceVersionsRef` (see its own comment) now
 // gives every reader of a given resource — grouped or targeted — one shared counter to reserve from.
 
+describe('Round 8 remediation: createManualLoan idempotency-key generation', () => {
+  it('mints one idempotency key per form mount and sends the same key on a rapid double-submit before the form closes', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Double-Click Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '500' } });
+
+    mockCreateManualLoan.mockReturnValue(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    // Two rapid clicks before the form has a chance to unmount, modeling the exact double-submit
+    // gap this key is meant to make safe (see LoanProgress.tsx's ManualLoanForm — no
+    // disabled-while-pending guard exists on this button).
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    expect(mockCreateManualLoan.mock.calls.length).toBeGreaterThanOrEqual(1);
+    const keysUsed = new Set(mockCreateManualLoan.mock.calls.map((call) => call[1]));
+    // Whether React let the second click land before the form unmounted or not, every call that
+    // DID land must carry the identical key minted for this one form mount — never a fresh key
+    // per click.
+    expect(keysUsed.size).toBe(1);
+    expect(typeof mockCreateManualLoan.mock.calls[0][1]).toBe('string');
+    expect((mockCreateManualLoan.mock.calls[0][1] as string).length).toBeGreaterThan(0);
+  });
+
+  it('a second, separate "add loan" session (form closed and reopened) mints a genuinely different key', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    // Neither submission is ever resolved — this isolates "does reopening the form mint a new
+    // key" from any loan-list re-render, which is a separate concern already covered elsewhere.
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'First Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '100' } });
+    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const firstKey = mockCreateManualLoan.mock.calls[0][1];
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Second Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '200' } });
+    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const secondKey = mockCreateManualLoan.mock.calls[1][1];
+
+    expect(secondKey).not.toBe(firstKey);
+  });
+});
+
 describe('42. createManualLoan mutation cross-lifecycle ownership: A -> B (Blocker 1)', () => {
   it("A's pending manual-loan create does not appear once B is ready", async () => {
     mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());

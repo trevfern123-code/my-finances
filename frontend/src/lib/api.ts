@@ -337,8 +337,21 @@ export function getManualLoans(): Promise<{ loans: ManualLoan[] }> {
   return authedFetch('/api/manual-loans');
 }
 
-export function createManualLoan(input: ManualLoanInput): Promise<{ loan: ManualLoan }> {
-  return authedFetch('/api/manual-loans', { method: 'POST', body: JSON.stringify(input) });
+/**
+ * `idempotencyKey` — generated once per create ATTEMPT on the caller's side (see
+ * LoanProgress.tsx's `ManualLoanForm`, which mints one per form mount) and sent as the
+ * `Idempotency-Key` header. The backend persists it alongside the created loan and replays the
+ * same loan on any later request carrying the same key, rather than creating a duplicate — this
+ * is what makes a retry (a double-click before the form closes, or a client-side resend after an
+ * ambiguous timeout) safe even though loan creation also triggers a same-request backfill step
+ * that can itself fail after the loan already persisted.
+ */
+export function createManualLoan(input: ManualLoanInput, idempotencyKey: string): Promise<{ loan: ManualLoan }> {
+  return authedFetch('/api/manual-loans', {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body: JSON.stringify(input),
+  });
 }
 
 export function updateManualLoan(

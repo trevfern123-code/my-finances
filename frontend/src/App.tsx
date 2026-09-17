@@ -1396,11 +1396,11 @@ export default function App() {
     }
   }
 
-  async function handleCreateManualLoan(input: ManualLoanInput) {
+  async function handleCreateManualLoan(input: ManualLoanInput, idempotencyKey: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
     try {
-      const res = await createManualLoan(input);
+      const res = await createManualLoan(input, idempotencyKey);
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => [...prev, res.loan]);
       });
