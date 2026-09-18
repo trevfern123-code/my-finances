@@ -27,6 +27,17 @@ const otherInput: ManualLoanInput = { ...input, name: 'Boat', current_balance: 5
 
 const SLOT = 'myfinances.pendingManualLoanCreation.user-a';
 
+/** A stored envelope with any part overridden — used to build every malformed variant. */
+function envelope(overrides: Record<string, unknown>): string {
+  return JSON.stringify({ version: 1, idempotencyKey: 'k0', input, ...overrides });
+}
+
+function withoutField(field: keyof ManualLoanInput): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...input };
+  delete copy[field];
+  return copy;
+}
+
 /** Runs the callback immediately and synchronously: "locking" that excludes nothing. Stands in for
  *  the Round 12 protocol (plain read-then-write) so the forced interleaving can show what the real
  *  lock prevents. */
@@ -90,7 +101,7 @@ describe('acquirePendingManualLoanCreation — cross-context exclusivity (Round 
 
     expect(first).toEqual({ status: 'acquired', pending: { idempotencyKey: 'k1', input } });
     expect(loser).toEqual({ status: 'held-by-other', pending: { idempotencyKey: 'k1', input } });
-    expect(localStorage.getItem(SLOT)).toBe(JSON.stringify({ idempotencyKey: 'k1', input }));
+    expect(localStorage.getItem(SLOT)).toBe(JSON.stringify({ version: 1, idempotencyKey: 'k1', input }));
     expect(locks.requested).toEqual([
       'myfinances.pendingManualLoanCreation.lock.user-a',
       'myfinances.pendingManualLoanCreation.lock.user-a',
@@ -109,7 +120,7 @@ describe('acquirePendingManualLoanCreation — cross-context exclusivity (Round 
     expect(winners).toHaveLength(1);
     const winner = winners[0].pending;
     for (const r of results) expect(r.pending).toEqual(winner);
-    expect(JSON.parse(localStorage.getItem(SLOT)!)).toEqual(winner);
+    expect(JSON.parse(localStorage.getItem(SLOT)!)).toEqual({ version: 1, ...winner });
   });
 
   it('users are independent: different users never contend for the same slot', async () => {
@@ -135,11 +146,23 @@ describe('acquirePendingManualLoanCreation — cross-context exclusivity (Round 
 
   it.each([
     ['not JSON', '{not json'],
-    ['wrong key type', '{"idempotencyKey":42,"input":{}}'],
-    ['empty key', '{"idempotencyKey":"","input":{}}'],
-    ['missing input', '{"idempotencyKey":"k0"}'],
-    ['array input', '{"idempotencyKey":"k0","input":[]}'],
-    ['extra field (unrecognized version)', '{"idempotencyKey":"k0","input":{},"version":2}'],
+    ['wrong key type', envelope({ idempotencyKey: 42 })],
+    ['empty key', envelope({ idempotencyKey: '' })],
+    ['missing input', JSON.stringify({ version: 1, idempotencyKey: 'k0' })],
+    ['array input', envelope({ input: [] })],
+    ['an unversioned (pre-Round 14) record', JSON.stringify({ idempotencyKey: 'k0', input })],
+    ['an unsupported version', envelope({ version: 2 })],
+    ['a non-numeric version', envelope({ version: '1' })],
+    ['an extra envelope field', JSON.stringify({ version: 1, idempotencyKey: 'k0', input, extra: true })],
+    ['an empty payload object ({ input: {} })', envelope({ input: {} })],
+    ['a payload missing a required field', envelope({ input: withoutField('current_balance') })],
+    ['a payload with a string balance', envelope({ input: { ...input, current_balance: '1200' } })],
+    ['a payload with a numeric name', envelope({ input: { ...input, name: 7 } })],
+    ['a payload with null where a string is required', envelope({ input: { ...input, name: null } })],
+    ['a payload with null where a number is required', envelope({ input: { ...input, current_balance: null } })],
+    ['a payload with an Infinity balance (1e999)', envelope({ input }).replace('"current_balance":1200', '"current_balance":1e999')],
+    ['a payload with an unknown extra field', envelope({ input: { ...input, surprise: 1 } })],
+    ['a payload failing a semantic rule (negative balance)', envelope({ input: { ...input, current_balance: -1 } })],
     ['a different shape entirely', '{"version":2,"attempt":{}}'],
     ['a JSON array', '[]'],
     ['JSON null', 'null'],
@@ -220,6 +243,13 @@ describe('releasePendingManualLoanCreation (Round 13 remediation)', () => {
     expect(localStorage.getItem(SLOT)).toBeNull();
   });
 
+  it('never removes a record whose PAYLOAD is malformed, even when its key matches', async () => {
+    const corrupt = envelope({ idempotencyKey: 'k1', input: {} });
+    localStorage.setItem(SLOT, corrupt);
+    await releasePendingManualLoanCreation('user-a', 'k1', new FakeLockManager());
+    expect(localStorage.getItem(SLOT)).toBe(corrupt);
+  });
+
   it('never removes a record it cannot read', async () => {
     localStorage.setItem(SLOT, '{not json');
     await releasePendingManualLoanCreation('user-a', 'k1', new FakeLockManager());
@@ -250,7 +280,7 @@ describe('releasePendingManualLoanCreation (Round 13 remediation)', () => {
   });
 
   it('is a no-op without Web Locks (the record survives; retrying it only replays the result)', async () => {
-    localStorage.setItem(SLOT, JSON.stringify({ idempotencyKey: 'k1', input }));
+    localStorage.setItem(SLOT, JSON.stringify({ version: 1, idempotencyKey: 'k1', input }));
     await releasePendingManualLoanCreation('user-a', 'k1', null);
     expect(loadPendingManualLoanCreation('user-a')?.idempotencyKey).toBe('k1');
   });
@@ -258,7 +288,7 @@ describe('releasePendingManualLoanCreation (Round 13 remediation)', () => {
 
 describe('loadPendingManualLoanCreation (display-only read)', () => {
   it('is scoped per user and ignores malformed records', () => {
-    localStorage.setItem(SLOT, JSON.stringify({ idempotencyKey: 'k1', input }));
+    localStorage.setItem(SLOT, JSON.stringify({ version: 1, idempotencyKey: 'k1', input }));
     expect(loadPendingManualLoanCreation('user-a')?.idempotencyKey).toBe('k1');
     expect(loadPendingManualLoanCreation('user-b')).toBeNull();
     localStorage.setItem(SLOT, '{not json');

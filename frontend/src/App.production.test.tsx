@@ -2073,7 +2073,7 @@ describe('Round 8 remediation: createManualLoan idempotency-key generation', () 
 
     // Persisted per user in real browser storage, not just component state.
     const stored = JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null');
-    expect(stored).toEqual({ idempotencyKey: firstKey, input: firstPayload });
+    expect(stored).toEqual({ version: 1, idempotencyKey: firstKey, input: firstPayload });
 
     // Tear the whole app down and bring it back up — the component tree, App state and the form
     // are all gone; only what was persisted survives.
@@ -2203,7 +2203,7 @@ describe('Round 8 remediation: createManualLoan idempotency-key generation', () 
       next_payment_due_date: null, notes: null, match_text: null,
     };
     localStorage.setItem('myfinances.pendingManualLoanCreation.user-a',
-      JSON.stringify({ idempotencyKey: 'other-tab-key', input: otherTabPayload }));
+      JSON.stringify({ version: 1, idempotencyKey: 'other-tab-key', input: otherTabPayload }));
 
     await clickSave();
 
@@ -2294,7 +2294,7 @@ describe('Round 8 remediation: createManualLoan idempotency-key generation', () 
 
     expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
     const [payload, key] = mockCreateManualLoan.mock.calls[0];
-    expect(server.storedAttemptAtSend[0]).toEqual({ idempotencyKey: key, input: payload });
+    expect(server.storedAttemptAtSend[0]).toEqual({ version: 1, idempotencyKey: key, input: payload });
     await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
     expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
   });
@@ -3239,7 +3239,7 @@ describe('Round 13: two tabs acquiring a pending manual-loan creation at the sam
     expect(server.loansByKey.size).toBe(1);
 
     // 3. The slot still holds the winner — the loser never overwrote it.
-    expect(JSON.parse(localStorage.getItem(SLOT) ?? 'null')).toEqual({ idempotencyKey: winnerKey, input: winnerPayload });
+    expect(JSON.parse(localStorage.getItem(SLOT) ?? 'null')).toEqual({ version: 1, idempotencyKey: winnerKey, input: winnerPayload });
 
     // 4. The loser converged on the winner's attempt, and finishing it from there reuses the SAME key.
     await waitFor(() => expect((within(tabB).getByLabelText('Name') as HTMLInputElement).value).toBe('Tab A Loan'));
@@ -3253,7 +3253,14 @@ describe('Round 13: two tabs acquiring a pending manual-loan creation at the sam
   });
 
   it('a non-empty but malformed slot blocks creation and is left byte-for-byte untouched', async () => {
-    for (const corrupt of ['{"idempotencyKey":42,"input":{}}', '{not json', '{"version":2,"attempt":{}}']) {
+    for (const corrupt of [
+      '{"idempotencyKey":42,"input":{}}',
+      '{not json',
+      '{"version":2,"attempt":{}}',
+      // Round 14: a valid envelope whose PAYLOAD is empty / wrongly typed must fail closed too.
+      '{"version":1,"idempotencyKey":"k0","input":{}}',
+      '{"version":1,"idempotencyKey":"k0","input":{"name":"X","loan_type":"personal","current_balance":"100","origination_principal_amount":null,"interest_rate_percentage":null,"origination_date":null,"term_months":null,"minimum_payment_amount":null,"next_payment_due_date":null,"notes":null,"match_text":null}}',
+    ]) {
       cleanup();
       mockCreateManualLoan.mockClear();
       localStorage.clear();
@@ -3287,5 +3294,151 @@ describe('Round 13: two tabs acquiring a pending manual-loan creation at the sam
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain("can't coordinate"));
     expect(mockCreateManualLoan).not.toHaveBeenCalled();
     expect(localStorage.getItem(SLOT)).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Round 14 remediation: a manual-loan create begun by user A must never be sent under user B.
+//
+// `installVerifyingLoanServer` makes the mocked createManualLoan behave like the real one at its
+// send point: it calls the verifier App passes in with the session that is current AT THAT MOMENT
+// (currentFakeSession — what supabase.auth.getSession would return) and refuses before "sending" if
+// it fails, exactly as authedFetch does. Accepted requests record whose credentials they carried.
+// -------------------------------------------------------------------------------------------------
+describe('Round 14: manual-loan creation is bound to the initiating user and session', () => {
+  const SLOT_A = 'myfinances.pendingManualLoanCreation.user-a';
+  const SLOT_B = 'myfinances.pendingManualLoanCreation.user-b';
+
+  function installVerifyingLoanServer({ failFirst = false } = {}) {
+    const sentAs: { user: string; key: string }[] = [];
+    let calls = 0;
+    mockCreateManualLoan.mockImplementation(
+      async (payload: { name: string }, key: string, verifyOwnership: (session: unknown) => boolean) => {
+        calls += 1;
+        if (!currentFakeSession || !verifyOwnership(currentFakeSession)) {
+          throw new Error('Session no longer matches the expected authenticated owner');
+        }
+        sentAs.push({ user: currentFakeSession.user.id, key });
+        if (failFirst && calls === 1) throw new Error('Failed to backfill loan matches');
+        return { loan: { ...fakeManualLoan(payload.name).loan, id: `loan-for-${key}` } };
+      }
+    );
+    return { sentAs };
+  }
+
+  async function switchTo(userId: string, sessionId: string) {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    act(() => emitAuthEvent(fakeSession(userId, sessionId)));
+    // activeTab persists as 'loans'; its "Add a loan" button reappears once this lifecycle is ready.
+    await waitFor(() => expect(screen.getByText('Add a loan')).toBeTruthy());
+  }
+
+  it('A begins a create while the Web Lock is held; switching to B before release sends NOTHING, and A\'s pending record survives for A to retry', async () => {
+    const locks = installFakeWebLocks();
+    const server = installVerifyingLoanServer({ failFirst: true });
+    await bootToLoans('user-a');
+
+    // A's first attempt persists server-side but reports failure: A now has an unresolved record.
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'A Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '400' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(server.sentAs).toHaveLength(1);
+    const aRecord = localStorage.getItem(SLOT_A);
+    const aKey = JSON.parse(aRecord!).idempotencyKey;
+
+    // Another tab of A's is holding the cross-tab lock, so A's retry has to wait for it.
+    let releaseLock!: () => void;
+    void locks.request('myfinances.pendingManualLoanCreation.lock.user-a', () => new Promise<void>((r) => (releaseLock = r)));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+
+    // While A's retry is still queued on the lock, the browser signs in as B.
+    await switchTo('user-b', 'sid-b1');
+    await act(async () => {
+      releaseLock();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // Nothing at all was attempted under B: the only request ever made is A's original one.
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
+    expect(server.sentAs.every((r) => r.user === 'user-a')).toBe(true);
+    // A's record is byte-for-byte what it was; B has no record; B's screen shows nothing of A's.
+    expect(localStorage.getItem(SLOT_A)).toBe(aRecord);
+    expect(localStorage.getItem(SLOT_B)).toBeNull();
+    expect(screen.queryByText(/signed out before this loan was sent/)).toBeNull();
+    expect(screen.queryByDisplayValue('A Loan')).toBeNull();
+
+    // A returns (a brand-new session lifecycle): the pending attempt resumes, and the retry goes out
+    // under A with the SAME key and payload — replaying the loan A's first attempt created.
+    await switchTo('user-a', 'sid-a2');
+    await waitFor(() => expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('A Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+    await waitFor(() => expect(server.sentAs).toHaveLength(2));
+    expect(server.sentAs[1]).toEqual({ user: 'user-a', key: aKey });
+    await waitFor(() => expect(localStorage.getItem(SLOT_A)).toBeNull());
+  });
+
+  it('the verifier handed to createManualLoan accepts ONLY the initiating user in the initiating session', async () => {
+    installVerifyingLoanServer();
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Bound Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '5' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+    await waitFor(() => expect(mockCreateManualLoan).toHaveBeenCalledTimes(1));
+
+    const verify = mockCreateManualLoan.mock.calls[0][2] as (session: unknown) => boolean;
+    expect(verify(fakeSession('user-a', 'sid-user-a'))).toBe(true);
+    expect(verify(fakeSession('user-b', 'sid-user-a'))).toBe(false); // another user
+    expect(verify(fakeSession('user-a', 'sid-a-other'))).toBe(false); // same user, another session
+  });
+
+  it('a verifier refusal at send time (identity changed after the lock) sends nothing and keeps the pending record', async () => {
+    // Simulates the change landing in the last possible window — after App's post-lock check, while
+    // authedFetch looks up the session — by switching identity inside the send itself.
+    mockCreateManualLoan.mockImplementation(async (_p: unknown, _k: string, verify: (s: unknown) => boolean) => {
+      currentFakeSession = fakeSession('user-b', 'sid-b1');
+      if (!verify(currentFakeSession)) throw new Error('Session no longer matches the expected authenticated owner');
+      throw new Error('UNREACHABLE: request sent under the wrong identity');
+    });
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Late Switch Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '7' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('no longer matches'));
+    expect(JSON.parse(localStorage.getItem(SLOT_A) ?? 'null')).toMatchObject({ input: { name: 'Late Switch Loan' } });
+  });
+
+  it('same user, same session: create and ambiguous-failure retry still work under one key', async () => {
+    const server = installVerifyingLoanServer({ failFirst: true });
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Same User Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '12' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+    expect(server.sentAs.map((r) => r.user)).toEqual(['user-a', 'user-a']);
+    expect(new Set(server.sentAs.map((r) => r.key)).size).toBe(1);
+    expect(localStorage.getItem(SLOT_A)).toBeNull();
   });
 });

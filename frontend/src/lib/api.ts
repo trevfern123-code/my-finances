@@ -348,12 +348,30 @@ export function getManualLoans(): Promise<{ loans: ManualLoan[] }> {
  * ambiguous timeout) safe even though loan creation also triggers a same-request backfill step
  * that can itself fail after the loan already persisted.
  */
-export function createManualLoan(input: ManualLoanInput, idempotencyKey: string): Promise<{ loan: ManualLoan }> {
-  return authedFetch('/api/manual-loans', {
-    method: 'POST',
-    headers: { 'Idempotency-Key': idempotencyKey },
-    body: JSON.stringify(input),
-  });
+/**
+ * `verifyOwnership` is REQUIRED (Round 14 remediation). A create is initiated under one
+ * authenticated user, but the request is only sent after awaits — the cross-tab Web Lock, then
+ * authedFetch's own session lookup, and possibly its clock-skew retry delay — and authedFetch sends
+ * with whatever session is current when it looks. Without this, a sign-in change during any of
+ * those waits sent user A's loan with user B's bearer token, creating it in B's account.
+ * authedFetch calls this with the session it is about to use, immediately before the first send and
+ * again before any retry, and refuses to send unless it returns true.
+ */
+export function createManualLoan(
+  input: ManualLoanInput,
+  idempotencyKey: string,
+  verifyOwnership: (session: Session) => boolean
+): Promise<{ loan: ManualLoan }> {
+  return authedFetch(
+    '/api/manual-loans',
+    {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(input),
+    },
+    false,
+    verifyOwnership
+  );
 }
 
 /** True when a createManualLoan failure is the server's DEFINITIVE answer that this idempotency key

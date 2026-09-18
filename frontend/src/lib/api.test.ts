@@ -184,6 +184,7 @@ describe('createManualLoan — server resolution codes (Round 12 remediation)', 
     interest_rate_percentage: null, origination_date: null, term_months: null, minimum_payment_amount: null,
     next_payment_due_date: null, notes: null, match_text: null,
   };
+  const ownedByA = (session: { user: { id: string } }) => session.user.id === 'user-a';
 
   it("carries the server's code onto the thrown error, so a since-deleted key is recognized as resolved", async () => {
     mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
@@ -193,7 +194,7 @@ describe('createManualLoan — server resolution codes (Round 12 remediation)', 
       json: () => Promise.resolve({ error: 'already created and since deleted', code: 'idempotency_key_loan_deleted' }),
     } as never);
 
-    const err = await createManualLoan(input, 'key-1').catch((e: unknown) => e);
+    const err = await createManualLoan(input, 'key-1', ownedByA).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toBe('already created and since deleted');
@@ -209,8 +210,96 @@ describe('createManualLoan — server resolution codes (Round 12 remediation)', 
       json: () => Promise.resolve({ error: 'Failed to backfill loan matches' }),
     } as never);
 
-    const err = await createManualLoan(input, 'key-1').catch((e: unknown) => e);
+    const err = await createManualLoan(input, 'key-1', ownedByA).catch((e: unknown) => e);
 
     expect(isManualLoanCreationResolvedError(err)).toBe(false);
+  });
+});
+
+/**
+ * Round 14 remediation: createManualLoan used to call authedFetch with no ownership verifier, so a
+ * loan initiated by user A was sent with whichever session was current once authedFetch's session
+ * lookup (or its clock-skew retry) resolved. These drive the real createManualLoan -> authedFetch
+ * path with only supabase.auth.getSession and fetch faked.
+ */
+describe('createManualLoan — request bound to the initiating owner (Round 14 remediation)', () => {
+  const input = {
+    name: 'Car', loan_type: 'personal' as const, current_balance: 100, origination_principal_amount: null,
+    interest_rate_percentage: null, origination_date: null, term_months: null, minimum_payment_amount: null,
+    next_payment_due_date: null, notes: null, match_text: null,
+  };
+  const ownedByA = (session: { user: { id: string } }) => session.user.id === 'user-a';
+
+  function bearerTokensSent(): string[] {
+    return vi.mocked(fetch).mock.calls.map(
+      (call) => ((call[1] as RequestInit).headers as Record<string, string>).Authorization
+    );
+  }
+
+  it('a deferred getSession that resolves to user B is refused, and fetch is never called', async () => {
+    let resolveSession!: (value: unknown) => void;
+    mockGetSession.mockReturnValue(new Promise((resolve) => (resolveSession = resolve)));
+
+    const sending = createManualLoan(input, 'key-1', ownedByA);
+    // The identity changes while the lookup is outstanding.
+    resolveSession({ data: { session: SESSION_B } });
+
+    await expect(sending).rejects.toThrow(/owner/i);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('a clock-skew retry is re-verified: after switching to B the retry is refused and B\'s token is never sent', async () => {
+    vi.useFakeTimers();
+    let lookups = 0;
+    mockGetSession.mockImplementation(() => {
+      lookups++;
+      return Promise.resolve({ data: { session: lookups === 1 ? SESSION_A : SESSION_B } });
+    });
+    vi.mocked(fetch).mockResolvedValueOnce(clockSkewErrorResponse() as never);
+
+    const assertion = expect(createManualLoan(input, 'key-1', ownedByA)).rejects.toThrow(/owner/i);
+    await vi.advanceTimersByTimeAsync(1500);
+    await assertion;
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(bearerTokensSent()).toEqual(['Bearer a-token']);
+    vi.useRealTimers();
+  });
+
+  it('same user: sends once with A\'s token, carrying the idempotency key', async () => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+    vi.mocked(fetch).mockResolvedValue(okResponse({ loan: { id: 'loan-1' } }) as never);
+
+    const result = await createManualLoan(input, 'key-1', ownedByA);
+
+    expect(result).toEqual({ loan: { id: 'loan-1' } });
+    expect(bearerTokensSent()).toEqual(['Bearer a-token']);
+    expect(vi.mocked(fetch).mock.calls[0][1]).toMatchObject({ headers: expect.objectContaining({ 'Idempotency-Key': 'key-1' }) });
+  });
+
+  it('same user: a clock-skew retry still goes through, with A\'s token both times', async () => {
+    vi.useFakeTimers();
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(clockSkewErrorResponse() as never)
+      .mockResolvedValueOnce(okResponse({ loan: { id: 'loan-1' } }) as never);
+
+    const sending = createManualLoan(input, 'key-1', ownedByA);
+    await vi.advanceTimersByTimeAsync(1500);
+
+    await expect(sending).resolves.toEqual({ loan: { id: 'loan-1' } });
+    expect(bearerTokensSent()).toEqual(['Bearer a-token', 'Bearer a-token']);
+    vi.useRealTimers();
+  });
+
+  it('the verifier is consulted with the exact session about to be used', async () => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+    vi.mocked(fetch).mockResolvedValue(okResponse({ loan: { id: 'loan-1' } }) as never);
+    const verify = vi.fn(() => true);
+
+    await createManualLoan(input, 'key-1', verify);
+
+    expect(verify).toHaveBeenCalledWith(SESSION_A);
+    expect(verify.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(fetch).mock.invocationCallOrder[0]);
   });
 });

@@ -1,4 +1,5 @@
 import type { ManualLoanInput } from './api';
+import { parseManualLoanInput } from './manualLoanValidation';
 
 /**
  * A manual-loan creation that has been sent at least once but not yet confirmed resolved.
@@ -46,7 +47,23 @@ function browserLocks(): CrossContextLocks | null {
   return locks && typeof locks.request === 'function' ? locks : null;
 }
 
-/** Strict: exactly the two expected fields, of the expected types. Anything else is unrecognized. */
+/**
+ * Version of the stored envelope `{ version, idempotencyKey, input }`. A record with any other
+ * version (from a newer or older build of this app) is not understood, and — like any other
+ * unrecognized record — fails closed rather than being treated as an empty slot.
+ */
+const RECORD_VERSION = 1;
+
+function serializeRecord(pending: PendingManualLoanCreation): string {
+  return JSON.stringify({ version: RECORD_VERSION, idempotencyKey: pending.idempotencyKey, input: pending.input });
+}
+
+/**
+ * Strict: exactly `{ version, idempotencyKey, input }`, the supported version, a non-empty key, and
+ * an `input` that is a complete, well-typed ManualLoanInput passing the same rules as new input
+ * (Round 14 remediation — previously any non-array object was accepted as the payload and cast).
+ * Anything else is unrecognized and returns null.
+ */
 function parseRecord(raw: string): PendingManualLoanCreation | null {
   let parsed: unknown;
   try {
@@ -57,10 +74,12 @@ function parseRecord(raw: string): PendingManualLoanCreation | null {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
   const record = parsed as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  if (keys.length !== 2 || keys[0] !== 'idempotencyKey' || keys[1] !== 'input') return null;
+  if (keys.length !== 3 || keys[0] !== 'idempotencyKey' || keys[1] !== 'input' || keys[2] !== 'version') return null;
+  if (record.version !== RECORD_VERSION) return null;
   if (typeof record.idempotencyKey !== 'string' || record.idempotencyKey.length === 0) return null;
-  if (typeof record.input !== 'object' || record.input === null || Array.isArray(record.input)) return null;
-  return record as unknown as PendingManualLoanCreation;
+  const input = parseManualLoanInput(record.input);
+  if (input === null) return null;
+  return { idempotencyKey: record.idempotencyKey, input };
 }
 
 /**
@@ -135,7 +154,12 @@ export async function acquirePendingManualLoanCreation(
         : { status: 'held-by-other', pending: existing };
     }
 
-    const serialized = JSON.stringify(pending);
+    // Never write a record this module would itself refuse to read back: it would become an
+    // "unreadable" slot that blocks every later creation for this user.
+    if (parseManualLoanInput(pending.input) === null || pending.idempotencyKey.length === 0) {
+      throw new PendingCreationPersistenceError('This loan could not be saved because some of its details are invalid.');
+    }
+    const serialized = serializeRecord(pending);
     try {
       localStorage.setItem(key, serialized);
       if (localStorage.getItem(key) !== serialized) {

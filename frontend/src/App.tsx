@@ -1442,11 +1442,24 @@ export default function App() {
     const ownerUserId = userId;
 
     const refuse = (message: string): never => {
-      setActionError(message);
+      // Only surface it in the lifecycle that made the attempt — never on another user's screen.
+      if (isStillCurrentSession(expectedSessionId)) setActionError(message);
       throw new Error(message);
     };
-    if (!ownerUserId) refuse('Sign in again before adding a loan.');
+    if (!ownerUserId || !expectedSessionId) refuse('Sign in again before adding a loan.');
     const owner = ownerUserId as string;
+    const ownerSessionId = expectedSessionId as string;
+
+    // Round 14 remediation: this attempt belongs to the user AND the auth lifecycle that initiated it.
+    // Handed to createManualLoan, which checks it against the exact session it is about to send with
+    // (and again before any clock-skew retry), so a sign-in change during the lock wait, the session
+    // lookup or the retry delay can never send this loan with another user's bearer token. Mirrors
+    // the preference writes' verifier (NavLayoutScope/PreferencesScope).
+    const verifyOwnership = (session: Session) =>
+      session.user.id === owner &&
+      decodeSessionId(session.access_token) === ownerSessionId &&
+      isSessionCurrent(ownerSessionId);
+    const stillOwnLifecycle = () => userIdRef.current === owner && isSessionCurrent(ownerSessionId);
 
     // A payload the server would always reject must never become a locked, unresolvable attempt. (A
     // retry's input is the stored payload, which passed this same check when it was first sent.)
@@ -1465,19 +1478,27 @@ export default function App() {
     if (acquired.status === 'held-by-other') {
       // Another attempt is unresolved (this tab's form predates it, or another tab won the slot).
       // Surface it so the form adopts it and it can be finished from here — never send a new key.
-      if (userIdRef.current === owner) setPendingLoanCreate(acquired.pending);
+      if (stillOwnLifecycle()) setPendingLoanCreate(acquired.pending);
       refuse('An earlier loan save has not been confirmed yet. Finish that save before adding another loan.');
+    }
+    // Round 14: an early exit if the lifecycle changed while waiting for the lock. Not the safety
+    // mechanism (verifyOwnership at send time is), just a refusal before doing anything more. The
+    // pending record just acquired is deliberately LEFT in place: it belongs to `owner`, and it is
+    // what lets them retry this exact attempt (same key, same payload) when they return — removing
+    // it could forget an attempt that an earlier send already committed.
+    if (!stillOwnLifecycle()) {
+      refuse('You were signed out before this loan was sent. Sign back in to finish saving it.');
     }
     // The STORED payload is sent, never the caller's: for a retry it is what the key was first sent with.
     const pending = acquired.pending;
     const payload = pending.input;
-    if (userIdRef.current === owner) setPendingLoanCreate(pending);
+    setPendingLoanCreate(pending);
 
     setInFlightLoanCreateKey(idempotencyKey);
     try {
       let res: { loan: ManualLoan };
       try {
-        res = await createManualLoan(payload, idempotencyKey);
+        res = await createManualLoan(payload, idempotencyKey, verifyOwnership);
       } catch (err) {
         if (!isManualLoanCreationResolvedError(err)) throw err;
         // The server confirmed this key already created a loan, which has since been deleted: the
