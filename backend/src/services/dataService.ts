@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
 import { roundToCents } from './money';
 import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION, type SemanticRole } from './transactionClassifier';
+import { buildLoanDeletionReclassifyPayload, type LinkedTransactionClassifierInputs } from './loanDeletionReclassify';
 import {
   normalizePrincipalPortion,
   normalizeNonNegativeMoneyAmount,
@@ -1281,8 +1282,9 @@ const DELETE_MANUAL_LOAN_MAX_ATTEMPTS = 3;
  *
  * Classification stays here in TypeScript because transactionClassifier.ts is its single source of
  * truth. The trade-off is that rows are classified from an unlocked read, so the RPC verifies under
- * its lock that the linked set is still EXACTLY what was classified and rejects the call otherwise;
- * this function absorbs that rejection by re-reading and retrying.
+ * its lock that the linked set is still EXACTLY what was classified, and that every row's classifier
+ * inputs are unchanged, and rejects the call otherwise; this function absorbs that rejection by
+ * re-reading and reclassifying.
  *
  * Returns the affected transaction ids and whether this was a replay of an already-committed
  * deletion. The caller (manualLoanController.ts) owns the post-commit relational work: forward
@@ -1301,28 +1303,11 @@ export async function deleteManualLoan(
       .eq('manual_loan_id', id);
     if (fetchError) throw new Error(`Failed to load transactions linked to manual loan: ${fetchError.message}`);
 
-    const reclassify = ((linkedRows ?? []) as {
-      id: string;
-      amount: number;
-      category: string | null;
-      personal_finance_category_detailed: string | null;
-      personal_finance_category_confidence: string | null;
-    }[]).map((txn) => {
-      const classification = classifyRowLevel({
-        amount: txn.amount,
-        personalFinanceCategoryPrimary: txn.category,
-        personalFinanceCategoryDetailed: txn.personal_finance_category_detailed,
-        personalFinanceCategoryConfidence: txn.personal_finance_category_confidence,
-        manualLoanId: null,
-      });
-      return {
-        id: txn.id,
-        auto_role: classification.autoRole,
-        role_source: classification.roleSource,
-        role_confidence: classification.roleConfidence,
-        classifier_version: classification.classifierVersion,
-      };
-    });
+    // Carries the classifier inputs alongside each role (exp_*), so the RPC can reject a deletion
+    // whose rows were re-categorized by a concurrent sync after this read (Round 11 remediation).
+    const reclassify = buildLoanDeletionReclassifyPayload(
+      (linkedRows ?? []) as LinkedTransactionClassifierInputs[]
+    );
 
     const { data, error } = await supabaseAdmin.rpc('delete_manual_loan_atomic', {
       p_user_id: userId,

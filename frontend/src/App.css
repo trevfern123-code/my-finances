@@ -2086,6 +2086,14 @@ button:disabled {
   margin-bottom: 0.9rem;
 }
 
+/* Groups the fields only so they can be disabled together; it should not look like a fieldset. */
+.manual-loan-form-fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+
 .manual-loan-form-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));

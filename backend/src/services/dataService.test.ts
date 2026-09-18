@@ -1664,9 +1664,17 @@ describe('deleteManualLoan — one atomic, locked, replay-safe RPC (Round 10 rem
     expect(mockRpc).toHaveBeenCalledWith('delete_manual_loan_atomic', {
       p_user_id: 'user-1',
       p_loan_id: 'loan-1',
+      // Round 11: each row also carries the classifier inputs it was classified from (exp_*), so the
+      // RPC can reject the deletion if a concurrent sync changed them.
       p_reclassify: [
-        { id: 'txn-1', auto_role: 'expense', role_source: 'sign_default', role_confidence: 'low', classifier_version: 1 },
-        { id: 'txn-2', auto_role: 'income', role_source: 'sign_default', role_confidence: 'low', classifier_version: 1 },
+        {
+          id: 'txn-1', auto_role: 'expense', role_source: 'sign_default', role_confidence: 'low', classifier_version: 1,
+          exp_amount: 200, exp_category: null, exp_pfc_detailed: null, exp_pfc_confidence: null,
+        },
+        {
+          id: 'txn-2', auto_role: 'income', role_source: 'sign_default', role_confidence: 'low', classifier_version: 1,
+          exp_amount: -50, exp_category: null, exp_pfc_detailed: null, exp_pfc_confidence: null,
+        },
       ],
     });
     // The loan delete happens inside the RPC — there must be no separate .delete() query at all,

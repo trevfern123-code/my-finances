@@ -1572,10 +1572,13 @@ grant execute on function public.create_manual_loan_idempotent(uuid, text, text,
 --
 -- Classification itself deliberately stays in TypeScript (transactionClassifier.ts is the single
 -- source of truth for it, and porting it into SQL would fork that logic). The caller reads the
--- linked rows, classifies them, and passes the result in as p_reclassify; this function then proves
--- under the lock that the linked set it is about to act on is EXACTLY the set the caller classified
--- — so a concurrent link arriving in between is detected and the whole call is rejected for the
--- caller to retry with fresh state, rather than silently acting on a stale decision.
+-- linked rows, classifies them, and passes the result in as p_reclassify — together with the
+-- classifier inputs it observed for each row (exp_amount, exp_category, exp_pfc_detailed,
+-- exp_pfc_confidence). This function then proves under the lock that the linked set it is about to
+-- act on is EXACTLY the set the caller classified, AND that every row's classifier inputs are
+-- unchanged — so a concurrent link, unlink or resync arriving in between is detected and the whole
+-- call is rejected for the caller to retry with fresh state, rather than silently persisting a
+-- role computed from superseded data.
 create table public.manual_loan_deletions (
   user_id uuid not null,
   loan_id uuid not null,
@@ -1652,8 +1655,14 @@ begin
       v_distinct_count, v_reclassify_count;
   end if;
 
-  -- Lock the COMPLETE current linked set through its ownership chain. The aggregate sits outside
-  -- the locking select because PostgreSQL forbids FOR UPDATE alongside an aggregate.
+  -- Lock the COMPLETE current linked set AND its ownership chain. Round 11 remediation: this used to
+  -- lock only `t`, so a concurrent re-parenting of the account or plaid item (the rows the
+  -- `pi.user_id = p_user_id` test actually depends on) was neither waited for nor re-checked — the
+  -- statement just read the pre-change snapshot and went ahead. Locking `a` and `pi` as well makes
+  -- this wait for any such writer and then re-evaluate the ownership predicate against the
+  -- committed row, so a row whose chain no longer leads to this user drops out of the set (and the
+  -- set comparison below then rejects the call). The aggregate sits outside the locking select
+  -- because PostgreSQL forbids FOR UPDATE alongside an aggregate.
   select array_agg(locked.id order by locked.id) into v_linked_ids
   from (
     select t.id
@@ -1661,17 +1670,43 @@ begin
     join public.accounts a on a.id = t.account_id
     join public.plaid_items pi on pi.id = a.item_id
     where t.manual_loan_id = p_loan_id and pi.user_id = p_user_id
-    for update of t
+    for update of t, a, pi
   ) locked;
 
-  select array_agg(distinct r.id) into v_reclassify_ids
+  -- Round 11 remediation: ORDER BY is explicit. The comparison below is positional (array
+  -- equality), and PostgreSQL does not guarantee aggregate output order without ORDER BY — the
+  -- earlier version relied on DISTINCT happening to sort, which is an implementation detail.
+  select array_agg(distinct r.id order by r.id) into v_reclassify_ids
   from jsonb_to_recordset(coalesce(p_reclassify, '[]'::jsonb)) as r(id uuid);
 
-  -- Both arrays are ascending (array_agg DISTINCT sorts; the other is explicitly ordered), so this
-  -- is a true set comparison. A concurrent link or unlink landing between the caller's read and
-  -- this lock changes the set and is rejected here.
+  -- Both arrays are now explicitly ascending, so this is a true set comparison. A concurrent link
+  -- or unlink landing between the caller's read and this lock changes the set and is rejected here.
   if coalesce(v_linked_ids, '{}'::uuid[]) is distinct from coalesce(v_reclassify_ids, '{}'::uuid[]) then
     raise exception 'delete_manual_loan_atomic: the set of transactions linked to this loan changed since they were classified (concurrent modification) — re-read and retry';
+  end if;
+
+  -- Round 11 remediation: the id set alone is not enough. The caller's role decision for each row
+  -- depends on that row's amount, primary category, detailed category and category confidence
+  -- (transactionClassifier.ts's full input once manual_loan_id is cleared), all read OUTSIDE this
+  -- lock. A concurrent sync can change any of them while leaving the row linked — e.g. Plaid
+  -- re-categorizing an ordinary purchase as LOAN_PAYMENTS — and the id-only check then accepted and
+  -- persisted a role computed from the superseded inputs. Every classifier input the caller saw is
+  -- now echoed back as exp_* and compared against the locked row; any mismatch (including a
+  -- missing exp_* field, which compares as null) rejects the whole call so the caller re-reads and
+  -- reclassifies. The message deliberately shares the "changed since they were classified" phrase
+  -- with the set check above, because the caller's correct response to both is the same retry.
+  select count(*) into v_affected_count
+  from jsonb_to_recordset(p_reclassify) as r(
+    id uuid, exp_amount numeric, exp_category text, exp_pfc_detailed text, exp_pfc_confidence text
+  )
+  join public.transactions t on t.id = r.id
+  where t.amount is distinct from r.exp_amount
+     or t.category is distinct from r.exp_category
+     or t.personal_finance_category_detailed is distinct from r.exp_pfc_detailed
+     or t.personal_finance_category_confidence is distinct from r.exp_pfc_confidence;
+
+  if v_affected_count > 0 then
+    raise exception 'delete_manual_loan_atomic: % linked transaction(s) changed since they were classified (classifier inputs differ; concurrent modification) — re-read and retry', v_affected_count;
   end if;
 
   if coalesce(cardinality(v_linked_ids), 0) > 0 then

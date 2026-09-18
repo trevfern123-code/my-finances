@@ -456,6 +456,16 @@ async function waitForReady() {
   await waitFor(() => expect(screen.getByText('Customize dashboard')).toBeTruthy());
 }
 
+/** Renders a fresh App, signs `userId` in, waits for readiness and opens the Loans tab. Calling it
+ *  again after cleanup() is the test-level equivalent of a page reload for that user. */
+async function bootToLoans(userId: string) {
+  mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+  render(<App />);
+  act(() => emitAuthEvent(fakeSession(userId, `sid-${userId}`)));
+  await waitForReady();
+  act(() => screen.getByText('Loans').click());
+}
+
 async function waitForLoading() {
   await waitFor(() => expect(screen.getByText('Loading...')).toBeTruthy());
 }
@@ -489,6 +499,8 @@ function readNetWorth(): string | null {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Pending manual-loan creations persist per user in localStorage by design; each test starts clean.
+  localStorage.clear();
   currentFakeSession = null;
   latestLiveCallback = null;
   capturedPlaidOnSuccess = null;
@@ -1943,16 +1955,149 @@ describe('Round 8 remediation: createManualLoan idempotency-key generation', () 
     await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
   });
 
-  it('cancelling and reopening the form (a genuinely new create session) mints a different key', async () => {
-    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
-    render(<App />);
-    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
-    await waitForReady();
-    act(() => screen.getByText('Loans').click());
+  // Round 11 remediation (blocker 2). The previous version of this test asserted that Cancel after a
+  // failed create and then reopening minted a NEW key — which is precisely the duplicate-creating
+  // behavior: the failure is ambiguous (the loan may have committed), so abandoning its key is
+  // unsafe. Only confirmed success or an explicit "Discard attempt" may retire a key now.
+  it('Round 11: Cancel after an ambiguous failure, then reopening, RESUMES the same key and payload', async () => {
+    await bootToLoans('user-a');
 
     act(() => screen.getByText('Add a loan').click());
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'First Loan' } });
     fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '100' } });
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Failed to backfill loan matches'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    act(() => screen.getByText('Cancel').click());
+    expect(screen.queryByText('Save loan')).toBeNull();
+    act(() => screen.getByText('Add a loan').click());
+
+    // Reopened onto the pending attempt: same values, and edits are locked (a changed payload under
+    // the same key would be rejected by the server; under a new key it could duplicate the loan).
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('First Loan');
+    // Disabled via its <fieldset disabled> ancestor, which the element's own `disabled` property
+    // does not reflect — `:disabled` is the effective state.
+    expect(screen.getByLabelText('Name').matches(':disabled')).toBe(true);
+
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('First Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+  });
+
+  it('Round 11: Cancel is disabled while the create request is in flight', async () => {
+    await bootToLoans('user-a');
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Deferred Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '300' } });
+    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    const cancel = screen.getByText('Cancel') as HTMLButtonElement;
+    expect(cancel.disabled).toBe(true);
+    act(() => cancel.click());
+    // Still open — the outcome is unknown, so the form cannot be dismissed mid-request.
+    expect(screen.getByText('Saving…')).toBeTruthy();
+    expect(screen.getByLabelText('Name')).toBeTruthy();
+  });
+
+  it('Round 11: navigating to another tab mid-request and back resumes the SAME in-flight attempt; after it fails, retry reuses its key and payload', async () => {
+    await bootToLoans('user-a');
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Wandering Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '450' } });
+    const first = deferred<ReturnType<typeof fakeManualLoan>>();
+    mockCreateManualLoan.mockReturnValueOnce(first.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    // Leave the Loans tab entirely — this unmounts LoanProgress and the form with it.
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.queryByText('Saving…')).toBeNull();
+    act(() => screen.getByText('Loans').click());
+
+    // The remounted form opens straight onto the attempt, still shown as in progress.
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Wandering Loan');
+    expect(screen.getByText('Saving…')).toBeTruthy();
+    expect((screen.getByText('Cancel') as HTMLButtonElement).disabled).toBe(true);
+
+    // The original request now fails ambiguously.
+    await act(async () => {
+      first.reject(new Error('network dropped'));
+      await first.promise.catch(() => {});
+    });
+    await waitFor(() => expect(screen.getByText('Save loan')).toBeTruthy());
+
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Wandering Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+  });
+
+  it('Round 11: a full App remount (reload-equivalent) after an ambiguous failure resumes the persisted key and payload, and success clears it', async () => {
+    await bootToLoans('user-a');
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Reloaded Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '900' } });
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Failed to backfill loan matches'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    // Persisted per user in real browser storage, not just component state.
+    const stored = JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null');
+    expect(stored).toEqual({ idempotencyKey: firstKey, input: firstPayload });
+
+    // Tear the whole app down and bring it back up — the component tree, App state and the form
+    // are all gone; only what was persisted survives.
+    cleanup();
+    await bootToLoans('user-a');
+
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Reloaded Loan');
+    expect((screen.getByLabelText('Current balance') as HTMLInputElement).value).toBe('900');
+
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Reloaded Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+
+    await waitFor(() => expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull());
+  });
+
+  it('Round 11: "Discard attempt" is the explicit way to abandon a pending attempt, and only then is a new key minted', async () => {
+    await bootToLoans('user-a');
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Mistyped Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '10' } });
     mockCreateManualLoan.mockRejectedValueOnce(new Error('nope'));
     await act(async () => {
       fireEvent.click(screen.getByText('Save loan'));
@@ -1960,20 +2105,49 @@ describe('Round 8 remediation: createManualLoan idempotency-key generation', () 
     });
     const firstKey = mockCreateManualLoan.mock.calls[0][1];
 
-    // Cancel abandons this attempt deliberately — a new form is a new logical creation, so it must
-    // NOT reuse the abandoned attempt's key.
-    act(() => screen.getByText('Cancel').click());
-    act(() => screen.getByText('Add a loan').click());
-    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Second Loan' } });
-    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '200' } });
+    act(() => screen.getByText('Discard attempt').click());
+    expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
+    // Editable again, under a fresh key.
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '1000' } });
     mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
     await act(async () => {
       fireEvent.click(screen.getByText('Save loan'));
       await Promise.resolve();
     });
-    const secondKey = mockCreateManualLoan.mock.calls[1][1];
+    expect(mockCreateManualLoan.mock.calls[1][1]).not.toBe(firstKey);
+    expect(mockCreateManualLoan.mock.calls[1][0]).toMatchObject({ current_balance: 1000 });
+  });
 
-    expect(secondKey).not.toBe(firstKey);
+  it('Round 11: a pending attempt is scoped to its user — another user neither sees nor reuses it', async () => {
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'A Private Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '5' } });
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('nope'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const aKey = mockCreateManualLoan.mock.calls[0][1];
+
+    cleanup();
+    await bootToLoans('user-b');
+    // No form auto-opened for user B, and opening one starts blank under a fresh key.
+    expect(screen.queryByText('Save loan')).toBeNull();
+    act(() => screen.getByText('Add a loan').click());
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('');
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'B Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '6' } });
+    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    expect(mockCreateManualLoan.mock.calls[1][1]).not.toBe(aKey);
+    // A's attempt is untouched and still waiting for A.
+    expect(JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null')).toMatchObject({
+      idempotencyKey: aKey,
+    });
   });
 
   it('Round 9 verification: a genuinely SUCCESSFUL creation is followed by a new key on the next form mount (not merely an abandoned one)', async () => {

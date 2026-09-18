@@ -59,6 +59,12 @@ import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { decodeSessionId } from './lib/jwt';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
 import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
+import {
+  clearPendingManualLoanCreation,
+  loadPendingManualLoanCreation,
+  savePendingManualLoanCreation,
+  type PendingManualLoanCreation,
+} from './lib/pendingManualLoanCreation';
 import { DEFAULT_REPORTING_RANGE, type ReportingRangeId } from './lib/reportingRange';
 import { buildWebTabList } from './lib/webTabNav';
 import { useAuthSession } from './hooks/useAuthSession';
@@ -339,6 +345,19 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const userId = session?.user.id ?? null;
+
+  // Round 11 remediation: the in-progress manual-loan creation lives here, per authenticated user
+  // and persisted (see pendingManualLoanCreation.ts), not inside the create form — so Cancel, a tab
+  // switch, a reload or an auth remount mid-request can no longer discard the idempotency key of a
+  // create that may already have committed. `inFlightLoanCreateKey` is the key of a create request
+  // still awaiting its response, so a form remounted during that window shows it as in progress.
+  const [pendingLoanCreate, setPendingLoanCreate] = useState<PendingManualLoanCreation | null>(null);
+  const [inFlightLoanCreateKey, setInFlightLoanCreateKey] = useState<string | null>(null);
+  const userIdRef = useRef(userId);
+  useLayoutEffect(() => {
+    userIdRef.current = userId;
+    setPendingLoanCreate(userId ? loadPendingManualLoanCreation(userId) : null);
+  }, [userId]);
 
   // Mirrors sessionId for reads from inside async closures (bootstrapPreferences'/
   // refreshFinancialData's own captures below, and NavLayoutScope's/PreferencesScope's
@@ -1403,20 +1422,51 @@ export default function App() {
   // idempotency key, which is only possible while the original form is still mounted. Swallowing
   // the error here closed the form and discarded that key, turning the retry into a second,
   // duplicate loan. The form keeps itself open on rejection; see ManualLoanForm.handleSubmit.
+  //
+  // Round 11 remediation: the attempt is recorded as pending (key + exact payload, per user,
+  // persisted) BEFORE the request is sent, and cleared only once a response confirms success — for
+  // the user who made it, even if they have since navigated away or signed out. A failure leaves it
+  // in place, so whichever form mounts next for this user resumes the same key and payload.
   async function handleCreateManualLoan(input: ManualLoanInput, idempotencyKey: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownerUserId = userId;
+    if (ownerUserId) {
+      const pending = { idempotencyKey, input };
+      savePendingManualLoanCreation(ownerUserId, pending);
+      setPendingLoanCreate(pending);
+    }
+    setInFlightLoanCreateKey(idempotencyKey);
     try {
       const res = await createManualLoan(input, idempotencyKey);
+      if (ownerUserId) {
+        clearPendingManualLoanCreation(ownerUserId, idempotencyKey);
+        if (userIdRef.current === ownerUserId) setPendingLoanCreate(loadPendingManualLoanCreation(ownerUserId));
+      }
       commitMutationForResource('manualLoans', expectedSessionId, () => {
-        setManualLoans((prev) => [...prev, res.loan]);
+        // A retry of an already-successful attempt (e.g. resubmitted from a form remounted while
+        // the first request was still in flight) replays the SAME loan — never list it twice.
+        setManualLoans((prev) =>
+          prev.some((l) => l.id === res.loan.id)
+            ? prev.map((l) => (l.id === res.loan.id ? res.loan : l))
+            : [...prev, res.loan]
+        );
       });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to add loan');
       }
       throw err;
+    } finally {
+      setInFlightLoanCreateKey((current) => (current === idempotencyKey ? null : current));
     }
+  }
+
+  // An explicit user decision to abandon a pending attempt (e.g. to change its details). The only
+  // way besides confirmed success that a pending key is ever forgotten.
+  function handleDiscardPendingManualLoanCreate() {
+    if (userId) clearPendingManualLoanCreation(userId);
+    setPendingLoanCreate(null);
   }
 
   async function handleUpdateManualLoan(id: string, input: ManualLoanInput) {
@@ -1870,6 +1920,11 @@ export default function App() {
                       totalDebt={totalDebt}
                       totalMinimumPayment={totalMinimumPayment}
                       onCreateManualLoan={handleCreateManualLoan}
+                      pendingManualLoanCreate={pendingLoanCreate}
+                      manualLoanCreateInFlight={
+                        pendingLoanCreate !== null && inFlightLoanCreateKey === pendingLoanCreate.idempotencyKey
+                      }
+                      onDiscardPendingManualLoanCreate={handleDiscardPendingManualLoanCreate}
                       onUpdateManualLoan={handleUpdateManualLoan}
                       onDeleteManualLoan={handleDeleteManualLoan}
                       onFetchPayments={handleFetchPayments}
