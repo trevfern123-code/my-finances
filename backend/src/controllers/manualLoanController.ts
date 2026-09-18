@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
 import { backfillMatchesForLoan, computePayoffProgressPct } from '../services/loans';
@@ -54,25 +55,21 @@ interface ManualLoanBody {
   match_text?: string | null;
 }
 
-export async function createManualLoan(req: Request, res: Response, next: NextFunction) {
+/**
+ * Prefix for the keys the LEGACY create route generates on the server. The idempotent route
+ * refuses any client-supplied key carrying it, so a legacy request's key can never collide with,
+ * replay, or be replayed by a key from the new client's pending-attempt protocol.
+ */
+export const LEGACY_SERVER_KEY_PREFIX = 'legacy-server:';
+
+/** Creates the loan through the idempotent RPC under `idempotencyKey`, then backfills matches. */
+async function createLoanUnderKey(req: Request, res: Response, next: NextFunction, idempotencyKey: string) {
   try {
     const userId = req.user!.id;
     const body = req.body as ManualLoanBody;
 
     if (!body.name || typeof body.current_balance !== 'number') {
       res.status(400).json({ error: 'name and current_balance are required' });
-      return;
-    }
-
-    // Round 8 remediation: replaces the earlier time-window/exact-field-match heuristic with a
-    // genuine client-supplied idempotency key (see api.ts's createManualLoan and
-    // ManualLoanForm — one key is minted per form mount and resent unchanged on any resubmission
-    // of that same attempt). Required, not optional: a fallback for a missing key would just
-    // reintroduce the exact ambiguity this replaces. dataService.createManualLoan enforces the
-    // actual uniqueness/replay guarantee at the database layer.
-    const idempotencyKey = req.header('Idempotency-Key');
-    if (!idempotencyKey || idempotencyKey.trim() === '') {
-      res.status(400).json({ error: 'Idempotency-Key header is required' });
       return;
     }
 
@@ -95,8 +92,8 @@ export async function createManualLoan(req: Request, res: Response, next: NextFu
     );
 
     // Round 5 remediation: NOT best-effort/swallowed — a failure here must be reported as a
-    // failed request (the client can safely resend the identical request, idempotency key
-    // included, and it will replay the already-created loan above rather than duplicating it).
+    // failed request. On the idempotent route the client resends the identical request, key
+    // included, and replays the already-created loan above rather than duplicating it.
     await backfillMatchesForLoan(userId, loan);
     const refreshed = (await dataService.getManualLoan(loan.id, userId)) ?? loan;
 
@@ -110,6 +107,45 @@ export async function createManualLoan(req: Request, res: Response, next: NextFu
     }
     next(err);
   }
+}
+
+/**
+ * POST /api/manual-loans/idempotent — the ONLY create route the current frontend calls.
+ *
+ * Requires a client-supplied Idempotency-Key and never falls back to non-idempotent behaviour: a
+ * missing, blank, or reserved key is a 400, not a silent downgrade — the frontend's whole
+ * duplicate-prevention protocol (Rounds 8–15) depends on its key reaching the database.
+ */
+export async function createManualLoanIdempotent(req: Request, res: Response, next: NextFunction) {
+  const idempotencyKey = req.header('Idempotency-Key');
+  if (!idempotencyKey || idempotencyKey.trim() === '') {
+    res.status(400).json({ error: 'Idempotency-Key header is required' });
+    return;
+  }
+  if (idempotencyKey.startsWith(LEGACY_SERVER_KEY_PREFIX)) {
+    res.status(400).json({ error: 'Idempotency-Key uses a reserved prefix' });
+    return;
+  }
+  await createLoanUnderKey(req, res, next, idempotencyKey);
+}
+
+/**
+ * POST /api/manual-loans — LEGACY route, kept only for frontend bundles that predate the idempotent
+ * route (Round 16 remediation). The PWA precaches the app shell, so those bundles can keep running
+ * for a long time after a deploy; they send no Idempotency-Key and must keep working.
+ *
+ * Explicitly NOT retry-idempotent — the same as it always was for those clients: every request
+ * gets a fresh server-generated key, so a resubmission creates another loan, exactly as before
+ * Phase A. It goes through the same database RPC (ownership, numeric validation, atomicity) so it
+ * is no weaker than before, but it deliberately does not pretend two requests are one. Any
+ * Idempotency-Key header sent here is ignored: this route never enters the new client's
+ * pending-key protocol, and its keys live under LEGACY_SERVER_KEY_PREFIX, which the idempotent
+ * route rejects.
+ *
+ * Remove once no client can still be running a pre-Round-16 bundle (see the rollout plan).
+ */
+export async function createManualLoanLegacy(req: Request, res: Response, next: NextFunction) {
+  await createLoanUnderKey(req, res, next, `${LEGACY_SERVER_KEY_PREFIX}${randomUUID()}`);
 }
 
 export async function updateManualLoan(req: Request, res: Response, next: NextFunction) {

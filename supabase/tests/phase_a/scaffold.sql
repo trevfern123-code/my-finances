@@ -5,9 +5,7 @@
 -- tables with the column types and foreign keys of supabase/migrations/20260825195130_remote_schema.sql.
 -- It is NOT a replay of that migration (no auth schema, RLS policies or storage).
 --
--- Also defines the `th` ("test harness") schema of assertion helpers every test file uses. A failed
--- assertion raises, and the runner executes every file with ON_ERROR_STOP, so any failure fails the
--- test.
+-- The `th` assertion helpers live in helpers.sql, shared with the history mode (see run.sh).
 
 do $$
 begin
@@ -20,9 +18,17 @@ $$;
 -- A recreated `public` schema does not get the special PUBLIC usage the bootstrap one has.
 grant usage on schema public to anon, authenticated, service_role;
 
+-- The real project's default privileges, exactly as supabase/migrations/20260825195130_remote_schema.sql
+-- (pulled from the live database) sets them: every new table, sequence and function in public is
+-- granted to anon, authenticated AND service_role. This is what makes a migration's narrower GRANTs
+-- insufficient on their own (Round 16: the ACL tests must fail if a new table is not also REVOKEd
+-- from service_role), so the scaffold must reproduce it.
 alter default privileges for role postgres in schema public grant execute on functions to anon;
 alter default privileges for role postgres in schema public grant execute on functions to authenticated;
 alter default privileges for role postgres in schema public grant execute on functions to service_role;
+alter default privileges for role postgres in schema public grant select, update, usage on sequences to anon, authenticated, service_role;
+alter default privileges for role postgres in schema public
+  grant delete, insert, maintain, references, select, trigger, truncate, update on tables to anon, authenticated, service_role;
 
 create extension if not exists pgcrypto;
 
@@ -90,35 +96,3 @@ create table public.transactions (
 );
 
 grant all on all tables in schema public to service_role;
-
-create schema th;
-
-create function th.assert(p_condition boolean, p_message text) returns void
-language plpgsql as $$
-begin
-  if p_condition is not true then
-    raise exception 'ASSERTION FAILED: %', p_message;
-  end if;
-end;
-$$;
-
--- Runs p_sql and requires it to fail with an error whose message matches p_pattern (LIKE). The
--- statement runs inside this function's own exception block, i.e. a subtransaction, so whatever it
--- did before failing is rolled back — callers then assert the database is unchanged.
-create function th.expect_error(p_sql text, p_pattern text) returns void
-language plpgsql as $$
-begin
-  begin
-    execute p_sql;
-  exception when others then
-    if sqlerrm like p_pattern then
-      return;
-    end if;
-    raise exception 'ASSERTION FAILED: expected an error like % but got: %', p_pattern, sqlerrm;
-  end;
-  raise exception 'ASSERTION FAILED: expected an error like % but the statement succeeded: %', p_pattern, p_sql;
-end;
-$$;
-
-grant usage on schema th to anon, authenticated, service_role;
-grant execute on all functions in schema th to anon, authenticated, service_role;

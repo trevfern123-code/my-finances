@@ -25,6 +25,111 @@
 -- consumers that must account for manual-loan principal/interest decomposition use the
 -- getSemanticEffects() backend helper instead (see that module's own doc comment for why
 -- effective_role alone is insufficient for those rows).
+--
+-- ================================================================================================
+-- DIRTY-DATA GATE (Round 16 remediation) — must stay the FIRST executable statements in this file.
+-- ================================================================================================
+-- This migration adds nine NOT VALID numeric CHECK constraints (see further below). NOT VALID
+-- skips checking existing rows when the constraint is ADDED, but PostgreSQL still checks the
+-- COMPLETE resulting row against every CHECK constraint on every later UPDATE of that row —
+-- whichever columns the UPDATE touches. So a pre-existing violating row would become
+-- un-updatable by every write path the moment this migration committed: a Plaid resync of it
+-- fails the whole sync batch (and the sync cursor stops advancing), linking any transaction to a
+-- loan with an unrelated bad column fails, and even editing a note fails. Verified on PostgreSQL 17
+-- against the real schema history. This migration therefore refuses to install the constraints
+-- over dirty data at all:
+--
+--  1. The LOCK below takes ACCESS EXCLUSIVE on the three constrained tables. Locks are held until
+--     the migration's transaction ends, so no other session can insert or update a row in them
+--     between the check below and the moment the constraints are installed and committed. A writer
+--     that already holds a conflicting lock is waited for FIRST — so a violating row it commits is
+--     seen by the check. Writers that arrive later queue behind this lock and are checked against
+--     the new constraints once it commits. (ACCESS EXCLUSIVE rather than something weaker because
+--     the transactions rewrite and the ADD CONSTRAINTs below need it anyway, and it is held until
+--     commit regardless; taking it up front in a fixed order avoids lock-upgrade deadlocks. Reads
+--     of these three tables wait for the duration of this migration.)
+--  2. LOCK TABLE is only permitted inside a transaction block, so as the first statement it also
+--     proves this file is running in ONE transaction: a runner that executed it statement by
+--     statement in autocommit would fail right here, before anything was changed, rather than
+--     leaving the migration half applied. Every model this has been verified against — an explicit
+--     BEGIN/COMMIT (`psql -1`), and a single multi-statement query that PostgreSQL runs as one
+--     implicit transaction — makes the whole file, gate included, all-or-nothing.
+--  3. If any row violates any of the nine constraints, the DO block raises and the whole
+--     migration rolls back: no column, table, function, grant or constraint from this file
+--     remains. It never corrects, deletes or guesses at financial data. The error lists the
+--     violation count per constraint; the operator lists the actual rows with the read-only
+--     preflight queries in supabase/preflight/20260912120000_phase_a_numeric_preflight.sql,
+--     corrects them deliberately, and re-runs this migration.
+--
+-- lock_timeout makes the migration fail cleanly (and roll back) rather than queue indefinitely
+-- behind a long-running transaction while every other session queues behind it.
+set local lock_timeout = '15s';
+
+lock table public.manual_loans, public.manual_loan_payments, public.transactions in access exclusive mode;
+
+do $$
+declare
+  v_found text := '';
+  v_count bigint;
+begin
+  -- Each predicate is exactly its constraint's CHECK expression below; `is false` matches CHECK's
+  -- own semantics (a NULL result passes a CHECK constraint).
+  select count(*) into v_count from public.manual_loans
+    where (current_balance >= 0 and current_balance < 'Infinity'::numeric) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  manual_loans_current_balance_check: %s row(s)', v_count); end if;
+
+  select count(*) into v_count from public.manual_loans
+    where (origination_principal_amount is null
+           or (origination_principal_amount >= 0 and origination_principal_amount < 'Infinity'::numeric)) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  manual_loans_origination_principal_amount_check: %s row(s)', v_count); end if;
+
+  select count(*) into v_count from public.manual_loans
+    where (interest_rate_percentage is null
+           or (interest_rate_percentage >= 0 and interest_rate_percentage < 'Infinity'::numeric)) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  manual_loans_interest_rate_percentage_check: %s row(s)', v_count); end if;
+
+  select count(*) into v_count from public.manual_loans
+    where (minimum_payment_amount is null
+           or (minimum_payment_amount >= 0 and minimum_payment_amount < 'Infinity'::numeric)) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  manual_loans_minimum_payment_amount_check: %s row(s)', v_count); end if;
+
+  select count(*) into v_count from public.manual_loans
+    where (term_months is null or term_months > 0) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  manual_loans_term_months_check: %s row(s)', v_count); end if;
+
+  select count(*) into v_count from public.transactions
+    where (amount > -'Infinity'::numeric and amount < 'Infinity'::numeric) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  transactions_amount_finite_check: %s row(s)', v_count); end if;
+
+  select count(*) into v_count from public.transactions
+    where (principal_portion is null
+           or (principal_portion >= 0 and principal_portion < 'Infinity'::numeric)) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  transactions_principal_portion_check: %s row(s)', v_count); end if;
+
+  select count(*) into v_count from public.manual_loan_payments
+    where (principal_portion >= 0 and principal_portion < 'Infinity'::numeric) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  manual_loan_payments_principal_portion_check: %s row(s)', v_count); end if;
+
+  select count(*) into v_count from public.manual_loan_payments
+    where (interest_portion >= 0 and interest_portion < 'Infinity'::numeric) is false;
+  if v_count > 0 then v_found := v_found || format(E'\n  manual_loan_payments_interest_portion_check: %s row(s)', v_count); end if;
+
+  if v_found <> '' then
+    raise exception using
+      errcode = 'check_violation',
+      message = 'Phase A migration aborted before making any change: existing rows violate the new numeric constraints',
+      detail = 'Violating rows per constraint:' || v_found,
+      hint = 'List the rows with supabase/preflight/20260912120000_phase_a_numeric_preflight.sql, correct them '
+             || '(one UPDATE per row fixing every bad column), then re-run this migration. Nothing was modified.';
+  end if;
+end
+$$;
+
+-- Adding a STORED generated column (effective_role, below) makes PostgreSQL rewrite the entire
+-- transactions table while holding ACCESS EXCLUSIVE (already taken above). Reads and writes of
+-- transactions wait for that rewrite and for the rest of this migration; the duration scales with
+-- the table's size in production and cannot be predicted from test-data timings — plan the rollout
+-- window around it.
 alter table public.transactions
   add column personal_finance_category_detailed text null,
   add column personal_finance_category_confidence text null,
@@ -971,51 +1076,30 @@ grant execute on function public.confirm_transfer_pair(uuid, uuid, uuid, text, i
 -- application code path writes to it — only ever checked loan_type. These five CHECK constraints
 -- close that gap.
 --
--- Every one is added `NOT VALID`, a deliberate two-stage rollout rather than an ordinary CHECK
--- (verified against a disposable PostgreSQL instance for this round, not assumed):
+-- Every one is added `NOT VALID`, with a later, separate VALIDATE step (verified on PostgreSQL 17,
+-- not assumed). What NOT VALID does and does not do:
 --
---  1. `ALTER TABLE ... ADD CONSTRAINT ... CHECK (...) NOT VALID` takes only a brief metadata lock
---     and does NOT scan or lock existing rows at all — confirmed live: a row already violating
---     `current_balance >= 0` remained readable and untouched immediately after adding that exact
---     constraint NOT VALID. This is safe to apply to this table regardless of what unknown
---     existing production data it holds, which a same-migration ordinary (always-validated)
---     CHECK constraint is NOT — that variant scans and would abort the whole migration on the
---     first violating row, with no visibility into whether one exists before running it.
---  2. From the moment it's added, though, a NOT VALID constraint is FULLY enforced for every new
---     INSERT and every UPDATE that touches the constrained column — confirmed live: an insert of
---     a second violating row was rejected immediately after the NOT VALID constraint above was
---     added, well before anything validated existing rows. So this migration alone already closes
---     the write-path gap (Round 5 remediation, blocker 7's "database only checks loan_type"
---     finding) — no unvalidated new bad data can land, regardless of validation status.
---  3. Validating the constraint against whatever rows already exist (`ALTER TABLE ...
---     VALIDATE CONSTRAINT ...`) is intentionally a SEPARATE, LATER, MANUAL step — never run as
---     part of this migration, and never against production from this session (this project's
---     standing rule: never touch production Supabase directly). Confirmed live: VALIDATE
---     CONSTRAINT correctly refuses to complete while a violating row exists, and succeeds (flips
---     `pg_constraint.convalidated` to true) once none remain — a safe, non-destructive operation
---     that only ever reads and reports, never rewrites data. Before ever running it against
---     production, run this read-only preflight against the SAME database first (safe to run
---     anytime, changes nothing):
---
---       select id, user_id, name, current_balance, origination_principal_amount,
---              interest_rate_percentage, minimum_payment_amount, term_months
---       from public.manual_loans
---       where not (current_balance >= 0 and current_balance < 'Infinity'::numeric)
---          or (origination_principal_amount is not null
---              and not (origination_principal_amount >= 0 and origination_principal_amount < 'Infinity'::numeric))
---          or (interest_rate_percentage is not null
---              and not (interest_rate_percentage >= 0 and interest_rate_percentage < 'Infinity'::numeric))
---          or (minimum_payment_amount is not null
---              and not (minimum_payment_amount >= 0 and minimum_payment_amount < 'Infinity'::numeric))
---          or (term_months is not null and term_months <= 0);
---
---     An empty result means `VALIDATE CONSTRAINT` (run separately, once this migration itself has
---     been applied) will succeed immediately. Any returned row means that row needs a decision —
---     correct it or knowingly except it — before validating; the constraint keeps protecting every
---     NEW write in the meantime regardless of when (or whether) that validation step happens.
+--  1. `ADD CONSTRAINT ... CHECK (...) NOT VALID` does not scan existing rows when it is added.
+--  2. It is enforced immediately for every INSERT, and for every UPDATE of ANY row — PostgreSQL
+--     checks the complete resulting row against every CHECK constraint on each UPDATE, whichever
+--     columns that UPDATE touches. (An earlier version of this comment said only updates touching
+--     the constrained column were checked. That is wrong, and it mattered: it implied a legacy
+--     violating row could simply be left for later. In fact such a row becomes un-updatable by
+--     every write path the moment the constraint exists — proven on PostgreSQL 17 by a harness
+--     test that updates only an unrelated column of a pre-existing violator and is rejected.)
+--  3. That is why this migration opens with a dirty-data gate (see the top of this file): it takes
+--     the locks, proves no existing row violates any of the nine constraints, and only then
+--     installs them, all in one transaction — or aborts with nothing changed. So when this
+--     migration has committed, no violating row exists and none can have been written since.
+--  4. Marking the constraints validated (`ALTER TABLE ... VALIDATE CONSTRAINT ...`) is still a
+--     separate, later, manual step, never run by this migration. Because of the gate it is
+--     expected to succeed at any time; it takes only a SHARE UPDATE EXCLUSIVE lock (reads and
+--     writes continue) and changes no data. The standalone read-only preflight queries in
+--     supabase/preflight/20260912120000_phase_a_numeric_preflight.sql list any row that would
+--     block it — or that would make the gate refuse this migration in the first place.
 --
 -- Round 10 remediation (finiteness): each numeric check below pairs `>= 0` with `< 'Infinity'`
--- rather than testing `>= 0` alone, and the preflight query above is written the same way. An
+-- rather than testing `>= 0` alone, and the gate and preflight queries are written the same way. An
 -- unconstrained PostgreSQL `numeric` accepts 'NaN', 'Infinity' and '-Infinity', and PostgreSQL
 -- orders NaN ABOVE every ordinary numeric — so `NaN >= 0` is TRUE and a bare non-negativity check
 -- admits both NaN and +Infinity. Verified live before the fix: loans with NaN current_balance,
@@ -1050,21 +1134,12 @@ alter table public.manual_loans
 -- The same hazard applies to the two per-transaction/per-payment numeric columns this feature
 -- writes. transactions.amount is numeric(12,2), whose typmod rejects Infinity outright but still
 -- accepts NaN; principal_portion and the manual-payment portions are unconstrained numeric and
--- accept all three non-finite values. Both are added NOT VALID for the same staged-rollout reasons
--- documented above; the matching preflight queries are:
+-- accept all three non-finite values. Both are added NOT VALID for the same reasons, and are covered
+-- by the same dirty-data gate and standalone preflight queries.
 --
---       select id, amount, principal_portion from public.transactions
---       where not (amount > -'Infinity'::numeric and amount < 'Infinity'::numeric)
---          or (principal_portion is not null
---              and not (principal_portion >= 0 and principal_portion < 'Infinity'::numeric));
---
---       select id, principal_portion, interest_portion from public.manual_loan_payments
---       where not (principal_portion >= 0 and principal_portion < 'Infinity'::numeric)
---          or not (interest_portion >= 0 and interest_portion < 'Infinity'::numeric);
---
--- transactions.amount is deliberately only required to be FINITE, never non-negative: an ordinary
--- expense is negative in this schema's sign convention, so a non-negativity check there would be
--- wrong.
+-- transactions.amount is deliberately only required to be FINITE, never non-negative: income and
+-- refunds are negative in Plaid's sign convention (money out is positive), so a non-negativity check
+-- there would be wrong.
 alter table public.transactions
   add constraint transactions_amount_finite_check
     check (amount > -'Infinity'::numeric and amount < 'Infinity'::numeric) not valid;
@@ -1426,9 +1501,15 @@ alter table public.manual_loan_creation_requests enable row level security;
 -- denied for table manual_loan_creation_requests" the moment it touches this table — caught live
 -- against a disposable Postgres instance, not by static review. No UPDATE/DELETE grant is given
 -- because the function only ever SELECTs and INSERTs into this table.
+-- Round 16 remediation: service_role is revoked too, BEFORE the narrow grant. This project's
+-- default privileges (supabase/migrations/20260825195130_remote_schema.sql, pulled from the live
+-- database) give anon, authenticated AND service_role every table privilege on each new table in
+-- public, so a bare `grant select, insert` added to them rather than replacing them — verified on
+-- Supabase's own PostgreSQL 17, where service_role held DELETE/UPDATE/TRUNCATE/... here.
 revoke all on public.manual_loan_creation_requests from public;
 revoke all on public.manual_loan_creation_requests from anon;
 revoke all on public.manual_loan_creation_requests from authenticated;
+revoke all on public.manual_loan_creation_requests from service_role;
 grant select, insert on public.manual_loan_creation_requests to service_role;
 
 -- Atomically replays an existing loan for a (user, idempotency_key) pair already seen — but ONLY
@@ -1593,9 +1674,12 @@ alter table public.manual_loan_deletions enable row level security;
 -- Same explicit-grant reasoning as manual_loan_creation_requests above: a table created by this
 -- migration carries no grants of its own, and RLS-with-no-policies does not substitute for them.
 -- UPDATE is granted here (unlike that table) solely so a completed reconciliation can be marked.
+-- Revoked from service_role before the narrow grant for the same default-privileges reason as
+-- manual_loan_creation_requests above (Round 16 remediation).
 revoke all on public.manual_loan_deletions from public;
 revoke all on public.manual_loan_deletions from anon;
 revoke all on public.manual_loan_deletions from authenticated;
+revoke all on public.manual_loan_deletions from service_role;
 grant select, insert, update on public.manual_loan_deletions to service_role;
 
 create or replace function public.delete_manual_loan_atomic(

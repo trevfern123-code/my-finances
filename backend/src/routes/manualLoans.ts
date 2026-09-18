@@ -7,7 +7,10 @@ export const manualLoansRouter = Router();
 manualLoansRouter.use(requireAuth);
 
 manualLoansRouter.get('/', manualLoanController.listManualLoans);
-manualLoansRouter.post('/', manualLoanController.createManualLoan);
+// Two create routes during the transition (Round 16): the idempotent one the current frontend uses,
+// and the legacy one kept for cached pre-Round-16 bundles. See manualLoanController.ts.
+manualLoansRouter.post('/idempotent', manualLoanController.createManualLoanIdempotent);
+manualLoansRouter.post('/', manualLoanController.createManualLoanLegacy);
 manualLoansRouter.patch('/:id', manualLoanController.updateManualLoan);
 manualLoansRouter.delete('/:id', manualLoanController.deleteManualLoan);
 

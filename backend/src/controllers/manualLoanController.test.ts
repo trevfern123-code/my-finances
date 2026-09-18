@@ -43,7 +43,7 @@ vi.mock('../services/loans', () => ({
   computePayoffProgressPct: vi.fn(),
 }));
 
-import { createManualLoan, deleteManualLoan } from './manualLoanController';
+import { createManualLoanIdempotent, deleteManualLoan } from './manualLoanController';
 
 function fakeReq(): Request {
   return { user: { id: 'user-1' }, params: { id: 'loan-1' }, body: {} } as unknown as Request;
@@ -180,7 +180,7 @@ describe('createManualLoan controller — resolved idempotency keys (Round 12 re
     const res = fakeRes();
     const next = vi.fn() as unknown as NextFunction;
 
-    await createManualLoan(createReq(), res, next);
+    await createManualLoanIdempotent(createReq(), res, next);
 
     expect(res.status).toHaveBeenCalledWith(409);
     expect(res.json).toHaveBeenCalledWith({
@@ -195,7 +195,7 @@ describe('createManualLoan controller — resolved idempotency keys (Round 12 re
     const res = fakeRes();
     const next = vi.fn() as unknown as NextFunction;
 
-    await createManualLoan(createReq(), res, next);
+    await createManualLoanIdempotent(createReq(), res, next);
 
     expect(next).toHaveBeenCalledWith(expect.objectContaining({ message: 'Failed to create manual loan: boom' }));
     expect(res.status).not.toHaveBeenCalledWith(409);

@@ -362,8 +362,11 @@ export function createManualLoan(
   idempotencyKey: string,
   verifyOwnership: (session: Session) => boolean
 ): Promise<{ loan: ManualLoan }> {
+  // Round 16: the dedicated idempotent route, which rejects a missing key rather than silently
+  // creating a non-idempotent loan. POST /api/manual-loans is kept on the backend only for cached
+  // pre-Round-16 bundles, and gives no retry protection — this client must never call it.
   return authedFetch(
-    '/api/manual-loans',
+    '/api/manual-loans/idempotent',
     {
       method: 'POST',
       headers: { 'Idempotency-Key': idempotencyKey },

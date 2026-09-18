@@ -277,6 +277,17 @@ describe('createManualLoan — request bound to the initiating owner (Round 14 r
     expect(vi.mocked(fetch).mock.calls[0][1]).toMatchObject({ headers: expect.objectContaining({ 'Idempotency-Key': 'key-1' }) });
   });
 
+  it('Round 16: posts ONLY to the idempotent route, never the legacy non-idempotent one', async () => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+    vi.mocked(fetch).mockResolvedValue(okResponse({ loan: { id: 'loan-1' } }) as never);
+
+    await createManualLoan(input, 'key-1', ownedByA);
+
+    const url = String(vi.mocked(fetch).mock.calls[0][0]);
+    expect(url.endsWith('/api/manual-loans/idempotent')).toBe(true);
+    expect(vi.mocked(fetch).mock.calls[0][1]).toMatchObject({ method: 'POST' });
+  });
+
   it('same user: a clock-skew retry still goes through, with A\'s token both times', async () => {
     vi.useFakeTimers();
     mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
