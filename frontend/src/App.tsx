@@ -4,6 +4,7 @@ import { supabase } from './lib/supabaseClient';
 import {
   createBudgetCategory,
   createManualLoan,
+  isManualLoanCreationResolvedError,
   createManualPayment,
   clearTransactionSplits,
   deleteCategoryMapping,
@@ -62,9 +63,10 @@ import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
 import {
   clearPendingManualLoanCreation,
   loadPendingManualLoanCreation,
-  savePendingManualLoanCreation,
+  persistPendingManualLoanCreation,
   type PendingManualLoanCreation,
 } from './lib/pendingManualLoanCreation';
+import { validateManualLoanInput } from './lib/manualLoanValidation';
 import { DEFAULT_REPORTING_RANGE, type ReportingRangeId } from './lib/reportingRange';
 import { buildWebTabList } from './lib/webTabNav';
 import { useAuthSession } from './hooks/useAuthSession';
@@ -1424,25 +1426,68 @@ export default function App() {
   // duplicate loan. The form keeps itself open on rejection; see ManualLoanForm.handleSubmit.
   //
   // Round 11 remediation: the attempt is recorded as pending (key + exact payload, per user,
-  // persisted) BEFORE the request is sent, and cleared only once a response confirms success — for
-  // the user who made it, even if they have since navigated away or signed out. A failure leaves it
-  // in place, so whichever form mounts next for this user resumes the same key and payload.
+  // persisted) BEFORE the request is sent, and cleared only once the server confirms its outcome —
+  // for the user who made it, even if they have since navigated away or signed out. A failure leaves
+  // it in place, so whichever form mounts next for this user resumes the same key and payload.
+  //
+  // Round 12 remediation: (1) the record must be DURABLY written and read back before the request
+  // may be sent — if storage is unavailable nothing is sent, because a key that cannot survive a
+  // reload cannot make an ambiguous failure safely retryable; (2) while an attempt is unresolved,
+  // this refuses to start any other one, and a retry always resends the persisted payload rather
+  // than whatever the caller passed — so no path can pair the unresolved key with changed details
+  // or replace it with a new key.
   async function handleCreateManualLoan(input: ManualLoanInput, idempotencyKey: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
     const ownerUserId = userId;
-    if (ownerUserId) {
-      const pending = { idempotencyKey, input };
-      savePendingManualLoanCreation(ownerUserId, pending);
-      setPendingLoanCreate(pending);
+
+    const refuse = (message: string): never => {
+      setActionError(message);
+      throw new Error(message);
+    };
+    if (!ownerUserId) refuse('Sign in again before adding a loan.');
+    const owner = ownerUserId as string;
+
+    const unresolved = loadPendingManualLoanCreation(owner);
+    if (unresolved !== null && unresolved.idempotencyKey !== idempotencyKey) {
+      // Reachable when another tab left the attempt unresolved after this one loaded. Surface it so
+      // the form adopts it and it can be finished from here.
+      if (userIdRef.current === owner) setPendingLoanCreate(unresolved);
+      refuse('An earlier loan save has not been confirmed yet. Finish that save before adding another loan.');
     }
+    const isRetry = unresolved !== null;
+    const payload = isRetry ? unresolved.input : input;
+    if (!isRetry) {
+      // A payload the server would always reject must never become a locked, unresolvable attempt.
+      const invalid = validateManualLoanInput(payload);
+      if (invalid) refuse(invalid);
+    }
+
+    const pending = { idempotencyKey, input: payload };
+    try {
+      persistPendingManualLoanCreation(owner, pending);
+    } catch (err) {
+      refuse(err instanceof Error ? err.message : 'Could not save this attempt on this device.');
+    }
+    setPendingLoanCreate(pending);
+
     setInFlightLoanCreateKey(idempotencyKey);
     try {
-      const res = await createManualLoan(input, idempotencyKey);
-      if (ownerUserId) {
-        clearPendingManualLoanCreation(ownerUserId, idempotencyKey);
-        if (userIdRef.current === ownerUserId) setPendingLoanCreate(loadPendingManualLoanCreation(ownerUserId));
+      let res: { loan: ManualLoan };
+      try {
+        res = await createManualLoan(payload, idempotencyKey);
+      } catch (err) {
+        if (!isManualLoanCreationResolvedError(err)) throw err;
+        // The server confirmed this key already created a loan, which has since been deleted: the
+        // attempt is resolved (the creation happened), so it is safe — and necessary, since a retry
+        // would fail identically forever — to retire the key.
+        clearPendingManualLoanCreation(owner, idempotencyKey);
+        if (userIdRef.current === owner) setPendingLoanCreate(loadPendingManualLoanCreation(owner));
+        if (isStillCurrentSession(expectedSessionId)) setActionError((err as Error).message);
+        return;
       }
+      clearPendingManualLoanCreation(owner, idempotencyKey);
+      if (userIdRef.current === owner) setPendingLoanCreate(loadPendingManualLoanCreation(owner));
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         // A retry of an already-successful attempt (e.g. resubmitted from a form remounted while
         // the first request was still in flight) replays the SAME loan — never list it twice.
@@ -1460,13 +1505,6 @@ export default function App() {
     } finally {
       setInFlightLoanCreateKey((current) => (current === idempotencyKey ? null : current));
     }
-  }
-
-  // An explicit user decision to abandon a pending attempt (e.g. to change its details). The only
-  // way besides confirmed success that a pending key is ever forgotten.
-  function handleDiscardPendingManualLoanCreate() {
-    if (userId) clearPendingManualLoanCreation(userId);
-    setPendingLoanCreate(null);
   }
 
   async function handleUpdateManualLoan(id: string, input: ManualLoanInput) {
@@ -1924,7 +1962,6 @@ export default function App() {
                       manualLoanCreateInFlight={
                         pendingLoanCreate !== null && inFlightLoanCreateKey === pendingLoanCreate.idempotencyKey
                       }
-                      onDiscardPendingManualLoanCreate={handleDiscardPendingManualLoanCreate}
                       onUpdateManualLoan={handleUpdateManualLoan}
                       onDeleteManualLoan={handleDeleteManualLoan}
                       onFetchPayments={handleFetchPayments}

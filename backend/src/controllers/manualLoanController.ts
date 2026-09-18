@@ -102,6 +102,12 @@ export async function createManualLoan(req: Request, res: Response, next: NextFu
 
     res.status(201).json({ loan: await enrichLoan(refreshed) });
   } catch (err) {
+    if (err instanceof dataService.ManualLoanCreationKeyResolvedError) {
+      // Round 12: a definitive outcome for this key (it created a loan that was later deleted), so
+      // the client can stop retrying it — see ManualLoanCreationKeyResolvedError.
+      res.status(409).json({ error: err.message, code: 'idempotency_key_loan_deleted' });
+      return;
+    }
     next(err);
   }
 }

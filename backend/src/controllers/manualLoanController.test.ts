@@ -9,10 +9,14 @@ const mockListPaymentsForLoan = vi.hoisted(() => vi.fn());
 const mockGetLinkedPaymentsForLoan = vi.hoisted(() => vi.fn());
 
 // Declared via vi.hoisted so they exist by the time the hoisted vi.mock factory below runs.
-const { ManualLoanNotFoundError, ManualLoanCreationError } = vi.hoisted(() => ({
-  ManualLoanNotFoundError: class ManualLoanNotFoundError extends Error {},
-  ManualLoanCreationError: class ManualLoanCreationError extends Error {},
-}));
+const { ManualLoanNotFoundError, ManualLoanCreationError, ManualLoanCreationKeyResolvedError } = vi.hoisted(() => {
+  class ManualLoanCreationError extends Error {}
+  return {
+    ManualLoanNotFoundError: class ManualLoanNotFoundError extends Error {},
+    ManualLoanCreationError,
+    ManualLoanCreationKeyResolvedError: class ManualLoanCreationKeyResolvedError extends ManualLoanCreationError {},
+  };
+});
 
 vi.mock('../services/dataService', () => ({
   deleteManualLoan: mockDeleteManualLoan,
@@ -23,6 +27,7 @@ vi.mock('../services/dataService', () => ({
   getLinkedPaymentsForLoan: mockGetLinkedPaymentsForLoan,
   ManualLoanNotFoundError,
   ManualLoanCreationError,
+  ManualLoanCreationKeyResolvedError,
 }));
 
 const mockReconcileRelationalRoles = vi.hoisted(() => vi.fn());
@@ -38,7 +43,7 @@ vi.mock('../services/loans', () => ({
   computePayoffProgressPct: vi.fn(),
 }));
 
-import { deleteManualLoan } from './manualLoanController';
+import { createManualLoan, deleteManualLoan } from './manualLoanController';
 
 function fakeReq(): Request {
   return { user: { id: 'user-1' }, params: { id: 'loan-1' }, body: {} } as unknown as Request;
@@ -155,5 +160,44 @@ describe('deleteManualLoan controller — post-deletion reconciliation (Round 10
     expect(res.status).toHaveBeenCalledWith(404);
     expect(mockReconcileRelationalRoles).not.toHaveBeenCalled();
     expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
+  });
+});
+
+describe('createManualLoan controller — resolved idempotency keys (Round 12 remediation)', () => {
+  function createReq(): Request {
+    return {
+      user: { id: 'user-1' },
+      params: {},
+      body: { name: 'Car', current_balance: 100 },
+      header: (name: string) => (name === 'Idempotency-Key' ? 'key-1' : undefined),
+    } as unknown as Request;
+  }
+
+  it('answers 409 with a machine-readable code when the key already created a since-deleted loan', async () => {
+    mockCreateManualLoan.mockRejectedValue(
+      new ManualLoanCreationKeyResolvedError('This loan was already created by an earlier attempt and has since been deleted.')
+    );
+    const res = fakeRes();
+    const next = vi.fn() as unknown as NextFunction;
+
+    await createManualLoan(createReq(), res, next);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith({
+      error: 'This loan was already created by an earlier attempt and has since been deleted.',
+      code: 'idempotency_key_loan_deleted',
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('still passes every OTHER creation failure to the error handler, with no resolution code', async () => {
+    mockCreateManualLoan.mockRejectedValue(new ManualLoanCreationError('Failed to create manual loan: boom'));
+    const res = fakeRes();
+    const next = vi.fn() as unknown as NextFunction;
+
+    await createManualLoan(createReq(), res, next);
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ message: 'Failed to create manual loan: boom' }));
+    expect(res.status).not.toHaveBeenCalledWith(409);
   });
 });

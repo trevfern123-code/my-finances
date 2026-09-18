@@ -2092,30 +2092,224 @@ describe('Round 8 remediation: createManualLoan idempotency-key generation', () 
     await waitFor(() => expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull());
   });
 
-  it('Round 11: "Discard attempt" is the explicit way to abandon a pending attempt, and only then is a new key minted', async () => {
-    await bootToLoans('user-a');
+  // ---------------------------------------------------------------------------------------------
+  // Round 12 remediation. `installFakeLoanServer` stands in for the real endpoint's idempotency
+  // contract (create_manual_loan_idempotent): a key creates exactly one loan, every later request
+  // with it replays that loan, and reusing it with a different payload is rejected. With
+  // `persistThenFailFirst`, the FIRST request persists its loan and THEN reports failure — the
+  // backfill-failed-after-commit case that makes a create failure ambiguous. Tests count the loans
+  // the "server" actually holds, so a duplicate shows up as a second loan, not just as an extra call.
+  // ---------------------------------------------------------------------------------------------
+  function installFakeLoanServer({ persistThenFailFirst = false } = {}) {
+    const loansByKey = new Map<string, { payload: unknown; loan: ReturnType<typeof fakeManualLoan>['loan'] }>();
+    const storedAttemptAtSend: unknown[] = [];
+    let calls = 0;
+    mockCreateManualLoan.mockImplementation(async (payload: { name: string }, key: string) => {
+      calls += 1;
+      // What was durably recorded at the moment the request left — must already be this attempt.
+      storedAttemptAtSend.push(JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null'));
+      const existing = loansByKey.get(key);
+      if (existing) {
+        if (JSON.stringify(existing.payload) !== JSON.stringify(payload)) {
+          throw new Error(`idempotency_key ${key} was already used for a different request payload`);
+        }
+        return { loan: existing.loan };
+      }
+      const loan = { ...fakeManualLoan(payload.name).loan, id: `loan-for-${key}` };
+      loansByKey.set(key, { payload, loan });
+      if (persistThenFailFirst && calls === 1) throw new Error('Failed to backfill loan matches');
+      return { loan };
+    });
+    return { loansByKey, storedAttemptAtSend };
+  }
 
+  async function openAndFill(name: string, balance: string) {
     act(() => screen.getByText('Add a loan').click());
-    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Mistyped Loan' } });
-    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '10' } });
-    mockCreateManualLoan.mockRejectedValueOnce(new Error('nope'));
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: name } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: balance } });
+  }
+
+  async function clickSave() {
     await act(async () => {
       fireEvent.click(screen.getByText('Save loan'));
       await Promise.resolve();
     });
+  }
+
+  it('Round 12 (blocker 1): after a create that PERSISTED then errored, no UI action can mint a new key or send changed details — retry resends the identical key and payload and no duplicate loan is created', async () => {
+    const server = installFakeLoanServer({ persistThenFailFirst: true });
+    await bootToLoans('user-a');
+    await openAndFill('Persisted Loan', '700');
+    await clickSave();
+
+    // The server really did create the loan, but the client only saw an error.
+    expect(server.loansByKey.size).toBe(1);
+    expect(screen.getByRole('alert').textContent).toContain('Failed to backfill loan matches');
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    // The only controls on the unresolved attempt are Save (retry) and Cancel (close, keeps the
+    // attempt). "Discard attempt" — which minted a new key — no longer exists.
+    const form = screen.getByText('Add a personal loan').closest('form') as HTMLElement;
+    expect(within(form).getAllByRole('button').map((b) => b.textContent)).toEqual(['Save loan', 'Cancel']);
+    expect(screen.queryByText('Discard attempt')).toBeNull();
+
+    // Every field is disabled; even forcing new values into them (as a script or stale render
+    // could) must not change what the retry sends.
+    expect(screen.getByLabelText('Name').matches(':disabled')).toBe(true);
+    expect(screen.getByLabelText('Current balance').matches(':disabled')).toBe(true);
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Tampered Name' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '1' } });
+
+    await clickSave();
+
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+    // Still exactly one loan on the "server"; the retry replayed it.
+    expect(server.loansByKey.size).toBe(1);
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+    expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
+    expect(screen.getAllByText('Persisted Loan')).toHaveLength(1);
+  });
+
+  it('Round 12 (blocker 1): Cancel + reopen after the persisted-then-errored create also resumes the same key and payload — still one loan', async () => {
+    const server = installFakeLoanServer({ persistThenFailFirst: true });
+    await bootToLoans('user-a');
+    await openAndFill('Reopened Loan', '320');
+    await clickSave();
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    act(() => screen.getByText('Cancel').click());
+    act(() => screen.getByText('Add a loan').click());
+    await clickSave();
+
+    expect(mockCreateManualLoan.mock.calls[1][1]).toBe(firstKey);
+    expect(mockCreateManualLoan.mock.calls[1][0]).toEqual(firstPayload);
+    expect(server.loansByKey.size).toBe(1);
+  });
+
+  it('Round 12 (blocker 1): an attempt left unresolved by ANOTHER tab blocks a new key here, and this form then resumes that attempt instead', async () => {
+    const server = installFakeLoanServer();
+    await bootToLoans('user-a');
+    await openAndFill('This Tab Loan', '50');
+
+    // Another tab (same user, same storage) sent an attempt that is still unresolved.
+    const otherTabPayload = {
+      name: 'Other Tab Loan', loan_type: 'personal', current_balance: 80, origination_principal_amount: null,
+      interest_rate_percentage: null, origination_date: null, term_months: null, minimum_payment_amount: null,
+      next_payment_due_date: null, notes: null, match_text: null,
+    };
+    localStorage.setItem('myfinances.pendingManualLoanCreation.user-a',
+      JSON.stringify({ idempotencyKey: 'other-tab-key', input: otherTabPayload }));
+
+    await clickSave();
+
+    // Refused before any request: starting a second attempt under a new key while one is unresolved
+    // is exactly how a duplicate gets created.
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert').textContent).toContain('An earlier loan save has not been confirmed yet');
+    // The form has switched to that unresolved attempt, so it can be finished from here.
+    await waitFor(() => expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Other Tab Loan'));
+
+    await clickSave();
+    expect(mockCreateManualLoan.mock.calls[0][1]).toBe('other-tab-key');
+    expect(mockCreateManualLoan.mock.calls[0][0]).toEqual(otherTabPayload);
+    expect(server.loansByKey.size).toBe(1);
+  });
+
+  it('Round 12 (blocker 1): the ONLY key-retiring outcome besides success is the server confirming the key already created a (since-deleted) loan', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Deleted Elsewhere', '90');
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Failed to backfill loan matches'));
+    await clickSave();
     const firstKey = mockCreateManualLoan.mock.calls[0][1];
 
-    act(() => screen.getByText('Discard attempt').click());
+    mockCreateManualLoan.mockRejectedValueOnce(
+      Object.assign(new Error('This loan was already created by an earlier attempt and has since been deleted.'), {
+        code: 'idempotency_key_loan_deleted',
+      })
+    );
+    await clickSave();
+
+    expect(mockCreateManualLoan.mock.calls[1][1]).toBe(firstKey);
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
     expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
-    // Editable again, under a fresh key.
-    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '1000' } });
-    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
-    await act(async () => {
-      fireEvent.click(screen.getByText('Save loan'));
-      await Promise.resolve();
+    expect(screen.getByText(/already created by an earlier attempt and has since been deleted/)).toBeTruthy();
+  });
+
+  it('Round 12 (blocker 1): an ordinary failure never retires the key, however many times it repeats', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Stubborn Loan', '40');
+    mockCreateManualLoan.mockRejectedValue(new Error('Service unavailable'));
+    await clickSave();
+    await clickSave();
+    await clickSave();
+
+    const keys = new Set(mockCreateManualLoan.mock.calls.map((call) => call[1]));
+    expect(keys.size).toBe(1);
+    expect(JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null')).toMatchObject({
+      idempotencyKey: [...keys][0],
     });
-    expect(mockCreateManualLoan.mock.calls[1][1]).not.toBe(firstKey);
-    expect(mockCreateManualLoan.mock.calls[1][0]).toMatchObject({ current_balance: 1000 });
+  });
+
+  it('Round 12 (blocker 2): when localStorage.setItem throws, the request is NEVER sent and the user sees why', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Private Mode Loan', '250');
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    });
+
+    await clickSave();
+
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert').textContent).toContain("isn't letting the app save data on this device");
+    // Nothing was sent, so there is no attempt to protect: the form stays editable.
+    expect(screen.getByLabelText('Name').matches(':disabled')).toBe(false);
+  });
+
+  it('Round 12 (blocker 2): a storage write that does not read back identically also blocks the request', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Flaky Storage Loan', '250');
+    const realGetItem = Storage.prototype.getItem;
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+      const value = realGetItem.call(this, key);
+      return key.startsWith('myfinances.pendingManualLoanCreation.') && value !== null ? value.slice(0, -1) : value;
+    });
+
+    await clickSave();
+
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert').textContent).toContain("isn't letting the app save data on this device");
+  });
+
+  it('Round 12 (blocker 2): with working storage the attempt is durably recorded BEFORE the request leaves', async () => {
+    const server = installFakeLoanServer();
+    await bootToLoans('user-a');
+    await openAndFill('Normal Loan', '600');
+
+    await clickSave();
+
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
+    const [payload, key] = mockCreateManualLoan.mock.calls[0];
+    expect(server.storedAttemptAtSend[0]).toEqual({ idempotencyKey: key, input: payload });
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+    expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
+  });
+
+  it('Round 12: a payload the server would always reject never becomes a locked attempt — it is caught before anything is persisted or sent', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Negative Loan', '-5');
+
+    await clickSave();
+
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert').textContent).toContain('Current balance must be zero or more.');
+    expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
+    // Still editable, so the user can correct it.
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '5' } });
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Negative Loan'));
+    await clickSave();
+    expect(mockCreateManualLoan.mock.calls[0][0]).toMatchObject({ current_balance: 5 });
   });
 
   it('Round 11: a pending attempt is scoped to its user — another user neither sees nor reuses it', async () => {

@@ -1156,6 +1156,15 @@ function assertValidManualLoanFields(fields: {
 export class ManualLoanCreationError extends Error {}
 
 /**
+ * The idempotency key already created a loan, which has since been deleted. Unlike every other
+ * create failure this is a DEFINITIVE answer about the attempt — the creation happened — so it is
+ * reported distinctly (manualLoanController answers 409 with a machine-readable code) and the client
+ * may treat the attempt as resolved. Without it, a retry of that key would fail identically forever,
+ * because the client must never replace an unresolved key with a new one.
+ */
+export class ManualLoanCreationKeyResolvedError extends ManualLoanCreationError {}
+
+/**
  * `createManualLoan` is invoked synchronously by `manualLoanController.ts`'s create handler,
  * which ALSO runs `backfillMatchesForLoan` immediately afterward and (per Round 5) no longer
  * swallows that step's failure — meaning a loan can persist successfully while the overall
@@ -1219,7 +1228,16 @@ export async function createManualLoan(
     p_notes: params.notes,
     p_match_text: params.matchText,
   });
-  if (rpcError) throw new ManualLoanCreationError(`Failed to create manual loan: ${rpcError.message}`);
+  if (rpcError) {
+    // Matched on the message's fixed tail: the key is interpolated earlier in it, so a substring
+    // test elsewhere could be influenced by the key's own text.
+    if (rpcError.message.endsWith('was already used and the loan it created has since been deleted')) {
+      throw new ManualLoanCreationKeyResolvedError(
+        'This loan was already created by an earlier attempt and has since been deleted.'
+      );
+    }
+    throw new ManualLoanCreationError(`Failed to create manual loan: ${rpcError.message}`);
+  }
 
   const { data, error } = await supabaseAdmin.from('manual_loans').select('*').eq('id', loanId as string).single();
   if (error) throw new Error(`Failed to load created manual loan: ${error.message}`);

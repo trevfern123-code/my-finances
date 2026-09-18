@@ -493,7 +493,6 @@ function ManualLoanForm({
   onSubmit,
   pending = null,
   inFlight = false,
-  onDiscardPending,
 }: {
   initial: ManualLoanInput;
   onCancel: () => void;
@@ -507,25 +506,22 @@ function ManualLoanForm({
   // Create mode only: that pending attempt's request is still awaiting a response (possibly sent by
   // an earlier mount of this form).
   inFlight?: boolean;
-  onDiscardPending?: () => void;
 }) {
   const [form, setForm] = useState(() => pending?.input ?? initial);
   // One key per logical creation attempt, not per submit: a double-click on Save or a retry after a
   // failure resubmits with the SAME key, so the backend can tell "the same attempt, sent twice"
   // apart from a genuinely different loan. A pending attempt's key is resumed rather than replaced.
+  //
+  // Round 12 remediation: there is no longer any way to swap in a new key while an attempt is
+  // unresolved. The Round 11 "Discard attempt" button did exactly that, and was unsafe no matter how
+  // it was confirmed: the client cannot know whether the old key already created a loan, so a new
+  // key for the same intent could create a second one. The only ways out of an unresolved attempt
+  // are a server-confirmed outcome (App clears it) or retrying it. The setter below is used solely
+  // to ADOPT an existing pending key, never to mint one.
   const [idempotencyKey, setIdempotencyKey] = useState(() => pending?.idempotencyKey ?? crypto.randomUUID());
-  // If a pending attempt surfaces after this form mounted (it is loaded per user by App), adopt it:
-  // submitting under a fresh key could duplicate a loan that attempt already created.
-  useEffect(() => {
-    if (pending && pending.idempotencyKey !== idempotencyKey && !submittingRef.current) {
-      setIdempotencyKey(pending.idempotencyKey);
-      setForm(pending.input);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pending]);
   // While an attempt is pending its payload is frozen: the server would reject the same key with a
-  // different payload, and a new key could duplicate the loan. Changing the details requires an
-  // explicit discard.
+  // different payload, and a new key could duplicate the loan. The details become editable again
+  // only once the loan exists, through the normal edit flow.
   const locked = pending !== null && pending.idempotencyKey === idempotencyKey;
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -533,6 +529,17 @@ function ManualLoanForm({
   // tick both run before React re-renders, so neither `submitting` nor the button's disabled
   // attribute has updated yet by the time the second handler runs.
   const submittingRef = useRef(false);
+  // If a pending attempt surfaces after this form mounted (it is loaded per user by App, or reported
+  // by App when it refuses a submit because another tab left one unresolved), adopt it: submitting
+  // under a fresh key could duplicate a loan that attempt already created. Re-checked when this
+  // form's own submit settles, since App may surface the attempt mid-submit.
+  useEffect(() => {
+    if (pending && pending.idempotencyKey !== idempotencyKey && !submittingRef.current) {
+      setIdempotencyKey(pending.idempotencyKey);
+      setForm(pending.input);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, submitting]);
 
   // Round 10 remediation: awaits the submission and keeps this form — and therefore its
   // idempotency key and the values the user typed — mounted when it fails. Previously the create
@@ -553,7 +560,10 @@ function ManualLoanForm({
     setSubmitting(true);
     setSubmitError(null);
     try {
-      await onSubmit(form, idempotencyKey);
+      // A locked attempt always resends its PERSISTED payload, not the form's state: the disabled
+      // fieldset stops ordinary edits, but this guarantees nothing — a scripted DOM change, a stale
+      // render — can pair the unresolved key with different details. (App enforces the same.)
+      await onSubmit(locked && pending ? pending.input : form, idempotencyKey);
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : 'Failed to save loan');
     } finally {
@@ -564,19 +574,13 @@ function ManualLoanForm({
 
   const busy = submitting || inFlight;
 
-  function handleDiscardPending() {
-    onDiscardPending?.();
-    // The abandoned attempt's key must never be reused for different details.
-    setIdempotencyKey(crypto.randomUUID());
-  }
-
   return (
     <form className="card manual-loan-form" onSubmit={handleSubmit}>
       <h3>{initial.name ? 'Edit loan' : 'Add a personal loan'}</h3>
       {locked && !busy && (
         <p className="hint" role="status">
-          An earlier save of this loan may already have gone through. Saving again is safe — it
-          won't create a duplicate. To change the details, discard that attempt first.
+          An earlier save of this loan may already have gone through. Press Save loan to finish it —
+          saving again can't create a duplicate. Once it's saved you can edit or delete it as usual.
         </p>
       )}
       <fieldset className="manual-loan-form-fieldset" disabled={locked || busy}>
@@ -708,11 +712,6 @@ function ManualLoanForm({
         <button type="button" className="link-button" onClick={onCancel} disabled={busy}>
           Cancel
         </button>
-        {locked && !busy && onDiscardPending && (
-          <button type="button" className="link-button" onClick={handleDiscardPending}>
-            Discard attempt
-          </button>
-        )}
       </div>
     </form>
   );
@@ -726,7 +725,6 @@ export function LoanProgress({
   onCreateManualLoan,
   pendingManualLoanCreate = null,
   manualLoanCreateInFlight = false,
-  onDiscardPendingManualLoanCreate,
   onUpdateManualLoan,
   onDeleteManualLoan,
   onFetchPayments,
@@ -746,7 +744,6 @@ export function LoanProgress({
   // and whether its request is still awaiting a response. The create form resumes it.
   pendingManualLoanCreate?: PendingManualLoanCreation | null;
   manualLoanCreateInFlight?: boolean;
-  onDiscardPendingManualLoanCreate?: () => void;
   onUpdateManualLoan: (id: string, input: ManualLoanInput) => Promise<void>;
   onDeleteManualLoan: (id: string) => void;
   onFetchPayments: (loanId: string) => Promise<LoanPayment[]>;
@@ -898,7 +895,6 @@ export function LoanProgress({
           onSubmit={handleCreate}
           pending={pendingManualLoanCreate}
           inFlight={manualLoanCreateInFlight}
-          onDiscardPending={onDiscardPendingManualLoanCreate}
         />
       )}
 

@@ -1,28 +1,26 @@
 import type { ManualLoanInput } from './api';
 
 /**
- * A manual-loan creation that has been sent at least once but not yet confirmed successful.
+ * A manual-loan creation that has been sent at least once but not yet confirmed resolved.
  *
- * Kept OUTSIDE the create form, scoped to the authenticated user, and persisted across reloads,
- * because a create failure is ambiguous: the backend commits the loan before running
+ * A create failure is ambiguous: the backend commits the loan before running
  * backfillMatchesForLoan, so an error response (or a network drop, or the page going away
  * mid-request) can mean the loan already exists. The only safe retry resends the IDENTICAL
- * idempotency key and payload — which the server replays onto the loan it already created. If the
- * key lived only in the form's own state, any unmount (Cancel, switching tabs, a reload, an auth
- * remount) would discard it and the user's natural retry would mint a new key and create a
- * duplicate. The entry is removed only once a create using its key is confirmed successful, or when
- * the user explicitly discards the attempt.
+ * idempotency key and payload, which the server replays onto the loan it already created. So this
+ * record lives outside the create form, scoped to the authenticated user and in durable browser
+ * storage, and it is removed ONLY once the server has confirmed the attempt's outcome. There is
+ * deliberately no way for the client to abandon it: the client cannot know whether the key already
+ * created a loan, and a new key for the same intent is exactly how a duplicate gets created.
  */
 export interface PendingManualLoanCreation {
   idempotencyKey: string;
   input: ManualLoanInput;
 }
 
-const STORAGE_PREFIX = 'myfinances.pendingManualLoanCreation.';
+/** Durable storage could not be written and verified, so a create request must not be sent. */
+export class PendingCreationPersistenceError extends Error {}
 
-// Fallback for when localStorage is unavailable (private browsing, quota, disabled storage): the
-// pending attempt then at least survives unmounts within this page's lifetime, though not a reload.
-const memoryFallback = new Map<string, PendingManualLoanCreation>();
+const STORAGE_PREFIX = 'myfinances.pendingManualLoanCreation.';
 
 function storageKey(userId: string): string {
   return `${STORAGE_PREFIX}${userId}`;
@@ -42,34 +40,56 @@ function isPending(value: unknown): value is PendingManualLoanCreation {
 export function loadPendingManualLoanCreation(userId: string): PendingManualLoanCreation | null {
   try {
     const raw = localStorage.getItem(storageKey(userId));
-    if (raw !== null) {
-      const parsed: unknown = JSON.parse(raw);
-      return isPending(parsed) ? parsed : null;
-    }
+    if (raw === null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return isPending(parsed) ? parsed : null;
   } catch {
-    // Unreadable or corrupt storage — fall through to the in-memory copy.
+    // Unreadable storage cannot be written either, so persistPendingManualLoanCreation will refuse
+    // to authorize any new request — reporting "nothing pending" here cannot lead to a send.
+    return null;
   }
-  return memoryFallback.get(userId) ?? null;
 }
 
-export function savePendingManualLoanCreation(userId: string, pending: PendingManualLoanCreation): void {
-  memoryFallback.set(userId, pending);
+/**
+ * Makes `pending` durable and PROVES it, or throws PendingCreationPersistenceError. Callers must
+ * not send a create request unless this returns.
+ *
+ * Round 12 remediation: this used to swallow storage failures and fall back to an in-memory copy
+ * while the request went out anyway. That copy dies with the page, so an ambiguous failure followed
+ * by a reload lost the key and the next attempt could duplicate the loan. Now the exact serialized
+ * record must read back identically from localStorage before a request is allowed. A record that is
+ * already stored verbatim (a retry of an attempt that was persisted earlier) is accepted without
+ * rewriting, so a retry still works when storage has since become full.
+ */
+export function persistPendingManualLoanCreation(userId: string, pending: PendingManualLoanCreation): void {
+  const key = storageKey(userId);
+  const serialized = JSON.stringify(pending);
   try {
-    localStorage.setItem(storageKey(userId), JSON.stringify(pending));
-  } catch {
-    // See memoryFallback.
+    if (localStorage.getItem(key) !== serialized) {
+      localStorage.setItem(key, serialized);
+    }
+    if (localStorage.getItem(key) !== serialized) {
+      throw new PendingCreationPersistenceError('stored value did not read back identically');
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new PendingCreationPersistenceError(
+      `This browser isn't letting the app save data on this device (${reason}), so the loan was not sent — ` +
+        'without that, a failed save could not be safely retried. Turn off private browsing or allow site data, then try again.'
+    );
   }
 }
 
-/** Clears the pending attempt — but only if it is still the one identified by `idempotencyKey`,
- *  when given, so a late success for an older attempt can never erase a newer one. */
-export function clearPendingManualLoanCreation(userId: string, idempotencyKey?: string): void {
+/** Removes the record once the server has confirmed the attempt's outcome — and only if it is still
+ *  the attempt identified by `idempotencyKey`, so a late confirmation for an older attempt never
+ *  erases a newer one. Best-effort: if removal fails the record survives, and retrying it only
+ *  replays the already-confirmed result. */
+export function clearPendingManualLoanCreation(userId: string, idempotencyKey: string): void {
   const current = loadPendingManualLoanCreation(userId);
-  if (idempotencyKey !== undefined && current !== null && current.idempotencyKey !== idempotencyKey) return;
-  memoryFallback.delete(userId);
+  if (current === null || current.idempotencyKey !== idempotencyKey) return;
   try {
     localStorage.removeItem(storageKey(userId));
   } catch {
-    // See memoryFallback.
+    // See doc comment.
   }
 }

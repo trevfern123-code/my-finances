@@ -47,6 +47,7 @@ import {
   confirmTransferPair,
   TransferPairConfirmationError,
   ManualLoanCreationError,
+  ManualLoanCreationKeyResolvedError,
   getRelationallyClassifiedTransactionsPage,
   getTransactionsBackfillPage,
 } from './dataService';
@@ -1589,6 +1590,27 @@ describe('createManualLoan / updateManualLoan — numeric field validation (Roun
 
       await expect(createManualLoan('user-1', validParams, 'key-1')).rejects.toThrow(ManualLoanCreationError);
       expect(mockFrom).not.toHaveBeenCalled();
+    });
+
+    it('Round 12: reports a key that already created a since-deleted loan as ManualLoanCreationKeyResolvedError (a definitive outcome), not a generic failure', async () => {
+      mockRpc.mockResolvedValueOnce({
+        data: null,
+        error: { message: 'create_manual_loan_idempotent: idempotency_key key-1 was already used and the loan it created has since been deleted' },
+      });
+
+      await expect(createManualLoan('user-1', validParams, 'key-1')).rejects.toBeInstanceOf(ManualLoanCreationKeyResolvedError);
+      expect(mockFrom).not.toHaveBeenCalled();
+    });
+
+    it('Round 12: a key whose own TEXT merely contains the phrase is not mistaken for a resolved key', async () => {
+      mockRpc.mockResolvedValueOnce({
+        data: null,
+        error: { message: 'create_manual_loan_idempotent: idempotency_key has since been deleted was already used for a different request payload' },
+      });
+
+      const rejection = createManualLoan('user-1', validParams, 'has since been deleted');
+      await expect(rejection).rejects.toBeInstanceOf(ManualLoanCreationError);
+      await expect(rejection).rejects.not.toBeInstanceOf(ManualLoanCreationKeyResolvedError);
     });
 
     it('Round 9 remediation: propagates the RPC\'s fingerprint-conflict error (same idempotency key reused with a different payload) verbatim, not a silent replay', async () => {

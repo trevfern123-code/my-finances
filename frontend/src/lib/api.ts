@@ -67,7 +67,9 @@ async function authedFetch(
       return authedFetch(path, init, true, verifyOwnership);
     }
 
-    throw new Error(message);
+    // A machine-readable `code`, when the server sends one, lets a caller act on a specific outcome
+    // without parsing the human-readable message (see isManualLoanCreationResolvedError).
+    throw Object.assign(new Error(message), typeof body.code === 'string' ? { code: body.code } : {});
   }
 
   if (response.status === 204) return undefined;
@@ -352,6 +354,12 @@ export function createManualLoan(input: ManualLoanInput, idempotencyKey: string)
     headers: { 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify(input),
   });
+}
+
+/** True when a createManualLoan failure is the server's DEFINITIVE answer that this idempotency key
+ *  already created a loan which has since been deleted — i.e. the attempt is resolved, not failed. */
+export function isManualLoanCreationResolvedError(err: unknown): boolean {
+  return err instanceof Error && (err as Error & { code?: unknown }).code === 'idempotency_key_loan_deleted';
 }
 
 export function updateManualLoan(

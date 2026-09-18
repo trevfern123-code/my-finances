@@ -6,6 +6,8 @@ vi.mock('./supabaseClient', () => ({
 }));
 
 import {
+  createManualLoan,
+  isManualLoanCreationResolvedError,
   updateNavLayout,
   updateDashboardLayout,
   updateAppearance,
@@ -173,5 +175,42 @@ describe.each([
 
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(result).toEqual(successBody);
+  });
+});
+
+describe('createManualLoan — server resolution codes (Round 12 remediation)', () => {
+  const input = {
+    name: 'Car', loan_type: 'personal' as const, current_balance: 100, origination_principal_amount: null,
+    interest_rate_percentage: null, origination_date: null, term_months: null, minimum_payment_amount: null,
+    next_payment_due_date: null, notes: null, match_text: null,
+  };
+
+  it("carries the server's code onto the thrown error, so a since-deleted key is recognized as resolved", async () => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: () => Promise.resolve({ error: 'already created and since deleted', code: 'idempotency_key_loan_deleted' }),
+    } as never);
+
+    const err = await createManualLoan(input, 'key-1').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe('already created and since deleted');
+    expect(isManualLoanCreationResolvedError(err)).toBe(true);
+    expect(vi.mocked(fetch).mock.calls[0][1]).toMatchObject({ headers: expect.objectContaining({ 'Idempotency-Key': 'key-1' }) });
+  });
+
+  it('an ordinary failure (no code) is NOT treated as resolved', async () => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: () => Promise.resolve({ error: 'Failed to backfill loan matches' }),
+    } as never);
+
+    const err = await createManualLoan(input, 'key-1').catch((e: unknown) => e);
+
+    expect(isManualLoanCreationResolvedError(err)).toBe(false);
   });
 });
