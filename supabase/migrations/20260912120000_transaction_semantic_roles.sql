@@ -318,8 +318,14 @@ begin
     raise exception 'link_transaction_to_manual_loan: transaction not found or not owned by user';
   end if;
 
-  if p_principal_portion is null or p_principal_portion < 0 or p_principal_portion > v_amount then
-    raise exception 'link_transaction_to_manual_loan: principal_portion (%) must be between 0 and the transaction amount (%)',
+  -- Round 10 remediation: `>= 0 and < 'Infinity'` rather than a bare `< 0` test — PostgreSQL orders
+  -- NaN above every ordinary numeric, so `NaN < 0` is false and NaN would otherwise slip through
+  -- whenever v_amount is itself non-finite (making the `> v_amount` comparison false too).
+  if p_principal_portion is null
+     or not (p_principal_portion >= 0 and p_principal_portion < 'Infinity'::numeric)
+     or not (v_amount > -'Infinity'::numeric and v_amount < 'Infinity'::numeric)
+     or p_principal_portion > v_amount then
+    raise exception 'link_transaction_to_manual_loan: principal_portion (%) must be a finite value between 0 and the transaction amount (%)',
       p_principal_portion, v_amount;
   end if;
 
@@ -456,8 +462,13 @@ begin
     raise exception 'update_linked_payment_principal: transaction is not linked to this loan';
   end if;
 
-  if p_new_principal_portion is null or p_new_principal_portion < 0 or p_new_principal_portion > v_amount then
-    raise exception 'update_linked_payment_principal: principal_portion (%) must be between 0 and the transaction amount (%)',
+  -- Round 10 remediation (finiteness) — see link_transaction_to_manual_loan for why a bare `< 0`
+  -- test is not sufficient to exclude NaN.
+  if p_new_principal_portion is null
+     or not (p_new_principal_portion >= 0 and p_new_principal_portion < 'Infinity'::numeric)
+     or not (v_amount > -'Infinity'::numeric and v_amount < 'Infinity'::numeric)
+     or p_new_principal_portion > v_amount then
+    raise exception 'update_linked_payment_principal: principal_portion (%) must be a finite value between 0 and the transaction amount (%)',
       p_new_principal_portion, v_amount;
   end if;
 
@@ -505,11 +516,15 @@ begin
     raise exception 'create_manual_loan_payment: manual loan not found or not owned by user';
   end if;
 
-  if p_principal_portion is null or p_principal_portion < 0 then
-    raise exception 'create_manual_loan_payment: principal_portion must be a non-negative number';
+  -- Round 10 remediation (finiteness): `< 0` alone admits NaN and +Infinity, either of which would
+  -- propagate straight into the loan's current_balance arithmetic below and poison it permanently.
+  if p_principal_portion is null
+     or not (p_principal_portion >= 0 and p_principal_portion < 'Infinity'::numeric) then
+    raise exception 'create_manual_loan_payment: principal_portion must be a finite non-negative number';
   end if;
-  if p_interest_portion is null or p_interest_portion < 0 then
-    raise exception 'create_manual_loan_payment: interest_portion must be a non-negative number';
+  if p_interest_portion is null
+     or not (p_interest_portion >= 0 and p_interest_portion < 'Infinity'::numeric) then
+    raise exception 'create_manual_loan_payment: interest_portion must be a finite non-negative number';
   end if;
 
   insert into public.manual_loan_payments (user_id, loan_id, date, principal_portion, interest_portion, notes)
@@ -570,11 +585,17 @@ begin
     raise exception 'update_manual_loan_payment: payment not found for this loan';
   end if;
 
-  if p_set_principal_portion and (p_principal_portion is null or p_principal_portion < 0) then
-    raise exception 'update_manual_loan_payment: principal_portion must be a non-negative number';
+  -- Round 10 remediation (finiteness) — see create_manual_loan_payment for why `< 0` alone is not
+  -- sufficient to exclude NaN/Infinity.
+  if p_set_principal_portion
+     and (p_principal_portion is null
+          or not (p_principal_portion >= 0 and p_principal_portion < 'Infinity'::numeric)) then
+    raise exception 'update_manual_loan_payment: principal_portion must be a finite non-negative number';
   end if;
-  if p_set_interest_portion and (p_interest_portion is null or p_interest_portion < 0) then
-    raise exception 'update_manual_loan_payment: interest_portion must be a non-negative number';
+  if p_set_interest_portion
+     and (p_interest_portion is null
+          or not (p_interest_portion >= 0 and p_interest_portion < 'Infinity'::numeric)) then
+    raise exception 'update_manual_loan_payment: interest_portion must be a finite non-negative number';
   end if;
 
   update public.manual_loan_payments
@@ -979,34 +1000,87 @@ grant execute on function public.confirm_transfer_pair(uuid, uuid, uuid, text, i
 --       select id, user_id, name, current_balance, origination_principal_amount,
 --              interest_rate_percentage, minimum_payment_amount, term_months
 --       from public.manual_loans
---       where current_balance < 0
---          or (origination_principal_amount is not null and origination_principal_amount < 0)
---          or (interest_rate_percentage is not null and interest_rate_percentage < 0)
---          or (minimum_payment_amount is not null and minimum_payment_amount < 0)
+--       where not (current_balance >= 0 and current_balance < 'Infinity'::numeric)
+--          or (origination_principal_amount is not null
+--              and not (origination_principal_amount >= 0 and origination_principal_amount < 'Infinity'::numeric))
+--          or (interest_rate_percentage is not null
+--              and not (interest_rate_percentage >= 0 and interest_rate_percentage < 'Infinity'::numeric))
+--          or (minimum_payment_amount is not null
+--              and not (minimum_payment_amount >= 0 and minimum_payment_amount < 'Infinity'::numeric))
 --          or (term_months is not null and term_months <= 0);
 --
 --     An empty result means `VALIDATE CONSTRAINT` (run separately, once this migration itself has
 --     been applied) will succeed immediately. Any returned row means that row needs a decision —
 --     correct it or knowingly except it — before validating; the constraint keeps protecting every
 --     NEW write in the meantime regardless of when (or whether) that validation step happens.
+--
+-- Round 10 remediation (finiteness): each numeric check below pairs `>= 0` with `< 'Infinity'`
+-- rather than testing `>= 0` alone, and the preflight query above is written the same way. An
+-- unconstrained PostgreSQL `numeric` accepts 'NaN', 'Infinity' and '-Infinity', and PostgreSQL
+-- orders NaN ABOVE every ordinary numeric — so `NaN >= 0` is TRUE and a bare non-negativity check
+-- admits both NaN and +Infinity. Verified live before the fix: loans with NaN current_balance,
+-- Infinity current_balance, NaN interest_rate_percentage and Infinity minimum_payment_amount all
+-- inserted cleanly past the previous constraints, and the previous preflight query reported none of
+-- them. `x >= 0 and x < 'Infinity'` rejects NaN (NaN < Infinity is false), rejects +Infinity
+-- (Infinity < Infinity is false), rejects -Infinity (fails `>= 0`), and accepts every finite
+-- non-negative value including 0. term_months is an integer and so cannot be non-finite.
 alter table public.manual_loans
-  add constraint manual_loans_current_balance_check check (current_balance >= 0) not valid;
+  add constraint manual_loans_current_balance_check
+    check (current_balance >= 0 and current_balance < 'Infinity'::numeric) not valid;
 
 alter table public.manual_loans
   add constraint manual_loans_origination_principal_amount_check
-    check (origination_principal_amount is null or origination_principal_amount >= 0) not valid;
+    check (origination_principal_amount is null
+           or (origination_principal_amount >= 0 and origination_principal_amount < 'Infinity'::numeric)) not valid;
 
 alter table public.manual_loans
   add constraint manual_loans_interest_rate_percentage_check
-    check (interest_rate_percentage is null or interest_rate_percentage >= 0) not valid;
+    check (interest_rate_percentage is null
+           or (interest_rate_percentage >= 0 and interest_rate_percentage < 'Infinity'::numeric)) not valid;
 
 alter table public.manual_loans
   add constraint manual_loans_minimum_payment_amount_check
-    check (minimum_payment_amount is null or minimum_payment_amount >= 0) not valid;
+    check (minimum_payment_amount is null
+           or (minimum_payment_amount >= 0 and minimum_payment_amount < 'Infinity'::numeric)) not valid;
 
 alter table public.manual_loans
   add constraint manual_loans_term_months_check
     check (term_months is null or term_months > 0) not valid;
+
+-- The same hazard applies to the two per-transaction/per-payment numeric columns this feature
+-- writes. transactions.amount is numeric(12,2), whose typmod rejects Infinity outright but still
+-- accepts NaN; principal_portion and the manual-payment portions are unconstrained numeric and
+-- accept all three non-finite values. Both are added NOT VALID for the same staged-rollout reasons
+-- documented above; the matching preflight queries are:
+--
+--       select id, amount, principal_portion from public.transactions
+--       where not (amount > -'Infinity'::numeric and amount < 'Infinity'::numeric)
+--          or (principal_portion is not null
+--              and not (principal_portion >= 0 and principal_portion < 'Infinity'::numeric));
+--
+--       select id, principal_portion, interest_portion from public.manual_loan_payments
+--       where not (principal_portion >= 0 and principal_portion < 'Infinity'::numeric)
+--          or not (interest_portion >= 0 and interest_portion < 'Infinity'::numeric);
+--
+-- transactions.amount is deliberately only required to be FINITE, never non-negative: an ordinary
+-- expense is negative in this schema's sign convention, so a non-negativity check there would be
+-- wrong.
+alter table public.transactions
+  add constraint transactions_amount_finite_check
+    check (amount > -'Infinity'::numeric and amount < 'Infinity'::numeric) not valid;
+
+alter table public.transactions
+  add constraint transactions_principal_portion_check
+    check (principal_portion is null
+           or (principal_portion >= 0 and principal_portion < 'Infinity'::numeric)) not valid;
+
+alter table public.manual_loan_payments
+  add constraint manual_loan_payments_principal_portion_check
+    check (principal_portion >= 0 and principal_portion < 'Infinity'::numeric) not valid;
+
+alter table public.manual_loan_payments
+  add constraint manual_loan_payments_interest_portion_check
+    check (interest_portion >= 0 and interest_portion < 'Infinity'::numeric) not valid;
 
 -- Round 8 remediation (blocker 3, closing the candidate-insertion phantom): confirm_transfer_pair
 -- (Round 7) re-discovers candidates from inside its own locked transaction, but that protection
@@ -1055,6 +1129,9 @@ declare
   v_distinct_count integer;
   v_owned_count integer;
   v_affected_count integer;
+  v_stale_count integer;
+  v_dest_accounts uuid[];
+  v_dest_categories uuid[];
   v_inserted jsonb;
 begin
   perform pg_advisory_xact_lock(hashtext(p_user_id::text));
@@ -1094,19 +1171,60 @@ begin
     end if;
   end if;
 
-  -- Verify ownership of every account referenced by an insert row BEFORE inserting anything.
-  if v_insert_count > 0 then
-    select count(*) into v_distinct_count
-    from (select distinct x.account_id from jsonb_to_recordset(p_inserts) as x(account_id uuid)) d;
+  -- Verify ownership of every DESTINATION account BEFORE writing anything — for updates as well as
+  -- inserts (Round 10 remediation). An earlier version validated only the CURRENT owner of each
+  -- target transaction, never the replacement `account_id` the update supplies, so an update that
+  -- named a legitimately-owned transaction could move it into ANOTHER user's account: the
+  -- current-owner check passed, then the UPDATE happily wrote the foreign account_id. Confirmed
+  -- live before the fix. Both accounts and plaid_items rows are locked (not just transactions), so
+  -- the ownership chain proven here cannot be re-parented by a concurrent writer before we commit.
+  -- The destination set is materialized into an array first because FOR UPDATE may not be combined
+  -- with UNION at the same query level.
+  if v_insert_count > 0 or v_update_count > 0 then
+    select array_agg(distinct d.aid) into v_dest_accounts
+    from (
+      select x.account_id as aid from jsonb_to_recordset(coalesce(p_inserts, '[]'::jsonb)) as x(account_id uuid)
+      union all
+      select x.account_id from jsonb_to_recordset(coalesce(p_updates, '[]'::jsonb)) as x(account_id uuid)
+    ) d;
 
     select count(*) into v_owned_count
-    from (select distinct x.account_id from jsonb_to_recordset(p_inserts) as x(account_id uuid)) d
-    join public.accounts a on a.id = d.account_id
-    join public.plaid_items pi on pi.id = a.item_id
-    where pi.user_id = p_user_id;
+    from (
+      select a.id
+      from unnest(v_dest_accounts) as u(aid)
+      join public.accounts a on a.id = u.aid
+      join public.plaid_items pi on pi.id = a.item_id
+      where pi.user_id = p_user_id
+      for update of a, pi
+    ) locked;
 
-    if v_owned_count is distinct from v_distinct_count then
-      raise exception 'apply_synced_transaction_batch: one or more insert rows reference an account not owned by this user';
+    -- A null account_id survives into the array and can never join, so this also rejects it.
+    if v_owned_count is distinct from cardinality(v_dest_accounts) then
+      raise exception 'apply_synced_transaction_batch: one or more rows reference an account not owned by this user';
+    end if;
+  end if;
+
+  -- budget_category_id is the other user-owned foreign reference this RPC accepts. Only the insert
+  -- branch can set it (the UPDATE below deliberately never touches budget_category_id, so a resync
+  -- cannot un-categorize an already-categorized row), so only inserts need validating.
+  if v_insert_count > 0 then
+    select array_agg(distinct x.budget_category_id) into v_dest_categories
+    from jsonb_to_recordset(p_inserts) as x(budget_category_id uuid)
+    where x.budget_category_id is not null;
+
+    if v_dest_categories is not null then
+      select count(*) into v_owned_count
+      from (
+        select bc.id
+        from unnest(v_dest_categories) as u(bcid)
+        join public.budget_categories bc on bc.id = u.bcid
+        where bc.user_id = p_user_id
+        for update of bc
+      ) locked;
+
+      if v_owned_count is distinct from cardinality(v_dest_categories) then
+        raise exception 'apply_synced_transaction_batch: one or more insert rows reference a budget category not owned by this user';
+      end if;
     end if;
   end if;
 
@@ -1129,6 +1247,62 @@ begin
 
     if v_owned_count is distinct from v_update_count then
       raise exception 'apply_synced_transaction_batch: one or more update rows reference a transaction not owned by this user';
+    end if;
+
+    -- Compare-and-swap against the snapshot the CALLER classified from (Round 10 remediation).
+    -- applyTransactionChanges reads each existing row, decides in TypeScript whether to reclassify
+    -- it and whether its stored principal_portion is still compatible with the incoming amount, and
+    -- only THEN calls this function — so the advisory lock, acquired here, serializes the WRITES
+    -- but does nothing about that earlier unlocked READ. The concrete corruption that allowed:
+    -- sync reads T as unlinked/amount 100; a concurrent request links T to a loan with
+    -- principal_portion 80 and commits; this batch then writes amount 20 plus non-loan role fields
+    -- (both decisions having been made against the now-stale "unlinked" snapshot), leaving T linked
+    -- with principal 80 > amount 20 and a role that contradicts its own loan link.
+    --
+    -- Every field the caller's decision actually read is echoed back as exp_* and re-checked here
+    -- against the CURRENT locked row, so a batch built on any stale premise is rejected whole. The
+    -- caller gets a hard error, the sync cursor is left unadvanced, and the retry re-reads fresh
+    -- state — the same fail-closed contract the pre-existing linked-payment integrity check uses.
+    select count(*) into v_stale_count
+    from jsonb_to_recordset(p_updates) as x(
+      id uuid, exp_account_id uuid, exp_amount numeric, exp_date date, exp_name text,
+      exp_merchant_name text, exp_category text, exp_pfc_detailed text, exp_pfc_confidence text,
+      exp_manual_loan_id uuid, exp_auto_role text, exp_principal_portion numeric
+    )
+    join public.transactions t on t.id = x.id
+    where t.account_id is distinct from x.exp_account_id
+       or t.amount is distinct from x.exp_amount
+       or t.date is distinct from x.exp_date
+       or t.name is distinct from x.exp_name
+       or t.merchant_name is distinct from x.exp_merchant_name
+       or t.category is distinct from x.exp_category
+       or t.personal_finance_category_detailed is distinct from x.exp_pfc_detailed
+       or t.personal_finance_category_confidence is distinct from x.exp_pfc_confidence
+       or t.manual_loan_id is distinct from x.exp_manual_loan_id
+       or t.auto_role is distinct from x.exp_auto_role
+       or t.principal_portion is distinct from x.exp_principal_portion;
+
+    if v_stale_count > 0 then
+      raise exception 'apply_synced_transaction_batch: % update row(s) no longer match the state they were classified against (concurrent modification) — re-read and retry', v_stale_count;
+    end if;
+
+    -- Independent of the CAS above, re-assert the linked-payment invariant from CURRENT locked
+    -- state: a row that is linked to a manual loan must keep principal_portion <= amount, and its
+    -- amount must be a finite, positive number. NaN is deliberately excluded via `< 'Infinity'`
+    -- rather than a `<= 0` test, because Postgres orders NaN ABOVE every ordinary numeric, so
+    -- `NaN <= 0` is false and a naive comparison would let NaN straight through.
+    select count(*) into v_stale_count
+    from jsonb_to_recordset(p_updates) as x(id uuid, amount numeric)
+    join public.transactions t on t.id = x.id
+    where t.manual_loan_id is not null
+      and (
+        x.amount is null
+        or not (x.amount > 0 and x.amount < 'Infinity'::numeric)
+        or coalesce(t.principal_portion, 0) > x.amount
+      );
+
+    if v_stale_count > 0 then
+      raise exception 'apply_synced_transaction_batch: % update row(s) would leave a manual-loan-linked transaction with a non-finite/non-positive amount or principal_portion greater than amount', v_stale_count;
     end if;
   end if;
 
@@ -1154,11 +1328,18 @@ begin
       )
       returning id, name, merchant_name, amount
     )
-    select jsonb_agg(jsonb_build_object('id', id, 'name', name, 'merchant_name', merchant_name, 'amount', amount))
-    into v_inserted
+    -- Both the payload AND the row count come from the same aggregate over `ins` (Round 10
+    -- remediation). GET DIAGNOSTICS ROW_COUNT must NOT be used here: it reports the row count of
+    -- the statement just executed, which is this OUTER aggregate SELECT — always exactly 1 row,
+    -- whatever `ins` inserted. That made every batch of two or more inserts raise a bogus "insert
+    -- count mismatch" and roll back the whole sync; caught live, since the earlier round's tests
+    -- only ever exercised single-row insert batches.
+    select
+      jsonb_agg(jsonb_build_object('id', id, 'name', name, 'merchant_name', merchant_name, 'amount', amount)),
+      count(*)
+    into v_inserted, v_affected_count
     from ins;
 
-    get diagnostics v_affected_count = row_count;
     if v_affected_count is distinct from v_insert_count then
       raise exception 'apply_synced_transaction_batch: insert count mismatch (expected %, got %)', v_insert_count, v_affected_count;
     end if;
@@ -1219,10 +1400,17 @@ grant execute on function public.apply_synced_transaction_batch(uuid, jsonb, jso
 -- of every field the caller supplied is stored alongside the key; a replay must match it exactly,
 -- or the call fails loudly (see create_manual_loan_idempotent below) rather than silently
 -- returning a loan that doesn't reflect what was just asked for.
+-- Round 10 remediation: `loan_id` was `not null ... on delete cascade`, which meant deleting a loan
+-- also deleted the record that its idempotency key had ever been used — so a delayed retry of the
+-- original creation (the exact case this table exists for) found no record, created a SECOND loan,
+-- and silently resurrected deleted data. The reference is now nullable and ON DELETE SET NULL, so
+-- the row survives as an immutable tombstone of the key: `loan_id is null` means "this key was
+-- used, and the loan it produced has since been deleted," which create_manual_loan_idempotent
+-- reports as a deterministic error rather than creating a replacement loan.
 create table public.manual_loan_creation_requests (
   user_id uuid not null,
   idempotency_key text not null,
-  loan_id uuid not null references public.manual_loans(id) on delete cascade,
+  loan_id uuid null references public.manual_loans(id) on delete set null,
   request_fingerprint text not null,
   created_at timestamp with time zone not null default now(),
   primary key (user_id, idempotency_key)
@@ -1275,6 +1463,7 @@ as $$
 declare
   v_existing_loan_id uuid;
   v_existing_fingerprint text;
+  v_key_already_used boolean;
   v_fingerprint text;
   v_new_loan_id uuid;
 begin
@@ -1284,30 +1473,52 @@ begin
 
   perform pg_advisory_xact_lock(hashtext(p_user_id::text || ':' || p_idempotency_key));
 
-  -- A single deterministic fingerprint of every field the caller supplied — '\x01'-separated so a
-  -- field boundary can never be forged by a value that happens to contain the separator itself
-  -- (e.g. a name containing a literal '|'), unlike a naive '|'-joined string.
-  v_fingerprint := md5(
-    coalesce(p_name, E'\x02') || E'\x01' ||
-    coalesce(p_loan_type, E'\x02') || E'\x01' ||
-    coalesce(p_current_balance::text, E'\x02') || E'\x01' ||
-    coalesce(p_origination_principal_amount::text, E'\x02') || E'\x01' ||
-    coalesce(p_interest_rate_percentage::text, E'\x02') || E'\x01' ||
-    coalesce(p_origination_date::text, E'\x02') || E'\x01' ||
-    coalesce(p_term_months::text, E'\x02') || E'\x01' ||
-    coalesce(p_minimum_payment_amount::text, E'\x02') || E'\x01' ||
-    coalesce(p_next_payment_due_date::text, E'\x02') || E'\x01' ||
-    coalesce(p_notes, E'\x02') || E'\x01' ||
-    coalesce(p_match_text, E'\x02')
+  -- Round 10 remediation: the fingerprint was previously an md5 over the fields concatenated with
+  -- E'\x01' separators and an E'\x02' null marker. Those are ordinary characters that PostgreSQL
+  -- text can contain, so the field boundaries were forgeable and genuinely different payloads
+  -- collided — verified live: notes='alpha\x01beta', match_text='gamma' produced the identical
+  -- fingerprint to notes='alpha', match_text='beta\x01gamma', and the second, different request
+  -- silently replayed the first one's loan. Building a jsonb object instead removes the ambiguity
+  -- at the source: jsonb escapes control characters in its text output, orders its keys
+  -- deterministically, and represents SQL NULL as a json null that no string value can imitate. The
+  -- hash is sha256 rather than md5, and both sha256() and convert_to() are pg_catalog builtins, so
+  -- this needs no extension and stays correct under `search_path = ''`.
+  v_fingerprint := encode(
+    pg_catalog.sha256(
+      pg_catalog.convert_to(
+        jsonb_build_object(
+          'name', p_name,
+          'loan_type', p_loan_type,
+          'current_balance', p_current_balance,
+          'origination_principal_amount', p_origination_principal_amount,
+          'interest_rate_percentage', p_interest_rate_percentage,
+          'origination_date', p_origination_date,
+          'term_months', p_term_months,
+          'minimum_payment_amount', p_minimum_payment_amount,
+          'next_payment_due_date', p_next_payment_due_date,
+          'notes', p_notes,
+          'match_text', p_match_text
+        )::text,
+        'UTF8'
+      )
+    ),
+    'hex'
   );
 
-  select loan_id, request_fingerprint into v_existing_loan_id, v_existing_fingerprint
+  select loan_id, request_fingerprint, true
+  into v_existing_loan_id, v_existing_fingerprint, v_key_already_used
   from public.manual_loan_creation_requests
   where user_id = p_user_id and idempotency_key = p_idempotency_key;
 
-  if v_existing_loan_id is not null then
+  -- NB: test the KEY's existence, not `loan_id is not null` — after the loan has been deleted the
+  -- tombstone row survives with a null loan_id, and treating that as "key unused" is exactly the
+  -- duplicate-creating bug the ON DELETE SET NULL change above exists to prevent.
+  if coalesce(v_key_already_used, false) then
     if v_existing_fingerprint is distinct from v_fingerprint then
       raise exception 'create_manual_loan_idempotent: idempotency_key % was already used for a different request payload', p_idempotency_key;
+    end if;
+    if v_existing_loan_id is null then
+      raise exception 'create_manual_loan_idempotent: idempotency_key % was already used and the loan it created has since been deleted', p_idempotency_key;
     end if;
     return v_existing_loan_id;
   end if;
@@ -1334,3 +1545,205 @@ revoke execute on function public.create_manual_loan_idempotent(uuid, text, text
 revoke execute on function public.create_manual_loan_idempotent(uuid, text, text, text, numeric, numeric, numeric, date, integer, numeric, date, text, text) from anon;
 revoke execute on function public.create_manual_loan_idempotent(uuid, text, text, text, numeric, numeric, numeric, date, integer, numeric, date, text, text) from authenticated;
 grant execute on function public.create_manual_loan_idempotent(uuid, text, text, text, numeric, numeric, numeric, date, integer, numeric, date, text, text) to service_role;
+
+-- Round 10 remediation (manual-loan deletion atomicity): deletion used to be a read of the linked
+-- transactions, then ONE SEPARATE unlink RPC PER ROW, then a separate direct DELETE of the loan —
+-- three or more independent transactions with no shared lock. Four concrete failures followed from
+-- that, all of them reachable:
+--
+--   1. A transaction linked AFTER the initial linked-row read but BEFORE the loan delete had its
+--      manual_loan_id cleared by the FK's ON DELETE SET NULL, but kept a stale principal_portion
+--      and a stale `manual_loan_link` role — a row claiming to be a payment on a deleted loan.
+--   2. One unlink committing and a later one failing left the deletion half-done, with no record
+--      of what still needed finishing.
+--   3. Every unlink committing but the loan DELETE failing left the loan present with all its
+--      payments detached, and a retry then saw no linked rows at all — the affected transaction
+--      ids, which still needed relational reconciliation, were simply lost.
+--   4. Reconciliation failing after a committed deletion could not be retried through the endpoint
+--      at all, because the loan was already gone and the request reported it as missing.
+--
+-- This function replaces all of it with a single transaction: it takes the same per-user advisory
+-- lock every other candidate-affecting writer takes, locks the loan and the COMPLETE linked set,
+-- verifies that set still matches exactly what the caller classified against, reclassifies every
+-- row, records a durable tombstone, and deletes the loan — atomically. Because the tombstone
+-- carries the affected transaction ids and survives the loan, a retry after a post-commit
+-- reconciliation failure replays them instead of reporting the loan as missing (failure 4), and no
+-- partial state is reachable (failures 1-3).
+--
+-- Classification itself deliberately stays in TypeScript (transactionClassifier.ts is the single
+-- source of truth for it, and porting it into SQL would fork that logic). The caller reads the
+-- linked rows, classifies them, and passes the result in as p_reclassify; this function then proves
+-- under the lock that the linked set it is about to act on is EXACTLY the set the caller classified
+-- — so a concurrent link arriving in between is detected and the whole call is rejected for the
+-- caller to retry with fresh state, rather than silently acting on a stale decision.
+create table public.manual_loan_deletions (
+  user_id uuid not null,
+  loan_id uuid not null,
+  affected_transaction_ids uuid[] not null,
+  reconciled_at timestamp with time zone null,
+  created_at timestamp with time zone not null default now(),
+  primary key (user_id, loan_id)
+);
+
+alter table public.manual_loan_deletions enable row level security;
+
+-- Same explicit-grant reasoning as manual_loan_creation_requests above: a table created by this
+-- migration carries no grants of its own, and RLS-with-no-policies does not substitute for them.
+-- UPDATE is granted here (unlike that table) solely so a completed reconciliation can be marked.
+revoke all on public.manual_loan_deletions from public;
+revoke all on public.manual_loan_deletions from anon;
+revoke all on public.manual_loan_deletions from authenticated;
+grant select, insert, update on public.manual_loan_deletions to service_role;
+
+create or replace function public.delete_manual_loan_atomic(
+  p_user_id uuid,
+  p_loan_id uuid,
+  p_reclassify jsonb
+) returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_reclassify_count integer;
+  v_distinct_count integer;
+  v_linked_ids uuid[];
+  v_reclassify_ids uuid[];
+  v_existing_ids uuid[];
+  v_existing_reconciled timestamp with time zone;
+  v_tombstone_found boolean;
+  v_loan_found boolean;
+  v_affected_count integer;
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  -- Replay path: this (user, loan) was already deleted by an earlier call that committed. Return
+  -- the recorded affected ids so the caller can re-run the reconciliation that failed after that
+  -- commit, instead of reporting a loan that no longer exists as simply missing.
+  select affected_transaction_ids, reconciled_at, true
+  into v_existing_ids, v_existing_reconciled, v_tombstone_found
+  from public.manual_loan_deletions
+  where user_id = p_user_id and loan_id = p_loan_id;
+
+  if coalesce(v_tombstone_found, false) then
+    return jsonb_build_object(
+      'replayed', true,
+      'already_reconciled', v_existing_reconciled is not null,
+      'affected_transaction_ids', to_jsonb(v_existing_ids)
+    );
+  end if;
+
+  select true into v_loan_found
+  from public.manual_loans l
+  where l.id = p_loan_id and l.user_id = p_user_id
+  for update;
+
+  if not coalesce(v_loan_found, false) then
+    raise exception 'delete_manual_loan_atomic: manual loan not found or not owned by user';
+  end if;
+
+  v_reclassify_count := coalesce(jsonb_array_length(p_reclassify), 0);
+
+  select count(distinct r.id) into v_distinct_count
+  from jsonb_to_recordset(coalesce(p_reclassify, '[]'::jsonb)) as r(id uuid);
+
+  if v_distinct_count is distinct from v_reclassify_count then
+    raise exception 'delete_manual_loan_atomic: duplicate id supplied in p_reclassify (% distinct of %)',
+      v_distinct_count, v_reclassify_count;
+  end if;
+
+  -- Lock the COMPLETE current linked set through its ownership chain. The aggregate sits outside
+  -- the locking select because PostgreSQL forbids FOR UPDATE alongside an aggregate.
+  select array_agg(locked.id order by locked.id) into v_linked_ids
+  from (
+    select t.id
+    from public.transactions t
+    join public.accounts a on a.id = t.account_id
+    join public.plaid_items pi on pi.id = a.item_id
+    where t.manual_loan_id = p_loan_id and pi.user_id = p_user_id
+    for update of t
+  ) locked;
+
+  select array_agg(distinct r.id) into v_reclassify_ids
+  from jsonb_to_recordset(coalesce(p_reclassify, '[]'::jsonb)) as r(id uuid);
+
+  -- Both arrays are ascending (array_agg DISTINCT sorts; the other is explicitly ordered), so this
+  -- is a true set comparison. A concurrent link or unlink landing between the caller's read and
+  -- this lock changes the set and is rejected here.
+  if coalesce(v_linked_ids, '{}'::uuid[]) is distinct from coalesce(v_reclassify_ids, '{}'::uuid[]) then
+    raise exception 'delete_manual_loan_atomic: the set of transactions linked to this loan changed since they were classified (concurrent modification) — re-read and retry';
+  end if;
+
+  if coalesce(cardinality(v_linked_ids), 0) > 0 then
+    update public.transactions t
+    set manual_loan_id = null,
+        principal_portion = null,
+        auto_role = r.auto_role,
+        role_source = r.role_source,
+        role_confidence = r.role_confidence,
+        classifier_version = r.classifier_version
+    from jsonb_to_recordset(p_reclassify) as r(
+      id uuid, auto_role text, role_source text, role_confidence text, classifier_version smallint
+    )
+    where t.id = r.id;
+
+    get diagnostics v_affected_count = row_count;
+    if v_affected_count is distinct from cardinality(v_linked_ids) then
+      raise exception 'delete_manual_loan_atomic: reclassified row count mismatch (expected %, got %)',
+        cardinality(v_linked_ids), v_affected_count;
+    end if;
+  end if;
+
+  insert into public.manual_loan_deletions (user_id, loan_id, affected_transaction_ids)
+  values (p_user_id, p_loan_id, coalesce(v_linked_ids, '{}'::uuid[]));
+
+  delete from public.manual_loans where id = p_loan_id and user_id = p_user_id;
+
+  get diagnostics v_affected_count = row_count;
+  if v_affected_count is distinct from 1 then
+    raise exception 'delete_manual_loan_atomic: expected to delete exactly 1 loan, deleted %', v_affected_count;
+  end if;
+
+  return jsonb_build_object(
+    'replayed', false,
+    'already_reconciled', false,
+    'affected_transaction_ids', to_jsonb(coalesce(v_linked_ids, '{}'::uuid[]))
+  );
+end;
+$$;
+
+revoke execute on function public.delete_manual_loan_atomic(uuid, uuid, jsonb) from public;
+revoke execute on function public.delete_manual_loan_atomic(uuid, uuid, jsonb) from anon;
+revoke execute on function public.delete_manual_loan_atomic(uuid, uuid, jsonb) from authenticated;
+grant execute on function public.delete_manual_loan_atomic(uuid, uuid, jsonb) to service_role;
+
+-- Marks a committed deletion's post-commit reconciliation as finished. Kept separate from
+-- delete_manual_loan_atomic on purpose: reconciliation runs in the application, AFTER that
+-- function's transaction has committed, so until it succeeds the tombstone must stay unmarked and
+-- keep driving retries.
+create or replace function public.mark_manual_loan_deletion_reconciled(
+  p_user_id uuid,
+  p_loan_id uuid
+) returns void
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_affected_count integer;
+begin
+  update public.manual_loan_deletions
+  set reconciled_at = now()
+  where user_id = p_user_id and loan_id = p_loan_id;
+
+  get diagnostics v_affected_count = row_count;
+  if v_affected_count is distinct from 1 then
+    raise exception 'mark_manual_loan_deletion_reconciled: no deletion record for this user/loan';
+  end if;
+end;
+$$;
+
+revoke execute on function public.mark_manual_loan_deletion_reconciled(uuid, uuid) from public;
+revoke execute on function public.mark_manual_loan_deletion_reconciled(uuid, uuid) from anon;
+revoke execute on function public.mark_manual_loan_deletion_reconciled(uuid, uuid) from authenticated;
+grant execute on function public.mark_manual_loan_deletion_reconciled(uuid, uuid) to service_role;

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { LoanPayment, ManualPaymentInput, Loan, ManualLoan, ManualLoanInput } from '../lib/api';
 import { formatCurrency } from '../lib/currency';
 
@@ -493,19 +493,49 @@ function ManualLoanForm({
 }: {
   initial: ManualLoanInput;
   onCancel: () => void;
-  onSubmit: (input: ManualLoanInput, idempotencyKey: string) => void;
+  // Returns a promise so this form can await the outcome — a rejection keeps the form (and its
+  // idempotency key) mounted for a safe retry. See handleSubmit.
+  onSubmit: (input: ManualLoanInput, idempotencyKey: string) => void | Promise<void>;
 }) {
   const [form, setForm] = useState(initial);
   // Minted once per form mount (a fresh "add loan"/"edit loan" session), not per submit attempt —
-  // a double-click on Save before this form closes, or any future retry-on-error, resubmits with
-  // the SAME key, so the backend can tell "the same attempt, sent twice" apart from "the user
-  // opened the form again to add a genuinely different loan" (a remount, which mints a new key).
+  // a double-click on Save, or a retry after a failed attempt, resubmits with the SAME key, so the
+  // backend can tell "the same attempt, sent twice" apart from "the user opened the form again to
+  // add a genuinely different loan" (a remount, which mints a new key).
   const [idempotencyKey] = useState(() => crypto.randomUUID());
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  // A ref, not the state above, is what actually guards re-entry: two clicks dispatched in the same
+  // tick both run before React re-renders, so neither `submitting` nor the button's disabled
+  // attribute has updated yet by the time the second handler runs.
+  const submittingRef = useRef(false);
 
-  function handleSubmit(e: React.FormEvent) {
+  // Round 10 remediation: awaits the submission and keeps this form — and therefore its
+  // idempotency key and the values the user typed — mounted when it fails. Previously the create
+  // path closed the form synchronously without awaiting anything, so a create that failed AFTER
+  // persisting the loan (the backend runs backfillMatchesForLoan after the insert commits, and
+  // reports a failure there as a failed request) left the user with an error, no form, and a
+  // discarded key: reopening minted a new key and the "retry" created a duplicate loan. Retrying
+  // from the still-open form resends the identical key and payload, which the backend replays onto
+  // the loan it already created.
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!form.name || form.current_balance === null) return;
-    onSubmit(form, idempotencyKey);
+    // Pending-submit protection is additive, not a replacement for the idempotency key: it stops
+    // the common double-click locally, while the key remains what makes a retry safe across a
+    // genuinely ambiguous failure.
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      await onSubmit(form, idempotencyKey);
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'Failed to save loan');
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -623,8 +653,15 @@ function ManualLoanForm({
           </span>
         </label>
       </div>
+      {submitError && (
+        <p className="form-error" role="alert">
+          {submitError} — your details are still here; press Save loan to retry.
+        </p>
+      )}
       <div className="manual-loan-form-actions">
-        <button type="submit">Save loan</button>
+        <button type="submit" disabled={submitting}>
+          {submitting ? 'Saving…' : 'Save loan'}
+        </button>
         <button type="button" className="link-button" onClick={onCancel}>
           Cancel
         </button>
@@ -652,7 +689,8 @@ export function LoanProgress({
   manualLoans: ManualLoan[];
   totalDebt: number;
   totalMinimumPayment: number;
-  onCreateManualLoan: (input: ManualLoanInput, idempotencyKey: string) => void;
+  // Must reject on failure — the create form relies on that to stay open for a same-key retry.
+  onCreateManualLoan: (input: ManualLoanInput, idempotencyKey: string) => Promise<void>;
   onUpdateManualLoan: (id: string, input: ManualLoanInput) => Promise<void>;
   onDeleteManualLoan: (id: string) => void;
   onFetchPayments: (loanId: string) => Promise<LoanPayment[]>;
@@ -679,8 +717,13 @@ export function LoanProgress({
 
   const editingLoan = manualLoans.find((l) => l.id === editingLoanId) ?? null;
 
-  function handleCreate(input: ManualLoanInput, idempotencyKey: string) {
-    onCreateManualLoan(input, idempotencyKey);
+  // Round 10 remediation: awaits the create and closes the form ONLY once it has actually
+  // succeeded. Closing first (which this did) discarded the form's idempotency key before anyone
+  // knew whether the loan had been created, making the user's natural retry a duplicate. The
+  // rejection is deliberately re-thrown rather than handled here so ManualLoanForm can surface it
+  // and stay open with the same key and values.
+  async function handleCreate(input: ManualLoanInput, idempotencyKey: string) {
+    await onCreateManualLoan(input, idempotencyKey);
     setShowAddForm(false);
   }
 

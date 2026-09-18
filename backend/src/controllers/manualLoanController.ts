@@ -1,7 +1,11 @@
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
 import { backfillMatchesForLoan, computePayoffProgressPct } from '../services/loans';
-import { reconcileAfterRelationalStateChange, repairExistingRelationalRoles } from '../services/roleReconciliation';
+import {
+  reconcileAfterRelationalStateChange,
+  reconcileRelationalRoles,
+  repairExistingRelationalRoles,
+} from '../services/roleReconciliation';
 import type { ManualLoanRow } from '../types';
 
 type LifetimeTotals = { principalPaid: number; interestPaid: number };
@@ -148,15 +152,36 @@ export async function deleteManualLoan(req: Request, res: Response, next: NextFu
   try {
     const { id } = req.params;
     const userId = req.user!.id;
-    const { affectedTransactionIds } = await dataService.deleteManualLoan(id, userId);
-    // Round 5 remediation (blocker 6): a transaction just reclassified off this deleted loan may
-    // have previously been (or be about to become) a transfer counterpart or refund original —
-    // the same bounded repair sweep every other relational-state change runs.
-    if (affectedTransactionIds.length > 0) {
+    const { affectedTransactionIds, alreadyReconciled } = await dataService.deleteManualLoan(id, userId);
+
+    // Round 10 remediation: this used to run ONLY the repair sweep, which looks backwards — it
+    // fixes rows that depended on the deleted loan's transactions in their OLD state. It never ran
+    // FORWARD reconciliation for the reclassified rows themselves, even though reclassifying a row
+    // off a loan is exactly what can make it newly eligible as a transfer counterpart or refund
+    // original (`transfer_like_unconfirmed` / a refund-eligible `sign_default`). Both directions
+    // are needed, in this order, and this is the same pairing reconcileAfterRelationalStateChange
+    // performs for a single-row relational change.
+    //
+    // This block also runs on a REPLAY (a retry of a deletion that already committed but whose
+    // reconciliation then failed) — deliberately, because that is the only way such a failure ever
+    // gets retried. Both halves are idempotent, so re-running them for an already-reconciled
+    // deletion is safe; it is skipped in that case only to avoid pointless work.
+    if (!alreadyReconciled) {
+      if (affectedTransactionIds.length > 0) {
+        await reconcileRelationalRoles(userId, affectedTransactionIds);
+      }
       await repairExistingRelationalRoles(userId);
+      // Only now is the deletion genuinely complete. If either call above throws, the tombstone
+      // stays unmarked and a retried DELETE replays the same affected ids and tries again.
+      await dataService.markManualLoanDeletionReconciled(id, userId);
     }
+
     res.status(204).send();
   } catch (err) {
+    if (err instanceof dataService.ManualLoanNotFoundError) {
+      res.status(404).json({ error: 'Manual loan not found' });
+      return;
+    }
     next(err);
   }
 }

@@ -1396,6 +1396,13 @@ export default function App() {
     }
   }
 
+  // Round 10 remediation: this RETHROWS after recording the error, unlike the other mutation
+  // handlers. The creation form must be able to tell success from failure, because a failed create
+  // is ambiguous — the backend may well have persisted the loan and then failed in
+  // backfillMatchesForLoan afterwards — and the only safe retry is one that resends the IDENTICAL
+  // idempotency key, which is only possible while the original form is still mounted. Swallowing
+  // the error here closed the form and discarded that key, turning the retry into a second,
+  // duplicate loan. The form keeps itself open on rejection; see ManualLoanForm.handleSubmit.
   async function handleCreateManualLoan(input: ManualLoanInput, idempotencyKey: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
@@ -1408,6 +1415,7 @@ export default function App() {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to add loan');
       }
+      throw err;
     }
   }
 

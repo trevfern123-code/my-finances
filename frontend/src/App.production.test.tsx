@@ -1842,7 +1842,7 @@ describe('41. A1 -> A3 (same user, new session): ad-hoc ownership uses session_i
 // gives every reader of a given resource — grouped or targeted — one shared counter to reserve from.
 
 describe('Round 8 remediation: createManualLoan idempotency-key generation', () => {
-  it('mints one idempotency key per form mount and sends the same key on a rapid double-submit before the form closes', async () => {
+  it('blocks a rapid double-submit while the first is still in flight, and any call that lands carries the one key minted for this form mount', async () => {
     mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
     render(<App />);
     act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
@@ -1854,44 +1854,115 @@ describe('Round 8 remediation: createManualLoan idempotency-key generation', () 
     fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '500' } });
 
     mockCreateManualLoan.mockReturnValue(deferred<ReturnType<typeof fakeManualLoan>>().promise);
-    // Two rapid clicks before the form has a chance to unmount, modeling the exact double-submit
-    // gap this key is meant to make safe (see LoanProgress.tsx's ManualLoanForm — no
-    // disabled-while-pending guard exists on this button).
     await act(async () => {
       fireEvent.click(screen.getByText('Save loan'));
       fireEvent.click(screen.getByText('Save loan'));
       await Promise.resolve();
     });
 
-    expect(mockCreateManualLoan.mock.calls.length).toBeGreaterThanOrEqual(1);
+    // Round 10: the pending-submit guard stops the second click outright. That guard is additive —
+    // the idempotency key is still what makes a retry safe across a genuinely ambiguous failure,
+    // which no client-side guard can cover.
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
     const keysUsed = new Set(mockCreateManualLoan.mock.calls.map((call) => call[1]));
-    // Whether React let the second click land before the form unmounted or not, every call that
-    // DID land must carry the identical key minted for this one form mount — never a fresh key
-    // per click.
     expect(keysUsed.size).toBe(1);
     expect(typeof mockCreateManualLoan.mock.calls[0][1]).toBe('string');
     expect((mockCreateManualLoan.mock.calls[0][1] as string).length).toBeGreaterThan(0);
   });
 
-  it('a second, separate "add loan" session (form closed and reopened) mints a genuinely different key', async () => {
+  it('Round 10 (blocker 4): a FAILED create keeps the form open with its values, and retrying sends the IDENTICAL key and payload — the ambiguous-failure case that used to duplicate the loan', async () => {
     mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
     render(<App />);
     act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
     await waitForReady();
     act(() => screen.getByText('Loans').click());
 
-    // Neither submission is ever resolved — this isolates "does reopening the form mint a new
-    // key" from any loan-list re-render, which is a separate concern already covered elsewhere.
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Ambiguous Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '750' } });
+
+    // Models the real ambiguous failure: the backend PERSISTED the loan, then failed in
+    // backfillMatchesForLoan and reported the request as failed. The client cannot tell this apart
+    // from a create that never happened.
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Failed to backfill loan matches'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    // The form must still be mounted, still holding what the user typed.
+    expect(screen.getByText('Save loan')).toBeTruthy();
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Ambiguous Loan');
+    expect((screen.getByLabelText('Current balance') as HTMLInputElement).value).toBe('750');
+    expect(screen.getByRole('alert').textContent).toContain('Failed to backfill loan matches');
+
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    // The retry: the server replays the loan it already created for this key.
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Ambiguous Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(2);
+
+    // Only now — after a confirmed success — does the form close.
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+  });
+
+  it('Round 10 (blocker 4): the form stays open while the create is still in flight, and closes only once it resolves', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Inflight Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '100' } });
+
+    const pending = deferred<ReturnType<typeof fakeManualLoan>>();
+    mockCreateManualLoan.mockReturnValueOnce(pending.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    // Still open, and the button reflects the in-flight state rather than inviting another submit.
+    expect(screen.getByText('Saving…')).toBeTruthy();
+
+    await act(async () => {
+      pending.resolve(fakeManualLoan('Inflight Loan'));
+      await pending.promise;
+    });
+
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+  });
+
+  it('cancelling and reopening the form (a genuinely new create session) mints a different key', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
     act(() => screen.getByText('Add a loan').click());
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'First Loan' } });
     fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '100' } });
-    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('nope'));
     await act(async () => {
       fireEvent.click(screen.getByText('Save loan'));
       await Promise.resolve();
     });
     const firstKey = mockCreateManualLoan.mock.calls[0][1];
 
+    // Cancel abandons this attempt deliberately — a new form is a new logical creation, so it must
+    // NOT reuse the abandoned attempt's key.
+    act(() => screen.getByText('Cancel').click());
     act(() => screen.getByText('Add a loan').click());
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Second Loan' } });
     fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '200' } });
