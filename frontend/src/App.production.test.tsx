@@ -13,6 +13,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import type { UserPreferences } from './lib/api';
+import { installFakeWebLocks, removeWebLocks } from './testUtils/fakeWebLocks';
 
 const mockGetSession = vi.hoisted(() => vi.fn());
 const mockOnAuthStateChange = vi.hoisted(() => vi.fn());
@@ -501,6 +502,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Pending manual-loan creations persist per user in localStorage by design; each test starts clean.
   localStorage.clear();
+  // jsdom has no Web Locks; every test gets a fresh cross-tab lock manager (see fakeWebLocks.ts).
+  installFakeWebLocks();
   currentFakeSession = null;
   latestLiveCallback = null;
   capturedPlaidOnSuccess = null;
@@ -3145,5 +3148,144 @@ describe('57. handleSaveCategoryMapping: a lifecycle change during the post-back
     expect(screen.getByText(/B-Transaction/)).toBeTruthy();
     expect(screen.queryByText(/A-Transaction/)).toBeNull();
     expect(screen.queryByText(/A-Stale-Transaction/)).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Round 13 remediation: cross-tab acquisition of a pending manual-loan creation.
+//
+// Two App instances rendered into one document stand in for two browser tabs of the same user: they
+// share localStorage and navigator.locks (the FakeLockManager installed in beforeEach), exactly the
+// state real same-origin tabs share, while each has its own React tree, state and form. jsdom runs
+// them on one thread, so the dangerous interleaving is forced deterministically: the storage spy
+// below lets tab A read the (empty) slot, then — before A can act on that read — makes tab B submit.
+// Without a cross-context lock both tabs therefore observe the original empty slot before either
+// has stored its attempt, which is exactly the race a real pair of tabs can hit.
+// -------------------------------------------------------------------------------------------------
+describe('Round 13: two tabs acquiring a pending manual-loan creation at the same time', () => {
+  const SLOT = 'myfinances.pendingManualLoanCreation.user-a';
+
+  /** Fake server honouring the idempotency contract: the first request for a key creates (persists)
+   *  one loan; its response is held open so the attempt stays unresolved for the whole test. */
+  function installHoldingLoanServer() {
+    const loansByKey = new Map<string, unknown>();
+    mockCreateManualLoan.mockImplementation((payload: unknown, key: string) => {
+      if (!loansByKey.has(key)) loansByKey.set(key, payload);
+      return deferred<ReturnType<typeof fakeManualLoan>>().promise;
+    });
+    return { loansByKey };
+  }
+
+  async function bootTwoTabs() {
+    const callbacks: LiveCallback[] = [];
+    mockOnAuthStateChange.mockImplementation((cb: LiveCallback) => {
+      callbacks.push(cb);
+      return { data: { subscription: { unsubscribe: vi.fn() } } };
+    });
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences()).mockResolvedValueOnce(fakePreferences());
+    const tabA = render(<App />).container;
+    const tabB = render(<App />).container;
+    const session = fakeSession('user-a', 'sid-user-a');
+    currentFakeSession = session;
+    act(() => callbacks.forEach((cb) => cb('AUTH_EVENT', session)));
+    await waitFor(() => {
+      expect(within(tabA).getByText('Customize dashboard')).toBeTruthy();
+      expect(within(tabB).getByText('Customize dashboard')).toBeTruthy();
+    });
+    act(() => within(tabA).getByText('Loans').click());
+    act(() => within(tabB).getByText('Loans').click());
+    return { tabA, tabB };
+  }
+
+  function fill(tab: HTMLElement, name: string, balance: string) {
+    act(() => within(tab).getByText('Add a loan').click());
+    fireEvent.change(within(tab).getByLabelText('Name'), { target: { value: name } });
+    fireEvent.change(within(tab).getByLabelText('Current balance'), { target: { value: balance } });
+  }
+
+  /** The first read of the user's slot (by whichever tab reads it first) returns what storage held
+   *  at that instant, but only AFTER running `interleave` — so the reader acts on a value that the
+   *  interleaved contender may already have invalidated. */
+  function interleaveAfterFirstSlotRead(interleave: () => void) {
+    const realGetItem = Storage.prototype.getItem;
+    let armed = true;
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+      const observed = realGetItem.call(this, key);
+      if (armed && key === SLOT) {
+        armed = false;
+        interleave();
+      }
+      return observed;
+    });
+  }
+
+  it('exactly one tab acquires the attempt, exactly one new-key request is sent, and the loser adopts the winner without overwriting it', async () => {
+    const server = installHoldingLoanServer();
+    const { tabA, tabB } = await bootTwoTabs();
+    fill(tabA, 'Tab A Loan', '111');
+    fill(tabB, 'Tab B Loan', '222');
+
+    // Tab B submits at the precise moment tab A has read the empty slot but not yet stored its key.
+    interleaveAfterFirstSlotRead(() => fireEvent.click(within(tabB).getByText('Save loan')));
+    await act(async () => {
+      fireEvent.click(within(tabA).getByText('Save loan'));
+    });
+    await waitFor(() => expect(within(tabB).getByRole('alert').textContent).toContain('An earlier loan save has not been confirmed yet'));
+
+    // 1 & 2. One attempt acquired, one request sent, one loan on the server.
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
+    const [winnerPayload, winnerKey] = mockCreateManualLoan.mock.calls[0];
+    expect(winnerPayload).toMatchObject({ name: 'Tab A Loan', current_balance: 111 });
+    expect(server.loansByKey.size).toBe(1);
+
+    // 3. The slot still holds the winner — the loser never overwrote it.
+    expect(JSON.parse(localStorage.getItem(SLOT) ?? 'null')).toEqual({ idempotencyKey: winnerKey, input: winnerPayload });
+
+    // 4. The loser converged on the winner's attempt, and finishing it from there reuses the SAME key.
+    await waitFor(() => expect((within(tabB).getByLabelText('Name') as HTMLInputElement).value).toBe('Tab A Loan'));
+    await act(async () => {
+      fireEvent.click(within(tabB).getByText('Save loan'));
+    });
+    await waitFor(() => expect(mockCreateManualLoan).toHaveBeenCalledTimes(2));
+    expect(mockCreateManualLoan.mock.calls[1][1]).toBe(winnerKey);
+    expect(mockCreateManualLoan.mock.calls[1][0]).toEqual(winnerPayload);
+    expect(server.loansByKey.size).toBe(1);
+  });
+
+  it('a non-empty but malformed slot blocks creation and is left byte-for-byte untouched', async () => {
+    for (const corrupt of ['{"idempotencyKey":42,"input":{}}', '{not json', '{"version":2,"attempt":{}}']) {
+      cleanup();
+      mockCreateManualLoan.mockClear();
+      localStorage.clear();
+      localStorage.setItem(SLOT, corrupt);
+      await bootToLoans('user-a');
+      await act(async () => {
+        screen.getByText('Add a loan').click();
+      });
+      fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Blocked Loan' } });
+      fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '10' } });
+      await act(async () => {
+        fireEvent.click(screen.getByText('Save loan'));
+      });
+
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('unreadable'));
+      expect(mockCreateManualLoan).not.toHaveBeenCalled();
+      expect(localStorage.getItem(SLOT)).toBe(corrupt);
+    }
+  });
+
+  it('without Web Locks the tab refuses to create at all — nothing is stored and nothing is sent', async () => {
+    removeWebLocks();
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'No Locks Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '10' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain("can't coordinate"));
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(localStorage.getItem(SLOT)).toBeNull();
   });
 });

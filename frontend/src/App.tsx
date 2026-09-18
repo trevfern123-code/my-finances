@@ -61,9 +61,9 @@ import { decodeSessionId } from './lib/jwt';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
 import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
 import {
-  clearPendingManualLoanCreation,
+  acquirePendingManualLoanCreation,
   loadPendingManualLoanCreation,
-  persistPendingManualLoanCreation,
+  releasePendingManualLoanCreation,
   type PendingManualLoanCreation,
 } from './lib/pendingManualLoanCreation';
 import { validateManualLoanInput } from './lib/manualLoanValidation';
@@ -1448,28 +1448,30 @@ export default function App() {
     if (!ownerUserId) refuse('Sign in again before adding a loan.');
     const owner = ownerUserId as string;
 
-    const unresolved = loadPendingManualLoanCreation(owner);
-    if (unresolved !== null && unresolved.idempotencyKey !== idempotencyKey) {
-      // Reachable when another tab left the attempt unresolved after this one loaded. Surface it so
-      // the form adopts it and it can be finished from here.
-      if (userIdRef.current === owner) setPendingLoanCreate(unresolved);
+    // A payload the server would always reject must never become a locked, unresolvable attempt. (A
+    // retry's input is the stored payload, which passed this same check when it was first sent.)
+    const invalid = validateManualLoanInput(input);
+    if (invalid) refuse(invalid);
+
+    // Round 13 remediation: claiming the attempt is one step under a cross-tab lock (see
+    // acquirePendingManualLoanCreation), not a read here followed by a write. Round 12's
+    // read-then-write let two tabs both see an empty slot and each send a request under its own key.
+    let acquired: Awaited<ReturnType<typeof acquirePendingManualLoanCreation>>;
+    try {
+      acquired = await acquirePendingManualLoanCreation(owner, { idempotencyKey, input });
+    } catch (err) {
+      return refuse(err instanceof Error ? err.message : 'Could not save this attempt on this device.');
+    }
+    if (acquired.status === 'held-by-other') {
+      // Another attempt is unresolved (this tab's form predates it, or another tab won the slot).
+      // Surface it so the form adopts it and it can be finished from here — never send a new key.
+      if (userIdRef.current === owner) setPendingLoanCreate(acquired.pending);
       refuse('An earlier loan save has not been confirmed yet. Finish that save before adding another loan.');
     }
-    const isRetry = unresolved !== null;
-    const payload = isRetry ? unresolved.input : input;
-    if (!isRetry) {
-      // A payload the server would always reject must never become a locked, unresolvable attempt.
-      const invalid = validateManualLoanInput(payload);
-      if (invalid) refuse(invalid);
-    }
-
-    const pending = { idempotencyKey, input: payload };
-    try {
-      persistPendingManualLoanCreation(owner, pending);
-    } catch (err) {
-      refuse(err instanceof Error ? err.message : 'Could not save this attempt on this device.');
-    }
-    setPendingLoanCreate(pending);
+    // The STORED payload is sent, never the caller's: for a retry it is what the key was first sent with.
+    const pending = acquired.pending;
+    const payload = pending.input;
+    if (userIdRef.current === owner) setPendingLoanCreate(pending);
 
     setInFlightLoanCreateKey(idempotencyKey);
     try {
@@ -1481,12 +1483,12 @@ export default function App() {
         // The server confirmed this key already created a loan, which has since been deleted: the
         // attempt is resolved (the creation happened), so it is safe — and necessary, since a retry
         // would fail identically forever — to retire the key.
-        clearPendingManualLoanCreation(owner, idempotencyKey);
+        await releasePendingManualLoanCreation(owner, idempotencyKey);
         if (userIdRef.current === owner) setPendingLoanCreate(loadPendingManualLoanCreation(owner));
         if (isStillCurrentSession(expectedSessionId)) setActionError((err as Error).message);
         return;
       }
-      clearPendingManualLoanCreation(owner, idempotencyKey);
+      await releasePendingManualLoanCreation(owner, idempotencyKey);
       if (userIdRef.current === owner) setPendingLoanCreate(loadPendingManualLoanCreation(owner));
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         // A retry of an already-successful attempt (e.g. resubmitted from a form remounted while
