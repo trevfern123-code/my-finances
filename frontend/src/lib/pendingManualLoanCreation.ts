@@ -54,6 +54,15 @@ function browserLocks(): CrossContextLocks | null {
  */
 const RECORD_VERSION = 1;
 
+/**
+ * Matches the backend, which rejects a key whose trim() is empty. Such a key is REJECTED, never
+ * trimmed and used: the key is the attempt's identity, so altering it would make it a different
+ * attempt.
+ */
+function isUsableIdempotencyKey(key: string): boolean {
+  return key.trim().length > 0;
+}
+
 function serializeRecord(pending: PendingManualLoanCreation): string {
   return JSON.stringify({ version: RECORD_VERSION, idempotencyKey: pending.idempotencyKey, input: pending.input });
 }
@@ -76,7 +85,7 @@ function parseRecord(raw: string): PendingManualLoanCreation | null {
   const keys = Object.keys(record).sort();
   if (keys.length !== 3 || keys[0] !== 'idempotencyKey' || keys[1] !== 'input' || keys[2] !== 'version') return null;
   if (record.version !== RECORD_VERSION) return null;
-  if (typeof record.idempotencyKey !== 'string' || record.idempotencyKey.length === 0) return null;
+  if (typeof record.idempotencyKey !== 'string' || !isUsableIdempotencyKey(record.idempotencyKey)) return null;
   const input = parseManualLoanInput(record.input);
   if (input === null) return null;
   return { idempotencyKey: record.idempotencyKey, input };
@@ -156,7 +165,7 @@ export async function acquirePendingManualLoanCreation(
 
     // Never write a record this module would itself refuse to read back: it would become an
     // "unreadable" slot that blocks every later creation for this user.
-    if (parseManualLoanInput(pending.input) === null || pending.idempotencyKey.length === 0) {
+    if (parseManualLoanInput(pending.input) === null || !isUsableIdempotencyKey(pending.idempotencyKey)) {
       throw new PendingCreationPersistenceError('This loan could not be saved because some of its details are invalid.');
     }
     const serialized = serializeRecord(pending);

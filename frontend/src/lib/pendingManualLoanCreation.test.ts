@@ -164,6 +164,11 @@ describe('acquirePendingManualLoanCreation — cross-context exclusivity (Round 
     ['a payload with an unknown extra field', envelope({ input: { ...input, surprise: 1 } })],
     ['a payload failing a semantic rule (negative balance)', envelope({ input: { ...input, current_balance: -1 } })],
     ['a different shape entirely', '{"version":2,"attempt":{}}'],
+    // Round 15: keys the backend rejects (its check is trim()-based) and a PostgreSQL-invalid year.
+    ['a whitespace-only key', envelope({ idempotencyKey: ' ' })],
+    ['a tab/newline-only key', envelope({ idempotencyKey: '\t\n ' })],
+    ['a year-zero origination_date', envelope({ input: { ...input, origination_date: '0000-01-01' } })],
+    ['a year-zero next_payment_due_date', envelope({ input: { ...input, next_payment_due_date: '0000-06-15' } })],
     ['a JSON array', '[]'],
     ['JSON null', 'null'],
   ])('a non-empty slot holding %s fails closed and is not overwritten', async (_label, corrupt) => {
@@ -223,6 +228,37 @@ describe('acquirePendingManualLoanCreation — cross-context exclusivity (Round 
     ).rejects.toThrow(PendingCreationPersistenceError);
   });
 
+  it.each([
+    ['a single space', ' '],
+    ['only whitespace characters', ' \t\n\r '],
+  ])('Round 15: a fresh acquisition with a key of %s is REJECTED before anything is written — never trimmed', async (_label, key) => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    await expect(
+      acquirePendingManualLoanCreation('user-a', { idempotencyKey: key, input }, new FakeLockManager())
+    ).rejects.toThrow(PendingCreationPersistenceError);
+    expect(setItem).not.toHaveBeenCalled();
+    expect(localStorage.getItem(SLOT)).toBeNull();
+  });
+
+  it('Round 15: a key with surrounding whitespace but real content is kept EXACTLY as given, not normalized', async () => {
+    const key = '  7f3c9e2a-1b4d-4c8e-9a6f-2d5b8e1c0a47  ';
+    const result = await acquirePendingManualLoanCreation('user-a', { idempotencyKey: key, input }, new FakeLockManager());
+    expect(result).toEqual({ status: 'acquired', pending: { idempotencyKey: key, input } });
+    expect(JSON.parse(localStorage.getItem(SLOT)!).idempotencyKey).toBe(key);
+  });
+
+  it('Round 15: an ordinary UUID key round-trips unchanged through storage and back', async () => {
+    const key = crypto.randomUUID();
+    const locks = new FakeLockManager();
+    await acquirePendingManualLoanCreation('user-a', { idempotencyKey: key, input }, locks);
+    expect(loadPendingManualLoanCreation('user-a')).toEqual({ idempotencyKey: key, input });
+    // A retry under the same key finds it as its own attempt.
+    expect(await acquirePendingManualLoanCreation('user-a', { idempotencyKey: key, input }, locks)).toEqual({
+      status: 'acquired',
+      pending: { idempotencyKey: key, input },
+    });
+  });
+
   it('the stored record survives a module reload (durable, not in memory)', async () => {
     await acquirePendingManualLoanCreation('user-a', { idempotencyKey: 'k1', input }, new FakeLockManager());
     vi.resetModules();
@@ -247,6 +283,16 @@ describe('releasePendingManualLoanCreation (Round 13 remediation)', () => {
     const corrupt = envelope({ idempotencyKey: 'k1', input: {} });
     localStorage.setItem(SLOT, corrupt);
     await releasePendingManualLoanCreation('user-a', 'k1', new FakeLockManager());
+    expect(localStorage.getItem(SLOT)).toBe(corrupt);
+  });
+
+  it.each([
+    ['a whitespace-only key', envelope({ idempotencyKey: ' ' }), ' '],
+    ['a year-zero origination_date', envelope({ idempotencyKey: 'k1', input: { ...input, origination_date: '0000-01-01' } }), 'k1'],
+    ['a year-zero next_payment_due_date', envelope({ idempotencyKey: 'k1', input: { ...input, next_payment_due_date: '0000-06-15' } }), 'k1'],
+  ])('Round 15: never removes a stored record with %s, even when released with its exact key', async (_label, corrupt, key) => {
+    localStorage.setItem(SLOT, corrupt);
+    await releasePendingManualLoanCreation('user-a', key, new FakeLockManager());
     expect(localStorage.getItem(SLOT)).toBe(corrupt);
   });
 

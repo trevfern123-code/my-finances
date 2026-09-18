@@ -139,3 +139,30 @@ describe('parseManualLoanInput (Round 14) — runtime check of an UNTRUSTED stor
     expect(parseManualLoanInput({ ...complete, user_id: 'someone-else' })).toBeNull();
   });
 });
+
+describe('Round 15: dates PostgreSQL can accept — year zero is rejected in both date fields', () => {
+  const base: ManualLoanInput = { ...valid, name: 'Dated Loan' };
+  const dateFields = ['origination_date', 'next_payment_due_date'] as const;
+
+  it.each(dateFields)('validateManualLoanInput rejects year zero in %s', (field) => {
+    expect(validateManualLoanInput({ ...base, [field]: '0000-01-01' })).not.toBeNull();
+    expect(validateManualLoanInput({ ...base, [field]: '0000-02-29' })).not.toBeNull();
+  });
+
+  it.each(dateFields)('parseManualLoanInput rejects year zero in %s', (field) => {
+    expect(parseManualLoanInput({ ...base, [field]: '0000-01-01' })).toBeNull();
+  });
+
+  it.each(dateFields)('year 0001 and a real leap day stay valid in %s, and round-trip exactly', (field) => {
+    for (const date of ['0001-01-01', '2024-02-29']) {
+      expect(validateManualLoanInput({ ...base, [field]: date })).toBeNull();
+      expect(parseManualLoanInput({ ...base, [field]: date })).toEqual({ ...base, [field]: date });
+    }
+  });
+
+  it.each(dateFields)('impossible dates remain invalid in %s', (field) => {
+    for (const date of ['2023-02-29', '2024-13-01', '2024-04-31', '2024-00-10']) {
+      expect(validateManualLoanInput({ ...base, [field]: date })).not.toBeNull();
+    }
+  });
+});
