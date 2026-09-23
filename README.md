@@ -561,9 +561,14 @@ extracted, since which props each card needs only exists as live app state in `A
 ## Flow
 
 1. User signs in via Supabase Auth in the frontend.
-2. When the user clicks **Link a bank account**, the frontend calls `POST /api/plaid/link-token` (with the user's Supabase JWT). The backend records a one-time, 30-minute **Link attempt** bound to the verified user *and* their login session (the JWT's `session_id` claim; table `plaid_link_attempts`, service-role only) and returns a Plaid `link_token` plus the `link_attempt_id`.
-3. Frontend opens Plaid Link with that token; on success Plaid returns a `public_token`.
-4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token` and `link_attempt_id`. Before anything reaches Plaid, the backend atomically consumes the attempt (`consume_plaid_link_attempt`): a different user, the same user in a newer login, a replay (409 `link_attempt_invalid`), an expired attempt (410 `link_attempt_expired`) or a missing id (400 `link_attempt_required`) is refused and nothing is stored. The owner is always the verified bearer token's user, never anything in the body. **Limitation:** the attempt proves the caller recently started *a* Link flow, not that this `public_token` came from it — see "Wave 1 follow-ups" below. Then it exchanges the token for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
+2. When the user clicks **Link a bank account**, the frontend opens a new tab and calls `POST /api/plaid/link-token` (with the user's Supabase JWT). The backend creates a Plaid **Hosted Link** token (`hosted_link` with a 30-minute `url_lifetime_seconds` and `completion_redirect_uri` = `${FRONTEND_URL}/plaid-link-complete.html`). It stores that link token server-side, encrypted under the Plaid token key ring and bound to the attempt, in a one-time, 30-minute **Link attempt**. The attempt is tied to the verified user *and* their login session (the JWT's `session_id` claim; table `plaid_link_attempts`, service-role only). The response is only `hosted_link_url`, `link_attempt_id` and `expires_at`; the link token never leaves the backend.
+3. The new tab goes to the Hosted Link URL and the user links their bank on Plaid's own page. When it ends, Plaid sends that tab to `plaid-link-complete.html`, which tells the app tab to check now and tries to close itself.
+4. The app tab calls `POST /api/plaid/link-attempts/:link_attempt_id/complete` (every 4 s, on returning to the tab, and when the completion page signals). Only the attempt's own user in its own login session gets anything; anyone else gets 409 `link_attempt_invalid`. The backend reads its stored link token and asks Plaid (`/link/token/get`) for that token's own session result:
+   - Still in progress: 202 `pending`.
+   - Exited: 409 `link_attempt_exited`. More than one result: 409 `link_attempt_ambiguous`. Expired: 410 `link_attempt_expired`.
+   - Exactly one public token: the attempt is atomically claimed, then exchanged, stored in Supabase (`plaid_items`, `accounts`) and marked completed. A duplicate or concurrent call gets 202 `completing`; a replay gets 409 `link_attempt_already_completed`.
+
+   No endpoint accepts a public token from a client: the retired `POST /api/plaid/exchange-public-token` always answers 410 `exchange_retired`. A verified `SESSION_FINISHED` webhook only records readiness; it never exchanges. The access token never leaves the backend.
 5. Frontend calls `GET /api/plaid/items` to display the user's linked institutions/accounts.
 
 **Every mutation is bound to the session that started it.** Each frontend change request (every
@@ -572,8 +577,8 @@ the user's action starts (`lib/sessionOwnership.ts`, `App.tsx`'s `captureOwnersh
 user *and* the same Supabase login (`session_id`), still current. `authedFetch` refuses to send a
 mutation without one, and refuses — sending nothing — if a sign-out/sign-in (as anyone, including
 the same user again) happened while the action waited. Multi-step flows (Plaid Link, reconnect)
-also stop between steps, and `PlaidLink` is keyed by login so a sign-in change destroys an open
-Link. `lib/sessionOwnership.test.ts` exercises every mutation export this way.
+also stop between steps, and `PlaidLink` is keyed by login so a sign-in change abandons a pending
+Hosted Link attempt. `lib/sessionOwnership.test.ts` exercises every mutation export this way.
 
 **No direct client access to `plaid_items`.** The browser's Supabase client is used for Auth only.
 `supabase/migrations/20260922120000_restrict_plaid_items_client_access.sql` revokes every
@@ -584,44 +589,34 @@ straight from Supabase's REST API. The backend's service-role access is unchange
 Supabase's PostgreSQL 17 image and queries as `anon`/`authenticated`/`service_role` exactly as
 PostgREST would; `EXCLUDE=<migration file>` shows the tests failing without it).
 
-## Wave 1 follow-ups (open)
+## Wave 1 follow-ups
 
-**P1 — public-token binding (unresolved, blocks deploy; needs a product decision).** A Link attempt
-proves the caller is the same user and login that recently asked for a link token. It does not prove
-the submitted `public_token` came from that link token's flow, so user B could exchange a public
-token captured from user A using B's own fresh attempt, pulling A's bank data into B's account.
-Plaid, per its current docs (checked 2026-09-22):
-- Embedded Link (what `react-plaid-link` uses) returns the public token to the browser.
-- `/item/public_token/exchange` returns only `access_token`, `item_id` and `request_id`. The Item
-  object carries no link token, Link session or `client_user_id`. Nothing server-side ties a public
-  token to its link token after the fact.
-- `/link/token/get` does return each session's public tokens (`link_sessions[].results
-  .item_add_results[].public_token`, kept six hours). But by default Plaid returns complete session
-  data only for Hosted Link; other flows need Plaid to enable "Link events" on the account.
+**P1 — public-token binding: resolved with Plaid Hosted Link.** A Link attempt on its own only proved
+the caller had recently started *a* Link flow. With embedded Link the browser held the public token,
+so user B could exchange a public token captured from user A using B's own fresh attempt.
+(Embedded Link offers no default server-side way to tie a public token to its link token.
+`/link/token/get` returns full session results by default only for Hosted Link.)
 
-Viable options (none implemented):
-1. **Hosted Link.** Create the link token with `hosted_link` and store it server-side with the
-   attempt. The user completes Plaid's hosted page; the backend takes the public token from the
-   `SESSION_FINISHED` webhook or `/link/token/get` for that stored link token and exchanges it
-   itself. The browser never holds or submits a public token, which removes the attack. No account
-   enablement is needed. Costs: a UX change (Plaid page in a new tab or redirect instead of an
-   in-app modal), a completion redirect/poll, and reliance on the existing verified webhook
-   receiver.
-2. **Keep embedded Link and ask Plaid to enable Link events.** At exchange, call `/link/token/get`
-   with the attempt's stored link token. Exchange only if the submitted public token appears in that
-   token's own sessions; fail closed otherwise. This keeps today's UX but depends on a Plaid account
-   change, and must first be confirmed in Sandbox and Production to return embedded sessions' public
-   tokens.
-3. **Not viable:** correlating after the exchange (no Plaid field to correlate on, and it would
-   exchange first), or comparing client-sent `onSuccess` metadata such as `link_session_id`
-   (client-supplied, so it proves nothing).
+Now the backend creates and keeps the Hosted Link token and gets the public token from Plaid itself
+for that exact token. No endpoint accepts a public token from a client, so the attack has nowhere to
+be submitted. The attack is an active test in `backend/src/controllers/plaidController.test.ts`.
 
-The attack is recorded as a pending test in `backend/src/controllers/plaidController.test.ts`.
-Whichever option is chosen must make that test pass.
+**Manual configuration required before deploying (not done by this repository):**
+- **Plaid Dashboard:** allow the completion redirect URI
+  `https://my-finances-frontend-kappa.vercel.app/plaid-link-complete.html`, or whatever
+  `${FRONTEND_URL}/plaid-link-complete.html` (or `PLAID_HOSTED_LINK_COMPLETION_REDIRECT_URI`, if set)
+  resolves to. For local Sandbox testing, also `http://localhost:5173/plaid-link-complete.html`, if
+  the Dashboard accepts it.
+- **Supabase:** apply `20260922120000_restrict_plaid_items_client_access.sql`, then
+  `20260922130000_plaid_link_attempts.sql`, *before* deploying the backend.
+- **Railway:** no new required variables. `FRONTEND_URL` must be the exact frontend origin (it now
+  also forms the redirect URI). `BACKEND_PUBLIC_URL` should stay set so `SESSION_FINISHED` webhooks
+  arrive; they are optional, since completion always asks Plaid directly.
 
 **Other follow-ups (deliberately out of scope for the Wave 1 corrective pass):**
 - Reconnect button stays stuck on "Reconnecting..." if Plaid Update Mode is closed without
-  finishing (`frontend/src/components/ReconnectButton.tsx`, pre-existing).
+  finishing (`frontend/src/components/ReconnectButton.tsx`, pre-existing). Update Mode stays embedded
+  Link: it produces no public token.
 - Supabase's default privileges still grant every new `public` table/function to
   `anon`/`authenticated` (`20260825195130_remote_schema.sql`), so each new object must revoke
   explicitly. Changing the defaults is a separate, project-wide migration.
@@ -666,7 +661,7 @@ create policy "Users can only see their own net_worth_snapshots"
   using (auth.uid() = user_id);
 ```
 
-One row per `(user_id, date)`, upserted (`services/dataService.ts`'s `upsertNetWorthSnapshot`, `onConflict: 'user_id,date'`) whenever balances are actually refreshed from Plaid — initial link (`exchangePublicToken`) and manual "Refresh balances" (`refreshAccounts`) — since that's the only time `accounts.current_balance` changes. There's no scheduled/cron snapshot yet, so a user who never clicks refresh won't accumulate history; that's a reasonable follow-up if daily granularity independent of user activity turns out to matter.
+One row per `(user_id, date)`, upserted (`services/dataService.ts`'s `upsertNetWorthSnapshot`, `onConflict: 'user_id,date'`) whenever balances are actually refreshed from Plaid — initial link (`completeLinkAttempt`) and manual "Refresh balances" (`refreshAccounts`) — since that's the only time `accounts.current_balance` changes. There's no scheduled/cron snapshot yet, so a user who never clicks refresh won't accumulate history; that's a reasonable follow-up if daily granularity independent of user activity turns out to matter.
 
 The asset/liability split (`services/netWorth.ts`'s `aggregateAssetsAndLiabilities`) is the same logic `getSpendingSummary` already used — extracted into its own pure, tested module and reused by both, rather than duplicated.
 

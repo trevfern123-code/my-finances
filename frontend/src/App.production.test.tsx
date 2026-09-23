@@ -989,7 +989,7 @@ describe('16. ordinary background loading no longer sends an already-ready lifec
     expect(screen.queryByText('Refreshing…')).toBeNull();
 
     // Held open so `loading` reliably stays true for this assertion regardless of exactly how many
-    // microtask hops PlaidLink's own onSuccess (which awaits exchangePublicToken before calling
+    // microtask hops PlaidLink's completion check (which awaits completeLinkAttempt before calling
     // onLinked) takes to actually reach refreshFinancialData's setLoading(true).
     const pendingItems = deferred<{ items: unknown[]; is_sandbox: boolean }>();
     mockGetLinkedItems.mockReturnValueOnce(pendingItems.promise);
