@@ -240,7 +240,16 @@ export function exchangePublicToken(_req: Request, res: Response) {
   });
 }
 
-type AttemptRefusal = 'invalid' | 'expired' | 'completed' | 'failed' | 'ambiguous' | 'exited' | 'exchange_unknown';
+/**
+ * exchange_unknown: Plaid may have created the Item even though its access token was never stored
+ * here, so the connection may exist at Plaid. Deliberately does NOT say it was not added, and does
+ * NOT invite linking again — relinking before the uncertain Item is checked could create a
+ * duplicate Item (and duplicate billing). It asks the user to wait and contact support instead.
+ */
+export const LINK_OUTCOME_UNKNOWN_MESSAGE =
+  "We couldn't confirm whether this bank connection was completed. Please don't try linking this bank again yet — contact support so the connection can be checked first.";
+
+type AttemptRefusal ='invalid' | 'expired' | 'completed' | 'failed' | 'ambiguous' | 'exited' | 'exchange_unknown';
 
 /** The fixed, non-sensitive refusal for each way an attempt cannot be completed. */
 function attemptRefusal(res: Response, outcome: AttemptRefusal) {
@@ -273,10 +282,7 @@ function attemptRefusal(res: Response, outcome: AttemptRefusal) {
       res.status(409).json({ error: 'This bank link did not finish. Start linking the account again.', code: 'link_attempt_failed' });
       return;
     case 'exchange_unknown':
-      res.status(409).json({
-        error: "We couldn't confirm this bank connection, so it was not added. Start linking the account again.",
-        code: 'link_attempt_outcome_unknown',
-      });
+      res.status(409).json({ error: LINK_OUTCOME_UNKNOWN_MESSAGE, code: 'link_attempt_outcome_unknown' });
       return;
   }
 }

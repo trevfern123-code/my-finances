@@ -3778,19 +3778,37 @@ describe('Wave 1 Hosted Link recovery outcomes, as the user sees them', () => {
     expect(screen.queryByText(/Some details are still loading/)).toBeNull();
   });
 
-  it("an unknown exchange outcome is final: it says the bank was not added, stops checking, and doesn't claim success", async () => {
+  it('an unknown exchange outcome is final: it shows the server\'s guidance (unconfirmed, don\'t relink yet, contact support), never polls again or starts another attempt, and claims neither success nor absence', async () => {
+    // The backend's LINK_OUTCOME_UNKNOWN_MESSAGE, verbatim.
+    const guidance =
+      "We couldn't confirm whether this bank connection was completed. Please don't try linking this bank again yet — contact support so the connection can be checked first.";
     await bootAndOpen();
     const before = mockGetLinkedItems.mock.calls.length;
-    mockCompleteLinkAttempt.mockRejectedValueOnce(
-      Object.assign(new Error("We couldn't confirm this bank connection, so it was not added. Start linking the account again."), {
-        code: 'link_attempt_outcome_unknown',
-      })
-    );
+    mockCompleteLinkAttempt.mockRejectedValueOnce(Object.assign(new Error(guidance), { code: 'link_attempt_outcome_unknown' }));
     await pollNow();
-    await waitFor(() => expect(screen.getByText(/so it was not added/)).toBeTruthy());
-    const calls = mockCompleteLinkAttempt.mock.calls.length;
+    await waitFor(() => expect(screen.getByText(guidance)).toBeTruthy());
+
+    // Final: the waiting state is gone, and no trigger — focus, the completion page's broadcast,
+    // or time passing — ever asks about this attempt again or starts a new one on its own.
+    expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull();
+    const completeCalls = mockCompleteLinkAttempt.mock.calls.length;
     await pollNow();
-    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(calls);
+    await act(async () => {
+      const channel = new BroadcastChannel('my-finances-plaid-link');
+      channel.postMessage('finished');
+      channel.close();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(completeCalls);
+    expect(mockCreateHostedLinkAttempt).toHaveBeenCalledTimes(1);
+    expect(openedTabs).toHaveLength(1);
+    // Neither success (no data refresh, no success hint) nor a claim that nothing was added.
     expect(mockGetLinkedItems.mock.calls.length).toBe(before);
+    expect(screen.queryByText(/Some details are still loading/)).toBeNull();
+    const shown = screen.getByText(guidance).textContent ?? '';
+    expect(shown).not.toMatch(/was not added|wasn't added|not linked|start linking|try again/i);
+    expect(shown).toMatch(/don't try linking this bank again yet/i);
+    expect(shown).toMatch(/contact support/i);
   });
 });

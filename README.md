@@ -568,7 +568,7 @@ extracted, since which props each card needs only exists as live app state in `A
    - Exited: 409 `link_attempt_exited`. More than one result: 409 `link_attempt_ambiguous`. Expired: 410 `link_attempt_expired`.
    - Exactly one public token: the attempt is atomically **claimed** (with a claim token), then durably marked **exchanging**, and only then exchanged — once. The new item and its encrypted access token are stored **immediately**, in the same database transaction that marks the attempt **completed** (`store_plaid_link_item`), before any other Plaid call. A duplicate or concurrent call gets 202 `completing`; a replay gets 409 `link_attempt_already_completed`.
    - After that the bank is linked. Institution, accounts, initial sync, the net-worth snapshot and liabilities are follow-ups: if any fails, the response still says `completed` and lists it in `follow_up_incomplete`. **Refresh balances** retries accounts, institution, snapshot and liabilities; **Sync transactions** (or the webhook) retries the sync.
-   - Failures: a Plaid-rejected exchange ends `failed`. An exchange whose outcome is unknown (network error, 30 s timeout, 5xx) ends `exchange_unknown`, 409 `link_attempt_outcome_unknown` — never re-exchanged, since Plaid does not document that as safe. If the item cannot be stored and the database definitively stored nothing, the item is removed at Plaid (`/item/remove`): `failed` if Plaid confirms the removal, `exchange_unknown` if not. If whether it was stored is itself unknown, nothing is removed.
+   - Failures: a Plaid-rejected exchange ends `failed`. An exchange whose outcome is unknown (network error, 30 s timeout, 5xx) ends `exchange_unknown`, 409 `link_attempt_outcome_unknown` — never re-exchanged, since Plaid does not document that as safe. The user is told the outcome could not be confirmed and asked **not to link that bank again yet but to contact support**: Plaid may already have created the Item, so relinking before it is checked could duplicate it (and its billing). If the item cannot be stored and the database definitively stored nothing, the item is removed at Plaid (`/item/remove`): `failed` if Plaid confirms the removal, `exchange_unknown` if not. If whether it was stored is itself unknown, nothing is removed.
    - Recovery (two minutes): an abandoned claim whose exchange never began is safely re-claimed. An abandoned `exchanging` attempt becomes `exchange_unknown`.
    - Limit: at most five live attempts per user, counting pending, claimed and exchanging ones. Only pending ones are removed to make room; with five being completed, creation answers 429.
 
@@ -617,7 +617,7 @@ be submitted. The attack is an active test in `backend/src/controllers/plaidCont
   also forms the redirect URI). `BACKEND_PUBLIC_URL` should stay set so `SESSION_FINISHED` webhooks
   arrive; they are optional, since completion always asks Plaid directly.
 
-**Residual, unavoidable with Plaid's API: orphaned Items.** An attempt that ends `exchange_unknown`
+**Residual, unavoidable with Plaid's API: orphaned Items — `exchange_unknown` requires investigation before relinking.** An attempt that ends `exchange_unknown`
 may have left an Item at Plaid whose access token this app never stored (the exchange succeeded but
 the answer was lost, or it could not be stored and its removal was not confirmed). Without that
 access token nothing can call `/item/remove` for it. Plaid documents neither exchange replay nor
@@ -625,6 +625,11 @@ access token nothing can call `/item/remove` for it. Plaid documents neither exc
 subscription billing (Transactions, Liabilities) running until Plaid support removes it. Monitor it with
 `select failure_reason, count(*) from plaid_link_attempts where status = 'exchange_unknown' group by 1;`
 before rows are swept, an hour after expiry.
+
+When a user reports this message, before they link that bank again:
+1. Note when it happened: `select id, created_at, failure_reason from plaid_link_attempts where user_id = '<user>' and status = 'exchange_unknown';`. The row is swept about 90 minutes after it was created, so run this promptly; otherwise use the time the user reports.
+2. Using the Plaid Dashboard's logs, or Plaid support, check for an Item created around then for that institution. The Link token was created with `client_user_id` = the user's id.
+3. If such an Item exists, ask Plaid support to remove it (this app holds no access token for it). Only then tell the user it is safe to link again.
 
 **Other follow-ups (deliberately out of scope for the Wave 1 corrective pass):**
 - Reconnect button stays stuck on "Reconnecting..." if Plaid Update Mode is closed without

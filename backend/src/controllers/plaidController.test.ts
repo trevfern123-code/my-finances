@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response, NextFunction } from 'express';
-import { completeLinkAttempt, completeReauth, createLinkToken, exchangePublicToken, refreshAccounts } from './plaidController';
+import {
+  completeLinkAttempt,
+  completeReauth,
+  createLinkToken,
+  exchangePublicToken,
+  LINK_OUTCOME_UNKNOWN_MESSAGE,
+  refreshAccounts,
+} from './plaidController';
 import { UnknownKeyIdError, PlaidCredentialError } from '../services/tokenEncryption';
 
 const mockGetPlaidItemForUser = vi.hoisted(() => vi.fn());
@@ -825,5 +832,71 @@ describe('refreshAccounts — retries the institution follow-up for items still 
     await refreshAccounts(authedReq(userA), res, next);
     expect(res.json).toHaveBeenCalled();
     expect(mockGetItemInstitution).not.toHaveBeenCalled();
+  });
+});
+
+describe('exchange_unknown guidance: the Item may exist at Plaid, so never say it was not added or invite relinking', () => {
+  function expectCalmUnknownGuidance(res: Response) {
+    expect(res.status).toHaveBeenCalledWith(409);
+    const body = jsonBody(res);
+    expect(body).toEqual({ code: 'link_attempt_outcome_unknown', error: LINK_OUTCOME_UNKNOWN_MESSAGE });
+    const message: string = body.error;
+    // States that the outcome could not be confirmed, and asks for support before any retry.
+    expect(message).toMatch(/couldn't confirm/i);
+    expect(message).toMatch(/don't try linking this bank again yet/i);
+    expect(message).toMatch(/contact support/i);
+    // Never claims the connection is definitely absent...
+    expect(message).not.toMatch(/was not added|wasn't added|not linked|was not connected|nothing was (added|linked)|no (bank|connection) was/i);
+    // ...and never advises linking again now.
+    expect(message).not.toMatch(/start linking|link (it|the account|this bank|your bank) again(?! yet)|try again|please retry|start again/i);
+    // No Plaid token of any kind in the response.
+    const serialized = JSON.stringify(body);
+    for (const secret of [PUBLIC_TOKEN, ACCESS_TOKEN, 'link-sandbox-']) expect(serialized).not.toContain(secret);
+  }
+
+  async function expectTerminal(attemptId: string) {
+    const exchangesBefore = mockExchangePublicToken.mock.calls.length;
+    for (let i = 0; i < 3; i++) {
+      clock += 5 * 60 * 1000;
+      expectCalmUnknownGuidance(await complete(userA, attemptId));
+    }
+    expect(attempts.get(attemptId)!.status).toBe('exchange_unknown');
+    expect(mockExchangePublicToken.mock.calls.length).toBe(exchangesBefore);
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+    expect(mockStorePlaidLinkItem.mock.calls.length).toBeLessThanOrEqual(1);
+    expectNoSecretsLogged();
+  }
+
+  it.each([
+    ['a network error / timeout', Object.assign(new Error('timeout of 30000ms exceeded'), { code: 'ECONNABORTED', config: { data: JSON.stringify({ public_token: PUBLIC_TOKEN }) } })],
+    ['a Plaid 5xx', plaidApiError(500, 'INTERNAL_SERVER_ERROR')],
+  ])('exchange outcome unknown after %s', async (_label, err) => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockExchangePublicToken.mockRejectedValueOnce(err);
+    expectCalmUnknownGuidance(await complete(userA, attemptId));
+    await expectTerminal(attemptId);
+  });
+
+  it('a stale exchange whose process died mid-exchange', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockExchangePublicToken.mockImplementationOnce(never);
+    completeAndDie(userA, attemptId);
+    await flush();
+    clock += 3 * 60 * 1000;
+    expectCalmUnknownGuidance(await complete(userA, attemptId));
+    await expectTerminal(attemptId);
+  });
+
+  it('the item could not be stored and its removal at Plaid could not be confirmed', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockStorePlaidLinkItem.mockResolvedValueOnce({ outcome: 'rejected' });
+    mockRemoveItem.mockRejectedValueOnce(Object.assign(new Error('socket hang up'), { config: { data: JSON.stringify({ access_token: ACCESS_TOKEN }) } }));
+    expectCalmUnknownGuidance(await complete(userA, attemptId));
+    expect(mockRemoveItem).toHaveBeenCalledTimes(1);
+    await expectTerminal(attemptId);
+    expect(mockRemoveItem).toHaveBeenCalledTimes(1); // no repeated compensation either
   });
 });
