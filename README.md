@@ -566,6 +566,15 @@ extracted, since which props each card needs only exists as live app state in `A
 4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token`. The backend exchanges it for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
 5. Frontend calls `GET /api/plaid/items` to display the user's linked institutions/accounts.
 
+**No direct client access to `plaid_items`.** The browser's Supabase client is used for Auth only.
+`supabase/migrations/20260922120000_restrict_plaid_items_client_access.sql` revokes every
+anon/authenticated privilege on `plaid_items` (table and column level) and drops the old
+owner-select policy, which had let a signed-in user read their own stored Plaid credentials
+straight from Supabase's REST API. The backend's service-role access is unchanged. Proof:
+`bash supabase/tests/access_control/run.sh` (Docker; applies the real migration history to
+Supabase's PostgreSQL 17 image and queries as `anon`/`authenticated`/`service_role` exactly as
+PostgREST would; `EXCLUDE=<migration file>` shows the tests failing without it).
+
 ## Budget periods
 
 `GET /api/budget-categories` now returns a `spent` figure per category, computed server-side (`budgetCategoryController.ts` + `services/budgetPeriod.ts`) as the sum of that category's positive-amount transactions dated within the current calendar month (UTC) — previously this was computed client-side in `BudgetCategories.tsx` from whatever transactions happened to already be loaded in the feed, which wasn't scoped to a calendar month at all and silently included spend from every month in the loaded window as one running total.

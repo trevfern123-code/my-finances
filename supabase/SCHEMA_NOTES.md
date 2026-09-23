@@ -26,6 +26,11 @@ could have revealed, and surfaced one genuine finding worth flagging:
   and re-adding the constraint as `unique (user_id, name)`, a live schema change on production
   data that deserves its own reviewed migration, not a drive-by fix while reconciling docs).
   Worth deciding on deliberately before a second real user ever signs up.
+- **Superseded for `plaid_items` (2026-09-22, Wave 1)**: `20260922120000_restrict_plaid_items_client_access.sql`
+  revokes every anon/authenticated/PUBLIC privilege on `plaid_items` and drops its owner-select
+  policy — that policy let a signed-in user read their own Plaid credential columns (plaintext
+  `access_token` included) directly through Supabase's REST API. Only the backend's service role
+  can touch the table now. Verified by `supabase/tests/access_control/run.sh`.
 - Every Phase-1 table's RLS status is now confirmed rather than guessed: `plaid_items`,
   `budget_categories`, `manual_loans`, and `manual_loan_payments` all have RLS enabled *and* an
   explicit `auth.uid() = user_id` select policy. `accounts` has RLS enabled with **no** policy —
