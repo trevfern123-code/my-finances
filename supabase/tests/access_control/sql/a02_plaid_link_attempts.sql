@@ -9,6 +9,16 @@ select th.assert(not exists (select 1 from information_schema.role_table_grants
                              where table_schema = 'public' and table_name = 'plaid_link_attempts'
                                and grantee in ('PUBLIC', 'anon', 'authenticated')),
   'plaid_link_attempts: no grant to PUBLIC/anon/authenticated');
+-- has_table_privilege, not information_schema, so PostgreSQL 17's MAINTAIN is covered too.
+select th.assert(not exists (
+  select 1 from (values ('public'), ('anon'), ('authenticated')) r(role)
+  cross join (values ('select'), ('insert'), ('update'), ('delete'), ('truncate'), ('references'), ('trigger'), ('maintain')) p(priv)
+  where has_table_privilege(r.role, 'public.plaid_link_attempts', p.priv)),
+  'plaid_link_attempts: no privilege of any kind, MAINTAIN included, for PUBLIC/anon/authenticated');
+select th.assert((select array_agg(p.priv order by p.priv)
+                  from (values ('select'), ('insert'), ('update'), ('delete'), ('truncate'), ('references'), ('trigger'), ('maintain')) p(priv)
+                  where has_table_privilege('service_role', 'public.plaid_link_attempts', p.priv)) = array['delete', 'insert', 'select'],
+  'plaid_link_attempts: service_role holds exactly SELECT, INSERT, DELETE — no UPDATE/TRUNCATE/REFERENCES/TRIGGER/MAINTAIN');
 select th.assert((select relrowsecurity from pg_class where oid = 'public.plaid_link_attempts'::regclass),
   'plaid_link_attempts: row level security enabled');
 select th.assert(not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'plaid_link_attempts'),

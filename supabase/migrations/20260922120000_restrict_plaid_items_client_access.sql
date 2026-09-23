@@ -52,7 +52,7 @@ declare
   v_col  record;
 begin
   foreach v_role in array array['public', 'anon', 'authenticated'] loop
-    foreach v_priv in array array['select', 'insert', 'update', 'delete', 'truncate', 'references', 'trigger'] loop
+    foreach v_priv in array array['select', 'insert', 'update', 'delete', 'truncate', 'references', 'trigger', 'maintain'] loop
       if has_table_privilege(v_role, 'public.plaid_items', v_priv) then
         raise exception 'plaid_items lockdown failed: % still has % on public.plaid_items', v_role, v_priv;
       end if;

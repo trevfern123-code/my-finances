@@ -4,7 +4,7 @@
 -- ---- Catalog state ------------------------------------------------------------------------------
 select th.assert(not exists (
   select 1 from (values ('public'), ('anon'), ('authenticated')) r(role)
-  cross join (values ('select'), ('insert'), ('update'), ('delete'), ('truncate'), ('references'), ('trigger')) p(priv)
+  cross join (values ('select'), ('insert'), ('update'), ('delete'), ('truncate'), ('references'), ('trigger'), ('maintain')) p(priv)
   where has_table_privilege(r.role, 'public.plaid_items', p.priv)),
   'no table privilege on plaid_items for PUBLIC/anon/authenticated');
 
