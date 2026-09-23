@@ -24,14 +24,14 @@ select th.assert((select relrowsecurity from pg_class where oid = 'public.plaid_
 select th.assert(not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'plaid_link_attempts'),
   'plaid_link_attempts: no policies');
 select th.assert((select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-                  where n.nspname = 'public' and p.proname in ('create_plaid_link_attempt', 'consume_plaid_link_attempt')
+                  where n.nspname = 'public' and p.proname in ('create_plaid_link_attempt', 'consume_plaid_link_attempt', 'purge_expired_plaid_link_attempts')
                     and not p.prosecdef
                     and p.proconfig = array['search_path=""']
                     and not has_function_privilege('public', p.oid, 'execute')
                     and not has_function_privilege('anon', p.oid, 'execute')
                     and not has_function_privilege('authenticated', p.oid, 'execute')
-                    and has_function_privilege('service_role', p.oid, 'execute')) = 2,
-  'both functions: security invoker, search_path pinned empty, executable by service_role only');
+                    and has_function_privilege('service_role', p.oid, 'execute')) = 3,
+  'all three functions: security invoker, search_path pinned empty, executable by service_role only');
 
 -- ---- Clients are refused at runtime -------------------------------------------------------------
 begin;
@@ -40,6 +40,7 @@ set local request.jwt.claims = '{"sub":"00000000-0000-0000-0000-0000000000aa","r
 set local request.jwt.claim.sub = '00000000-0000-0000-0000-0000000000aa';
 select th.expect_error($q$ select public.create_plaid_link_attempt(auth.uid(), 'sid-a') $q$, '%permission denied for function%');
 select th.expect_error($q$ select public.consume_plaid_link_attempt(gen_random_uuid(), auth.uid(), 'sid-a') $q$, '%permission denied for function%');
+select th.expect_error($q$ select public.purge_expired_plaid_link_attempts(100) $q$, '%permission denied for function%');
 select th.expect_error($q$ select * from public.plaid_link_attempts $q$, '%permission denied for table%');
 select th.expect_error($q$ insert into public.plaid_link_attempts (user_id, session_id, expires_at) values (auth.uid(), 's', now() + interval '1 hour') $q$, '%permission denied for table%');
 rollback;
@@ -86,11 +87,11 @@ select th.assert(public.consume_plaid_link_attempt('00000000-0000-0000-0000-0000
 select th.assert(public.consume_plaid_link_attempt('00000000-0000-0000-0000-00000000e001', '00000000-0000-0000-0000-0000000000aa', 'sid-a') = 'invalid',
   'expired attempt cannot be retried');
 
--- Bounded: creating removes the user's expired attempts and keeps at most five live ones; another
--- user's attempts are never touched.
+-- Bounded per user: creating keeps the user's four newest LIVE attempts plus the new one — never
+-- more than five live — and the sweep in the same call removes the expired one.
+delete from public.plaid_link_attempts;
 insert into public.plaid_link_attempts (id, user_id, session_id, created_at, expires_at) values
-  ('00000000-0000-0000-0000-00000000e002', '00000000-0000-0000-0000-0000000000aa', 'sid-a', now() - interval '1 hour', now() - interval '30 minutes'),
-  ('00000000-0000-0000-0000-00000000e003', '00000000-0000-0000-0000-0000000000bb', 'sid-b', now() - interval '1 hour', now() - interval '30 minutes');
+  ('00000000-0000-0000-0000-00000000e002', '00000000-0000-0000-0000-0000000000aa', 'sid-a', now() - interval '1 hour', now() - interval '30 minutes');
 insert into public.plaid_link_attempts (user_id, session_id, created_at, expires_at)
   select '00000000-0000-0000-0000-0000000000aa', 'sid-a', now() - make_interval(secs => g), now() + interval '10 minutes'
   from generate_series(1, 6) g;
@@ -98,9 +99,29 @@ select public.create_plaid_link_attempt('00000000-0000-0000-0000-0000000000aa', 
 select th.assert(not exists (select 1 from public.plaid_link_attempts where id = '00000000-0000-0000-0000-00000000e002'),
   'creating removed the user''s expired attempt');
 select th.assert((select count(*) from public.plaid_link_attempts where user_id = '00000000-0000-0000-0000-0000000000aa') = 5,
-  'at most five live attempts per user');
-select th.assert(exists (select 1 from public.plaid_link_attempts where id = '00000000-0000-0000-0000-00000000e003'),
-  'another user''s rows are untouched');
+  'at most five live attempts per user, and no expired leftovers');
+
+-- Global, bounded sweep: ANY user's create or consume removes up to 100 of ANYONE's expired
+-- attempts, oldest first, and never a live one.
+delete from public.plaid_link_attempts;
+insert into public.plaid_link_attempts (user_id, session_id, created_at, expires_at)
+  select '00000000-0000-0000-0000-0000000000bb', 'sid-b', now() - interval '2 hours', now() - interval '1 hour' - make_interval(secs => g)
+  from generate_series(1, 150) g;
+insert into public.plaid_link_attempts (id, user_id, session_id, expires_at) values
+  ('00000000-0000-0000-0000-00000000f001', '00000000-0000-0000-0000-0000000000bb', 'sid-b', now() + interval '10 minutes');
+select public.create_plaid_link_attempt('00000000-0000-0000-0000-0000000000aa', 'sid-a');
+select th.assert((select count(*) from public.plaid_link_attempts where user_id = '00000000-0000-0000-0000-0000000000bb' and expires_at <= now()) = 50,
+  'user aa''s create swept 100 of user bb''s expired attempts (bounded batch)');
+select th.assert(exists (select 1 from public.plaid_link_attempts where id = '00000000-0000-0000-0000-00000000f001'),
+  'the sweep never touches a live attempt');
+select th.assert(public.consume_plaid_link_attempt(gen_random_uuid(), '00000000-0000-0000-0000-0000000000aa', 'sid-a') = 'invalid',
+  'a consume (even an invalid one) also sweeps');
+select th.assert(not exists (select 1 from public.plaid_link_attempts where expires_at <= now()),
+  'the consume swept the remaining 50');
+select th.assert(public.purge_expired_plaid_link_attempts(100) = 0, 'nothing left to purge');
+select th.expect_error($q$ select public.purge_expired_plaid_link_attempts(0) $q$, '%p_limit must be between 1 and 1000%');
+select th.expect_error($q$ select public.purge_expired_plaid_link_attempts(1001) $q$, '%p_limit must be between 1 and 1000%');
+select th.expect_error($q$ select public.purge_expired_plaid_link_attempts(null) $q$, '%p_limit must be between 1 and 1000%');
 
 -- A user and a login session are required.
 select th.expect_error($q$ select public.create_plaid_link_attempt('00000000-0000-0000-0000-0000000000aa', ' ') $q$, '%a user and a login session are required%');
