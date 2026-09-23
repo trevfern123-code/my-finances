@@ -566,7 +566,11 @@ extracted, since which props each card needs only exists as live app state in `A
 4. The app tab calls `POST /api/plaid/link-attempts/:link_attempt_id/complete` (every 4 s, on returning to the tab, and when the completion page signals). Only the attempt's own user in its own login session gets anything; anyone else gets 409 `link_attempt_invalid`. The backend reads its stored link token and asks Plaid (`/link/token/get`) for that token's own session result:
    - Still in progress: 202 `pending`.
    - Exited: 409 `link_attempt_exited`. More than one result: 409 `link_attempt_ambiguous`. Expired: 410 `link_attempt_expired`.
-   - Exactly one public token: the attempt is atomically claimed, then exchanged, stored in Supabase (`plaid_items`, `accounts`) and marked completed. A duplicate or concurrent call gets 202 `completing`; a replay gets 409 `link_attempt_already_completed`.
+   - Exactly one public token: the attempt is atomically **claimed** (with a claim token), then durably marked **exchanging**, and only then exchanged — once. The new item and its encrypted access token are stored **immediately**, in the same database transaction that marks the attempt **completed** (`store_plaid_link_item`), before any other Plaid call. A duplicate or concurrent call gets 202 `completing`; a replay gets 409 `link_attempt_already_completed`.
+   - After that the bank is linked. Institution, accounts, initial sync, the net-worth snapshot and liabilities are follow-ups: if any fails, the response still says `completed` and lists it in `follow_up_incomplete`. **Refresh balances** retries accounts, institution, snapshot and liabilities; **Sync transactions** (or the webhook) retries the sync.
+   - Failures: a Plaid-rejected exchange ends `failed`. An exchange whose outcome is unknown (network error, 30 s timeout, 5xx) ends `exchange_unknown`, 409 `link_attempt_outcome_unknown` — never re-exchanged, since Plaid does not document that as safe. If the item cannot be stored and the database definitively stored nothing, the item is removed at Plaid (`/item/remove`): `failed` if Plaid confirms the removal, `exchange_unknown` if not. If whether it was stored is itself unknown, nothing is removed.
+   - Recovery (two minutes): an abandoned claim whose exchange never began is safely re-claimed. An abandoned `exchanging` attempt becomes `exchange_unknown`.
+   - Limit: at most five live attempts per user, counting pending, claimed and exchanging ones. Only pending ones are removed to make room; with five being completed, creation answers 429.
 
    No endpoint accepts a public token from a client: the retired `POST /api/plaid/exchange-public-token` always answers 410 `exchange_retired`. A verified `SESSION_FINISHED` webhook only records readiness; it never exchanges. The access token never leaves the backend.
 5. Frontend calls `GET /api/plaid/items` to display the user's linked institutions/accounts.
@@ -612,6 +616,15 @@ be submitted. The attack is an active test in `backend/src/controllers/plaidCont
 - **Railway:** no new required variables. `FRONTEND_URL` must be the exact frontend origin (it now
   also forms the redirect URI). `BACKEND_PUBLIC_URL` should stay set so `SESSION_FINISHED` webhooks
   arrive; they are optional, since completion always asks Plaid directly.
+
+**Residual, unavoidable with Plaid's API: orphaned Items.** An attempt that ends `exchange_unknown`
+may have left an Item at Plaid whose access token this app never stored (the exchange succeeded but
+the answer was lost, or it could not be stored and its removal was not confirmed). Without that
+access token nothing can call `/item/remove` for it. Plaid documents neither exchange replay nor
+`/item/remove` idempotency, and has no API to list Items per `client_user_id`. Such an Item may keep
+subscription billing (Transactions, Liabilities) running until Plaid support removes it. Monitor it with
+`select failure_reason, count(*) from plaid_link_attempts where status = 'exchange_unknown' group by 1;`
+before rows are swept, an hour after expiry.
 
 **Other follow-ups (deliberately out of scope for the Wave 1 corrective pass):**
 - Reconnect button stays stuck on "Reconnecting..." if Plaid Update Mode is closed without

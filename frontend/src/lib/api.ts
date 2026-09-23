@@ -196,11 +196,14 @@ export function createHostedLinkAttempt(verifyOwnership: OwnershipCheck): Promis
  * mean "ask again shortly". Every refusal is a thrown error carrying the server's `code` (e.g.
  * link_attempt_expired, link_attempt_exited, link_attempt_invalid, link_attempt_already_completed).
  * No Plaid token is ever sent or received — this app has no way to submit a public token at all.
+ * On 'completed', `follow_up_incomplete` lists linking steps that did not finish (institution,
+ * accounts, transactions, net_worth_snapshot, liabilities): the bank IS linked, and Refresh balances
+ * / Sync transactions retry them.
  */
 export function completeLinkAttempt(
   linkAttemptId: string,
   verifyOwnership: OwnershipCheck
-): Promise<{ status: 'pending' | 'completing' | 'completed' }> {
+): Promise<{ status: 'pending' | 'completing' } | { status: 'completed'; follow_up_incomplete?: string[] }> {
   return authedFetch(
     `/api/plaid/link-attempts/${encodeURIComponent(linkAttemptId)}/complete`,
     { method: 'POST' },

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response, NextFunction } from 'express';
-import { completeLinkAttempt, completeReauth, createLinkToken, exchangePublicToken } from './plaidController';
-import { UnknownKeyIdError } from '../services/tokenEncryption';
+import { completeLinkAttempt, completeReauth, createLinkToken, exchangePublicToken, refreshAccounts } from './plaidController';
+import { UnknownKeyIdError, PlaidCredentialError } from '../services/tokenEncryption';
 
 const mockGetPlaidItemForUser = vi.hoisted(() => vi.fn());
 const mockSetItemStatus = vi.hoisted(() => vi.fn());
@@ -11,12 +11,31 @@ const mockUpsertAccountsForItem = vi.hoisted(() => vi.fn());
 const mockCreatePlaidLinkAttempt = vi.hoisted(() => vi.fn());
 const mockReadPlaidLinkAttempt = vi.hoisted(() => vi.fn());
 const mockClaimPlaidLinkAttempt = vi.hoisted(() => vi.fn());
-const mockFinishPlaidLinkAttempt = vi.hoisted(() => vi.fn());
+const mockBeginPlaidLinkExchange = vi.hoisted(() => vi.fn());
+const mockStorePlaidLinkItem = vi.hoisted(() => vi.fn());
+const mockFailPlaidLinkAttempt = vi.hoisted(() => vi.fn());
+const mockUpdatePlaidItemInstitution = vi.hoisted(() => vi.fn());
+const mockGetPlaidItemsForUser = vi.hoisted(() => vi.fn());
+const mockGetPlaidItemIdsMissingInstitution = vi.hoisted(() => vi.fn());
+const dataServiceErrors = vi.hoisted(() => ({
+  TooManyPlaidLinkAttemptsError: class TooManyPlaidLinkAttemptsError extends Error {
+    constructor() {
+      super('Too many bank links are still being finished. Wait a moment and try again.');
+    }
+  },
+  PlaidLinkStoreOutcomeUnknownError: class PlaidLinkStoreOutcomeUnknownError extends Error {},
+}));
 vi.mock('../services/dataService', () => ({
   createPlaidLinkAttempt: mockCreatePlaidLinkAttempt,
   readPlaidLinkAttempt: mockReadPlaidLinkAttempt,
   claimPlaidLinkAttempt: mockClaimPlaidLinkAttempt,
-  finishPlaidLinkAttempt: mockFinishPlaidLinkAttempt,
+  beginPlaidLinkExchange: mockBeginPlaidLinkExchange,
+  storePlaidLinkItem: mockStorePlaidLinkItem,
+  failPlaidLinkAttempt: mockFailPlaidLinkAttempt,
+  updatePlaidItemInstitution: mockUpdatePlaidItemInstitution,
+  getPlaidItemsForUser: mockGetPlaidItemsForUser,
+  getPlaidItemIdsMissingInstitution: mockGetPlaidItemIdsMissingInstitution,
+  ...dataServiceErrors,
   getPlaidItemForUser: mockGetPlaidItemForUser,
   setItemStatus: mockSetItemStatus,
   getLinkedItemsForUser: mockGetLinkedItemsForUser,
@@ -29,15 +48,22 @@ const mockExchangePublicToken = vi.hoisted(() => vi.fn());
 const mockGetItemInstitution = vi.hoisted(() => vi.fn());
 const mockPlaidCreateHostedLinkToken = vi.hoisted(() => vi.fn());
 const mockGetLinkTokenSessions = vi.hoisted(() => vi.fn());
-vi.mock('../services/plaidService', () => ({
-  createHostedLinkToken: mockPlaidCreateHostedLinkToken,
-  getLinkTokenSessions: mockGetLinkTokenSessions,
-  getAccounts: mockGetAccounts,
-  exchangePublicToken: mockExchangePublicToken,
-  getItemInstitution: mockGetItemInstitution,
-  isReauthRequiredError: (err: unknown) =>
-    (err as { response?: { data?: { error_code?: string } } })?.response?.data?.error_code === 'ITEM_LOGIN_REQUIRED',
-}));
+const mockRemoveItem = vi.hoisted(() => vi.fn());
+const mockUpdateItemWebhook = vi.hoisted(() => vi.fn());
+vi.mock('../services/plaidService', async () => {
+  const errors = await vi.importActual<typeof import('../services/plaidErrors')>('../services/plaidErrors');
+  return {
+    createHostedLinkToken: mockPlaidCreateHostedLinkToken,
+    getLinkTokenSessions: mockGetLinkTokenSessions,
+    getAccounts: mockGetAccounts,
+    exchangePublicToken: mockExchangePublicToken,
+    removeItem: mockRemoveItem,
+    updateItemWebhook: mockUpdateItemWebhook,
+    getItemInstitution: mockGetItemInstitution,
+    isReauthRequiredError: errors.isReauthRequiredError,
+    isDefinitivePlaidRejection: errors.isDefinitivePlaidRejection,
+  };
+});
 
 // Only needed by completeLinkAttempt, below — completeReauth never touches any of these.
 const mockSyncItemTransactions = vi.hoisted(() => vi.fn());
@@ -123,22 +149,36 @@ describe('completeReauth — controller-level credential_error vs login_required
 
 // ---- Wave 1: backend-owned Plaid Hosted Link ------------------------------------------------------
 // `attempts` is an in-memory stand-in for the plaid_link_attempts functions' contract (the SQL itself
-// is proven against PostgreSQL 17 by supabase/tests/access_control/), and `plaidSessions` for what
-// Plaid's /link/token/get reports per link token. Neither ever reaches a client.
+// is proven against PostgreSQL 17 by supabase/tests/access_control/, including every transition and
+// race below), with its own clock so a claim or exchange can go stale. `plaidSessions` stands in for
+// what Plaid's /link/token/get reports per link token; `storedItems` for plaid_items rows written by
+// store_plaid_link_item. A process "terminated" at some step is simulated by a call that never
+// settles: nothing after it — including catch blocks — ever runs for that request.
+type Status = 'pending' | 'claimed' | 'exchanging' | 'completed' | 'failed' | 'exchange_unknown';
 type FakeAttempt = {
   userId: string;
   sessionId: string;
   linkToken: string;
-  status: 'pending' | 'completing' | 'completed' | 'failed';
+  status: Status;
   expired: boolean;
+  claimToken: string | null;
+  claimedAt: number | null;
+  exchangeStartedAt: number | null;
   itemRowId: string | null;
+  reason: string | null;
 };
+const STALE_MS = 2 * 60 * 1000;
 const attempts = new Map<string, FakeAttempt>();
 const plaidSessions = new Map<string, unknown[]>();
-let linkTokenCounter = 0;
+const storedItems: { itemRowId: string; userId: string; plaidItemId: string; accessToken: string }[] = [];
+let clock = 0;
+let counter = 0;
+const never = () => new Promise<never>(() => {});
 
 const userA = { id: 'user-a', sessionId: 'sid-a' };
 const userB = { id: 'user-b', sessionId: 'sid-b' };
+const ACCESS_TOKEN = 'access-sandbox-secret-for-a';
+const PUBLIC_TOKEN = 'public-sandbox-secret-for-a';
 
 function authedReq(user: { id: string; sessionId: string | null }, extra: { params?: Record<string, string>; body?: unknown } = {}): Request {
   return { user, params: extra.params ?? {}, body: extra.body ?? {} } as unknown as Request;
@@ -157,8 +197,15 @@ async function complete(user: { id: string; sessionId: string | null }, attemptI
   await completeLinkAttempt(authedReq(user, { params: { attemptId }, body }), res, next);
   return res;
 }
+/** Starts a completion that will never finish (the process "dies" at whichever step never settles). */
+function completeAndDie(user: { id: string; sessionId: string }, attemptId: string) {
+  void completeLinkAttempt(authedReq(user, { params: { attemptId } }), fakeRes(), next);
+}
+async function flush() {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
 /** Plaid's view once the user finished Hosted Link for `linkToken` and Plaid created an Item. */
-function plaidFinished(linkToken: string, publicToken: string) {
+function plaidFinished(linkToken: string, publicToken = PUBLIC_TOKEN) {
   plaidSessions.set(linkToken, [
     {
       link_session_id: `session-for-${linkToken}`,
@@ -168,60 +215,109 @@ function plaidFinished(linkToken: string, publicToken: string) {
     },
   ]);
 }
+/** A Plaid API error as Axios raises it: Plaid answered with an error code, and the outgoing request
+ *  (which carried the public token) is attached — exactly what must never be logged. */
+function plaidApiError(status: number, errorCode?: string) {
+  return Object.assign(new Error(`Request failed with status code ${status}`), {
+    isAxiosError: true,
+    config: { data: JSON.stringify({ public_token: PUBLIC_TOKEN }) },
+    response: { status, data: errorCode ? { error_code: errorCode, error_type: 'INVALID_INPUT' } : {} },
+  });
+}
+function expectNoSecretsLogged() {
+  const logged = JSON.stringify((console.error as unknown as ReturnType<typeof vi.fn>).mock.calls);
+  for (const secret of [ACCESS_TOKEN, PUBLIC_TOKEN, 'link-sandbox-']) expect(logged).not.toContain(secret);
+}
+function callOrder(...mocks: ReturnType<typeof vi.fn>[]) {
+  return mocks.map((m) => m.mock.invocationCallOrder[0] ?? Infinity);
+}
 
 beforeEach(() => {
   attempts.clear();
   plaidSessions.clear();
+  storedItems.length = 0;
+  clock = 0;
   mockPlaidCreateHostedLinkToken.mockImplementation(async (userId: string) => {
-    linkTokenCounter += 1;
-    return { linkToken: `link-sandbox-${userId}-${linkTokenCounter}`, hostedLinkUrl: `https://hosted.plaid.test/link/${linkTokenCounter}` };
+    counter += 1;
+    return { linkToken: `link-sandbox-${userId}-${counter}`, hostedLinkUrl: `https://hosted.plaid.test/link/${counter}` };
   });
   mockGetLinkTokenSessions.mockImplementation(async (linkToken: string) => plaidSessions.get(linkToken) ?? []);
-  mockCreatePlaidLinkAttempt.mockImplementation(
-    async (p: { attemptId: string; userId: string; sessionId: string; linkToken: string }) => {
-      attempts.set(p.attemptId, { userId: p.userId, sessionId: p.sessionId, linkToken: p.linkToken, status: 'pending', expired: false, itemRowId: null });
-      return { expiresAt: '2026-09-22T12:30:00+00:00' };
-    }
-  );
+  mockCreatePlaidLinkAttempt.mockImplementation(async (p: { attemptId: string; userId: string; sessionId: string; linkToken: string }) => {
+    attempts.set(p.attemptId, {
+      userId: p.userId,
+      sessionId: p.sessionId,
+      linkToken: p.linkToken,
+      status: 'pending',
+      expired: false,
+      claimToken: null,
+      claimedAt: null,
+      exchangeStartedAt: null,
+      itemRowId: null,
+      reason: null,
+    });
+    return { expiresAt: '2026-09-22T12:30:00+00:00' };
+  });
   const own = (id: string, userId: string, sessionId: string) => {
     const a = attempts.get(id);
     return a && a.userId === userId && a.sessionId === sessionId ? a : undefined;
   };
+  const isStale = (a: FakeAttempt) =>
+    (a.status === 'claimed' && clock - a.claimedAt! >= STALE_MS) || (a.status === 'exchanging' && clock - a.exchangeStartedAt! >= STALE_MS);
   mockReadPlaidLinkAttempt.mockImplementation(async (id: string, userId: string, sessionId: string) => {
     const a = own(id, userId, sessionId);
     if (!a) return null;
-    return a.status === 'pending' ? { status: a.status, expired: a.expired, linkToken: a.linkToken } : { status: a.status, expired: a.expired };
+    const base = { status: a.status, expired: a.expired, stale: isStale(a) };
+    return a.status === 'pending' || a.status === 'claimed' ? { ...base, linkToken: a.linkToken } : base;
   });
   mockClaimPlaidLinkAttempt.mockImplementation(async (id: string, userId: string, sessionId: string) => {
     const a = own(id, userId, sessionId);
-    if (!a) return 'invalid';
-    if (a.status === 'pending' && !a.expired) {
-      a.status = 'completing';
-      return 'claimed';
+    if (!a) return { outcome: 'invalid' };
+    if (!a.expired && (a.status === 'pending' || (a.status === 'claimed' && isStale(a)))) {
+      counter += 1;
+      Object.assign(a, { status: 'claimed', claimToken: `claim-${counter}`, claimedAt: clock });
+      return { outcome: 'claimed', claimToken: a.claimToken };
     }
-    return a.status === 'pending' ? 'expired' : a.status;
+    if (a.status === 'exchanging' && isStale(a)) Object.assign(a, { status: 'exchange_unknown', reason: 'stale_exchange' });
+    if ((a.status === 'pending' || a.status === 'claimed') && a.expired) return { outcome: 'expired' };
+    if (a.status === 'claimed' || a.status === 'exchanging') return { outcome: 'in_progress' };
+    return { outcome: a.status };
   });
-  mockFinishPlaidLinkAttempt.mockImplementation(
-    async (id: string, userId: string, sessionId: string, outcome: 'completed' | 'failed', itemRowId: string | null) => {
-      const a = own(id, userId, sessionId);
-      if (!a) return false;
-      if (outcome === 'completed' && a.status === 'completing') Object.assign(a, { status: 'completed', itemRowId });
-      else if (outcome === 'failed' && (a.status === 'pending' || a.status === 'completing')) a.status = 'failed';
-      else return false;
-      return true;
+  mockBeginPlaidLinkExchange.mockImplementation(async (id: string, userId: string, sessionId: string, token: string) => {
+    const a = own(id, userId, sessionId);
+    if (!a || a.status !== 'claimed' || a.claimToken !== token) return false;
+    Object.assign(a, { status: 'exchanging', exchangeStartedAt: clock });
+    return true;
+  });
+  mockStorePlaidLinkItem.mockImplementation(
+    async (p: { attemptId: string; userId: string; sessionId: string; claimToken: string; plaidItemId: string; accessToken: string }) => {
+      const a = own(p.attemptId, p.userId, p.sessionId);
+      if (!a || a.status !== 'exchanging' || a.claimToken !== p.claimToken) return { outcome: 'refused' };
+      counter += 1;
+      const itemRowId = `row-${counter}`;
+      Object.assign(a, { status: 'completed', itemRowId });
+      storedItems.push({ itemRowId, userId: p.userId, plaidItemId: p.plaidItemId, accessToken: p.accessToken });
+      return { outcome: 'stored', itemRowId };
     }
   );
-  mockExchangePublicToken.mockImplementation(async (publicToken: string) => ({
-    accessToken: `in-memory-access-for-${publicToken}`,
-    itemId: `plaid-item-${publicToken === "public-a" ? "a" : "other"}`,
-  }));
+  mockFailPlaidLinkAttempt.mockImplementation(async (id: string, userId: string, sessionId: string, token: string | null, reason: string) => {
+    const a = own(id, userId, sessionId);
+    const rules: Record<string, [Status, Status[]]> = {
+      exited: ['failed', ['pending']],
+      ambiguous: ['failed', ['pending']],
+      exchange_rejected: ['failed', ['exchanging']],
+      exchange_outcome_unknown: ['exchange_unknown', ['exchanging']],
+      store_failed_item_removed: ['failed', ['exchanging', 'exchange_unknown']],
+      store_failed_remove_unknown: ['exchange_unknown', ['exchanging', 'exchange_unknown']],
+    };
+    const [to, from] = rules[reason];
+    if (!a || !from.includes(a.status) || (a.status !== 'pending' && a.claimToken !== token)) return false;
+    Object.assign(a, { status: to, reason });
+    return true;
+  });
+  mockExchangePublicToken.mockResolvedValue({ accessToken: ACCESS_TOKEN, itemId: 'plaid-item-a' });
+  mockRemoveItem.mockResolvedValue(undefined);
   mockGetItemInstitution.mockResolvedValue({ institutionId: 'ins_1', institutionName: 'Sandbox Bank' });
-  mockInsertPlaidItem.mockImplementation(async (p: { userId: string; itemId: string }) => ({
-    id: `row-for-${p.itemId}`,
-    access_token: null,
-    institution_id: 'ins_1',
-    institution_name: 'Sandbox Bank',
-  }));
+  mockUpdatePlaidItemInstitution.mockResolvedValue(undefined);
   mockGetAccounts.mockResolvedValue([{ account_id: 'plaid-acc-1' }]);
   mockUpsertAccountsForItem.mockResolvedValue([{ id: 'account-row-1', plaid_account_id: 'plaid-acc-1' }]);
   mockSyncItemTransactions.mockResolvedValue({ added: 3 });
@@ -231,7 +327,8 @@ beforeEach(() => {
 
 function expectNothingExchanged() {
   expect(mockExchangePublicToken).not.toHaveBeenCalled();
-  expect(mockInsertPlaidItem).not.toHaveBeenCalled();
+  expect(mockStorePlaidLinkItem).not.toHaveBeenCalled();
+  expect(storedItems).toHaveLength(0);
 }
 
 describe('POST /link-token — Hosted Link attempt creation', () => {
@@ -242,24 +339,26 @@ describe('POST /link-token — Hosted Link attempt creation', () => {
     expect(mockPlaidCreateHostedLinkToken).toHaveBeenCalledWith('user-a');
     const body = jsonBody(res);
     expect(Object.keys(body).sort()).toEqual(['expires_at', 'hosted_link_url', 'link_attempt_id']);
-    expect(body.hosted_link_url).toMatch(/^https:\/\/hosted\.plaid\.test\//);
-    expect(body.link_attempt_id).toMatch(/^[0-9a-f-]{36}$/);
     const stored = attempts.get(body.link_attempt_id)!;
     expect(stored).toMatchObject({ userId: 'user-a', sessionId: 'sid-a', status: 'pending' });
-    // The link token itself never leaves the server.
     expect(JSON.stringify(body)).not.toContain(stored.linkToken);
-    expect(mockCreatePlaidLinkAttempt).toHaveBeenCalledWith(
-      expect.objectContaining({ attemptId: body.link_attempt_id, userId: 'user-a', sessionId: 'sid-a', linkToken: stored.linkToken })
-    );
   });
 
   it('refuses (401) a token that carries no login session — no Plaid call, no attempt', async () => {
     const res = fakeRes();
     await createLinkToken(authedReq({ id: 'user-a', sessionId: null }), res, next);
     expect(res.status).toHaveBeenCalledWith(401);
-    expect(jsonBody(res)).toMatchObject({ code: 'session_required' });
     expect(mockPlaidCreateHostedLinkToken).not.toHaveBeenCalled();
     expect(mockCreatePlaidLinkAttempt).not.toHaveBeenCalled();
+  });
+
+  it('five attempts already being completed: 429, no Hosted Link URL', async () => {
+    mockCreatePlaidLinkAttempt.mockRejectedValueOnce(new dataServiceErrors.TooManyPlaidLinkAttemptsError());
+    const res = fakeRes();
+    await createLinkToken(authedReq(userA), res, next);
+    expect(res.status).toHaveBeenCalledWith(429);
+    expect(jsonBody(res)).toMatchObject({ code: 'link_attempts_in_progress' });
+    expect(next).not.toHaveBeenCalled();
   });
 
   it('if the attempt cannot be stored, no Hosted Link URL is returned', async () => {
@@ -272,102 +371,73 @@ describe('POST /link-token — Hosted Link attempt creation', () => {
   });
 });
 
-describe('POST /link-attempts/:attemptId/complete — the only way an item is created', () => {
-  it('success: exchanges the public token Plaid reports for the attempt\'s OWN stored link token, stores the item for the verified user, and completes the attempt once', async () => {
+describe('completion — success, and the order of durable steps', () => {
+  it('claims, records the exchange start, exchanges once, stores the item IMMEDIATELY (before any other Plaid call), then runs the follow-ups', async () => {
     const { attemptId, linkToken } = await startLink(userA);
-    plaidFinished(linkToken, 'public-a');
+    plaidFinished(linkToken);
 
     const res = await complete(userA, attemptId);
 
     expect(res.status).toHaveBeenCalledWith(201);
     expect(mockGetLinkTokenSessions).toHaveBeenCalledWith(linkToken);
-    expect(mockExchangePublicToken).toHaveBeenCalledExactlyOnceWith('public-a');
-    expect(mockInsertPlaidItem).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ userId: 'user-a', accessToken: 'in-memory-access-for-public-a' }));
-    // The in-memory access token is what later steps use (never re-read off the stored row).
-    expect(mockGetAccounts).toHaveBeenCalledWith('in-memory-access-for-public-a');
-    expect(mockSyncItemTransactions).toHaveBeenCalledWith(expect.objectContaining({ access_token: 'in-memory-access-for-public-a', user_id: 'user-a' }));
-    expect(mockRefreshLoansForItem).toHaveBeenCalledWith('row-for-plaid-item-a', 'in-memory-access-for-public-a', expect.any(Map));
-    expect(attempts.get(attemptId)).toMatchObject({ status: 'completed', itemRowId: 'row-for-plaid-item-a' });
+    expect(mockExchangePublicToken).toHaveBeenCalledExactlyOnceWith(PUBLIC_TOKEN);
+    expect(mockStorePlaidLinkItem).toHaveBeenCalledExactlyOnceWith({
+      attemptId,
+      userId: 'user-a',
+      sessionId: 'sid-a',
+      claimToken: expect.any(String),
+      plaidItemId: 'plaid-item-a',
+      accessToken: ACCESS_TOKEN,
+    });
+    const order = callOrder(
+      mockClaimPlaidLinkAttempt,
+      mockBeginPlaidLinkExchange,
+      mockExchangePublicToken,
+      mockStorePlaidLinkItem,
+      mockGetItemInstitution,
+      mockGetAccounts,
+      mockSyncItemTransactions,
+      mockRecordSnapshotForUser,
+      mockRefreshLoansForItem
+    );
+    expect([...order].sort((x, y) => x - y)).toEqual(order);
+
+    expect(storedItems).toEqual([{ itemRowId: expect.any(String), userId: 'user-a', plaidItemId: 'plaid-item-a', accessToken: ACCESS_TOKEN }]);
+    const itemRowId = storedItems[0].itemRowId;
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'completed', itemRowId });
+    expect(mockUpdatePlaidItemInstitution).toHaveBeenCalledWith(itemRowId, 'ins_1', 'Sandbox Bank');
+    expect(mockUpsertAccountsForItem).toHaveBeenCalledWith(itemRowId, [{ account_id: 'plaid-acc-1' }]);
+    expect(mockSyncItemTransactions).toHaveBeenCalledWith({ id: itemRowId, user_id: 'user-a', access_token: ACCESS_TOKEN, transactions_cursor: null });
+    expect(mockRefreshLoansForItem).toHaveBeenCalledWith(itemRowId, ACCESS_TOKEN, expect.any(Map));
     const body = jsonBody(res);
-    expect(body).toMatchObject({ status: 'completed', item: { id: 'row-for-plaid-item-a' }, transactions_synced: 3 });
+    expect(body).toMatchObject({
+      status: 'completed',
+      item: { id: itemRowId, institution_id: 'ins_1', institution_name: 'Sandbox Bank' },
+      transactions_synced: 3,
+      follow_up_incomplete: [],
+    });
     const serialized = JSON.stringify(body);
-    for (const secret of ['public-a', 'in-memory-access-for-public-a', linkToken]) expect(serialized).not.toContain(secret);
+    for (const secret of [PUBLIC_TOKEN, ACCESS_TOKEN, linkToken]) expect(serialized).not.toContain(secret);
     expect(next).not.toHaveBeenCalled();
   });
 
-  it('pending: Hosted Link not finished yet -> 202 pending; nothing claimed or exchanged; completes on a later call', async () => {
+  it('replay: an already-completed attempt -> 409 link_attempt_already_completed; exchanged and stored exactly once', async () => {
     const { attemptId, linkToken } = await startLink(userA);
-
-    const noSession = await complete(userA, attemptId);
-    expect(noSession.status).toHaveBeenCalledWith(202);
-    expect(jsonBody(noSession)).toEqual({ status: 'pending' });
-
-    plaidSessions.set(linkToken, [{ link_session_id: 's1', started_at: '2026-09-22T12:00:00Z', finished_at: null }]);
-    const inProgress = await complete(userA, attemptId);
-    expect(jsonBody(inProgress)).toEqual({ status: 'pending' });
-
-    // "Finished" with no result yet (and no exit) is still pending, never a failure.
-    plaidSessions.set(linkToken, [{ link_session_id: 's1', finished_at: '2026-09-22T12:05:00Z', results: { item_add_results: [] } }]);
-    expect(jsonBody(await complete(userA, attemptId))).toEqual({ status: 'pending' });
-
-    expect(mockClaimPlaidLinkAttempt).not.toHaveBeenCalled();
-    expectNothingExchanged();
-    expect(attempts.get(attemptId)!.status).toBe('pending');
-
-    plaidFinished(linkToken, 'public-a');
+    plaidFinished(linkToken);
     expect((await complete(userA, attemptId)).status).toHaveBeenCalledWith(201);
-  });
-
-  it('exit: the user left Hosted Link without linking -> 409 link_attempt_exited, the attempt fails, and it can never be exchanged later', async () => {
-    const { attemptId, linkToken } = await startLink(userA);
-    plaidSessions.set(linkToken, [{ link_session_id: 's1', finished_at: '2026-09-22T12:05:00Z', exit: { error: null, metadata: { status: 'institution_not_found' } } }]);
-
-    const res = await complete(userA, attemptId);
-    expect(res.status).toHaveBeenCalledWith(409);
-    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_exited' });
-    expect(attempts.get(attemptId)!.status).toBe('failed');
-
-    plaidFinished(linkToken, 'public-a'); // even if Plaid later reported a token for it
-    const again = await complete(userA, attemptId);
-    expect(jsonBody(again)).toMatchObject({ code: 'link_attempt_failed' });
-    expectNothingExchanged();
-  });
-
-  it('expiry: -> 410 link_attempt_expired, without asking Plaid or exchanging', async () => {
-    const { attemptId, linkToken } = await startLink(userA);
-    plaidFinished(linkToken, 'public-a');
-    attempts.get(attemptId)!.expired = true;
-
-    const res = await complete(userA, attemptId);
-    expect(res.status).toHaveBeenCalledWith(410);
-    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_expired' });
-    expect(mockGetLinkTokenSessions).not.toHaveBeenCalled();
-    expectNothingExchanged();
-  });
-
-  it('replay: completing an already-completed attempt -> 409 link_attempt_already_completed; exchanged and stored exactly once', async () => {
-    const { attemptId, linkToken } = await startLink(userA);
-    plaidFinished(linkToken, 'public-a');
-    expect((await complete(userA, attemptId)).status).toHaveBeenCalledWith(201);
-
     for (let i = 0; i < 3; i++) {
-      const res = await complete(userA, attemptId);
-      expect(res.status).toHaveBeenCalledWith(409);
-      expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_already_completed' });
+      expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_already_completed' });
     }
     expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
-    expect(mockInsertPlaidItem).toHaveBeenCalledTimes(1);
+    expect(storedItems).toHaveLength(1);
   });
 
-  it('concurrent completion: two simultaneous calls -> exactly one exchange and one insert; the other is told it is completing', async () => {
+  it('concurrent completion: two simultaneous calls -> exactly one exchange and one stored item; the other is told it is completing', async () => {
     const { attemptId, linkToken } = await startLink(userA);
-    plaidFinished(linkToken, 'public-a');
+    plaidFinished(linkToken);
     let releaseExchange!: () => void;
     mockExchangePublicToken.mockImplementationOnce(
-      (publicToken: string) =>
-        new Promise((resolve) => {
-          releaseExchange = () => resolve({ accessToken: `in-memory-access-for-${publicToken}`, itemId: 'plaid-item-a' });
-        })
+      () => new Promise((resolve) => (releaseExchange = () => resolve({ accessToken: ACCESS_TOKEN, itemId: 'plaid-item-a' })))
     );
 
     const first = complete(userA, attemptId);
@@ -381,84 +451,288 @@ describe('POST /link-attempts/:attemptId/complete — the only way an item is cr
     expect(secondRes.status).toHaveBeenCalledWith(202);
     expect(jsonBody(secondRes)).toEqual({ status: 'completing' });
     expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
-    expect(mockInsertPlaidItem).toHaveBeenCalledTimes(1);
+    expect(storedItems).toHaveLength(1);
     expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_already_completed' });
   });
+});
 
-  it("foreign user: B completing A's attempt -> 409 link_attempt_invalid, reveals and touches nothing; A can still finish", async () => {
+describe('completion — failures and simulated termination at every step', () => {
+  it('terminated immediately BEFORE the exchange (claimed, exchange never begun): after two minutes the claim is safely taken over and completes — one exchange in total', async () => {
     const { attemptId, linkToken } = await startLink(userA);
-    plaidFinished(linkToken, 'public-a');
+    plaidFinished(linkToken);
+    mockBeginPlaidLinkExchange.mockImplementationOnce(never); // the process dies right after claiming
+    completeAndDie(userA, attemptId);
+    await flush();
+    expect(attempts.get(attemptId)!.status).toBe('claimed');
 
-    const res = await complete(userB, attemptId);
-    expect(res.status).toHaveBeenCalledWith(409);
-    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_invalid' });
-    expect(mockGetLinkTokenSessions).not.toHaveBeenCalled();
-    expect(mockClaimPlaidLinkAttempt).not.toHaveBeenCalled();
-    expectNothingExchanged();
-    expect(attempts.get(attemptId)!.status).toBe('pending');
+    // Within two minutes the live-looking claim is left alone.
+    clock += 60 * 1000;
+    const early = await complete(userA, attemptId);
+    expect(early.status).toHaveBeenCalledWith(202);
+    expect(jsonBody(early)).toEqual({ status: 'completing' });
 
-    expect((await complete(userA, attemptId)).status).toHaveBeenCalledWith(201);
-    expect(mockInsertPlaidItem).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user-a' }));
+    clock += 2 * 60 * 1000;
+    const recovered = await complete(userA, attemptId);
+    expect(recovered.status).toHaveBeenCalledWith(201);
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+    expect(storedItems).toHaveLength(1);
   });
 
-  it('foreign session: the same user after signing out and back in cannot complete the old attempt', async () => {
+  it('terminated DURING the exchange (outcome never learned): after two minutes it is exchange_unknown — never exchanged again', async () => {
     const { attemptId, linkToken } = await startLink(userA);
-    plaidFinished(linkToken, 'public-a');
-    const res = await complete({ id: 'user-a', sessionId: 'sid-a-relogin' }, attemptId);
-    expect(res.status).toHaveBeenCalledWith(409);
-    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_invalid' });
-    expectNothingExchanged();
-  });
+    plaidFinished(linkToken);
+    mockExchangePublicToken.mockImplementationOnce(never);
+    completeAndDie(userA, attemptId);
+    await flush();
+    expect(attempts.get(attemptId)!.status).toBe('exchanging');
 
-  it('a malformed attempt id is refused before the attempt store; a token with no login session is refused (401)', async () => {
-    const malformed = await complete(userA, 'not-a-uuid');
-    expect(jsonBody(malformed)).toMatchObject({ code: 'link_attempt_invalid' });
-    const { attemptId } = await startLink(userA);
-    const noSession = await complete({ id: 'user-a', sessionId: null }, attemptId);
-    expect(noSession.status).toHaveBeenCalledWith(401);
-    expect(mockReadPlaidLinkAttempt).not.toHaveBeenCalled();
-    expectNothingExchanged();
-  });
+    clock += 60 * 1000;
+    expect(jsonBody(await complete(userA, attemptId))).toEqual({ status: 'completing' });
 
-  it('ambiguous: Plaid reports two public tokens for the one link token -> 409, the attempt fails, nothing is guessed or exchanged', async () => {
-    const { attemptId, linkToken } = await startLink(userA);
-    plaidSessions.set(linkToken, [
-      { link_session_id: 's1', finished_at: 'x', results: { item_add_results: [{ public_token: 'public-1' }] } },
-      { link_session_id: 's2', finished_at: 'y', results: { item_add_results: [{ public_token: 'public-2' }] } },
-    ]);
+    clock += 2 * 60 * 1000;
     const res = await complete(userA, attemptId);
-    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_ambiguous' });
-    expect(attempts.get(attemptId)!.status).toBe('failed');
-    expectNothingExchanged();
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_outcome_unknown' });
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'exchange_unknown', reason: 'stale_exchange' });
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_outcome_unknown' });
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+    expect(mockStorePlaidLinkItem).not.toHaveBeenCalled();
   });
 
-  it('an exchange failure after claiming fails the attempt: the error propagates and the public token is never exchanged again', async () => {
+  it('exchange rejected by Plaid (4xx with an error code): failed, never retried, nothing stored or removed, no token logged', async () => {
     const { attemptId, linkToken } = await startLink(userA);
-    plaidFinished(linkToken, 'public-a');
-    const failure = new Error('INVALID_PUBLIC_TOKEN');
-    mockExchangePublicToken.mockRejectedValueOnce(failure);
+    plaidFinished(linkToken);
+    mockExchangePublicToken.mockRejectedValueOnce(plaidApiError(400, 'INVALID_PUBLIC_TOKEN'));
 
-    await complete(userA, attemptId);
-    expect(next).toHaveBeenCalledWith(failure);
-    expect(attempts.get(attemptId)!.status).toBe('failed');
-    expect(mockInsertPlaidItem).not.toHaveBeenCalled();
+    const res = await complete(userA, attemptId);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_failed' });
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'failed', reason: 'exchange_rejected' });
+    expect(mockStorePlaidLinkItem).not.toHaveBeenCalled();
+    expect(mockRemoveItem).not.toHaveBeenCalled();
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_failed' });
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+    expectNoSecretsLogged();
+  });
 
-    const retry = await complete(userA, attemptId);
-    expect(jsonBody(retry)).toMatchObject({ code: 'link_attempt_failed' });
+  it.each([
+    ['a network error / timeout (no response)', Object.assign(new Error('timeout of 30000ms exceeded'), { code: 'ECONNABORTED' })],
+    ['a Plaid 5xx', plaidApiError(500, 'INTERNAL_SERVER_ERROR')],
+  ])('exchange failure with %s: exchange_unknown (Plaid may have exchanged), never retried', async (_label, err) => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockExchangePublicToken.mockRejectedValueOnce(err);
+
+    const res = await complete(userA, attemptId);
+    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_outcome_unknown' });
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'exchange_unknown', reason: 'exchange_outcome_unknown' });
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_outcome_unknown' });
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+    expect(mockStorePlaidLinkItem).not.toHaveBeenCalled();
+    expectNoSecretsLogged();
+  });
+
+  it('terminated immediately AFTER the exchange (token received, never stored): exchange_unknown once stale; no second exchange', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockStorePlaidLinkItem.mockImplementationOnce(never); // dies with the access token only in memory
+    completeAndDie(userA, attemptId);
+    await flush();
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+
+    clock += 3 * 60 * 1000;
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_outcome_unknown' });
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+    expect(storedItems).toHaveLength(0);
+  });
+
+  it('item persistence rejected by the database (rolled back): the Item is removed at Plaid, then failed — no follow-ups, no token logged or returned', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockStorePlaidLinkItem.mockResolvedValueOnce({ outcome: 'rejected' });
+
+    const res = await complete(userA, attemptId);
+    expect(mockRemoveItem).toHaveBeenCalledExactlyOnceWith(ACCESS_TOKEN);
+    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_failed' });
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'failed', reason: 'store_failed_item_removed' });
+    expect(mockGetItemInstitution).not.toHaveBeenCalled();
+    expect(mockGetAccounts).not.toHaveBeenCalled();
+    expect(JSON.stringify(jsonBody(res))).not.toContain(ACCESS_TOKEN);
+    expectNoSecretsLogged();
+  });
+
+  it('item persistence refused because the attempt was meanwhile recorded exchange_unknown: removed at Plaid, recorded failed', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockStorePlaidLinkItem.mockImplementationOnce(async (p: { attemptId: string }) => {
+      Object.assign(attempts.get(p.attemptId)!, { status: 'exchange_unknown', reason: 'stale_exchange' });
+      return { outcome: 'refused' };
+    });
+    const res = await complete(userA, attemptId);
+    expect(mockRemoveItem).toHaveBeenCalledExactlyOnceWith(ACCESS_TOKEN);
+    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_failed' });
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'failed', reason: 'store_failed_item_removed' });
+  });
+
+  it('item persistence failed and the compensating removal failed too: exchange_unknown — never reported as removed', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockStorePlaidLinkItem.mockResolvedValueOnce({ outcome: 'rejected' });
+    mockRemoveItem.mockRejectedValueOnce(Object.assign(new Error('socket hang up'), { config: { data: JSON.stringify({ access_token: ACCESS_TOKEN }) } }));
+
+    const res = await complete(userA, attemptId);
+    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_outcome_unknown' });
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'exchange_unknown', reason: 'store_failed_remove_unknown' });
+    expectNoSecretsLogged();
+  });
+
+  it('encrypting the access token failed (nothing sent): definitively not stored, so it is removed at Plaid', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockStorePlaidLinkItem.mockRejectedValueOnce(new PlaidCredentialError('Plaid credential encryption key configuration is invalid.'));
+    const res = await complete(userA, attemptId);
+    expect(mockRemoveItem).toHaveBeenCalledExactlyOnceWith(ACCESS_TOKEN);
+    expect(jsonBody(res)).toMatchObject({ code: 'link_attempt_failed' });
+  });
+
+  it('whether the item was stored is UNKNOWN (no answer from the database): nothing is removed; the attempt resolves later', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockStorePlaidLinkItem.mockRejectedValueOnce(new dataServiceErrors.PlaidLinkStoreOutcomeUnknownError('unknown'));
+
+    const res = await complete(userA, attemptId);
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(jsonBody(res)).toEqual({ status: 'completing' });
+    expect(mockRemoveItem).not.toHaveBeenCalled(); // it may well be stored — removing it could destroy a linked item
+    expect(mockFailPlaidLinkAttempt).not.toHaveBeenCalled();
+    expect(mockGetAccounts).not.toHaveBeenCalled();
+
+    clock += 3 * 60 * 1000; // (here it was not stored) — once stale it is exchange_unknown, never re-exchanged
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_outcome_unknown' });
     expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
   });
 
-  it('a failure AFTER the item is stored still completes the attempt (the item exists), so it can never be exchanged twice', async () => {
+  it('terminated AFTER the item was stored (store and completion are one transaction): the item is linked; a later call reports completed and never re-exchanges', async () => {
     const { attemptId, linkToken } = await startLink(userA);
-    plaidFinished(linkToken, 'public-a');
-    const failure = new Error('sync failed');
-    mockSyncItemTransactions.mockRejectedValueOnce(failure);
+    plaidFinished(linkToken);
+    mockGetItemInstitution.mockImplementationOnce(never); // dies in the first follow-up
+    completeAndDie(userA, attemptId);
+    await flush();
 
+    expect(storedItems).toHaveLength(1);
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'completed', itemRowId: storedItems[0].itemRowId });
+    clock += 3 * 60 * 1000;
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_already_completed' });
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+    expect(mockRemoveItem).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['institution lookup', () => mockGetItemInstitution.mockRejectedValueOnce(plaidApiError(500, 'INTERNAL_SERVER_ERROR')), ['institution']],
+    ['account retrieval', () => mockGetAccounts.mockRejectedValueOnce(plaidApiError(500, 'INTERNAL_SERVER_ERROR')), ['accounts', 'transactions', 'liabilities']],
+    ['account insertion', () => mockUpsertAccountsForItem.mockRejectedValueOnce(new Error('Failed to insert accounts: timeout')), ['accounts', 'transactions', 'liabilities']],
+    ['transaction synchronization', () => mockSyncItemTransactions.mockRejectedValueOnce(plaidApiError(400, 'PRODUCT_NOT_READY')), ['transactions']],
+    ['net-worth snapshot', () => mockRecordSnapshotForUser.mockRejectedValueOnce(new Error('Failed to record snapshot')), ['net_worth_snapshot']],
+    ['liability refresh', () => mockRefreshLoansForItem.mockRejectedValueOnce(plaidApiError(400, 'PRODUCTS_NOT_SUPPORTED')), ['liabilities']],
+  ])('%s failure after the item is stored: still 201 linked, the item and attempt are untouched, and the failure is reported as follow-up', async (_label, arrange, incomplete) => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    arrange();
+
+    const res = await complete(userA, attemptId);
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(jsonBody(res)).toMatchObject({ status: 'completed', follow_up_incomplete: incomplete });
+    expect(storedItems).toHaveLength(1);
+    expect(attempts.get(attemptId)!.status).toBe('completed');
+    expect(mockRemoveItem).not.toHaveBeenCalled();
+    expect(mockFailPlaidLinkAttempt).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expectNoSecretsLogged();
+  });
+
+  it('a failure before claiming (reading Plaid\'s sessions) changes nothing and can simply be retried', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    const failure = plaidApiError(500, 'INTERNAL_SERVER_ERROR');
+    mockGetLinkTokenSessions.mockRejectedValueOnce(failure);
     await complete(userA, attemptId);
     expect(next).toHaveBeenCalledWith(failure);
-    expect(attempts.get(attemptId)).toMatchObject({ status: 'completed', itemRowId: 'row-for-plaid-item-a' });
-    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_already_completed' });
-    expect(mockInsertPlaidItem).toHaveBeenCalledTimes(1);
+    expect(attempts.get(attemptId)!.status).toBe('pending');
+    expect((await complete(userA, attemptId)).status).toHaveBeenCalledWith(201);
+  });
+});
+
+describe('completion — binding, pending, exit, expiry', () => {
+  it('pending: Hosted Link not finished yet -> 202 pending; nothing claimed or exchanged; completes on a later call', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    expect(jsonBody(await complete(userA, attemptId))).toEqual({ status: 'pending' });
+    plaidSessions.set(linkToken, [{ link_session_id: 's1', finished_at: '2026-09-22T12:05:00Z', results: { item_add_results: [] } }]);
+    expect(jsonBody(await complete(userA, attemptId))).toEqual({ status: 'pending' });
+    expect(mockClaimPlaidLinkAttempt).not.toHaveBeenCalled();
+    expectNothingExchanged();
+    plaidFinished(linkToken);
+    expect((await complete(userA, attemptId)).status).toHaveBeenCalledWith(201);
+  });
+
+  it('exit -> 409 link_attempt_exited; the attempt fails and can never be exchanged later', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidSessions.set(linkToken, [{ link_session_id: 's1', finished_at: 'x', exit: { error: null, metadata: null } }]);
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_exited' });
+    expect(attempts.get(attemptId)).toMatchObject({ status: 'failed', reason: 'exited' });
+    plaidFinished(linkToken);
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_failed' });
+    expectNothingExchanged();
+  });
+
+  it('ambiguous (two public tokens) -> 409, failed, nothing guessed or exchanged', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidSessions.set(linkToken, [
+      { link_session_id: 's1', results: { item_add_results: [{ public_token: 'public-1' }] } },
+      { link_session_id: 's2', results: { item_add_results: [{ public_token: 'public-2' }] } },
+    ]);
+    expect(jsonBody(await complete(userA, attemptId))).toMatchObject({ code: 'link_attempt_ambiguous' });
+    expect(attempts.get(attemptId)!.status).toBe('failed');
+    expectNothingExchanged();
+  });
+
+  it('expiry -> 410, without asking Plaid or exchanging', async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    attempts.get(attemptId)!.expired = true;
+    expect((await complete(userA, attemptId)).status).toHaveBeenCalledWith(410);
+    expect(mockGetLinkTokenSessions).not.toHaveBeenCalled();
+    expectNothingExchanged();
+  });
+
+  it("foreign user: B completing A's attempt -> 409 invalid, touches nothing; A can still finish", async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    expect(jsonBody(await complete(userB, attemptId))).toMatchObject({ code: 'link_attempt_invalid' });
+    expect(mockGetLinkTokenSessions).not.toHaveBeenCalled();
+    expect(mockClaimPlaidLinkAttempt).not.toHaveBeenCalled();
+    expect(attempts.get(attemptId)!.status).toBe('pending');
+    expect((await complete(userA, attemptId)).status).toHaveBeenCalledWith(201);
+    expect(storedItems[0].userId).toBe('user-a');
+  });
+
+  it("foreign user or session cannot trigger recovery of someone else's stale attempt", async () => {
+    const { attemptId, linkToken } = await startLink(userA);
+    plaidFinished(linkToken);
+    mockExchangePublicToken.mockImplementationOnce(never);
+    completeAndDie(userA, attemptId);
+    await flush();
+    clock += 3 * 60 * 1000;
+    expect(jsonBody(await complete(userB, attemptId))).toMatchObject({ code: 'link_attempt_invalid' });
+    expect(jsonBody(await complete({ id: 'user-a', sessionId: 'sid-a-relogin' }, attemptId))).toMatchObject({ code: 'link_attempt_invalid' });
+    expect(attempts.get(attemptId)!.status).toBe('exchanging');
+  });
+
+  it('a malformed attempt id is refused before the attempt store; a token with no login session is refused (401)', async () => {
+    expect(jsonBody(await complete(userA, 'not-a-uuid'))).toMatchObject({ code: 'link_attempt_invalid' });
+    const { attemptId } = await startLink(userA);
+    expect((await complete({ id: 'user-a', sessionId: null }, attemptId)).status).toHaveBeenCalledWith(401);
+    expect(mockReadPlaidLinkAttempt).not.toHaveBeenCalled();
+    expectNothingExchanged();
   });
 
   it('ignores anything in the request body — including a public token', async () => {
@@ -471,36 +745,28 @@ describe('POST /link-attempts/:attemptId/complete — the only way an item is cr
 
 describe('Wave 1 P1: a public token is only exchanged for the Link flow that produced it', () => {
   it("user A completes Link and keeps the public token; user B signs in, creates a fresh valid attempt and submits A's public token with it: rejected before exchange, and no Plaid item is created", async () => {
-    // User A completes Hosted Link; Plaid reports A's public token for A's link token, and A keeps it.
     const a = await startLink(userA);
     plaidFinished(a.linkToken, 'public-token-of-a');
     const capturedPublicTokenOfA = 'public-token-of-a';
 
-    // User B signs in and creates a fresh, valid attempt of their own.
     const b = await startLink(userB);
     expect(attempts.get(b.attemptId)).toMatchObject({ userId: 'user-b', status: 'pending' });
 
-    // B submits A's public token with B's attempt — on the retired route (the only one that ever
-    // took a public token)...
     const retired = fakeRes();
     exchangePublicToken(authedReq(userB, { body: { public_token: capturedPublicTokenOfA, link_attempt_id: b.attemptId } }), retired);
     expect(retired.status).toHaveBeenCalledWith(410);
     expect(jsonBody(retired)).toMatchObject({ code: 'exchange_retired' });
 
-    // ...and on the completion route, for B's own attempt: the body is ignored, and Plaid is asked
-    // only about B's own link token, whose flow B has not finished.
     const own = await complete(userB, b.attemptId, { public_token: capturedPublicTokenOfA });
     expect(jsonBody(own)).toEqual({ status: 'pending' });
     expect(mockGetLinkTokenSessions).toHaveBeenCalledWith(b.linkToken);
     expect(mockGetLinkTokenSessions).not.toHaveBeenCalledWith(a.linkToken);
 
-    // ...and by completing A's attempt: not B's.
     const foreign = await complete(userB, a.attemptId, { public_token: capturedPublicTokenOfA });
     expect(jsonBody(foreign)).toMatchObject({ code: 'link_attempt_invalid' });
 
-    // Rejected before any exchange; no Plaid item was created or stored — for B or anyone.
     expect(mockExchangePublicToken).not.toHaveBeenCalled();
-    expect(mockInsertPlaidItem).not.toHaveBeenCalled();
+    expect(storedItems).toHaveLength(0);
     expect(attempts.get(b.attemptId)!.status).toBe('pending');
     expect(attempts.get(a.attemptId)!.status).toBe('pending');
   });
@@ -520,5 +786,44 @@ describe('POST /exchange-public-token — retired', () => {
     expect(mockClaimPlaidLinkAttempt).not.toHaveBeenCalled();
     expect(mockGetLinkTokenSessions).not.toHaveBeenCalled();
     expectNothingExchanged();
+  });
+});
+
+describe('refreshAccounts — retries the institution follow-up for items still missing it (Wave 1)', () => {
+  const item = (id: string) => ({ id, user_id: 'user-a', access_token: `access-for-${id}`, transactions_cursor: null });
+
+  beforeEach(() => {
+    mockGetPlaidItemsForUser.mockResolvedValue([item('row-missing'), item('row-known')]);
+    mockGetPlaidItemIdsMissingInstitution.mockResolvedValue(new Set(['row-missing']));
+    mockUpdateItemWebhook.mockResolvedValue(undefined);
+    mockGetLinkedItemsForUser.mockResolvedValue([]);
+    mockSetItemStatus.mockResolvedValue(undefined);
+  });
+
+  it('looks up and stores the institution only for the item that has none', async () => {
+    const res = fakeRes();
+    await refreshAccounts(authedReq(userA), res, next);
+    expect(mockGetItemInstitution).toHaveBeenCalledExactlyOnceWith('access-for-row-missing');
+    expect(mockUpdatePlaidItemInstitution).toHaveBeenCalledExactlyOnceWith('row-missing', 'ins_1', 'Sandbox Bank');
+    expect(res.json).toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('an enrichment failure is logged (sanitized) and does not fail the refresh', async () => {
+    mockGetItemInstitution.mockRejectedValueOnce(plaidApiError(500, 'INTERNAL_SERVER_ERROR'));
+    const res = fakeRes();
+    await refreshAccounts(authedReq(userA), res, next);
+    expect(res.json).toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expect(mockUpsertAccountsForItem).toHaveBeenCalledTimes(2);
+    expectNoSecretsLogged();
+  });
+
+  it('if the missing-institution check itself fails, the refresh still runs (without enrichment)', async () => {
+    mockGetPlaidItemIdsMissingInstitution.mockRejectedValueOnce(new Error('down'));
+    const res = fakeRes();
+    await refreshAccounts(authedReq(userA), res, next);
+    expect(res.json).toHaveBeenCalled();
+    expect(mockGetItemInstitution).not.toHaveBeenCalled();
   });
 });

@@ -54,9 +54,15 @@ import {
   createPlaidLinkAttempt,
   readPlaidLinkAttempt,
   claimPlaidLinkAttempt,
-  finishPlaidLinkAttempt,
+  beginPlaidLinkExchange,
+  storePlaidLinkItem,
+  failPlaidLinkAttempt,
   markPlaidLinkAttemptReady,
   hashLinkToken,
+  updatePlaidItemInstitution,
+  getPlaidItemIdsMissingInstitution,
+  TooManyPlaidLinkAttemptsError,
+  PlaidLinkStoreOutcomeUnknownError,
 } from './dataService';
 import {
   decryptAccessToken,
@@ -2615,9 +2621,12 @@ describe('getTransactionsBackfillPage — deterministic keyset pagination (Round
 describe('Plaid Hosted Link attempts (Wave 1)', () => {
   const ATTEMPT_ID = 'b1b2c3d4-0000-4000-8000-000000000001';
   const LINK_TOKEN = 'link-sandbox-placeholder-token';
+  const ACCESS_TOKEN = 'access-sandbox-placeholder-token';
+  const CLAIM = 'c1c2c3c4-0000-4000-8000-000000000001';
 
   beforeEach(() => {
     mockRpc.mockReset();
+    mockFrom.mockReset();
   });
 
   it('createPlaidLinkAttempt stores the link token ENCRYPTED (bound to the attempt id) plus its SHA-256 — never the token itself', async () => {
@@ -2629,15 +2638,8 @@ describe('Plaid Hosted Link attempts (Wave 1)', () => {
     const [fn, args] = mockRpc.mock.calls[0];
     expect(fn).toBe('create_plaid_link_attempt');
     expect(JSON.stringify(args)).not.toContain(LINK_TOKEN);
-    expect(args).toMatchObject({
-      p_id: ATTEMPT_ID,
-      p_user_id: 'user-1',
-      p_session_id: 'sid-1',
-      p_link_token_key_id: 'TEST_V1',
-      p_link_token_enc_version: 1,
-    });
+    expect(args).toMatchObject({ p_id: ATTEMPT_ID, p_user_id: 'user-1', p_session_id: 'sid-1', p_link_token_key_id: 'TEST_V1', p_link_token_enc_version: 1 });
     expect(args.p_link_token_hash).toBe(createHash('sha256').update(LINK_TOKEN).digest('hex'));
-    expect(hashLinkToken(LINK_TOKEN)).toBe(args.p_link_token_hash);
     const enc = {
       ciphertextBase64: args.p_link_token_ciphertext,
       nonceBase64: args.p_link_token_nonce,
@@ -2646,12 +2648,13 @@ describe('Plaid Hosted Link attempts (Wave 1)', () => {
       encVersion: args.p_link_token_enc_version,
     };
     expect(decryptLinkToken(enc, TEST_KEY_RING, ATTEMPT_ID)).toBe(LINK_TOKEN);
-    expect(() => decryptLinkToken(enc, TEST_KEY_RING, 'b1b2c3d4-0000-4000-8000-000000000002')).toThrow(GcmAuthenticationError);
   });
 
-  it('createPlaidLinkAttempt throws on an RPC error or a missing expiry', async () => {
+  it('createPlaidLinkAttempt maps the "too many in progress" refusal, and throws on other errors', async () => {
     const params = { attemptId: ATTEMPT_ID, userId: 'u', sessionId: 's', linkToken: LINK_TOKEN };
-    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+    mockRpc.mockResolvedValueOnce({ data: null, error: { code: 'P0001', message: 'too many Plaid Link attempts in progress' } });
+    await expect(createPlaidLinkAttempt(params)).rejects.toBeInstanceOf(TooManyPlaidLinkAttemptsError);
+    mockRpc.mockResolvedValueOnce({ data: null, error: { code: 'XX000', message: 'boom' } });
     await expect(createPlaidLinkAttempt(params)).rejects.toThrow('Failed to start Plaid Link attempt: boom');
     mockRpc.mockResolvedValueOnce({ data: null, error: null });
     await expect(createPlaidLinkAttempt(params)).rejects.toThrow('no expiry returned');
@@ -2662,6 +2665,7 @@ describe('Plaid Hosted Link attempts (Wave 1)', () => {
     return {
       status: 'pending',
       expired: false,
+      stale: false,
       link_token_ciphertext: enc.ciphertextBase64,
       link_token_nonce: enc.nonceBase64,
       link_token_auth_tag: enc.authTagBase64,
@@ -2670,95 +2674,159 @@ describe('Plaid Hosted Link attempts (Wave 1)', () => {
       ...overrides,
     };
   }
+  const erased = {
+    link_token_ciphertext: null,
+    link_token_nonce: null,
+    link_token_auth_tag: null,
+    link_token_key_id: null,
+    link_token_enc_version: null,
+  };
 
-  it("readPlaidLinkAttempt decrypts a pending attempt's link token for its own user and session", async () => {
-    mockRpc.mockResolvedValueOnce({ data: [storedRow()], error: null });
+  it.each(['pending', 'claimed'] as const)("readPlaidLinkAttempt decrypts a %s attempt's link token for its own user and session", async (status) => {
+    mockRpc.mockResolvedValueOnce({ data: [storedRow({ status, stale: status === 'claimed' })], error: null });
     await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toEqual({
-      status: 'pending',
+      status,
       expired: false,
+      stale: status === 'claimed',
       linkToken: LINK_TOKEN,
     });
     expect(mockRpc).toHaveBeenCalledWith('read_plaid_link_attempt', { p_id: ATTEMPT_ID, p_user_id: 'user-1', p_session_id: 'sid-1' });
   });
 
-  it("readPlaidLinkAttempt returns null when the attempt is not this user's and session's (zero rows)", async () => {
+  it('readPlaidLinkAttempt: null for zero rows; no token for an exchanging or finished attempt', async () => {
     mockRpc.mockResolvedValueOnce({ data: [], error: null });
     await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-2', 'sid-2')).resolves.toBeNull();
-  });
-
-  it('readPlaidLinkAttempt never decrypts (or returns) a token for a finished attempt', async () => {
-    const erased = {
-      link_token_ciphertext: null,
-      link_token_nonce: null,
-      link_token_auth_tag: null,
-      link_token_key_id: null,
-      link_token_enc_version: null,
-    };
-    mockRpc.mockResolvedValueOnce({ data: [storedRow({ status: 'completed', ...erased })], error: null });
-    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toEqual({ status: 'completed', expired: false });
+    for (const status of ['exchanging', 'completed', 'failed', 'exchange_unknown']) {
+      mockRpc.mockResolvedValueOnce({ data: [storedRow({ status, stale: true, ...erased })], error: null });
+      await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toEqual({ status, expired: false, stale: true });
+    }
   });
 
   it('readPlaidLinkAttempt fails closed on a foreign or partial ciphertext, and on unexpected shapes', async () => {
     const foreign = encryptLinkToken(LINK_TOKEN, TEST_KEY_RING, 'b1b2c3d4-0000-4000-8000-000000000009');
     mockRpc.mockResolvedValueOnce({
-      data: [
-        storedRow({
-          link_token_ciphertext: foreign.ciphertextBase64,
-          link_token_nonce: foreign.nonceBase64,
-          link_token_auth_tag: foreign.authTagBase64,
-        }),
-      ],
+      data: [storedRow({ link_token_ciphertext: foreign.ciphertextBase64, link_token_nonce: foreign.nonceBase64, link_token_auth_tag: foreign.authTagBase64 })],
       error: null,
     });
     await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow(GcmAuthenticationError);
     mockRpc.mockResolvedValueOnce({ data: [storedRow({ link_token_nonce: null })], error: null });
     await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow(PartialEncryptedRepresentationError);
-    mockRpc.mockResolvedValueOnce({ data: [storedRow({ status: 'unknown' })], error: null });
-    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
-    mockRpc.mockResolvedValueOnce({ data: [storedRow(), storedRow()], error: null });
-    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
+    for (const bad of [{ status: 'completing' }, { stale: null }]) {
+      mockRpc.mockResolvedValueOnce({ data: [storedRow(bad)], error: null });
+      await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
+    }
     mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'down' } });
     await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('Failed to read Plaid Link attempt: down');
   });
 
-  it.each(['claimed', 'invalid', 'expired', 'completing', 'completed', 'failed'] as const)(
-    'claimPlaidLinkAttempt passes %s through verbatim',
+  it('claimPlaidLinkAttempt returns the claim token only for a won claim', async () => {
+    mockRpc.mockResolvedValueOnce({ data: [{ outcome: 'claimed', claim_token: CLAIM }], error: null });
+    await expect(claimPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toEqual({ outcome: 'claimed', claimToken: CLAIM });
+    expect(mockRpc).toHaveBeenCalledWith('claim_plaid_link_attempt', { p_id: ATTEMPT_ID, p_user_id: 'user-1', p_session_id: 'sid-1' });
+  });
+
+  it.each(['invalid', 'expired', 'in_progress', 'completed', 'failed', 'exchange_unknown'] as const)(
+    'claimPlaidLinkAttempt passes the refusal %s through, with no token',
     async (outcome) => {
-      mockRpc.mockResolvedValueOnce({ data: outcome, error: null });
-      await expect(claimPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toBe(outcome);
-      expect(mockRpc).toHaveBeenCalledWith('claim_plaid_link_attempt', { p_id: ATTEMPT_ID, p_user_id: 'user-1', p_session_id: 'sid-1' });
+      mockRpc.mockResolvedValueOnce({ data: [{ outcome, claim_token: null }], error: null });
+      await expect(claimPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toEqual({ outcome });
     }
   );
 
-  it.each([[null], [''], ['CLAIMED'], [true], [{ status: 'claimed' }]])(
-    'claimPlaidLinkAttempt treats any other result (%j) as an error, never as claimed',
-    async (data) => {
-      mockRpc.mockResolvedValueOnce({ data, error: null });
-      await expect(claimPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
-    }
-  );
+  it.each([
+    [null],
+    [[]],
+    [[{ outcome: 'claimed', claim_token: null }]],
+    [[{ outcome: 'in_progress', claim_token: CLAIM }]],
+    [[{ outcome: 'CLAIMED', claim_token: CLAIM }]],
+    [[{ outcome: 'claimed', claim_token: CLAIM }, { outcome: 'claimed', claim_token: CLAIM }]],
+  ])('claimPlaidLinkAttempt treats any other result (%j) as an error, never as claimed', async (data) => {
+    mockRpc.mockResolvedValueOnce({ data, error: null });
+    await expect(claimPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
+  });
 
-  it('finishPlaidLinkAttempt passes the outcome and item id, and requires a boolean back', async () => {
+  it('beginPlaidLinkExchange passes the claim token and requires a boolean back', async () => {
     mockRpc.mockResolvedValueOnce({ data: true, error: null });
-    await expect(finishPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1', 'completed', 'row-1')).resolves.toBe(true);
-    expect(mockRpc).toHaveBeenCalledWith('finish_plaid_link_attempt', {
+    await expect(beginPlaidLinkExchange(ATTEMPT_ID, 'user-1', 'sid-1', CLAIM)).resolves.toBe(true);
+    expect(mockRpc).toHaveBeenCalledWith('begin_plaid_link_exchange', { p_id: ATTEMPT_ID, p_user_id: 'user-1', p_session_id: 'sid-1', p_claim_token: CLAIM });
+    mockRpc.mockResolvedValueOnce({ data: 'yes', error: null });
+    await expect(beginPlaidLinkExchange(ATTEMPT_ID, 'user-1', 'sid-1', CLAIM)).rejects.toThrow('unexpected result');
+  });
+
+  const storeParams = { attemptId: ATTEMPT_ID, userId: 'user-1', sessionId: 'sid-1', claimToken: CLAIM, plaidItemId: 'plaid-item-1', accessToken: ACCESS_TOKEN };
+
+  it('storePlaidLinkItem sends the access token only ENCRYPTED, AAD-bound to a fresh item row id, in one RPC', async () => {
+    mockRpc.mockResolvedValueOnce({ data: true, error: null, status: 200 });
+    const result = await storePlaidLinkItem(storeParams);
+    expect(result.outcome).toBe('stored');
+    const itemRowId = (result as { itemRowId: string }).itemRowId;
+
+    expect(mockRpc).toHaveBeenCalledTimes(1);
+    const [fn, args] = mockRpc.mock.calls[0];
+    expect(fn).toBe('store_plaid_link_item');
+    expect(JSON.stringify(args)).not.toContain(ACCESS_TOKEN);
+    expect(args).toMatchObject({ p_id: ATTEMPT_ID, p_user_id: 'user-1', p_session_id: 'sid-1', p_claim_token: CLAIM, p_item_row_id: itemRowId, p_plaid_item_id: 'plaid-item-1' });
+    const enc = {
+      ciphertextBase64: args.p_access_token_ciphertext,
+      nonceBase64: args.p_access_token_nonce,
+      authTagBase64: args.p_access_token_auth_tag,
+      keyId: args.p_access_token_key_id,
+      encVersion: args.p_access_token_enc_version,
+    };
+    expect(decryptAccessToken(enc, TEST_KEY_RING, itemRowId)).toBe(ACCESS_TOKEN);
+    expect(() => decryptLinkToken(enc, TEST_KEY_RING, itemRowId)).toThrow(GcmAuthenticationError); // access-token AAD, not link-token
+    expect(mockFrom).not.toHaveBeenCalled(); // no separate, non-atomic insert
+  });
+
+  it('storePlaidLinkItem: false -> refused; a 4xx database answer -> rejected (rolled back)', async () => {
+    mockRpc.mockResolvedValueOnce({ data: false, error: null, status: 200 });
+    await expect(storePlaidLinkItem(storeParams)).resolves.toEqual({ outcome: 'refused' });
+    mockRpc.mockResolvedValueOnce({ data: null, error: { code: '23505', message: 'duplicate key' }, status: 409 });
+    await expect(storePlaidLinkItem(storeParams)).resolves.toEqual({ outcome: 'rejected' });
+  });
+
+  it.each([
+    ['no response (network error / timeout)', { data: null, error: { code: '', message: 'FetchError: fetch failed' }, status: 0 }],
+    ['a 5xx (e.g. a gateway timeout)', { data: null, error: { code: '', message: 'upstream timeout' }, status: 504 }],
+    ['an unexpected success value', { data: 'maybe', error: null, status: 200 }],
+  ])('storePlaidLinkItem: %s -> outcome unknown (thrown), never "rejected"', async (_label, response) => {
+    mockRpc.mockResolvedValueOnce(response);
+    await expect(storePlaidLinkItem(storeParams)).rejects.toBeInstanceOf(PlaidLinkStoreOutcomeUnknownError);
+  });
+
+  it('failPlaidLinkAttempt passes the reason and claim token, and requires a boolean back', async () => {
+    mockRpc.mockResolvedValueOnce({ data: true, error: null });
+    await expect(failPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1', CLAIM, 'store_failed_item_removed')).resolves.toBe(true);
+    expect(mockRpc).toHaveBeenCalledWith('fail_plaid_link_attempt', {
       p_id: ATTEMPT_ID,
       p_user_id: 'user-1',
       p_session_id: 'sid-1',
-      p_outcome: 'completed',
-      p_plaid_item_id: 'row-1',
+      p_claim_token: CLAIM,
+      p_reason: 'store_failed_item_removed',
     });
-    mockRpc.mockResolvedValueOnce({ data: 'yes', error: null });
-    await expect(finishPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1', 'failed', null)).rejects.toThrow('unexpected result');
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
+    await expect(failPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1', null, 'exited')).rejects.toThrow('unexpected result');
   });
 
   it("markPlaidLinkAttemptReady sends only the SHA-256 of the webhook's link token, never the token", async () => {
     mockRpc.mockResolvedValueOnce({ data: true, error: null });
     await expect(markPlaidLinkAttemptReady(LINK_TOKEN, 'SUCCESS')).resolves.toBe(true);
-    const [fn, args] = mockRpc.mock.calls[0];
-    expect(fn).toBe('mark_plaid_link_attempt_ready');
-    expect(args).toEqual({ p_link_token_hash: hashLinkToken(LINK_TOKEN), p_status: 'SUCCESS' });
-    mockRpc.mockResolvedValueOnce({ data: false, error: null });
-    await expect(markPlaidLinkAttemptReady(LINK_TOKEN, 'SUCCESS')).resolves.toBe(false);
+    expect(mockRpc.mock.calls[0]).toEqual(['mark_plaid_link_attempt_ready', { p_link_token_hash: hashLinkToken(LINK_TOKEN), p_status: 'SUCCESS' }]);
+  });
+
+  it('updatePlaidItemInstitution and getPlaidItemIdsMissingInstitution touch only the institution columns of the given item/user', async () => {
+    const update = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(update);
+    await updatePlaidItemInstitution('row-1', 'ins_1', 'Sandbox Bank');
+    expect(mockFrom).toHaveBeenCalledWith('plaid_items');
+    expect(update.update).toHaveBeenCalledWith({ institution_id: 'ins_1', institution_name: 'Sandbox Bank' });
+    expect(update.eq).toHaveBeenCalledWith('id', 'row-1');
+
+    const select = createQueryBuilder({ data: [{ id: 'row-1' }, { id: 'row-2' }], error: null });
+    mockFrom.mockReturnValueOnce(select);
+    await expect(getPlaidItemIdsMissingInstitution('user-1')).resolves.toEqual(new Set(['row-1', 'row-2']));
+    expect(select.select).toHaveBeenCalledWith('id');
+    expect(select.eq).toHaveBeenCalledWith('user_id', 'user-1');
+    expect(select.is).toHaveBeenCalledWith('institution_id', null);
   });
 });

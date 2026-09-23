@@ -43,6 +43,8 @@ export function PlaidLink({
   const [attempt, setAttempt] = useState<WaitingAttempt | null>(null);
   const [preparing, setPreparing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Linked, but some follow-up step did not finish (the server says which): not an error.
+  const [notice, setNotice] = useState<string | null>(null);
   // App's handler is recreated every render; the polling effect must not restart for that.
   const onLinkedRef = useRef(onLinked);
   onLinkedRef.current = onLinked;
@@ -55,6 +57,7 @@ export function PlaidLink({
     if (tab) tab.opener = null;
     setPreparing(true);
     setError(null);
+    setNotice(null);
     try {
       const res = await createHostedLinkAttempt(ownership.verify);
       // Signed out, or someone else signed in, while the attempt was being created: drop it.
@@ -109,7 +112,12 @@ export function PlaidLink({
       try {
         const res = await completeLinkAttempt(attempt.attemptId, attempt.ownership.verify);
         if (stopped || !attempt.ownership.isCurrent()) return;
-        if (res.status === 'completed') stop(null, true);
+        if (res.status === 'completed') {
+          stop(null, true);
+          if (res.follow_up_incomplete && res.follow_up_incomplete.length > 0) {
+            setNotice('Bank linked. Some details are still loading — use Refresh balances or Sync transactions if anything is missing.');
+          }
+        }
         // 'pending' / 'completing': ask again on the next trigger.
       } catch (err) {
         if (stopped || !attempt.ownership.isCurrent()) return;
@@ -166,6 +174,7 @@ export function PlaidLink({
           </button>
         </div>
       )}
+      {notice && <p className="hint">{notice}</p>}
       {error && <p className="error">{error}</p>}
     </div>
   );

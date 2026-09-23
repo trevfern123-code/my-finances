@@ -3743,3 +3743,54 @@ describe('Wave 1: App mutations carry an owner check bound to the lifecycle that
     });
   });
 });
+
+describe('Wave 1 Hosted Link recovery outcomes, as the user sees them', () => {
+  async function bootAndOpen() {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    await openPlaidLink();
+  }
+  async function pollNow() {
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  it('linked with some follow-up unfinished: data refreshes and a non-error hint points to Refresh balances / Sync', async () => {
+    await bootAndOpen();
+    const before = mockGetLinkedItems.mock.calls.length;
+    mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed', follow_up_incomplete: ['accounts', 'transactions', 'liabilities'] });
+    await pollNow();
+    await waitFor(() => expect(mockGetLinkedItems.mock.calls.length).toBeGreaterThan(before));
+    expect(screen.getByText(/Bank linked\. Some details are still loading/)).toBeTruthy();
+    expect(document.querySelector('.error')).toBeNull();
+  });
+
+  it('linked with every follow-up done: no hint', async () => {
+    await bootAndOpen();
+    mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed', follow_up_incomplete: [] });
+    await pollNow();
+    await waitFor(() => expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull());
+    expect(screen.queryByText(/Some details are still loading/)).toBeNull();
+  });
+
+  it("an unknown exchange outcome is final: it says the bank was not added, stops checking, and doesn't claim success", async () => {
+    await bootAndOpen();
+    const before = mockGetLinkedItems.mock.calls.length;
+    mockCompleteLinkAttempt.mockRejectedValueOnce(
+      Object.assign(new Error("We couldn't confirm this bank connection, so it was not added. Start linking the account again."), {
+        code: 'link_attempt_outcome_unknown',
+      })
+    );
+    await pollNow();
+    await waitFor(() => expect(screen.getByText(/so it was not added/)).toBeTruthy());
+    const calls = mockCompleteLinkAttempt.mock.calls.length;
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(calls);
+    expect(mockGetLinkedItems.mock.calls.length).toBe(before);
+  });
+});

@@ -6,28 +6,38 @@
 -- When Hosted Link finishes, the same user in the same login session asks the backend to complete
 -- the attempt; the backend reads its own stored link token, asks Plaid (/link/token/get) for the
 -- public token of THAT link token's session, and exchanges it. No endpoint accepts a public token
--- from a client, so a public token captured from another user has nowhere to be submitted
--- (Wave 1 review P1). The user id always comes from the verified bearer token, never a request body.
+-- from a client (Wave 1 review P1). The user id always comes from the verified bearer token.
 --
--- Lifecycle (`status`):
---   pending     created; Hosted Link in progress. The encrypted link token is present.
---   completing  one completion call claimed it (claim_plaid_link_attempt) and is exchanging. The
---               claim is a single conditional UPDATE, so concurrent or duplicate completion calls
---               cannot both claim: the loser sees 'completing'/'completed' and exchanges nothing.
---   completed   an item was stored (plaid_item_id). The link token is erased.
---   failed      exited, ambiguous, or the exchange failed before an item was stored. Erased too.
+-- Lifecycle (`status`) — each step is recorded durably BEFORE the work it guards:
+--   pending           created; Hosted Link in progress. The encrypted link token is present.
+--   claimed           one completion call won the claim (claim_plaid_link_attempt) and holds a
+--                     random claim_token. The exchange is known NOT to have started. A claim older
+--                     than two minutes is presumed abandoned and may be re-claimed (new token).
+--   exchanging        begin_plaid_link_exchange recorded, just before /item/public_token/exchange,
+--                     that the exchange may have started. The link token is erased. From here the
+--                     public token is NEVER exchanged again: Plaid does not document that as safe.
+--   completed         store_plaid_link_item stored the new plaid_items row (encrypted token) AND
+--                     marked the attempt completed in ONE transaction: an item is linked exactly when
+--                     its attempt says completed.
+--   failed            definitively nothing linked: exited, ambiguous, exchange rejected by Plaid, or
+--                     the item could not be stored and was removed at Plaid (compensation).
+--   exchange_unknown  an access token may exist at Plaid but was not stored here: the exchange's
+--                     outcome is unknown (network error / timeout / the process died mid-exchange —
+--                     a stale `exchanging` row), or compensation's result is unknown. Terminal.
 -- A verified SESSION_FINISHED webhook only records readiness (ready_at/ready_status). It never
 -- claims, exchanges or changes status.
 --
 -- Concurrency (Wave 1 review P2): create_plaid_link_attempt serializes per user with a
--- transaction-scoped advisory lock, so concurrent requests cannot exceed five live pending attempts
--- per user. Rows are swept globally, in bounded batches, an hour after they expire (the hour keeps
--- replay detection), by every create and every completion claim.
+-- transaction-scoped advisory lock. At most five live (unexpired) attempts per user count toward the
+-- limit — pending, claimed and exchanging alike; to make room only the oldest PENDING ones are
+-- removed, never one being completed, and a create with five in flight is refused. Rows are swept
+-- globally, in bounded batches, an hour after they expire, by every create and every claim.
 --
 -- Every function: SECURITY INVOKER, search_path pinned empty, executable by service_role only. The
 -- table: service_role only, with exactly SELECT, INSERT, DELETE and column-level UPDATE of the
 -- lifecycle columns — Supabase's default privileges would otherwise grant every privilege to
--- anon/authenticated/service_role.
+-- anon/authenticated/service_role. store_plaid_link_item inserts into plaid_items with the
+-- service_role's existing privileges there (unchanged by this migration).
 --
 -- Deploy order: apply this migration BEFORE deploying the backend that calls these functions
 -- (until then that backend refuses to create link tokens: linking fails closed, nothing else is
@@ -35,7 +45,9 @@
 --
 -- Rollback (only after reverting the backend to a build that does not call these functions):
 --   drop function public.mark_plaid_link_attempt_ready(text, text);
---   drop function public.finish_plaid_link_attempt(uuid, uuid, text, text, uuid);
+--   drop function public.fail_plaid_link_attempt(uuid, uuid, text, uuid, text);
+--   drop function public.store_plaid_link_item(uuid, uuid, text, uuid, uuid, text, text, text, text, text, smallint);
+--   drop function public.begin_plaid_link_exchange(uuid, uuid, text, uuid);
 --   drop function public.claim_plaid_link_attempt(uuid, uuid, text);
 --   drop function public.read_plaid_link_attempt(uuid, uuid, text);
 --   drop function public.create_plaid_link_attempt(uuid, uuid, text, text, text, text, text, text, smallint);
@@ -51,13 +63,13 @@ create table public.plaid_link_attempts (
   created_at             timestamptz not null default now(),
   expires_at             timestamptz not null,
   status                 text        not null default 'pending'
-                                     check (status in ('pending', 'completing', 'completed', 'failed')),
+                                     check (status in ('pending', 'claimed', 'exchanging', 'completed', 'failed', 'exchange_unknown')),
   -- SHA-256 (hex) of the link token: lets a SESSION_FINISHED webhook find its attempt without
   -- decrypting anything. Not reversible.
   link_token_hash        text        not null unique check (link_token_hash ~ '^[0-9a-f]{64}$'),
   -- The link token itself, AES-256-GCM encrypted under the Plaid token key ring (see
   -- backend/src/services/tokenEncryption.ts), AAD-bound to this row's id. Present only while the
-  -- attempt can still be completed.
+  -- attempt may still need to ask Plaid for its result (pending, claimed).
   link_token_ciphertext  text,
   link_token_nonce       text,
   link_token_auth_tag    text,
@@ -65,20 +77,30 @@ create table public.plaid_link_attempts (
   link_token_enc_version smallint,
   ready_at               timestamptz,
   ready_status           text        check (ready_status is null or length(ready_status) between 1 and 32),
+  claim_token            uuid,
   claimed_at             timestamptz,
+  exchange_started_at    timestamptz,
   finished_at            timestamptz,
+  failure_reason         text,
   plaid_item_id          uuid,
   check (expires_at > created_at),
   check (
-    (status in ('pending', 'completing')
+    (status in ('pending', 'claimed')
       and link_token_ciphertext is not null and link_token_nonce is not null and link_token_auth_tag is not null
       and link_token_key_id is not null and link_token_enc_version is not null)
     or
-    (status in ('completed', 'failed')
+    (status not in ('pending', 'claimed')
       and link_token_ciphertext is null and link_token_nonce is null and link_token_auth_tag is null
       and link_token_key_id is null and link_token_enc_version is null)
   ),
-  check ((status = 'completed') = (plaid_item_id is not null))
+  check (status not in ('claimed', 'exchanging') or (claim_token is not null and claimed_at is not null)),
+  check (status not in ('exchanging', 'completed', 'exchange_unknown') or exchange_started_at is not null),
+  check ((status = 'completed') = (plaid_item_id is not null)),
+  check (
+    (status = 'failed' and failure_reason in ('exited', 'ambiguous', 'exchange_rejected', 'store_failed_item_removed'))
+    or (status = 'exchange_unknown' and failure_reason in ('exchange_outcome_unknown', 'stale_exchange', 'store_failed_remove_unknown'))
+    or (status not in ('failed', 'exchange_unknown') and failure_reason is null)
+  )
 );
 
 create index plaid_link_attempts_user_id_idx on public.plaid_link_attempts (user_id);
@@ -88,16 +110,16 @@ alter table public.plaid_link_attempts enable row level security;
 
 revoke all on table public.plaid_link_attempts from public, anon, authenticated, service_role;
 grant select, insert, delete on table public.plaid_link_attempts to service_role;
-grant update (status, ready_at, ready_status, claimed_at, finished_at, plaid_item_id,
-              link_token_ciphertext, link_token_nonce, link_token_auth_tag, link_token_key_id,
-              link_token_enc_version)
+grant update (status, ready_at, ready_status, claim_token, claimed_at, exchange_started_at, finished_at,
+              failure_reason, plaid_item_id, link_token_ciphertext, link_token_nonce, link_token_auth_tag,
+              link_token_key_id, link_token_enc_version)
   on table public.plaid_link_attempts to service_role;
 
 -- Deletes up to p_limit rows of ANY user that expired more than an hour ago, oldest first, and
 -- returns how many. At most one sweep runs at a time: a sweeper that cannot take the sweep lock
 -- immediately returns 0 rather than waiting, so two sweeps never contend for (or deadlock on) the
--- same rows. Only long-expired rows are touched, and the per-user cap below only touches live ones,
--- so a sweep in progress does not hold up another user's link creation.
+-- same rows. Only long-expired rows are touched, and the per-user limit below only touches live
+-- ones, so a sweep in progress does not hold up another user's link creation.
 create function public.purge_expired_plaid_link_attempts(p_limit integer)
 returns integer
 language plpgsql
@@ -129,8 +151,9 @@ $$;
 -- Records a new pending attempt (id, encrypted link token and its hash supplied by the backend) and
 -- returns its expiry. Serialized per user: the advisory lock is held until the calling transaction
 -- commits, so a concurrent create for the same user waits here and then sees this one's committed
--- row. Under it, the user's oldest live pending attempts are removed until four remain, then the new
--- one is inserted: never more than five live pending attempts.
+-- row. Live attempts — pending, claimed and exchanging — all count toward the limit of five; the
+-- oldest PENDING ones are removed to make room, and if five are already being completed the create
+-- is refused (SQLSTATE P0001, 'too many Plaid Link attempts in progress').
 create function public.create_plaid_link_attempt(
   p_id uuid,
   p_user_id uuid,
@@ -148,6 +171,7 @@ security invoker
 set search_path = ''
 as $$
 declare
+  v_in_flight integer;
   v_expires_at timestamptz;
 begin
   if p_id is null or p_user_id is null or p_session_id is null or btrim(p_session_id) = '' then
@@ -157,12 +181,20 @@ begin
 
   perform pg_advisory_xact_lock(hashtextextended('public.plaid_link_attempts:user:' || p_user_id::text, 0));
 
+  select count(*) into v_in_flight
+    from public.plaid_link_attempts a
+   where a.user_id = p_user_id and a.status in ('claimed', 'exchanging') and a.expires_at > now();
+  if v_in_flight >= 5 then
+    raise exception 'too many Plaid Link attempts in progress' using errcode = 'P0001';
+  end if;
+
+  -- Keep at most (4 - in flight) live pending attempts, so with the new one there are at most five.
   delete from public.plaid_link_attempts a
    where a.user_id = p_user_id
      and a.id in (select b.id from public.plaid_link_attempts b
                    where b.user_id = p_user_id and b.status = 'pending' and b.expires_at > now()
                    order by b.created_at desc, b.id desc
-                   offset 4);
+                   offset 4 - v_in_flight);
 
   insert into public.plaid_link_attempts (
     id, user_id, session_id, expires_at, link_token_hash, link_token_ciphertext, link_token_nonce,
@@ -180,11 +212,14 @@ end;
 $$;
 
 -- The attempt as seen by its OWN user in its OWN login session — zero rows for anyone else, or for
--- an unknown id. `expired` is decided by the database clock.
+-- an unknown id. `expired` and `stale` (a claim or exchange older than two minutes: its process is
+-- presumed gone) are decided by the database clock. The encrypted link token is returned only while
+-- it still exists (pending, claimed).
 create function public.read_plaid_link_attempt(p_id uuid, p_user_id uuid, p_session_id text)
 returns table (
   status text,
   expired boolean,
+  stale boolean,
   link_token_ciphertext text,
   link_token_nonce text,
   link_token_auth_tag text,
@@ -196,62 +231,109 @@ stable
 security invoker
 set search_path = ''
 as $$
-  select a.status, a.expires_at <= now(), a.link_token_ciphertext, a.link_token_nonce,
-         a.link_token_auth_tag, a.link_token_key_id, a.link_token_enc_version
+  select a.status,
+         a.expires_at <= now(),
+         case a.status
+           when 'claimed' then a.claimed_at <= now() - interval '2 minutes'
+           when 'exchanging' then a.exchange_started_at <= now() - interval '2 minutes'
+           else false
+         end,
+         a.link_token_ciphertext, a.link_token_nonce, a.link_token_auth_tag, a.link_token_key_id,
+         a.link_token_enc_version
     from public.plaid_link_attempts a
    where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id;
 $$;
 
--- Claims a pending, unexpired attempt for its own user and login session: exactly one caller can
--- ever get 'claimed' (one conditional UPDATE; a concurrent claimer blocks on the row lock, then
--- re-checks status and finds it no longer pending). Everyone else gets the reason:
---   'invalid'     no such attempt for this user and session (unknown, swept, or someone else's)
---   'expired'     still pending, but past its 30 minutes
---   'completing'  another call claimed it and is exchanging right now
---   'completed'   already exchanged
---   'failed'      exited, ambiguous or failed — start again
+-- Claims the caller's own attempt for completion with a fresh claim_token. Claimable: pending and
+-- unexpired, or claimed-but-stale and unexpired (its exchange is known not to have started, so
+-- taking it over is safe). Exactly one caller can win: a single conditional UPDATE, and a
+-- concurrent claimer blocks on the row lock and then re-checks. A STALE `exchanging` attempt is
+-- never re-claimed: it is recorded as exchange_unknown (reason stale_exchange). Returns:
+--   'claimed' + claim_token, or (claim_token null):
+--   'invalid'      no such attempt for this user and session (unknown, swept, or someone else's)
+--   'expired'      past its 30 minutes before it could be claimed
+--   'in_progress'  another call holds a live claim or is exchanging right now
+--   'completed' | 'failed' | 'exchange_unknown'   already finished
 create function public.claim_plaid_link_attempt(p_id uuid, p_user_id uuid, p_session_id text)
-returns text
+returns table (outcome text, claim_token uuid)
 language plpgsql
 security invoker
 set search_path = ''
 as $$
 declare
+  v_token uuid;
   v_status text;
+  v_expired boolean;
 begin
   update public.plaid_link_attempts a
-     set status = 'completing', claimed_at = now()
+     set status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now()
    where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
-     and a.status = 'pending' and a.expires_at > now();
-  if found then
+     and a.expires_at > now()
+     and (a.status = 'pending' or (a.status = 'claimed' and a.claimed_at <= now() - interval '2 minutes'))
+  returning a.claim_token into v_token;
+  if v_token is not null then
     perform public.purge_expired_plaid_link_attempts(100);
-    return 'claimed';
+    return query select 'claimed'::text, v_token;
+    return;
   end if;
 
-  select a.status into v_status
+  update public.plaid_link_attempts a
+     set status = 'exchange_unknown', failure_reason = 'stale_exchange', finished_at = now()
+   where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
+     and a.status = 'exchanging' and a.exchange_started_at <= now() - interval '2 minutes';
+
+  select a.status, a.expires_at <= now() into v_status, v_expired
     from public.plaid_link_attempts a
    where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id;
   if not found then
-    return 'invalid';
+    return query select 'invalid'::text, null::uuid;
+  elsif v_status in ('pending', 'claimed') and v_expired then
+    return query select 'expired'::text, null::uuid;
+  elsif v_status in ('claimed', 'exchanging') then
+    return query select 'in_progress'::text, null::uuid;
+  else
+    return query select v_status, null::uuid;
   end if;
-  if v_status = 'pending' then
-    return 'expired';
-  end if;
-  return v_status;
 end;
 $$;
 
--- Ends an attempt and erases its link token. Only these transitions exist:
---   'completed'  completing -> completed (p_plaid_item_id required): the claimer stored an item
---   'failed'     pending or completing -> failed: exited/ambiguous, or the claimer's exchange failed
--- Returns false when the attempt is not in a state that allows the transition (or is not this user's
--- and session's), changing nothing.
-create function public.finish_plaid_link_attempt(
+-- Records, for the holder of the claim only, that the exchange may be about to start: claimed ->
+-- exchanging, and erases the link token. Must succeed BEFORE /item/public_token/exchange is called;
+-- false (claim lost, e.g. taken over as stale) means the caller must not exchange.
+create function public.begin_plaid_link_exchange(p_id uuid, p_user_id uuid, p_session_id text, p_claim_token uuid)
+returns boolean
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+begin
+  update public.plaid_link_attempts a
+     set status = 'exchanging', exchange_started_at = now(),
+         link_token_ciphertext = null, link_token_nonce = null, link_token_auth_tag = null,
+         link_token_key_id = null, link_token_enc_version = null
+   where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
+     and a.status = 'claimed' and a.claim_token = p_claim_token;
+  return found;
+end;
+$$;
+
+-- In ONE transaction: marks the claim holder's exchanging attempt completed and inserts the new
+-- plaid_items row (encrypted access token only — no plaintext column is written) for the attempt's
+-- own user. Returns false, inserting nothing, when the attempt is not this claim's exchanging
+-- attempt (e.g. it was meanwhile recorded as exchange_unknown). If the insert fails, the whole
+-- call — attempt update included — rolls back and raises.
+create function public.store_plaid_link_item(
   p_id uuid,
   p_user_id uuid,
   p_session_id text,
-  p_outcome text,
-  p_plaid_item_id uuid
+  p_claim_token uuid,
+  p_item_row_id uuid,
+  p_plaid_item_id text,
+  p_access_token_ciphertext text,
+  p_access_token_nonce text,
+  p_access_token_auth_tag text,
+  p_access_token_key_id text,
+  p_access_token_enc_version smallint
 )
 returns boolean
 language plpgsql
@@ -259,28 +341,72 @@ security invoker
 set search_path = ''
 as $$
 begin
-  if p_outcome = 'completed' then
-    if p_plaid_item_id is null then
-      raise exception 'finish_plaid_link_attempt: a completed attempt needs its plaid item id'
-        using errcode = '22023';
-    end if;
-    update public.plaid_link_attempts a
-       set status = 'completed', plaid_item_id = p_plaid_item_id, finished_at = now(),
-           link_token_ciphertext = null, link_token_nonce = null, link_token_auth_tag = null,
-           link_token_key_id = null, link_token_enc_version = null
-     where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
-       and a.status = 'completing';
-  elsif p_outcome = 'failed' then
-    update public.plaid_link_attempts a
-       set status = 'failed', finished_at = now(),
-           link_token_ciphertext = null, link_token_nonce = null, link_token_auth_tag = null,
-           link_token_key_id = null, link_token_enc_version = null
-     where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
-       and a.status in ('pending', 'completing');
-  else
-    raise exception 'finish_plaid_link_attempt: outcome must be completed or failed'
+  if p_item_row_id is null or p_plaid_item_id is null or btrim(p_plaid_item_id) = '' then
+    raise exception 'store_plaid_link_item: an item row id and a Plaid item id are required'
       using errcode = '22023';
   end if;
+
+  update public.plaid_link_attempts a
+     set status = 'completed', plaid_item_id = p_item_row_id, finished_at = now()
+   where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
+     and a.status = 'exchanging' and a.claim_token = p_claim_token;
+  if not found then
+    return false;
+  end if;
+
+  insert into public.plaid_items (
+    id, user_id, plaid_item_id, access_token_ciphertext, access_token_nonce, access_token_auth_tag,
+    access_token_key_id, access_token_enc_version)
+  values (
+    p_item_row_id, p_user_id, p_plaid_item_id, p_access_token_ciphertext, p_access_token_nonce,
+    p_access_token_auth_tag, p_access_token_key_id, p_access_token_enc_version);
+  return true;
+end;
+$$;
+
+-- Ends an attempt that did not link anything here, recording why. Each reason allows only the
+-- transitions it can truthfully describe:
+--   exited, ambiguous                  pending -> failed                  (no claim token)
+--   exchange_rejected                  exchanging -> failed               (Plaid refused the exchange)
+--   exchange_outcome_unknown           exchanging -> exchange_unknown     (network error / timeout)
+--   store_failed_item_removed          exchanging|exchange_unknown -> failed           (compensated)
+--   store_failed_remove_unknown        exchanging|exchange_unknown -> exchange_unknown
+-- Every reason after `pending` requires the matching claim token. Returns false, changing nothing,
+-- when the transition does not apply. The link token (if any is left) is erased.
+create function public.fail_plaid_link_attempt(
+  p_id uuid,
+  p_user_id uuid,
+  p_session_id text,
+  p_claim_token uuid,
+  p_reason text
+)
+returns boolean
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_to text;
+  v_from text[];
+begin
+  case p_reason
+    when 'exited' then v_to := 'failed'; v_from := array['pending'];
+    when 'ambiguous' then v_to := 'failed'; v_from := array['pending'];
+    when 'exchange_rejected' then v_to := 'failed'; v_from := array['exchanging'];
+    when 'exchange_outcome_unknown' then v_to := 'exchange_unknown'; v_from := array['exchanging'];
+    when 'store_failed_item_removed' then v_to := 'failed'; v_from := array['exchanging', 'exchange_unknown'];
+    when 'store_failed_remove_unknown' then v_to := 'exchange_unknown'; v_from := array['exchanging', 'exchange_unknown'];
+    else
+      raise exception 'fail_plaid_link_attempt: unknown reason' using errcode = '22023';
+  end case;
+
+  update public.plaid_link_attempts a
+     set status = v_to, failure_reason = p_reason, finished_at = now(),
+         link_token_ciphertext = null, link_token_nonce = null, link_token_auth_tag = null,
+         link_token_key_id = null, link_token_enc_version = null
+   where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
+     and a.status = any (v_from)
+     and (a.status = 'pending' or a.claim_token = p_claim_token);
   return found;
 end;
 $$;
@@ -311,11 +437,15 @@ revoke all on function public.purge_expired_plaid_link_attempts(integer) from pu
 revoke all on function public.create_plaid_link_attempt(uuid, uuid, text, text, text, text, text, text, smallint) from public, anon, authenticated;
 revoke all on function public.read_plaid_link_attempt(uuid, uuid, text) from public, anon, authenticated;
 revoke all on function public.claim_plaid_link_attempt(uuid, uuid, text) from public, anon, authenticated;
-revoke all on function public.finish_plaid_link_attempt(uuid, uuid, text, text, uuid) from public, anon, authenticated;
+revoke all on function public.begin_plaid_link_exchange(uuid, uuid, text, uuid) from public, anon, authenticated;
+revoke all on function public.store_plaid_link_item(uuid, uuid, text, uuid, uuid, text, text, text, text, text, smallint) from public, anon, authenticated;
+revoke all on function public.fail_plaid_link_attempt(uuid, uuid, text, uuid, text) from public, anon, authenticated;
 revoke all on function public.mark_plaid_link_attempt_ready(text, text) from public, anon, authenticated;
 grant execute on function public.purge_expired_plaid_link_attempts(integer) to service_role;
 grant execute on function public.create_plaid_link_attempt(uuid, uuid, text, text, text, text, text, text, smallint) to service_role;
 grant execute on function public.read_plaid_link_attempt(uuid, uuid, text) to service_role;
 grant execute on function public.claim_plaid_link_attempt(uuid, uuid, text) to service_role;
-grant execute on function public.finish_plaid_link_attempt(uuid, uuid, text, text, uuid) to service_role;
+grant execute on function public.begin_plaid_link_exchange(uuid, uuid, text, uuid) to service_role;
+grant execute on function public.store_plaid_link_item(uuid, uuid, text, uuid, uuid, text, text, text, text, text, smallint) to service_role;
+grant execute on function public.fail_plaid_link_attempt(uuid, uuid, text, uuid, text) to service_role;
 grant execute on function public.mark_plaid_link_attempt_ready(text, text) to service_role;

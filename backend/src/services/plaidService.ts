@@ -8,7 +8,7 @@ import {
 import { plaidClient } from '../config/plaid';
 import { env } from '../config/env';
 
-export { isReauthRequiredError } from './plaidErrors';
+export { isDefinitivePlaidRejection, isReauthRequiredError } from './plaidErrors';
 
 const products = env.plaidProducts.map((p) => p as Products);
 const countryCodes = env.plaidCountryCodes.map((c) => c as CountryCode);
@@ -57,12 +57,24 @@ export async function getLinkTokenSessions(linkToken: string) {
   return response.data.link_sessions ?? [];
 }
 
+/** Bounds how long one exchange (or compensating removal) may keep the completion request waiting.
+ *  Hitting it does NOT mean Plaid did nothing — the outcome is then unknown (isDefinitivePlaidRejection
+ *  is false) and the attempt is recorded as exchange_unknown, never retried. Must stay well under the
+ *  two-minute staleness window in 20260922130000_plaid_link_attempts.sql. */
+export const PLAID_EXCHANGE_TIMEOUT_MS = 30_000;
+
 export async function exchangePublicToken(publicToken: string) {
-  const response = await plaidClient.itemPublicTokenExchange({ public_token: publicToken });
+  const response = await plaidClient.itemPublicTokenExchange({ public_token: publicToken }, { timeout: PLAID_EXCHANGE_TIMEOUT_MS });
   return {
     accessToken: response.data.access_token,
     itemId: response.data.item_id,
   };
+}
+
+/** Wave 1 compensation: removes an Item whose access token this backend received but could not
+ *  store. Resolves only when Plaid confirmed the removal; any error means its result is unknown. */
+export async function removeItem(accessToken: string): Promise<void> {
+  await plaidClient.itemRemove({ access_token: accessToken }, { timeout: PLAID_EXCHANGE_TIMEOUT_MS });
 }
 
 /** Confirms `accessToken` is still a live, Plaid-accepted credential by calling **only**
