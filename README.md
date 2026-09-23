@@ -563,7 +563,7 @@ extracted, since which props each card needs only exists as live app state in `A
 1. User signs in via Supabase Auth in the frontend.
 2. When the user clicks **Link a bank account**, the frontend calls `POST /api/plaid/link-token` (with the user's Supabase JWT). The backend records a one-time, 30-minute **Link attempt** bound to the verified user *and* their login session (the JWT's `session_id` claim; table `plaid_link_attempts`, service-role only) and returns a Plaid `link_token` plus the `link_attempt_id`.
 3. Frontend opens Plaid Link with that token; on success Plaid returns a `public_token`.
-4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token` and `link_attempt_id`. Before anything reaches Plaid, the backend atomically consumes the attempt (`consume_plaid_link_attempt`): a different user, the same user in a newer login, a replay (409 `link_attempt_invalid`), an expired attempt (410 `link_attempt_expired`) or a missing id (400 `link_attempt_required`) is refused and nothing is stored. The owner is always the verified bearer token's user, never anything in the body. Then it exchanges the token for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
+4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token` and `link_attempt_id`. Before anything reaches Plaid, the backend atomically consumes the attempt (`consume_plaid_link_attempt`): a different user, the same user in a newer login, a replay (409 `link_attempt_invalid`), an expired attempt (410 `link_attempt_expired`) or a missing id (400 `link_attempt_required`) is refused and nothing is stored. The owner is always the verified bearer token's user, never anything in the body. **Limitation:** the attempt proves the caller recently started *a* Link flow, not that this `public_token` came from it — see "Wave 1 follow-ups" below. Then it exchanges the token for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
 5. Frontend calls `GET /api/plaid/items` to display the user's linked institutions/accounts.
 
 **Every mutation is bound to the session that started it.** Each frontend change request (every
@@ -583,6 +583,52 @@ straight from Supabase's REST API. The backend's service-role access is unchange
 `bash supabase/tests/access_control/run.sh` (Docker; applies the real migration history to
 Supabase's PostgreSQL 17 image and queries as `anon`/`authenticated`/`service_role` exactly as
 PostgREST would; `EXCLUDE=<migration file>` shows the tests failing without it).
+
+## Wave 1 follow-ups (open)
+
+**P1 — public-token binding (unresolved, blocks deploy; needs a product decision).** A Link attempt
+proves the caller is the same user and login that recently asked for a link token. It does not prove
+the submitted `public_token` came from that link token's flow, so user B could exchange a public
+token captured from user A using B's own fresh attempt, pulling A's bank data into B's account.
+Plaid, per its current docs (checked 2026-09-22):
+- Embedded Link (what `react-plaid-link` uses) returns the public token to the browser.
+- `/item/public_token/exchange` returns only `access_token`, `item_id` and `request_id`. The Item
+  object carries no link token, Link session or `client_user_id`. Nothing server-side ties a public
+  token to its link token after the fact.
+- `/link/token/get` does return each session's public tokens (`link_sessions[].results
+  .item_add_results[].public_token`, kept six hours). But by default Plaid returns complete session
+  data only for Hosted Link; other flows need Plaid to enable "Link events" on the account.
+
+Viable options (none implemented):
+1. **Hosted Link.** Create the link token with `hosted_link` and store it server-side with the
+   attempt. The user completes Plaid's hosted page; the backend takes the public token from the
+   `SESSION_FINISHED` webhook or `/link/token/get` for that stored link token and exchanges it
+   itself. The browser never holds or submits a public token, which removes the attack. No account
+   enablement is needed. Costs: a UX change (Plaid page in a new tab or redirect instead of an
+   in-app modal), a completion redirect/poll, and reliance on the existing verified webhook
+   receiver.
+2. **Keep embedded Link and ask Plaid to enable Link events.** At exchange, call `/link/token/get`
+   with the attempt's stored link token. Exchange only if the submitted public token appears in that
+   token's own sessions; fail closed otherwise. This keeps today's UX but depends on a Plaid account
+   change, and must first be confirmed in Sandbox and Production to return embedded sessions' public
+   tokens.
+3. **Not viable:** correlating after the exchange (no Plaid field to correlate on, and it would
+   exchange first), or comparing client-sent `onSuccess` metadata such as `link_session_id`
+   (client-supplied, so it proves nothing).
+
+The attack is recorded as a pending test in `backend/src/controllers/plaidController.test.ts`.
+Whichever option is chosen must make that test pass.
+
+**Other follow-ups (deliberately out of scope for the Wave 1 corrective pass):**
+- Reconnect button stays stuck on "Reconnecting..." if Plaid Update Mode is closed without
+  finishing (`frontend/src/components/ReconnectButton.tsx`, pre-existing).
+- Supabase's default privileges still grant every new `public` table/function to
+  `anon`/`authenticated` (`20260825195130_remote_schema.sql`), so each new object must revoke
+  explicitly. Changing the defaults is a separate, project-wide migration.
+- `supabase/tests/phase_a/sql/t05_acl.sql` checks service_role's exact grants on
+  `manual_loan_creation_requests`/`manual_loan_deletions` via `information_schema`, which does not
+  report PostgreSQL 17's `MAINTAIN`. It should also use `has_table_privilege`, as the Wave 1 tests
+  now do.
 
 ## Budget periods
 

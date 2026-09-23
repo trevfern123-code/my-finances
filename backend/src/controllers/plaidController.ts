@@ -247,6 +247,12 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
 
     // Spent BEFORE the public token is exchanged, so a replayed, expired, or foreign attempt never
     // reaches Plaid and never creates an item.
+    //
+    // KNOWN GAP (Wave 1 review P1, unresolved): this proves the caller recently started SOME Link
+    // flow, not that `publicToken` came from it. Embedded Link returns the public token to the
+    // browser and Plaid offers no default server-side way to tie it to its link token, so a public
+    // token captured from another user is still accepted alongside the caller's own attempt. See
+    // README "Wave 1 follow-ups" for the options; do not treat the attempt as token binding.
     const attempt = await dataService.consumePlaidLinkAttempt(linkAttemptId, userId, sessionId);
     if (attempt === 'expired') {
       res.status(410).json({

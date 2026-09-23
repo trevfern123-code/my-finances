@@ -365,3 +365,14 @@ describe('Plaid Link attempts — exchange is bound to the initiating user and l
     expectNothingExchanged();
   });
 });
+
+// Wave 1 review P1 — UNRESOLVED, deliberately left pending rather than asserting a false guarantee.
+// A Link attempt proves the caller recently started SOME Link flow, not that the submitted public
+// token came from it, and embedded Link offers no default server-side correlation (README "Wave 1
+// follow-ups"). Whichever fix is chosen (Hosted Link, or /link/token/get with Plaid's Link-events
+// enablement) must turn this into a passing test.
+describe('Wave 1 P1: a public token is only exchanged for the Link flow that produced it', () => {
+  it.todo(
+    "user A completes Link and keeps the public token; user B signs in, creates a fresh valid attempt and submits A's public token with it: rejected before exchange, and no Plaid item is created"
+  );
+});
