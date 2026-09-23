@@ -72,8 +72,8 @@ describe('createSessionOwnership', () => {
 // Every mutation lib/api.ts exports, each called with representative arguments. A mutation added
 // later without an entry here (or without an owner check) is caught by the completeness test below.
 const MUTATIONS: { name: string; method: string; path: string; call: (verify: OwnershipCheck) => Promise<unknown> }[] = [
-  { name: 'createLinkToken', method: 'POST', path: '/api/plaid/link-token', call: (v) => api.createLinkToken(v) },
-  { name: 'exchangePublicToken', method: 'POST', path: '/api/plaid/exchange-public-token', call: (v) => api.exchangePublicToken('public-1', 'attempt-1', v) },
+  { name: 'createHostedLinkAttempt', method: 'POST', path: '/api/plaid/link-token', call: (v) => api.createHostedLinkAttempt(v) },
+  { name: 'completeLinkAttempt', method: 'POST', path: '/api/plaid/link-attempts/attempt-1/complete', call: (v) => api.completeLinkAttempt('attempt-1', v) },
   { name: 'refreshAccountBalances', method: 'POST', path: '/api/plaid/accounts/refresh', call: (v) => api.refreshAccountBalances(v) },
   { name: 'updateAccountCreditLimit', method: 'PATCH', path: '/api/plaid/accounts/acc-1/credit-limit', call: (v) => api.updateAccountCreditLimit('acc-1', 100, v) },
   { name: 'updateAccountCustomization', method: 'PATCH', path: '/api/plaid/accounts/acc-1/customization', call: (v) => api.updateAccountCustomization('acc-1', { hidden: true }, v) },
@@ -176,4 +176,9 @@ it('every exported mutation-named function is covered above', () => {
     .map(([name]) => name)
     .filter((name) => /^(create|exchange|refresh|update|delete|unlink|complete|sandbox|sync|set|approve|save|clear)[A-Z]/.test(name));
   expect(mutating.sort()).toEqual([...covered].sort());
+});
+
+it('Wave 1 Hosted Link: the frontend API has no way to send a Plaid public token', () => {
+  expect('exchangePublicToken' in api).toBe(false);
+  expect('createLinkToken' in api).toBe(false);
 });

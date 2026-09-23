@@ -177,21 +177,36 @@ export interface BudgetCategory {
   recent_avg_spent: number;
 }
 
-/** Wave 1: also starts a one-time, 30-minute server-side Link attempt bound to this user and login
- *  session. Its id must accompany the public token this Link flow produces (exchangePublicToken). */
-export function createLinkToken(
-  verifyOwnership: OwnershipCheck
-): Promise<{ link_token: string; link_attempt_id: string }> {
+/** A server-owned Plaid Hosted Link attempt (Wave 1). The Plaid link token stays on the server; this
+ *  app only opens `hosted_link_url` and later asks the server to complete `link_attempt_id`. */
+export interface HostedLinkAttempt {
+  hosted_link_url: string;
+  link_attempt_id: string;
+  expires_at: string;
+}
+
+/** Starts a one-time, 30-minute Hosted Link attempt bound to this user and login session. */
+export function createHostedLinkAttempt(verifyOwnership: OwnershipCheck): Promise<HostedLinkAttempt> {
   return authedFetch('/api/plaid/link-token', { method: 'POST' }, false, verifyOwnership);
 }
 
-/** Consumes `linkAttemptId` on the server — it cannot be reused, whatever the outcome. The server
- *  refuses an attempt started by another user or login session (409), or expired (410). */
-export function exchangePublicToken(publicToken: string, linkAttemptId: string, verifyOwnership: OwnershipCheck) {
-  return authedFetch('/api/plaid/exchange-public-token', {
-    method: 'POST',
-    body: JSON.stringify({ public_token: publicToken, link_attempt_id: linkAttemptId }),
-  }, false, verifyOwnership);
+/**
+ * Asks the server to finish the attempt: it reads Plaid's result for its OWN stored link token and,
+ * the first time Hosted Link has succeeded, exchanges and stores the item. 'pending'/'completing'
+ * mean "ask again shortly". Every refusal is a thrown error carrying the server's `code` (e.g.
+ * link_attempt_expired, link_attempt_exited, link_attempt_invalid, link_attempt_already_completed).
+ * No Plaid token is ever sent or received — this app has no way to submit a public token at all.
+ */
+export function completeLinkAttempt(
+  linkAttemptId: string,
+  verifyOwnership: OwnershipCheck
+): Promise<{ status: 'pending' | 'completing' | 'completed' }> {
+  return authedFetch(
+    `/api/plaid/link-attempts/${encodeURIComponent(linkAttemptId)}/complete`,
+    { method: 'POST' },
+    false,
+    verifyOwnership
+  );
 }
 
 export function getLinkedItems(): Promise<{ items: LinkedItem[]; is_sandbox: boolean }> {

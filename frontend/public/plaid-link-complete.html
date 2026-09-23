@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <meta name="referrer" content="no-referrer" />
+    <title>My Finances</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0f172a; color: #e2e8f0;
+             font: 16px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+      main { max-width: 28rem; padding: 2rem 1.5rem; text-align: center; }
+      h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
+      p { margin: 0; color: #94a3b8; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>You can close this tab</h1>
+      <p>Go back to your My Finances tab — it finishes linking your bank automatically.</p>
+    </main>
+    <script>
+      // Plaid Hosted Link's completion_redirect_uri (Wave 1). This page receives and sends nothing
+      // sensitive: the backend gets the result from Plaid itself. It only nudges the app tab to
+      // check now rather than on its next scheduled poll, then tries to close itself.
+      try { new BroadcastChannel('my-finances-plaid-link').postMessage('finished'); } catch (e) {}
+      try { window.close(); } catch (e) {}
+    </script>
+  </body>
+</html>

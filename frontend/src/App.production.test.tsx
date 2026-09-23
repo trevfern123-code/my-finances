@@ -67,10 +67,11 @@ const mockCreateBudgetCategory = vi.hoisted(() => vi.fn());
 const mockSaveCategoryMapping = vi.hoisted(() => vi.fn());
 const mockGetPlaidCategories = vi.hoisted(() => vi.fn());
 const mockGetCategoryMappings = vi.hoisted(() => vi.fn());
-// Wave 1: controlled so the Plaid Link tests can inspect the attempt id and owner check each request
-// carries, and hold the link-token request open across a sign-in change.
-const mockCreateLinkToken = vi.hoisted(() => vi.fn());
-const mockExchangePublicToken = vi.hoisted(() => vi.fn());
+// Wave 1 Hosted Link: controlled so the Plaid Link tests can inspect the attempt id and owner check
+// each request carries, hold attempt creation open across a sign-in change, and decide when Hosted
+// Link "finishes".
+const mockCreateHostedLinkAttempt = vi.hoisted(() => vi.fn());
+const mockCompleteLinkAttempt = vi.hoisted(() => vi.fn());
 
 vi.mock('./lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./lib/api')>();
@@ -130,11 +131,10 @@ vi.mock('./lib/api', async (importOriginal) => {
     updateFinancialPreferences: mockUpdateFinancialPreferences,
     updateReportingRange: vi.fn().mockResolvedValue({ reporting_range: 'last_6_months' }),
     updateNavLayout: mockUpdateNavLayout,
-    // PlaidLink's own two direct dependencies — PlaidLink calls createLinkToken() when "Link a bank
-    // account" is clicked (see openPlaidLink); the tests drive the rest through the mocked
-    // react-plaid-link hook below.
-    createLinkToken: mockCreateLinkToken,
-    exchangePublicToken: mockExchangePublicToken,
+    // PlaidLink's own two direct dependencies — it creates a Hosted Link attempt when "Link a bank
+    // account" is clicked, then asks for it to be completed (see openPlaidLink / finishHostedLink).
+    createHostedLinkAttempt: mockCreateHostedLinkAttempt,
+    completeLinkAttempt: mockCompleteLinkAttempt,
     // The four datasets this file actually controls.
     getUserPreferences: mockGetUserPreferences,
     getSpendingSummary: mockGetSpendingSummary,
@@ -143,18 +143,20 @@ vi.mock('./lib/api', async (importOriginal) => {
   };
 });
 
-// react-plaid-link renders real Plaid UI/scripts in a browser — mocked so it never tries to do
-// that in jsdom, and so the Plaid-link test can trigger a "successful link" by capturing and
-// calling PlaidLink's own onSuccess callback directly, exactly as Plaid's real widget would.
-let capturedPlaidOnSuccess: ((publicToken: string) => void) | null = null;
-let capturedPlaidOnExit: (() => void) | null = null;
+// react-plaid-link renders real Plaid UI/scripts in a browser — mocked so it never tries to do that
+// in jsdom. Only ReconnectButton (Update Mode) still uses it; bank linking is Hosted Link.
 vi.mock('react-plaid-link', () => ({
-  usePlaidLink: ({ onSuccess, onExit }: { onSuccess: (token: string) => void; onExit?: () => void }) => {
-    capturedPlaidOnSuccess = onSuccess;
-    capturedPlaidOnExit = onExit ?? null;
-    return { open: vi.fn(), ready: true };
-  },
+  usePlaidLink: () => ({ open: vi.fn(), ready: true }),
 }));
+
+/** A stand-in for the tab window.open() returns: records where it was sent and whether it closed. */
+function fakeTab() {
+  return { opener: {} as unknown, location: { replace: vi.fn() }, close: vi.fn() };
+}
+let openedTabs: ReturnType<typeof fakeTab>[] = [];
+function inThirtyMinutes() {
+  return new Date(Date.now() + 30 * 60 * 1000).toISOString();
+}
 
 interface FakeSession {
   user: { id: string };
@@ -195,17 +197,22 @@ function emitAuthEvent(session: FakeSession | null) {
   latestLiveCallback!('AUTH_EVENT', session);
 }
 
-/** Wave 1: Plaid Link only opens after a click has fetched a link token and its one-time attempt
- *  id, so a "successful link" is: click "Link a bank account", let that request resolve, and wait
- *  for the (mocked) Link instance to open — which captures the onSuccess Plaid would call. */
+/** Wave 1 Hosted Link: a "successful link" is — click "Link a bank account" (the server creates an
+ *  attempt and PlaidLink sends the new tab to its Hosted Link URL), then finishHostedLink(). */
 async function openPlaidLink() {
-  capturedPlaidOnSuccess = null;
   const button = screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement;
   await waitFor(() => expect(button.disabled).toBe(false));
   await act(async () => {
     fireEvent.click(button);
   });
-  await waitFor(() => expect(capturedPlaidOnSuccess).not.toBeNull());
+  await waitFor(() => expect(screen.getByText(/Finish linking in the Plaid tab/)).toBeTruthy());
+}
+
+/** The user finished Hosted Link: the server's next completion answer is "completed", and returning
+ *  to this tab (focus) makes PlaidLink ask for it right away. */
+function finishHostedLink() {
+  mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed' });
+  window.dispatchEvent(new Event('focus'));
 }
 
 /** Builds a full UserPreferences payload with sensible defaults, so each test only has to override
@@ -526,7 +533,6 @@ beforeEach(() => {
   installFakeWebLocks();
   currentFakeSession = null;
   latestLiveCallback = null;
-  capturedPlaidOnSuccess = null;
   mockOnAuthStateChange.mockImplementation((cb: LiveCallback) => {
     latestLiveCallback = cb;
     return { data: { subscription: { unsubscribe: vi.fn() } } };
@@ -545,8 +551,18 @@ beforeEach(() => {
   mockRefreshAccountBalances.mockResolvedValue({ items: [], is_sandbox: true });
   mockGetPlaidCategories.mockResolvedValue({ categories: [] });
   mockGetCategoryMappings.mockResolvedValue({ mappings: [] });
-  mockCreateLinkToken.mockResolvedValue({ link_token: 'fake-link-token', link_attempt_id: 'fake-link-attempt' });
-  mockExchangePublicToken.mockResolvedValue({});
+  mockCreateHostedLinkAttempt.mockResolvedValue({
+    hosted_link_url: 'https://hosted.plaid.test/link/fake',
+    link_attempt_id: 'fake-link-attempt',
+    expires_at: inThirtyMinutes(),
+  });
+  mockCompleteLinkAttempt.mockResolvedValue({ status: 'pending' });
+  openedTabs = [];
+  vi.spyOn(window, 'open').mockImplementation(() => {
+    const tab = fakeTab();
+    openedTabs.push(tab);
+    return tab as unknown as Window;
+  });
 });
 
 afterEach(() => {
@@ -828,7 +844,7 @@ describe('12. successful Plaid link refreshes range data through the same fresh-
     mockGetSpendingSummary.mockResolvedValueOnce({ ...emptySummary, net_worth: 400 });
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -863,7 +879,7 @@ describe('13. a successful Plaid link does not unmount PreferencesScope or re-bo
     const preferencesCallsBefore = mockGetUserPreferences.mock.calls.length;
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -898,7 +914,7 @@ describe('14. an in-flight Financial Preferences save survives a same-session Pl
     const preferencesCallsBefore = mockGetUserPreferences.mock.calls.length;
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -948,7 +964,7 @@ describe('15. SaveStatusTracker survives a same-session Plaid/background refresh
 
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -980,7 +996,7 @@ describe('16. ordinary background loading no longer sends an already-ready lifec
 
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1084,7 +1100,7 @@ describe('19. a successful Plaid link issues exactly one range-data refresh', ()
 
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1288,7 +1304,7 @@ describe('27. same-session background refresh does not revert financial lifecycl
     mockGetAssetsSummary.mockReturnValueOnce(pendingAssets.promise);
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve());
     });
 
@@ -1316,7 +1332,7 @@ describe('28. overlapping background financial refresh invocations: the newer wi
     mockGetAssetsSummary.mockReturnValueOnce(firstRefresh.promise);
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token-1');
+      finishHostedLink();
       await Promise.resolve();
     });
 
@@ -1324,7 +1340,7 @@ describe('28. overlapping background financial refresh invocations: the newer wi
     mockGetAssetsSummary.mockReturnValueOnce(secondRefresh.promise);
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token-2');
+      finishHostedLink();
       await Promise.resolve();
     });
 
@@ -1507,7 +1523,7 @@ describe('31. a background/Plaid refresh that supersedes the pending initial inv
     mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Plaid-Bank'));
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1540,7 +1556,7 @@ describe('32. a newer pre-readiness invocation failing establishes the financial
     mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1572,7 +1588,7 @@ describe('33. background refresh failure after readiness uses actionError, not t
     mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -2610,7 +2626,7 @@ describe('46. targeted assets refresh started BEFORE a grouped refresh: the late
     mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Grouped-Bank'));
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
     act(() => screen.getByText('Overview').click());
@@ -2638,7 +2654,7 @@ describe('47. grouped refresh started BEFORE a targeted assets refresh: the late
     mockGetAssetsSummary.mockReturnValueOnce(groupedAssets.promise);
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve());
     });
 
@@ -2678,7 +2694,7 @@ describe('48. recurring-streams targeted vs. grouped ordering shares the same re
     mockGetRecurringStreams.mockResolvedValueOnce(fakeRecurringStreams('Grouped-Subscription'));
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -2714,7 +2730,7 @@ describe('49. account-refresh committer vs. a newer grouped items write (Blocker
     mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('Grouped-Bank'));
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
     expect(screen.getByText(/Grouped-Bank/)).toBeTruthy();
@@ -2939,7 +2955,7 @@ describe('53. plaidCategories: same-session overlapping grouped reads settle wit
     mockGetPlaidCategories.mockReturnValueOnce(secondCategories.promise);
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve());
     });
 
@@ -3061,7 +3077,7 @@ describe('56. Accounts: an older grouped items read cannot overwrite a newer acc
     mockGetLinkedItems.mockReturnValueOnce(groupedItems.promise);
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve());
     });
 
@@ -3483,7 +3499,7 @@ describe('Round 14: manual-loan creation is bound to the initiating user and ses
 });
 
 // --- Wave 1: every mutation, and every Plaid Link flow, is bound to the session that started it ---
-describe('Wave 1: Plaid Link is bound to the initiating user and login session', () => {
+describe('Wave 1: Plaid Hosted Link is server-owned and bound to the initiating user and login session', () => {
   type Verify = (session: unknown) => boolean;
 
   async function bootAs(userId: string, sessionId: string) {
@@ -3492,86 +3508,107 @@ describe('Wave 1: Plaid Link is bound to the initiating user and login session',
     act(() => emitAuthEvent(fakeSession(userId, sessionId)));
     await waitForReady();
   }
-
-  it('the link-token request and the exchange both carry an owner check bound to the initiating session, and the exchange sends the server-issued attempt id', async () => {
-    await bootAs('user-a', 'sid-a1');
-    await openPlaidLink();
+  async function pollNow() {
     await act(async () => {
-      capturedPlaidOnSuccess!('public-token-a');
+      window.dispatchEvent(new Event('focus'));
+      await Promise.resolve();
       await Promise.resolve();
     });
+  }
 
-    expect(mockCreateLinkToken).toHaveBeenCalledTimes(1);
-    const linkTokenVerify = mockCreateLinkToken.mock.calls[0][0] as Verify;
-    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
-    const [publicToken, attemptId, exchangeVerify] = mockExchangePublicToken.mock.calls[0] as [string, string, Verify];
-    expect(publicToken).toBe('public-token-a');
+  it('opens Plaid in a new tab it cannot reach back from, and completes by attempt id alone — both requests bound to the initiating session', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+
+    const tab = openedTabs[0];
+    expect(window.open).toHaveBeenCalledWith('', '_blank');
+    expect(tab.opener).toBeNull();
+    expect(tab.location.replace).toHaveBeenCalledWith('https://hosted.plaid.test/link/fake');
+
+    await act(async () => {
+      finishHostedLink();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Link a bank account' })).toBeTruthy());
+
+    const createVerify = mockCreateHostedLinkAttempt.mock.calls[0][0] as Verify;
+    const [attemptId, completeVerify] = mockCompleteLinkAttempt.mock.calls[0] as [string, Verify];
     expect(attemptId).toBe('fake-link-attempt');
-    for (const verify of [linkTokenVerify, exchangeVerify]) {
+    for (const verify of [createVerify, completeVerify]) {
       expect(verify(fakeSession('user-a', 'sid-a1'))).toBe(true);
       expect(verify(fakeSession('user-b', 'sid-a1'))).toBe(false); // another user
       expect(verify(fakeSession('user-a', 'sid-a2'))).toBe(false); // same user, a later login
     }
+    // Nothing but the attempt id and the owner check is ever handed to the completion call.
+    expect(mockCompleteLinkAttempt.mock.calls[0]).toHaveLength(2);
+  });
+
+  it('pending keeps waiting; the completion page\'s broadcast or returning to the tab checks again; success refreshes the data', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    const linkedItemsCallsBefore = mockGetLinkedItems.mock.calls.length;
+
+    await pollNow();
+    expect(mockCompleteLinkAttempt).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/Finish linking in the Plaid tab/)).toBeTruthy();
+    expect(mockGetLinkedItems.mock.calls.length).toBe(linkedItemsCallsBefore);
+
+    mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed' });
+    await pollNow();
+    await waitFor(() => expect(mockGetLinkedItems.mock.calls.length).toBeGreaterThan(linkedItemsCallsBefore));
+    expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull();
   });
 
   it('an attempt is single-use: linking again starts a fresh attempt', async () => {
-    mockCreateLinkToken
-      .mockResolvedValueOnce({ link_token: 'link-1', link_attempt_id: 'attempt-1' })
-      .mockResolvedValueOnce({ link_token: 'link-2', link_attempt_id: 'attempt-2' });
+    mockCreateHostedLinkAttempt
+      .mockResolvedValueOnce({ hosted_link_url: 'https://hosted.plaid.test/link/1', link_attempt_id: 'attempt-1', expires_at: inThirtyMinutes() })
+      .mockResolvedValueOnce({ hosted_link_url: 'https://hosted.plaid.test/link/2', link_attempt_id: 'attempt-2', expires_at: inThirtyMinutes() });
     await bootAs('user-a', 'sid-a1');
-    for (const publicToken of ['public-1', 'public-2']) {
+    for (let i = 0; i < 2; i++) {
       await openPlaidLink();
       await act(async () => {
-        capturedPlaidOnSuccess!(publicToken);
+        finishHostedLink();
         await Promise.resolve();
       });
+      await waitFor(() => expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull());
     }
-    expect(mockCreateLinkToken).toHaveBeenCalledTimes(2);
-    expect(mockExchangePublicToken.mock.calls.map((call) => call[1])).toEqual(['attempt-1', 'attempt-2']);
+    expect(mockCreateHostedLinkAttempt).toHaveBeenCalledTimes(2);
+    expect(mockCompleteLinkAttempt.mock.calls.map((call) => call[0])).toEqual(['attempt-1', 'attempt-2']);
   });
 
-  it('logout/login mid-Link: a Link flow A started is never exchanged once B is signed in', async () => {
+  it('logout/login as B mid-flow: A\'s attempt is never polled again, and B starts with an idle button', async () => {
     await bootAs('user-a', 'sid-a1');
     await openPlaidLink();
-    const aOnSuccess = capturedPlaidOnSuccess!;
 
     mockGetUserPreferences.mockResolvedValue(fakePreferences());
     act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
     await waitForReady();
+    const callsAtSwitch = mockCompleteLinkAttempt.mock.calls.length;
 
-    // Plaid finishes A's flow after the switch.
-    await act(async () => {
-      aOnSuccess('public-token-a');
-      await Promise.resolve();
-    });
-    expect(mockExchangePublicToken).not.toHaveBeenCalled();
-    // B gets a fresh, idle Link button — nothing of A's flow carried over.
-    const button = screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement;
-    expect(button.disabled).toBe(false);
+    await pollNow();
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(callsAtSwitch);
+    expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull();
+    expect((screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it('the same user signing out and back in mid-Link: the old flow is not exchanged under the new login', async () => {
+  it('the same user signing out and back in mid-flow: the old attempt is abandoned, not completed under the new login', async () => {
     await bootAs('user-a', 'sid-a1');
     await openPlaidLink();
-    const oldOnSuccess = capturedPlaidOnSuccess!;
-
     act(() => emitAuthEvent(null));
     mockGetUserPreferences.mockResolvedValue(fakePreferences());
     act(() => emitAuthEvent(fakeSession('user-a', 'sid-a2')));
     await waitForReady();
+    const callsAtSwitch = mockCompleteLinkAttempt.mock.calls.length;
 
-    await act(async () => {
-      oldOnSuccess('public-token-a');
-      await Promise.resolve();
-    });
-    expect(mockExchangePublicToken).not.toHaveBeenCalled();
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(callsAtSwitch);
   });
 
-  it('a login change while the link token is being created: Link never opens for the old login', async () => {
-    const pending = deferred<{ link_token: string; link_attempt_id: string }>();
-    mockCreateLinkToken.mockReturnValueOnce(pending.promise);
+  it('a login change while the attempt is being created: the tab is closed and nothing is polled', async () => {
+    const pending = deferred<{ hosted_link_url: string; link_attempt_id: string; expires_at: string }>();
+    mockCreateHostedLinkAttempt.mockReturnValueOnce(pending.promise);
     await bootAs('user-a', 'sid-a1');
-    capturedPlaidOnSuccess = null;
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Link a bank account' }));
     });
@@ -3580,50 +3617,96 @@ describe('Wave 1: Plaid Link is bound to the initiating user and login session',
     act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
     await waitForReady();
     await act(async () => {
-      pending.resolve({ link_token: 'link-for-a', link_attempt_id: 'attempt-for-a' });
+      pending.resolve({ hosted_link_url: 'https://hosted.plaid.test/link/a', link_attempt_id: 'attempt-for-a', expires_at: inThirtyMinutes() });
       await pending.promise;
     });
 
-    expect(capturedPlaidOnSuccess).toBeNull(); // no Link instance was ever created for A's token
-    expect(mockExchangePublicToken).not.toHaveBeenCalled();
+    expect(openedTabs[0].close).toHaveBeenCalled();
+    expect(openedTabs[0].location.replace).not.toHaveBeenCalled();
+    await pollNow();
+    expect(mockCompleteLinkAttempt).not.toHaveBeenCalled();
   });
 
-  it('a backend without Link attempts (no link_attempt_id) fails closed: Link never opens', async () => {
-    mockCreateLinkToken.mockResolvedValueOnce({ link_token: 'fake-link-token' });
+  it.each([
+    ['an old backend that still returns a link token', { link_token: 'link-sandbox-x', link_attempt_id: 'attempt-x' }],
+    ['a non-https Hosted Link URL', { hosted_link_url: 'javascript:alert(1)', link_attempt_id: 'attempt-x', expires_at: 'x' }],
+    ['no attempt id', { hosted_link_url: 'https://hosted.plaid.test/link/x', expires_at: 'x' }],
+  ])('fails closed for %s: the tab is closed and no attempt starts', async (_label, response) => {
+    mockCreateHostedLinkAttempt.mockResolvedValueOnce(response);
     await bootAs('user-a', 'sid-a1');
-    capturedPlaidOnSuccess = null;
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Link a bank account' }));
     });
     await waitFor(() => expect(screen.getByText(/Could not start linking right now/)).toBeTruthy());
-    expect(capturedPlaidOnSuccess).toBeNull();
+    expect(openedTabs[0].close).toHaveBeenCalled();
+    expect(openedTabs[0].location.replace).not.toHaveBeenCalled();
+    await pollNow();
+    expect(mockCompleteLinkAttempt).not.toHaveBeenCalled();
   });
 
-  it('closing Link without finishing abandons the attempt: nothing is exchanged and the next click starts a new one', async () => {
+  it('a server refusal (expired) is shown, polling stops, and the next click starts a new attempt', async () => {
     await bootAs('user-a', 'sid-a1');
     await openPlaidLink();
-    act(() => capturedPlaidOnExit!());
+    mockCompleteLinkAttempt.mockRejectedValueOnce(
+      Object.assign(new Error('This bank link took too long and expired. Start linking the account again.'), { code: 'link_attempt_expired' })
+    );
+    await pollNow();
+    await waitFor(() => expect(screen.getByText(/took too long and expired/)).toBeTruthy());
+    const calls = mockCompleteLinkAttempt.mock.calls.length;
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(calls);
+
     await openPlaidLink();
-    expect(mockCreateLinkToken).toHaveBeenCalledTimes(2);
-    expect(mockExchangePublicToken).not.toHaveBeenCalled();
+    expect(mockCreateHostedLinkAttempt).toHaveBeenCalledTimes(2);
   });
 
-  it('a server refusal of the attempt (expired/invalid) is shown, and the next click starts a new attempt', async () => {
-    mockExchangePublicToken.mockRejectedValueOnce(
-      Object.assign(new Error('This bank link took too long and expired. Start linking the account again.'), {
-        code: 'link_attempt_expired',
-      })
+  it('link_attempt_already_completed (a lost response, then a retry) is treated as linked', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    const before = mockGetLinkedItems.mock.calls.length;
+    mockCompleteLinkAttempt.mockRejectedValueOnce(
+      Object.assign(new Error('This bank link has already been completed.'), { code: 'link_attempt_already_completed' })
     );
+    await pollNow();
+    await waitFor(() => expect(mockGetLinkedItems.mock.calls.length).toBeGreaterThan(before));
+    expect(screen.queryByText(/already been completed/)).toBeNull();
+  });
+
+  it('a transient failure (no server code) keeps waiting and succeeds on the next check', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    mockCompleteLinkAttempt.mockRejectedValueOnce(new Error('Failed to fetch'));
+    await pollNow();
+    expect(screen.getByText(/Finish linking in the Plaid tab/)).toBeTruthy();
+    mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed' });
+    await pollNow();
+    await waitFor(() => expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull());
+  });
+
+  it('Cancel stops waiting, closes the Plaid tab, and never polls again', async () => {
     await bootAs('user-a', 'sid-a1');
     await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('public-token-a');
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    });
+    expect(openedTabs[0].close).toHaveBeenCalled();
+    await pollNow();
+    expect(mockCompleteLinkAttempt).not.toHaveBeenCalled();
+    expect((screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('a blocked popup offers a plain link to the Hosted Link URL (noopener) and still completes', async () => {
+    vi.mocked(window.open).mockImplementation(() => null);
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    const link = screen.getByRole('link', { name: 'Open Plaid to link your bank' }) as HTMLAnchorElement;
+    expect(link.href).toBe('https://hosted.plaid.test/link/fake');
+    expect(link.rel).toContain('noopener');
+    await act(async () => {
+      finishHostedLink();
       await Promise.resolve();
     });
-    await waitFor(() => expect(screen.getByText(/took too long and expired/)).toBeTruthy());
-
-    await openPlaidLink();
-    expect(mockCreateLinkToken).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull());
   });
 });
 
