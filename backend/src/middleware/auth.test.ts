@@ -20,6 +20,12 @@ function mockReqRes(authHeader?: string) {
   return { req, res, next };
 }
 
+/** A JWT-shaped string carrying `claims`. Unsigned: Supabase (mocked here) is what verifies tokens. */
+function unsignedJwt(claims: Record<string, unknown>): string {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  return `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode(claims)}.signature`;
+}
+
 beforeEach(() => {
   mockGetUser.mockReset();
 });
@@ -46,9 +52,40 @@ describe('requireAuth', () => {
 
     await requireAuth(req, res, next);
 
-    expect(req.user).toEqual({ id: 'user-1', email: 'a@b.com' });
+    // Not a decodable JWT (Supabase is mocked), so there is no session to bind to.
+    expect(req.user).toEqual({ id: 'user-1', email: 'a@b.com', sessionId: null });
     expect(next).toHaveBeenCalledWith(); // called with no error
     expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('attaches the verified token\'s session_id claim as req.user.sessionId', async () => {
+    mockGetUser.mockResolvedValue({ data: { user: { id: 'user-1', email: 'a@b.com' } }, error: null });
+    const { req, res, next } = mockReqRes(`Bearer ${unsignedJwt({ sub: 'user-1', session_id: 'sid-1' })}`);
+
+    await requireAuth(req, res, next);
+
+    expect(req.user).toEqual({ id: 'user-1', email: 'a@b.com', sessionId: 'sid-1' });
+    expect(next).toHaveBeenCalledWith();
+  });
+
+  it('a blank or non-string session_id is treated as no session', async () => {
+    mockGetUser.mockResolvedValue({ data: { user: { id: 'user-1', email: null } }, error: null });
+    for (const sessionId of ['  ', 42]) {
+      const { req, res, next } = mockReqRes(`Bearer ${unsignedJwt({ sub: 'user-1', session_id: sessionId })}`);
+      await requireAuth(req, res, next);
+      expect(req.user?.sessionId).toBeNull();
+    }
+  });
+
+  it('refuses (401) a token whose sub is not the user Supabase verified', async () => {
+    mockGetUser.mockResolvedValue({ data: { user: { id: 'user-1', email: null } }, error: null });
+    const { req, res, next } = mockReqRes(`Bearer ${unsignedJwt({ sub: 'user-2', session_id: 'sid-2' })}`);
+
+    await requireAuth(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(req.user).toBeUndefined();
+    expect(next).not.toHaveBeenCalled();
   });
 
   it('returns 401 when Supabase reports an invalid/expired session', async () => {

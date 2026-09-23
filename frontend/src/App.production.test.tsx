@@ -67,6 +67,10 @@ const mockCreateBudgetCategory = vi.hoisted(() => vi.fn());
 const mockSaveCategoryMapping = vi.hoisted(() => vi.fn());
 const mockGetPlaidCategories = vi.hoisted(() => vi.fn());
 const mockGetCategoryMappings = vi.hoisted(() => vi.fn());
+// Wave 1: controlled so the Plaid Link tests can inspect the attempt id and owner check each request
+// carries, and hold the link-token request open across a sign-in change.
+const mockCreateLinkToken = vi.hoisted(() => vi.fn());
+const mockExchangePublicToken = vi.hoisted(() => vi.fn());
 
 vi.mock('./lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./lib/api')>();
@@ -126,10 +130,11 @@ vi.mock('./lib/api', async (importOriginal) => {
     updateFinancialPreferences: mockUpdateFinancialPreferences,
     updateReportingRange: vi.fn().mockResolvedValue({ reporting_range: 'last_6_months' }),
     updateNavLayout: mockUpdateNavLayout,
-    // PlaidLink's own two direct dependencies — PlaidLink calls createLinkToken() on mount; the
-    // Plaid-link test in this file drives the rest through the mocked react-plaid-link hook below.
-    createLinkToken: vi.fn().mockResolvedValue({ link_token: 'fake-link-token' }),
-    exchangePublicToken: vi.fn().mockResolvedValue({}),
+    // PlaidLink's own two direct dependencies — PlaidLink calls createLinkToken() when "Link a bank
+    // account" is clicked (see openPlaidLink); the tests drive the rest through the mocked
+    // react-plaid-link hook below.
+    createLinkToken: mockCreateLinkToken,
+    exchangePublicToken: mockExchangePublicToken,
     // The four datasets this file actually controls.
     getUserPreferences: mockGetUserPreferences,
     getSpendingSummary: mockGetSpendingSummary,
@@ -142,9 +147,11 @@ vi.mock('./lib/api', async (importOriginal) => {
 // that in jsdom, and so the Plaid-link test can trigger a "successful link" by capturing and
 // calling PlaidLink's own onSuccess callback directly, exactly as Plaid's real widget would.
 let capturedPlaidOnSuccess: ((publicToken: string) => void) | null = null;
+let capturedPlaidOnExit: (() => void) | null = null;
 vi.mock('react-plaid-link', () => ({
-  usePlaidLink: ({ onSuccess }: { onSuccess: (token: string) => void }) => {
+  usePlaidLink: ({ onSuccess, onExit }: { onSuccess: (token: string) => void; onExit?: () => void }) => {
     capturedPlaidOnSuccess = onSuccess;
+    capturedPlaidOnExit = onExit ?? null;
     return { open: vi.fn(), ready: true };
   },
 }));
@@ -186,6 +193,19 @@ let latestLiveCallback: LiveCallback | null = null;
 function emitAuthEvent(session: FakeSession | null) {
   currentFakeSession = session;
   latestLiveCallback!('AUTH_EVENT', session);
+}
+
+/** Wave 1: Plaid Link only opens after a click has fetched a link token and its one-time attempt
+ *  id, so a "successful link" is: click "Link a bank account", let that request resolve, and wait
+ *  for the (mocked) Link instance to open — which captures the onSuccess Plaid would call. */
+async function openPlaidLink() {
+  capturedPlaidOnSuccess = null;
+  const button = screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  await act(async () => {
+    fireEvent.click(button);
+  });
+  await waitFor(() => expect(capturedPlaidOnSuccess).not.toBeNull());
 }
 
 /** Builds a full UserPreferences payload with sensible defaults, so each test only has to override
@@ -525,6 +545,8 @@ beforeEach(() => {
   mockRefreshAccountBalances.mockResolvedValue({ items: [], is_sandbox: true });
   mockGetPlaidCategories.mockResolvedValue({ categories: [] });
   mockGetCategoryMappings.mockResolvedValue({ mappings: [] });
+  mockCreateLinkToken.mockResolvedValue({ link_token: 'fake-link-token', link_attempt_id: 'fake-link-attempt' });
+  mockExchangePublicToken.mockResolvedValue({});
 });
 
 afterEach(() => {
@@ -804,7 +826,7 @@ describe('12. successful Plaid link refreshes range data through the same fresh-
     await waitFor(() => expect(readNetWorth()).toBe('$100'));
 
     mockGetSpendingSummary.mockResolvedValueOnce({ ...emptySummary, net_worth: 400 });
-    expect(capturedPlaidOnSuccess).not.toBeNull();
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -839,6 +861,7 @@ describe('13. a successful Plaid link does not unmount PreferencesScope or re-bo
     expect(screen.getByText('Done')).toBeTruthy();
 
     const preferencesCallsBefore = mockGetUserPreferences.mock.calls.length;
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -873,6 +896,7 @@ describe('14. an in-flight Financial Preferences save survives a same-session Pl
     expect(savingsInput.value).toBe('30'); // local edit applies immediately, independent of the PUT
 
     const preferencesCallsBefore = mockGetUserPreferences.mock.calls.length;
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -922,6 +946,7 @@ describe('15. SaveStatusTracker survives a same-session Plaid/background refresh
     fireEvent.blur(savingsInput);
     await waitFor(() => expect(screen.getByText('Saving…')).toBeTruthy());
 
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -953,6 +978,7 @@ describe('16. ordinary background loading no longer sends an already-ready lifec
     const pendingItems = deferred<{ items: unknown[]; is_sandbox: boolean }>();
     mockGetLinkedItems.mockReturnValueOnce(pendingItems.promise);
 
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -1056,6 +1082,7 @@ describe('19. a successful Plaid link issues exactly one range-data refresh', ()
     const historyCallsBefore = mockGetNetWorthHistory.mock.calls.length;
     const breakdownCallsBefore = mockGetMonthlyBreakdown.mock.calls.length;
 
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -1259,6 +1286,7 @@ describe('27. same-session background refresh does not revert financial lifecycl
 
     const pendingAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
     mockGetAssetsSummary.mockReturnValueOnce(pendingAssets.promise);
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve());
@@ -1286,6 +1314,7 @@ describe('28. overlapping background financial refresh invocations: the newer wi
 
     const firstRefresh = deferred<ReturnType<typeof fakeAssetsSummary>>();
     mockGetAssetsSummary.mockReturnValueOnce(firstRefresh.promise);
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token-1');
       await Promise.resolve();
@@ -1293,6 +1322,7 @@ describe('28. overlapping background financial refresh invocations: the newer wi
 
     const secondRefresh = deferred<ReturnType<typeof fakeAssetsSummary>>();
     mockGetAssetsSummary.mockReturnValueOnce(secondRefresh.promise);
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token-2');
       await Promise.resolve();
@@ -1475,6 +1505,7 @@ describe('31. a background/Plaid refresh that supersedes the pending initial inv
     // is therefore also readiness-producing (this is the exact fix under test: this would have
     // been forbidden from setting financialOutcome under Round 5's caller-supplied isInitial flag).
     mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Plaid-Bank'));
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -1507,6 +1538,7 @@ describe('32. a newer pre-readiness invocation failing establishes the financial
     await waitForFinancialLoading();
 
     mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -1538,6 +1570,7 @@ describe('33. background refresh failure after readiness uses actionError, not t
     expect(screen.getByText(/A-Bank Checking/)).toBeTruthy();
 
     mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -2575,6 +2608,7 @@ describe('46. targeted assets refresh started BEFORE a grouped refresh: the late
     });
 
     mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Grouped-Bank'));
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -2602,6 +2636,7 @@ describe('47. grouped refresh started BEFORE a targeted assets refresh: the late
 
     const groupedAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
     mockGetAssetsSummary.mockReturnValueOnce(groupedAssets.promise);
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve());
@@ -2641,6 +2676,7 @@ describe('48. recurring-streams targeted vs. grouped ordering shares the same re
     });
 
     mockGetRecurringStreams.mockResolvedValueOnce(fakeRecurringStreams('Grouped-Subscription'));
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -2676,6 +2712,7 @@ describe('49. account-refresh committer vs. a newer grouped items write (Blocker
     });
 
     mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('Grouped-Bank'));
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
@@ -2900,6 +2937,7 @@ describe('53. plaidCategories: same-session overlapping grouped reads settle wit
 
     const secondCategories = deferred<{ categories: string[] }>();
     mockGetPlaidCategories.mockReturnValueOnce(secondCategories.promise);
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve());
@@ -3021,6 +3059,7 @@ describe('56. Accounts: an older grouped items read cannot overwrite a newer acc
     // account child operation below does, then holds open.
     const groupedItems = deferred<ReturnType<typeof fakeLinkedItems>>();
     mockGetLinkedItems.mockReturnValueOnce(groupedItems.promise);
+    await openPlaidLink();
     await act(async () => {
       capturedPlaidOnSuccess!('fake-public-token');
       await Promise.resolve().then(() => Promise.resolve());
@@ -3440,5 +3479,184 @@ describe('Round 14: manual-loan creation is bound to the initiating user and ses
     expect(server.sentAs.map((r) => r.user)).toEqual(['user-a', 'user-a']);
     expect(new Set(server.sentAs.map((r) => r.key)).size).toBe(1);
     expect(localStorage.getItem(SLOT_A)).toBeNull();
+  });
+});
+
+// --- Wave 1: every mutation, and every Plaid Link flow, is bound to the session that started it ---
+describe('Wave 1: Plaid Link is bound to the initiating user and login session', () => {
+  type Verify = (session: unknown) => boolean;
+
+  async function bootAs(userId: string, sessionId: string) {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession(userId, sessionId)));
+    await waitForReady();
+  }
+
+  it('the link-token request and the exchange both carry an owner check bound to the initiating session, and the exchange sends the server-issued attempt id', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    await act(async () => {
+      capturedPlaidOnSuccess!('public-token-a');
+      await Promise.resolve();
+    });
+
+    expect(mockCreateLinkToken).toHaveBeenCalledTimes(1);
+    const linkTokenVerify = mockCreateLinkToken.mock.calls[0][0] as Verify;
+    expect(mockExchangePublicToken).toHaveBeenCalledTimes(1);
+    const [publicToken, attemptId, exchangeVerify] = mockExchangePublicToken.mock.calls[0] as [string, string, Verify];
+    expect(publicToken).toBe('public-token-a');
+    expect(attemptId).toBe('fake-link-attempt');
+    for (const verify of [linkTokenVerify, exchangeVerify]) {
+      expect(verify(fakeSession('user-a', 'sid-a1'))).toBe(true);
+      expect(verify(fakeSession('user-b', 'sid-a1'))).toBe(false); // another user
+      expect(verify(fakeSession('user-a', 'sid-a2'))).toBe(false); // same user, a later login
+    }
+  });
+
+  it('an attempt is single-use: linking again starts a fresh attempt', async () => {
+    mockCreateLinkToken
+      .mockResolvedValueOnce({ link_token: 'link-1', link_attempt_id: 'attempt-1' })
+      .mockResolvedValueOnce({ link_token: 'link-2', link_attempt_id: 'attempt-2' });
+    await bootAs('user-a', 'sid-a1');
+    for (const publicToken of ['public-1', 'public-2']) {
+      await openPlaidLink();
+      await act(async () => {
+        capturedPlaidOnSuccess!(publicToken);
+        await Promise.resolve();
+      });
+    }
+    expect(mockCreateLinkToken).toHaveBeenCalledTimes(2);
+    expect(mockExchangePublicToken.mock.calls.map((call) => call[1])).toEqual(['attempt-1', 'attempt-2']);
+  });
+
+  it('logout/login mid-Link: a Link flow A started is never exchanged once B is signed in', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    const aOnSuccess = capturedPlaidOnSuccess!;
+
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitForReady();
+
+    // Plaid finishes A's flow after the switch.
+    await act(async () => {
+      aOnSuccess('public-token-a');
+      await Promise.resolve();
+    });
+    expect(mockExchangePublicToken).not.toHaveBeenCalled();
+    // B gets a fresh, idle Link button — nothing of A's flow carried over.
+    const button = screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+  });
+
+  it('the same user signing out and back in mid-Link: the old flow is not exchanged under the new login', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    const oldOnSuccess = capturedPlaidOnSuccess!;
+
+    act(() => emitAuthEvent(null));
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a2')));
+    await waitForReady();
+
+    await act(async () => {
+      oldOnSuccess('public-token-a');
+      await Promise.resolve();
+    });
+    expect(mockExchangePublicToken).not.toHaveBeenCalled();
+  });
+
+  it('a login change while the link token is being created: Link never opens for the old login', async () => {
+    const pending = deferred<{ link_token: string; link_attempt_id: string }>();
+    mockCreateLinkToken.mockReturnValueOnce(pending.promise);
+    await bootAs('user-a', 'sid-a1');
+    capturedPlaidOnSuccess = null;
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Link a bank account' }));
+    });
+
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitForReady();
+    await act(async () => {
+      pending.resolve({ link_token: 'link-for-a', link_attempt_id: 'attempt-for-a' });
+      await pending.promise;
+    });
+
+    expect(capturedPlaidOnSuccess).toBeNull(); // no Link instance was ever created for A's token
+    expect(mockExchangePublicToken).not.toHaveBeenCalled();
+  });
+
+  it('a backend without Link attempts (no link_attempt_id) fails closed: Link never opens', async () => {
+    mockCreateLinkToken.mockResolvedValueOnce({ link_token: 'fake-link-token' });
+    await bootAs('user-a', 'sid-a1');
+    capturedPlaidOnSuccess = null;
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Link a bank account' }));
+    });
+    await waitFor(() => expect(screen.getByText(/Could not start linking right now/)).toBeTruthy());
+    expect(capturedPlaidOnSuccess).toBeNull();
+  });
+
+  it('closing Link without finishing abandons the attempt: nothing is exchanged and the next click starts a new one', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    act(() => capturedPlaidOnExit!());
+    await openPlaidLink();
+    expect(mockCreateLinkToken).toHaveBeenCalledTimes(2);
+    expect(mockExchangePublicToken).not.toHaveBeenCalled();
+  });
+
+  it('a server refusal of the attempt (expired/invalid) is shown, and the next click starts a new attempt', async () => {
+    mockExchangePublicToken.mockRejectedValueOnce(
+      Object.assign(new Error('This bank link took too long and expired. Start linking the account again.'), {
+        code: 'link_attempt_expired',
+      })
+    );
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    await act(async () => {
+      capturedPlaidOnSuccess!('public-token-a');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getByText(/took too long and expired/)).toBeTruthy());
+
+    await openPlaidLink();
+    expect(mockCreateLinkToken).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Wave 1: App mutations carry an owner check bound to the lifecycle that started them', () => {
+  it("approveTransaction's owner check accepts only A's own login while it is current — after a switch to B it refuses every session", async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactionNeedingReview('txn-1', 'A-Transaction', true));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const pendingApprove = deferred<{ transaction: unknown }>();
+    mockApproveTransaction.mockReturnValueOnce(pendingApprove.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Approve'));
+      await Promise.resolve();
+    });
+    const verify = mockApproveTransaction.mock.calls[0][1] as (session: unknown) => boolean;
+    expect(verify(fakeSession('user-a', 'sid-a1'))).toBe(true);
+    expect(verify(fakeSession('user-a', 'sid-a2'))).toBe(false);
+
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactionNeedingReview('txn-1', 'B-Transaction', true));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText('B-Transaction')).toBeTruthy());
+
+    // Any send or clock-skew retry authedFetch attempts from here on is refused — under B, and even
+    // under A's own old token, since that login is no longer the app's current one.
+    expect(verify(fakeSession('user-b', 'sid-b1'))).toBe(false);
+    expect(verify(fakeSession('user-a', 'sid-a1'))).toBe(false);
+    await act(async () => {
+      pendingApprove.resolve({ transaction: {} });
+      await pendingApprove.promise;
+    });
   });
 });

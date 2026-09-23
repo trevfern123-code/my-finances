@@ -273,6 +273,42 @@ export async function getLinkedItemsForUser(userId: string) {
   return data;
 }
 
+// ---- Plaid Link attempts (Wave 1) --------------------------------------------
+// One-time, 30-minute, server-side records binding a Plaid Link flow to the user AND login session
+// that started it. See supabase/migrations/20260922130000_plaid_link_attempts.sql.
+
+/** Records a new attempt for `userId` in login session `sessionId` and returns its id. */
+export async function createPlaidLinkAttempt(userId: string, sessionId: string): Promise<string> {
+  const { data, error } = await supabaseAdmin.rpc('create_plaid_link_attempt', {
+    p_user_id: userId,
+    p_session_id: sessionId,
+  });
+  if (error) throw new Error(`Failed to start Plaid Link attempt: ${error.message}`);
+  if (typeof data !== 'string' || data === '') throw new Error('Failed to start Plaid Link attempt: no id returned');
+  return data;
+}
+
+export type PlaidLinkAttemptOutcome = 'consumed' | 'expired' | 'invalid';
+
+/**
+ * Atomically spends the attempt: 'consumed' only for its own user and login session, once, before
+ * it expires. Anything the function does not return verbatim is an error, never a success.
+ */
+export async function consumePlaidLinkAttempt(
+  attemptId: string,
+  userId: string,
+  sessionId: string
+): Promise<PlaidLinkAttemptOutcome> {
+  const { data, error } = await supabaseAdmin.rpc('consume_plaid_link_attempt', {
+    p_attempt_id: attemptId,
+    p_user_id: userId,
+    p_session_id: sessionId,
+  });
+  if (error) throw new Error(`Failed to verify Plaid Link attempt: ${error.message}`);
+  if (data === 'consumed' || data === 'expired' || data === 'invalid') return data;
+  throw new Error('Failed to verify Plaid Link attempt: unexpected result');
+}
+
 // ---- Accounts ---------------------------------------------------------------
 
 /** Excludes accounts flagged exclude_from_net_worth — net worth and liquid-cash figures should

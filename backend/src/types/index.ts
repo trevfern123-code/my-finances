@@ -1,6 +1,10 @@
 export interface AuthenticatedUser {
   id: string;
   email: string | null;
+  /** The `session_id` claim of the verified bearer token: one continuous Supabase login, stable
+   *  across that login's token refreshes, different for every sign-in. Null when the token carries
+   *  none — anything bound to a login session (e.g. a Plaid Link attempt) must then refuse. */
+  sessionId: string | null;
 }
 
 // Mirrors the Supabase schema (see project root README for the flow these support).

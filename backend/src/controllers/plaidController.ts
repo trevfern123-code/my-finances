@@ -197,11 +197,23 @@ export async function getNetWorthHistory(req: Request, res: Response, next: Next
   }
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Wave 1: every link token is issued together with a one-time, 30-minute Plaid Link attempt bound
+ * to the authenticated user and their current login session (the verified token's `session_id`).
+ * exchangePublicToken will only accept a public token alongside that attempt's id.
+ */
 export async function createLinkToken(req: Request, res: Response, next: NextFunction) {
   try {
-    const userId = req.user!.id;
+    const { id: userId, sessionId } = req.user!;
+    if (!sessionId) {
+      res.status(401).json({ error: 'Sign in again before linking an account.', code: 'session_required' });
+      return;
+    }
+    const linkAttemptId = await dataService.createPlaidLinkAttempt(userId, sessionId);
     const linkToken = await plaidService.createLinkToken(userId);
-    res.json({ link_token: linkToken });
+    res.json({ link_token: linkToken, link_attempt_id: linkAttemptId });
   } catch (err) {
     next(err);
   }
@@ -209,11 +221,45 @@ export async function createLinkToken(req: Request, res: Response, next: NextFun
 
 export async function exchangePublicToken(req: Request, res: Response, next: NextFunction) {
   try {
-    const userId = req.user!.id;
-    const { public_token: publicToken } = req.body as { public_token?: string };
+    // The owner is ALWAYS the verified bearer token's user — nothing in the body can change it.
+    const { id: userId, sessionId } = req.user!;
+    const { public_token: publicToken, link_attempt_id: linkAttemptId } = req.body as {
+      public_token?: unknown;
+      link_attempt_id?: unknown;
+    };
 
-    if (!publicToken) {
+    if (typeof publicToken !== 'string' || publicToken === '') {
       res.status(400).json({ error: 'public_token is required' });
+      return;
+    }
+    if (typeof linkAttemptId !== 'string' || !UUID_PATTERN.test(linkAttemptId)) {
+      // Also what a cached pre-Wave-1 frontend gets: it never sends an attempt id.
+      res.status(400).json({
+        error: 'This bank link was started from an out-of-date page. Reload the page and link the account again.',
+        code: 'link_attempt_required',
+      });
+      return;
+    }
+    if (!sessionId) {
+      res.status(401).json({ error: 'Sign in again before linking an account.', code: 'session_required' });
+      return;
+    }
+
+    // Spent BEFORE the public token is exchanged, so a replayed, expired, or foreign attempt never
+    // reaches Plaid and never creates an item.
+    const attempt = await dataService.consumePlaidLinkAttempt(linkAttemptId, userId, sessionId);
+    if (attempt === 'expired') {
+      res.status(410).json({
+        error: 'This bank link took too long and expired. Start linking the account again.',
+        code: 'link_attempt_expired',
+      });
+      return;
+    }
+    if (attempt !== 'consumed') {
+      res.status(409).json({
+        error: 'This bank link is no longer valid for the signed-in account. Start linking the account again.',
+        code: 'link_attempt_invalid',
+      });
       return;
     }
 

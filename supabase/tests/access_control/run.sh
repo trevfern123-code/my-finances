@@ -9,7 +9,8 @@
 # It applies the repository's ACTUAL migration history, in filename order, each file in one
 # transaction as the non-superuser `postgres` role (as `supabase db push` connects), seeds two users
 # with placeholder (non-secret) Plaid rows, then runs every sql/*.sql test — each must exit cleanly;
-# assertions raise on failure. Queries run under `set role authenticated` + `request.jwt.claims`,
+# assertions raise on failure — and every concurrency/<name>/ test (seed.sql, then holder.sql in the
+# background, contender.sql one second later, then verify.sql). Queries run under `set role authenticated` + `request.jwt.claims`,
 # which is exactly how PostgREST executes a request made with the anon key and a user's JWT.
 #
 # Requires: docker, bash.
@@ -81,6 +82,33 @@ for file in "$HERE"/sql/*.sql; do
   if psql_admin < "$HERE/seed.sql" >"$log" 2>&1 && psql_db < "$file" >>"$log" 2>&1; then
     echo "PASS  $name"
     if [ "${VERBOSE:-0}" = 1 ]; then sed 's/^/      | /' "$log"; fi
+    PASSED=$((PASSED + 1))
+  else
+    echo "FAIL  $name"
+    sed 's/^/      | /' "$log"
+    FAILED=$((FAILED + 1))
+    FAILED_NAMES+=("$name")
+  fi
+done
+
+for dir in "$HERE"/concurrency/*/; do
+  [ -d "$dir" ] || continue
+  name="$(basename "$dir")"
+  wanted "$name" || continue
+  log="$LOGS/$name.log"
+  status=0
+  psql_admin < "$HERE/seed.sql" >"$log" 2>&1 && psql_db < "$dir/seed.sql" >>"$log" 2>&1 || status=1
+  if [ "$status" -eq 0 ]; then
+    psql_db < "$dir/holder.sql" >"$LOGS/$name.holder.log" 2>&1 &
+    holder_pid=$!
+    sleep 1  # let the holder take its row lock first
+    psql_db < "$dir/contender.sql" >"$LOGS/$name.contender.log" 2>&1 || status=1
+    wait "$holder_pid" || status=1
+    { echo "--- holder"; cat "$LOGS/$name.holder.log"; echo "--- contender"; cat "$LOGS/$name.contender.log"; } >>"$log"
+    if [ "$status" -eq 0 ]; then psql_db < "$dir/verify.sql" >>"$log" 2>&1 || status=1; fi
+  fi
+  if [ "$status" -eq 0 ]; then
+    echo "PASS  $name"
     PASSED=$((PASSED + 1))
   else
     echo "FAIL  $name"

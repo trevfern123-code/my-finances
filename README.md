@@ -561,10 +561,19 @@ extracted, since which props each card needs only exists as live app state in `A
 ## Flow
 
 1. User signs in via Supabase Auth in the frontend.
-2. Frontend calls `POST /api/plaid/link-token` (with the user's Supabase JWT) to get a Plaid `link_token`.
+2. When the user clicks **Link a bank account**, the frontend calls `POST /api/plaid/link-token` (with the user's Supabase JWT). The backend records a one-time, 30-minute **Link attempt** bound to the verified user *and* their login session (the JWT's `session_id` claim; table `plaid_link_attempts`, service-role only) and returns a Plaid `link_token` plus the `link_attempt_id`.
 3. Frontend opens Plaid Link with that token; on success Plaid returns a `public_token`.
-4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token`. The backend exchanges it for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
+4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token` and `link_attempt_id`. Before anything reaches Plaid, the backend atomically consumes the attempt (`consume_plaid_link_attempt`): a different user, the same user in a newer login, a replay (409 `link_attempt_invalid`), an expired attempt (410 `link_attempt_expired`) or a missing id (400 `link_attempt_required`) is refused and nothing is stored. The owner is always the verified bearer token's user, never anything in the body. Then it exchanges the token for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
 5. Frontend calls `GET /api/plaid/items` to display the user's linked institutions/accounts.
+
+**Every mutation is bound to the session that started it.** Each frontend change request (every
+`lib/api.ts` export that sends POST/PATCH/PUT/DELETE) takes a required owner check, captured when
+the user's action starts (`lib/sessionOwnership.ts`, `App.tsx`'s `captureOwnership`): the same
+user *and* the same Supabase login (`session_id`), still current. `authedFetch` refuses to send a
+mutation without one, and refuses — sending nothing — if a sign-out/sign-in (as anyone, including
+the same user again) happened while the action waited. Multi-step flows (Plaid Link, reconnect)
+also stop between steps, and `PlaidLink` is keyed by login so a sign-in change destroys an open
+Link. `lib/sessionOwnership.test.ts` exercises every mutation export this way.
 
 **No direct client access to `plaid_items`.** The browser's Supabase client is used for Auth only.
 `supabase/migrations/20260922120000_restrict_plaid_items_client_access.sql` revokes every

@@ -58,6 +58,7 @@ import {
 import { currentGenerationValue } from './lib/authGeneration';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { decodeSessionId } from './lib/jwt';
+import { createSessionOwnership } from './lib/sessionOwnership';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
 import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
 import {
@@ -379,6 +380,20 @@ export default function App() {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
   const isSessionCurrent = useCallback((id: string) => sessionIdRef.current === id, []);
+
+  // Wave 1: the owner of one user-initiated operation — this user AND this login lifecycle — captured
+  // the moment the operation starts (see lib/sessionOwnership.ts). Every mutation request is sent
+  // with its `verify`, so a sign-out/sign-in while the operation waits on anything makes the request
+  // refuse to send rather than go out under whoever is signed in by then. Multi-step operations
+  // (Plaid Link, reconnect) also use its `isCurrent` to stop between steps.
+  const captureOwnership = useCallback(
+    () =>
+      createSessionOwnership(userIdRef.current, sessionIdRef.current, () => ({
+        userId: userIdRef.current,
+        sessionId: sessionIdRef.current,
+      })),
+    []
+  );
 
   // Every mutation handler below (createManualLoan, categorize a transaction, archive a category,
   // ...) applies its successful server response via a functional state updater (`setX(prev =>
@@ -1044,8 +1059,9 @@ export default function App() {
   async function handleUpdateCreditLimit(accountId: string, creditLimit: number | null) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateAccountCreditLimit(accountId, creditLimit);
+      const res = await updateAccountCreditLimit(accountId, creditLimit, ownership.verify);
       commitMutationForResource('items', expectedSessionId, () => {
         setItems((prev) =>
           prev.map((item) => ({
@@ -1064,8 +1080,9 @@ export default function App() {
   async function handleUpdateSavingsGoal(accountId: string, savingsGoal: number | null) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateAccountSavingsGoal(accountId, savingsGoal);
+      const res = await updateAccountSavingsGoal(accountId, savingsGoal, ownership.verify);
       commitMutationForResource('assets', expectedSessionId, () => {
         setAssetGroups((prev) =>
           prev.map((group) => ({
@@ -1097,8 +1114,9 @@ export default function App() {
   ) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateAccountCustomization(accountId, fields);
+      const res = await updateAccountCustomization(accountId, fields, ownership.verify);
       const committed = commitMutationForResource('items', expectedSessionId, () => {
         setItems((prev) =>
           prev.map((item) => ({
@@ -1136,9 +1154,10 @@ export default function App() {
     // See resourceVersionsRef's own comment — shared with handleSaveCategoryMapping's own backfill
     // refetch below, since both refetch the same `transactions` resource.
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     const version = ++resourceVersionsRef.current.transactions;
     try {
-      await syncTransactionsRequest();
+      await syncTransactionsRequest(ownership.verify);
       const res = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
       if (expectedSessionId !== sessionIdRef.current || version !== resourceVersionsRef.current.transactions) {
         return;
@@ -1161,10 +1180,11 @@ export default function App() {
   async function handleCategorize(transactionId: string, budgetCategoryId: string | null) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
       // The PATCH response is a bare `transactions` row with no joined accounts/plaid_items,
       // unlike the list endpoint — merge just the changed field instead of replacing the item.
-      await setTransactionCategory(transactionId, budgetCategoryId);
+      await setTransactionCategory(transactionId, budgetCategoryId, ownership.verify);
       const committed = commitMutationForResource('transactions', expectedSessionId, () => {
         setTransactions((prev) =>
           prev.map((t) => (t.id === transactionId ? { ...t, budget_category_id: budgetCategoryId } : t))
@@ -1181,8 +1201,9 @@ export default function App() {
   async function handleApproveTransaction(transactionId: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      await approveTransaction(transactionId);
+      await approveTransaction(transactionId, ownership.verify);
       commitMutationForResource('transactions', expectedSessionId, () => {
         setTransactions((prev) =>
           prev.map((t) => (t.id === transactionId ? { ...t, needs_review: false } : t))
@@ -1205,7 +1226,8 @@ export default function App() {
     splits: { budget_category_id: string; amount: number }[]
   ) {
     const expectedSessionId = sessionIdRef.current;
-    const res = await saveTransactionSplits(transactionId, splits);
+    const ownership = captureOwnership();
+    const res = await saveTransactionSplits(transactionId, splits, ownership.verify);
     const committed = commitMutationForResource('transactions', expectedSessionId, () => {
       setTransactions((prev) => prev.map((t) => (t.id === transactionId ? { ...t, splits: res.splits } : t)));
     });
@@ -1214,7 +1236,8 @@ export default function App() {
 
   async function handleClearTransactionSplits(transactionId: string) {
     const expectedSessionId = sessionIdRef.current;
-    await clearTransactionSplits(transactionId);
+    const ownership = captureOwnership();
+    await clearTransactionSplits(transactionId, ownership.verify);
     const committed = commitMutationForResource('transactions', expectedSessionId, () => {
       setTransactions((prev) => prev.map((t) => (t.id === transactionId ? { ...t, splits: [] } : t)));
     });
@@ -1229,8 +1252,9 @@ export default function App() {
   ) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await createBudgetCategory({ name, budget_amount: budgetAmount, emoji, color });
+      const res = await createBudgetCategory({ name, budget_amount: budgetAmount, emoji, color }, ownership.verify);
       // A brand-new category has no transactions assigned to it yet, so both derived fields
       // are always 0 — no need to refetch just to fill in values we already know.
       commitMutationForResource('budgets', expectedSessionId, () => {
@@ -1246,8 +1270,9 @@ export default function App() {
   async function handleUpdateCategory(id: string, budgetAmount: number) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateBudgetCategory(id, { budget_amount: budgetAmount });
+      const res = await updateBudgetCategory(id, { budget_amount: budgetAmount }, ownership.verify);
       // Merge rather than replace — the response has no spent/recent_avg_spent, and changing
       // budget_amount doesn't change how much has actually been spent, so keep what's there.
       commitMutationForResource('budgets', expectedSessionId, () => {
@@ -1263,8 +1288,9 @@ export default function App() {
   async function handleUpdateCategoryEmoji(id: string, emoji: string | null) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateBudgetCategory(id, { emoji });
+      const res = await updateBudgetCategory(id, { emoji }, ownership.verify);
       commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
       });
@@ -1278,8 +1304,9 @@ export default function App() {
   async function handleUpdateCategoryColor(id: string, color: string | null) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateBudgetCategory(id, { color });
+      const res = await updateBudgetCategory(id, { color }, ownership.verify);
       commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
       });
@@ -1293,8 +1320,9 @@ export default function App() {
   async function handleReorderCategory(id: string, sortOrder: number) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateBudgetCategory(id, { sort_order: sortOrder });
+      const res = await updateBudgetCategory(id, { sort_order: sortOrder }, ownership.verify);
       commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
       });
@@ -1308,8 +1336,9 @@ export default function App() {
   async function handleArchiveCategory(id: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateBudgetCategory(id, { archived: true });
+      const res = await updateBudgetCategory(id, { archived: true }, ownership.verify);
       commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
       });
@@ -1334,8 +1363,9 @@ export default function App() {
   async function handleUnarchiveCategory(id: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateBudgetCategory(id, { archived: false });
+      const res = await updateBudgetCategory(id, { archived: false }, ownership.verify);
       commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...res.category } : c)));
       });
@@ -1353,8 +1383,9 @@ export default function App() {
   ): Promise<number> {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await saveCategoryMapping(plaidCategory, budgetCategoryId, backfill);
+      const res = await saveCategoryMapping(plaidCategory, budgetCategoryId, backfill, ownership.verify);
       // The ENTIRE continuation below — including the backfill follow-up — must be completely
       // inert once the session has moved on, checked ONCE, before any of it (not merely before
       // the categoryMappings setState). A stale continuation that still bumped
@@ -1405,8 +1436,9 @@ export default function App() {
   async function handleDeleteCategoryMapping(id: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      await deleteCategoryMapping(id);
+      await deleteCategoryMapping(id, ownership.verify);
       commitMutationForResource('categoryMappings', expectedSessionId, () => {
         setCategoryMappings((prev) => prev.filter((m) => m.id !== id));
       });
@@ -1533,8 +1565,9 @@ export default function App() {
   async function handleUpdateManualLoan(id: string, input: ManualLoanInput) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateManualLoan(id, input);
+      const res = await updateManualLoan(id, input, ownership.verify);
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === id ? res.loan : l)));
       });
@@ -1548,8 +1581,9 @@ export default function App() {
   async function handleDeleteManualLoan(id: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      await deleteManualLoan(id);
+      await deleteManualLoan(id, ownership.verify);
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.filter((l) => l.id !== id));
       });
@@ -1568,8 +1602,9 @@ export default function App() {
   async function handleUpdateLinkedPayment(loanId: string, transactionId: string, principalPortion: number) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateLinkedLoanPayment(loanId, transactionId, principalPortion);
+      const res = await updateLinkedLoanPayment(loanId, transactionId, principalPortion, ownership.verify);
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
       });
@@ -1584,8 +1619,9 @@ export default function App() {
   async function handleUnlinkPayment(loanId: string, transactionId: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await unlinkLoanPayment(loanId, transactionId);
+      const res = await unlinkLoanPayment(loanId, transactionId, ownership.verify);
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
       });
@@ -1600,8 +1636,9 @@ export default function App() {
   async function handleCreateManualPayment(loanId: string, input: ManualPaymentInput) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await createManualPayment(loanId, input);
+      const res = await createManualPayment(loanId, input, ownership.verify);
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
       });
@@ -1616,8 +1653,9 @@ export default function App() {
   async function handleUpdateManualPayment(loanId: string, paymentId: string, input: ManualPaymentInput) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await updateManualPayment(loanId, paymentId, input);
+      const res = await updateManualPayment(loanId, paymentId, input, ownership.verify);
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
       });
@@ -1632,8 +1670,9 @@ export default function App() {
   async function handleDeleteManualPayment(loanId: string, paymentId: string) {
     setActionError(null);
     const expectedSessionId = sessionIdRef.current;
+    const ownership = captureOwnership();
     try {
-      const res = await deleteManualPayment(loanId, paymentId);
+      const res = await deleteManualPayment(loanId, paymentId, ownership.verify);
       commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
       });
@@ -1687,7 +1726,8 @@ export default function App() {
         <h1>My Finances</h1>
         <div className="app-header-actions">
           {loading && <span className="hint">Refreshing…</span>}
-          <PlaidLink onLinked={handlePlaidLinked} />
+          {/* Keyed by login lifecycle: a sign-in change unmounts it, destroying any open Link. */}
+          <PlaidLink key={sessionId ?? 'signed-out'} onLinked={handlePlaidLinked} captureOwnership={captureOwnership} />
           <button className="link-button" onClick={() => supabase.auth.signOut()}>
             Sign out
           </button>
@@ -2014,6 +2054,7 @@ export default function App() {
                         items={items}
                         isSandbox={isSandbox}
                         createRefreshCommitter={createAccountsRefreshCommitter}
+                        captureOwnership={captureOwnership}
                         onUpdateCreditLimit={handleUpdateCreditLimit}
                         onUpdateCustomization={handleUpdateAccountCustomization}
                       />

@@ -50,6 +50,8 @@ import {
   ManualLoanCreationKeyResolvedError,
   getRelationallyClassifiedTransactionsPage,
   getTransactionsBackfillPage,
+  createPlaidLinkAttempt,
+  consumePlaidLinkAttempt,
 } from './dataService';
 import {
   decryptAccessToken,
@@ -2600,5 +2602,49 @@ describe('getTransactionsBackfillPage — deterministic keyset pagination (Round
 
     const isCalls = (query.is as ReturnType<typeof vi.fn>).mock.calls;
     expect(isCalls.some((call) => call[0] === 'auto_role')).toBe(false);
+  });
+});
+
+describe('Plaid Link attempts (Wave 1)', () => {
+  beforeEach(() => {
+    mockRpc.mockReset();
+  });
+
+  it('createPlaidLinkAttempt calls create_plaid_link_attempt with the user and session, returning the id', async () => {
+    mockRpc.mockResolvedValueOnce({ data: 'attempt-1', error: null });
+    await expect(createPlaidLinkAttempt('user-1', 'sid-1')).resolves.toBe('attempt-1');
+    expect(mockRpc).toHaveBeenCalledWith('create_plaid_link_attempt', { p_user_id: 'user-1', p_session_id: 'sid-1' });
+  });
+
+  it('createPlaidLinkAttempt throws on an RPC error or a missing id', async () => {
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+    await expect(createPlaidLinkAttempt('user-1', 'sid-1')).rejects.toThrow('Failed to start Plaid Link attempt: boom');
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
+    await expect(createPlaidLinkAttempt('user-1', 'sid-1')).rejects.toThrow('no id returned');
+  });
+
+  it.each(['consumed', 'expired', 'invalid'] as const)('consumePlaidLinkAttempt passes %s through verbatim', async (outcome) => {
+    mockRpc.mockResolvedValueOnce({ data: outcome, error: null });
+    await expect(consumePlaidLinkAttempt('attempt-1', 'user-1', 'sid-1')).resolves.toBe(outcome);
+    expect(mockRpc).toHaveBeenCalledWith('consume_plaid_link_attempt', {
+      p_attempt_id: 'attempt-1',
+      p_user_id: 'user-1',
+      p_session_id: 'sid-1',
+    });
+  });
+
+  it.each([[null], [''], ['CONSUMED'], [true], [{ status: 'consumed' }]])(
+    'consumePlaidLinkAttempt treats any other result (%j) as an error, never as consumed',
+    async (data) => {
+      mockRpc.mockResolvedValueOnce({ data, error: null });
+      await expect(consumePlaidLinkAttempt('attempt-1', 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
+    }
+  );
+
+  it('consumePlaidLinkAttempt throws on an RPC error', async () => {
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'connection reset' } });
+    await expect(consumePlaidLinkAttempt('attempt-1', 'user-1', 'sid-1')).rejects.toThrow(
+      'Failed to verify Plaid Link attempt: connection reset'
+    );
   });
 });

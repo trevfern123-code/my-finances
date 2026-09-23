@@ -3,6 +3,7 @@ import type { LinkedAccount, LinkedItem } from '../lib/api';
 import { refreshAccountBalances, sandboxFireWebhook, sandboxResetLogin } from '../lib/api';
 import { accountDisplayName, sortAccountsByOrder } from '../lib/accountDisplay';
 import { computeReorder } from '../lib/reorder';
+import type { SessionOwnership } from '../lib/sessionOwnership';
 import { ReconnectButton } from './ReconnectButton';
 import { EmojiPicker } from './EmojiPicker';
 import { ColorPicker } from './ColorPicker';
@@ -176,6 +177,7 @@ export function LinkedAccounts({
   items,
   isSandbox,
   createRefreshCommitter,
+  captureOwnership,
   onUpdateCreditLimit,
   onUpdateCustomization,
 }: {
@@ -186,6 +188,9 @@ export function LinkedAccounts({
   // kicked off from the same render each get their own token this way, so whichever one
   // actually started later legitimately wins even if the other happens to resolve first.
   createRefreshCommitter: () => (items: LinkedItem[]) => void;
+  // Wave 1: each operation's owner, captured at the same moment as its committer and required by
+  // its request — a sign-in change before the request is sent makes it refuse to send.
+  captureOwnership: () => SessionOwnership;
   onUpdateCreditLimit: (accountId: string, creditLimit: number | null) => void;
   onUpdateCustomization: (accountId: string, fields: CustomizationFields) => void;
 }) {
@@ -197,11 +202,12 @@ export function LinkedAccounts({
     setRefreshing(true);
     setError(null);
     const commit = createRefreshCommitter();
+    const ownership = captureOwnership();
     try {
-      const res = await refreshAccountBalances();
+      const res = await refreshAccountBalances(ownership.verify);
       commit(res.items);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to refresh balances');
+      if (ownership.isCurrent()) setError(err instanceof Error ? err.message : 'Failed to refresh balances');
     } finally {
       setRefreshing(false);
     }
@@ -211,10 +217,12 @@ export function LinkedAccounts({
     setError(null);
     setHint(null);
     const commit = createRefreshCommitter();
+    const ownership = captureOwnership();
     try {
-      const res = await sandboxResetLogin(itemId);
+      const res = await sandboxResetLogin(itemId, ownership.verify);
       commit(res.items);
     } catch (err) {
+      if (!ownership.isCurrent()) return;
       setError(
         err instanceof Error
           ? `${err.message} (this only works against Plaid Sandbox)`
@@ -226,10 +234,12 @@ export function LinkedAccounts({
   async function handleSandboxWebhook(itemId: string) {
     setError(null);
     setHint(null);
+    const ownership = captureOwnership();
     try {
-      await sandboxFireWebhook(itemId);
-      setHint('Webhook fired — check Recent transactions in a few seconds.');
+      await sandboxFireWebhook(itemId, ownership.verify);
+      if (ownership.isCurrent()) setHint('Webhook fired — check Recent transactions in a few seconds.');
     } catch (err) {
+      if (!ownership.isCurrent()) return;
       setError(
         err instanceof Error
           ? `${err.message} (this only works against Plaid Sandbox)`
@@ -271,6 +281,7 @@ export function LinkedAccounts({
                     itemId={item.id}
                     institutionName={item.institution_name}
                     createRefreshCommitter={createRefreshCommitter}
+                    captureOwnership={captureOwnership}
                   />
                 )}
                 {item.status === 'credential_error' && (
