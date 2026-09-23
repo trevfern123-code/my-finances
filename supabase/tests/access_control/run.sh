@@ -70,6 +70,7 @@ done
 echo "repository migration history applied (as postgres, one transaction per file)"
 
 psql_admin < "$ROOT/supabase/tests/phase_a/helpers.sql" >"$LOGS/helpers.log" 2>&1 || { cat "$LOGS/helpers.log"; exit 1; }
+psql_admin < "$HERE/helpers.sql" >>"$LOGS/helpers.log" 2>&1 || { cat "$LOGS/helpers.log"; exit 1; }
 
 PASSED=0
 FAILED=0

@@ -1,45 +1,84 @@
--- Wave 1 remediation (2/2): one-time, short-lived, server-side Plaid Link attempts.
+-- Wave 1 remediation (2/2): server-owned Plaid Hosted Link attempts.
 --
--- POST /api/plaid/link-token records an attempt bound to the authenticated user AND that user's
--- Supabase login session (the verified JWT's `session_id` claim), and returns its id with the link
--- token. POST /api/plaid/exchange-public-token must present that id, and consumes it atomically
--- BEFORE the public token is exchanged with Plaid. The user id always comes from the verified
--- bearer token on the server, never from the request body.
+-- The backend creates the Plaid link token (with `hosted_link`, 30-minute URL lifetime) and stores
+-- it HERE, encrypted, bound to one attempt, one user and one Supabase login session (the verified
+-- JWT's `session_id` claim). The browser only ever receives the Hosted Link URL and the attempt id.
+-- When Hosted Link finishes, the same user in the same login session asks the backend to complete
+-- the attempt; the backend reads its own stored link token, asks Plaid (/link/token/get) for the
+-- public token of THAT link token's session, and exchanges it. No endpoint accepts a public token
+-- from a client, so a public token captured from another user has nowhere to be submitted
+-- (Wave 1 review P1). The user id always comes from the verified bearer token, never a request body.
 --
--- What an attempt proves: the caller is the same user, in the same login session, that asked for a
--- link token within the last 30 minutes, and has not already spent that request. What it does NOT
--- prove: that the submitted public token came from THAT link token's Link flow. Plaid's embedded
--- Link hands the public token to the browser, and Plaid exposes no default server-side way to tie a
--- public token back to its link token (see README "Wave 1 follow-ups"). A public token captured
--- from another user can therefore still be presented alongside the presenter's own valid attempt.
+-- Lifecycle (`status`):
+--   pending     created; Hosted Link in progress. The encrypted link token is present.
+--   completing  one completion call claimed it (claim_plaid_link_attempt) and is exchanging. The
+--               claim is a single conditional UPDATE, so concurrent or duplicate completion calls
+--               cannot both claim: the loser sees 'completing'/'completed' and exchanges nothing.
+--   completed   an item was stored (plaid_item_id). The link token is erased.
+--   failed      exited, ambiguous, or the exchange failed before an item was stored. Erased too.
+-- A verified SESSION_FINISHED webhook only records readiness (ready_at/ready_status). It never
+-- claims, exchanges or changes status.
 --
--- Concurrency: create_plaid_link_attempt serializes per user with a transaction-scoped advisory
--- lock, so concurrent requests for one user cannot exceed five live (unexpired) attempts. Expired
--- attempts are swept globally, in bounded batches, by every create and consume — not only when the
--- same user creates again.
+-- Concurrency (Wave 1 review P2): create_plaid_link_attempt serializes per user with a
+-- transaction-scoped advisory lock, so concurrent requests cannot exceed five live pending attempts
+-- per user. Rows are swept globally, in bounded batches, an hour after they expire (the hour keeps
+-- replay detection), by every create and every completion claim.
 --
--- Every function follows the Phase A conventions: SECURITY INVOKER, search_path pinned empty,
--- executable by service_role only. The table is reachable by service_role only, with exactly the
--- privileges those functions need (SELECT for the WHERE/RETURNING, INSERT, DELETE) — Supabase's
--- default privileges would otherwise grant every privilege to anon/authenticated/service_role.
+-- Every function: SECURITY INVOKER, search_path pinned empty, executable by service_role only. The
+-- table: service_role only, with exactly SELECT, INSERT, DELETE and column-level UPDATE of the
+-- lifecycle columns — Supabase's default privileges would otherwise grant every privilege to
+-- anon/authenticated/service_role.
 --
 -- Deploy order: apply this migration BEFORE deploying the backend that calls these functions
 -- (until then that backend refuses to create link tokens: linking fails closed, nothing else is
 -- affected).
 --
 -- Rollback (only after reverting the backend to a build that does not call these functions):
---   drop function public.consume_plaid_link_attempt(uuid, uuid, text);
---   drop function public.create_plaid_link_attempt(uuid, text);
+--   drop function public.mark_plaid_link_attempt_ready(text, text);
+--   drop function public.finish_plaid_link_attempt(uuid, uuid, text, text, uuid);
+--   drop function public.claim_plaid_link_attempt(uuid, uuid, text);
+--   drop function public.read_plaid_link_attempt(uuid, uuid, text);
+--   drop function public.create_plaid_link_attempt(uuid, uuid, text, text, text, text, text, text, smallint);
 --   drop function public.purge_expired_plaid_link_attempts(integer);
 --   drop table public.plaid_link_attempts;
 
 create table public.plaid_link_attempts (
-  id         uuid        primary key default gen_random_uuid(),
-  user_id    uuid        not null references auth.users(id) on delete cascade,
-  session_id text        not null check (btrim(session_id) <> ''),
-  created_at timestamptz not null default now(),
-  expires_at timestamptz not null,
-  check (expires_at > created_at)
+  -- Generated by the backend, not the database: the link token's encryption AAD is bound to this id
+  -- before the row exists (the same pattern insertPlaidItem uses for plaid_items).
+  id                     uuid        primary key,
+  user_id                uuid        not null references auth.users(id) on delete cascade,
+  session_id             text        not null check (btrim(session_id) <> ''),
+  created_at             timestamptz not null default now(),
+  expires_at             timestamptz not null,
+  status                 text        not null default 'pending'
+                                     check (status in ('pending', 'completing', 'completed', 'failed')),
+  -- SHA-256 (hex) of the link token: lets a SESSION_FINISHED webhook find its attempt without
+  -- decrypting anything. Not reversible.
+  link_token_hash        text        not null unique check (link_token_hash ~ '^[0-9a-f]{64}$'),
+  -- The link token itself, AES-256-GCM encrypted under the Plaid token key ring (see
+  -- backend/src/services/tokenEncryption.ts), AAD-bound to this row's id. Present only while the
+  -- attempt can still be completed.
+  link_token_ciphertext  text,
+  link_token_nonce       text,
+  link_token_auth_tag    text,
+  link_token_key_id      text,
+  link_token_enc_version smallint,
+  ready_at               timestamptz,
+  ready_status           text        check (ready_status is null or length(ready_status) between 1 and 32),
+  claimed_at             timestamptz,
+  finished_at            timestamptz,
+  plaid_item_id          uuid,
+  check (expires_at > created_at),
+  check (
+    (status in ('pending', 'completing')
+      and link_token_ciphertext is not null and link_token_nonce is not null and link_token_auth_tag is not null
+      and link_token_key_id is not null and link_token_enc_version is not null)
+    or
+    (status in ('completed', 'failed')
+      and link_token_ciphertext is null and link_token_nonce is null and link_token_auth_tag is null
+      and link_token_key_id is null and link_token_enc_version is null)
+  ),
+  check ((status = 'completed') = (plaid_item_id is not null))
 );
 
 create index plaid_link_attempts_user_id_idx on public.plaid_link_attempts (user_id);
@@ -49,12 +88,16 @@ alter table public.plaid_link_attempts enable row level security;
 
 revoke all on table public.plaid_link_attempts from public, anon, authenticated, service_role;
 grant select, insert, delete on table public.plaid_link_attempts to service_role;
+grant update (status, ready_at, ready_status, claimed_at, finished_at, plaid_item_id,
+              link_token_ciphertext, link_token_nonce, link_token_auth_tag, link_token_key_id,
+              link_token_enc_version)
+  on table public.plaid_link_attempts to service_role;
 
--- Deletes up to p_limit expired attempts belonging to ANY user, oldest first, and returns how many.
--- At most one sweep runs at a time: a sweeper that cannot take the sweep lock immediately returns 0
--- rather than waiting, so two sweeps never contend for (or deadlock on) the same rows. The lock is
--- transaction-scoped, released at commit. Only expired rows are touched, and the per-user cap below
--- only touches live ones, so a sweep in progress does not hold up another user's link creation.
+-- Deletes up to p_limit rows of ANY user that expired more than an hour ago, oldest first, and
+-- returns how many. At most one sweep runs at a time: a sweeper that cannot take the sweep lock
+-- immediately returns 0 rather than waiting, so two sweeps never contend for (or deadlock on) the
+-- same rows. Only long-expired rows are touched, and the per-user cap below only touches live ones,
+-- so a sweep in progress does not hold up another user's link creation.
 create function public.purge_expired_plaid_link_attempts(p_limit integer)
 returns integer
 language plpgsql
@@ -75,7 +118,7 @@ begin
 
   delete from public.plaid_link_attempts a
    where a.id in (select b.id from public.plaid_link_attempts b
-                   where b.expires_at <= now()
+                   where b.expires_at <= now() - interval '1 hour'
                    order by b.expires_at, b.id
                    limit p_limit);
   get diagnostics v_deleted = row_count;
@@ -83,22 +126,32 @@ begin
 end;
 $$;
 
--- Returns the new attempt's id. Serialized per user: the advisory lock below is held until the
--- calling transaction commits, so a concurrent create for the same user waits here and then sees
--- this one's committed row. Under it, the user's oldest LIVE attempts are removed until four remain,
--- then the new one is inserted: never more than five live attempts. Expired ones are already
--- unusable (consume reports them 'expired') and are left to the sweep.
-create function public.create_plaid_link_attempt(p_user_id uuid, p_session_id text)
-returns uuid
+-- Records a new pending attempt (id, encrypted link token and its hash supplied by the backend) and
+-- returns its expiry. Serialized per user: the advisory lock is held until the calling transaction
+-- commits, so a concurrent create for the same user waits here and then sees this one's committed
+-- row. Under it, the user's oldest live pending attempts are removed until four remain, then the new
+-- one is inserted: never more than five live pending attempts.
+create function public.create_plaid_link_attempt(
+  p_id uuid,
+  p_user_id uuid,
+  p_session_id text,
+  p_link_token_hash text,
+  p_link_token_ciphertext text,
+  p_link_token_nonce text,
+  p_link_token_auth_tag text,
+  p_link_token_key_id text,
+  p_link_token_enc_version smallint
+)
+returns timestamptz
 language plpgsql
 security invoker
 set search_path = ''
 as $$
 declare
-  v_id uuid;
+  v_expires_at timestamptz;
 begin
-  if p_user_id is null or p_session_id is null or btrim(p_session_id) = '' then
-    raise exception 'create_plaid_link_attempt: a user and a login session are required'
+  if p_id is null or p_user_id is null or p_session_id is null or btrim(p_session_id) = '' then
+    raise exception 'create_plaid_link_attempt: an id, a user and a login session are required'
       using errcode = '22023';
   end if;
 
@@ -107,57 +160,162 @@ begin
   delete from public.plaid_link_attempts a
    where a.user_id = p_user_id
      and a.id in (select b.id from public.plaid_link_attempts b
-                   where b.user_id = p_user_id and b.expires_at > now()
+                   where b.user_id = p_user_id and b.status = 'pending' and b.expires_at > now()
                    order by b.created_at desc, b.id desc
                    offset 4);
 
-  insert into public.plaid_link_attempts (user_id, session_id, expires_at)
-  values (p_user_id, p_session_id, now() + interval '30 minutes')
-  returning id into v_id;
+  insert into public.plaid_link_attempts (
+    id, user_id, session_id, expires_at, link_token_hash, link_token_ciphertext, link_token_nonce,
+    link_token_auth_tag, link_token_key_id, link_token_enc_version)
+  values (
+    p_id, p_user_id, p_session_id, now() + interval '30 minutes', p_link_token_hash,
+    p_link_token_ciphertext, p_link_token_nonce, p_link_token_auth_tag, p_link_token_key_id,
+    p_link_token_enc_version)
+  returning expires_at into v_expires_at;
 
   perform public.purge_expired_plaid_link_attempts(100);
 
-  return v_id;
+  return v_expires_at;
 end;
 $$;
 
--- Consumes the attempt exactly once: one DELETE ... RETURNING, so of two concurrent consumers of the
--- same attempt, the second blocks on the row lock and then finds nothing. Returns
---   'consumed'  the attempt existed, belonged to this user and session, and had not expired
---   'expired'   it belonged to this user and session but its TTL had passed (it is deleted anyway)
---   'invalid'   no such attempt for this user and session: unknown, already used, or someone else's.
---               Another user's attempt is left untouched (it is not theirs to spend).
--- Also runs one bounded global sweep of expired attempts.
-create function public.consume_plaid_link_attempt(p_attempt_id uuid, p_user_id uuid, p_session_id text)
+-- The attempt as seen by its OWN user in its OWN login session — zero rows for anyone else, or for
+-- an unknown id. `expired` is decided by the database clock.
+create function public.read_plaid_link_attempt(p_id uuid, p_user_id uuid, p_session_id text)
+returns table (
+  status text,
+  expired boolean,
+  link_token_ciphertext text,
+  link_token_nonce text,
+  link_token_auth_tag text,
+  link_token_key_id text,
+  link_token_enc_version smallint
+)
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select a.status, a.expires_at <= now(), a.link_token_ciphertext, a.link_token_nonce,
+         a.link_token_auth_tag, a.link_token_key_id, a.link_token_enc_version
+    from public.plaid_link_attempts a
+   where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id;
+$$;
+
+-- Claims a pending, unexpired attempt for its own user and login session: exactly one caller can
+-- ever get 'claimed' (one conditional UPDATE; a concurrent claimer blocks on the row lock, then
+-- re-checks status and finds it no longer pending). Everyone else gets the reason:
+--   'invalid'     no such attempt for this user and session (unknown, swept, or someone else's)
+--   'expired'     still pending, but past its 30 minutes
+--   'completing'  another call claimed it and is exchanging right now
+--   'completed'   already exchanged
+--   'failed'      exited, ambiguous or failed — start again
+create function public.claim_plaid_link_attempt(p_id uuid, p_user_id uuid, p_session_id text)
 returns text
 language plpgsql
 security invoker
 set search_path = ''
 as $$
 declare
-  v_expires_at timestamptz;
-  v_found boolean;
+  v_status text;
 begin
-  delete from public.plaid_link_attempts a
-   where a.id = p_attempt_id and a.user_id = p_user_id and a.session_id = p_session_id
-  returning a.expires_at into v_expires_at;
-  v_found := found;
+  update public.plaid_link_attempts a
+     set status = 'completing', claimed_at = now()
+   where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
+     and a.status = 'pending' and a.expires_at > now();
+  if found then
+    perform public.purge_expired_plaid_link_attempts(100);
+    return 'claimed';
+  end if;
 
-  perform public.purge_expired_plaid_link_attempts(100);
-
-  if not v_found then
+  select a.status into v_status
+    from public.plaid_link_attempts a
+   where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id;
+  if not found then
     return 'invalid';
   end if;
-  if v_expires_at <= now() then
+  if v_status = 'pending' then
     return 'expired';
   end if;
-  return 'consumed';
+  return v_status;
+end;
+$$;
+
+-- Ends an attempt and erases its link token. Only these transitions exist:
+--   'completed'  completing -> completed (p_plaid_item_id required): the claimer stored an item
+--   'failed'     pending or completing -> failed: exited/ambiguous, or the claimer's exchange failed
+-- Returns false when the attempt is not in a state that allows the transition (or is not this user's
+-- and session's), changing nothing.
+create function public.finish_plaid_link_attempt(
+  p_id uuid,
+  p_user_id uuid,
+  p_session_id text,
+  p_outcome text,
+  p_plaid_item_id uuid
+)
+returns boolean
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+begin
+  if p_outcome = 'completed' then
+    if p_plaid_item_id is null then
+      raise exception 'finish_plaid_link_attempt: a completed attempt needs its plaid item id'
+        using errcode = '22023';
+    end if;
+    update public.plaid_link_attempts a
+       set status = 'completed', plaid_item_id = p_plaid_item_id, finished_at = now(),
+           link_token_ciphertext = null, link_token_nonce = null, link_token_auth_tag = null,
+           link_token_key_id = null, link_token_enc_version = null
+     where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
+       and a.status = 'completing';
+  elsif p_outcome = 'failed' then
+    update public.plaid_link_attempts a
+       set status = 'failed', finished_at = now(),
+           link_token_ciphertext = null, link_token_nonce = null, link_token_auth_tag = null,
+           link_token_key_id = null, link_token_enc_version = null
+     where a.id = p_id and a.user_id = p_user_id and a.session_id = p_session_id
+       and a.status in ('pending', 'completing');
+  else
+    raise exception 'finish_plaid_link_attempt: outcome must be completed or failed'
+      using errcode = '22023';
+  end if;
+  return found;
+end;
+$$;
+
+-- For a verified SESSION_FINISHED webhook: records, once, that Plaid reported the Hosted Link
+-- session for this link token as finished. Informational only — it never claims, exchanges or
+-- changes status, so it cannot bypass the attempt's user/session binding. A duplicate delivery, an
+-- unknown token, or a malformed hash changes nothing and returns false.
+create function public.mark_plaid_link_attempt_ready(p_link_token_hash text, p_status text)
+returns boolean
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+begin
+  if p_link_token_hash is null or p_link_token_hash !~ '^[0-9a-f]{64}$' then
+    return false;
+  end if;
+  update public.plaid_link_attempts a
+     set ready_at = now(),
+         ready_status = coalesce(nullif(left(upper(btrim(coalesce(p_status, ''))), 32), ''), 'UNKNOWN')
+   where a.link_token_hash = p_link_token_hash and a.ready_at is null;
+  return found;
 end;
 $$;
 
 revoke all on function public.purge_expired_plaid_link_attempts(integer) from public, anon, authenticated;
-revoke all on function public.create_plaid_link_attempt(uuid, text) from public, anon, authenticated;
-revoke all on function public.consume_plaid_link_attempt(uuid, uuid, text) from public, anon, authenticated;
+revoke all on function public.create_plaid_link_attempt(uuid, uuid, text, text, text, text, text, text, smallint) from public, anon, authenticated;
+revoke all on function public.read_plaid_link_attempt(uuid, uuid, text) from public, anon, authenticated;
+revoke all on function public.claim_plaid_link_attempt(uuid, uuid, text) from public, anon, authenticated;
+revoke all on function public.finish_plaid_link_attempt(uuid, uuid, text, text, uuid) from public, anon, authenticated;
+revoke all on function public.mark_plaid_link_attempt_ready(text, text) from public, anon, authenticated;
 grant execute on function public.purge_expired_plaid_link_attempts(integer) to service_role;
-grant execute on function public.create_plaid_link_attempt(uuid, text) to service_role;
-grant execute on function public.consume_plaid_link_attempt(uuid, uuid, text) to service_role;
+grant execute on function public.create_plaid_link_attempt(uuid, uuid, text, text, text, text, text, text, smallint) to service_role;
+grant execute on function public.read_plaid_link_attempt(uuid, uuid, text) to service_role;
+grant execute on function public.claim_plaid_link_attempt(uuid, uuid, text) to service_role;
+grant execute on function public.finish_plaid_link_attempt(uuid, uuid, text, text, uuid) to service_role;
+grant execute on function public.mark_plaid_link_attempt_ready(text, text) to service_role;

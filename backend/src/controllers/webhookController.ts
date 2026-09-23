@@ -10,6 +10,9 @@ interface PlaidWebhookPayload {
   webhook_code: string;
   item_id: string;
   error?: { error_code?: string } | null;
+  // LINK / SESSION_FINISHED only.
+  link_token?: unknown;
+  status?: unknown;
 }
 
 export async function handlePlaidWebhook(req: Request, res: Response) {
@@ -42,6 +45,18 @@ export async function handlePlaidWebhook(req: Request, res: Response) {
 }
 
 async function processWebhook(payload: PlaidWebhookPayload) {
+  if (payload.webhook_type === 'LINK') {
+    // Wave 1 Hosted Link. A SESSION_FINISHED webhook only records that Plaid finished the session
+    // for this link token (matched by its hash). It never claims, exchanges or stores anything, and
+    // its public_token(s) are deliberately ignored: only the attempt's own user, in its own login
+    // session, can complete it (completeLinkAttempt), which re-reads the result from Plaid itself.
+    // A duplicate delivery is a no-op. The link token is never logged.
+    if (payload.webhook_code === 'SESSION_FINISHED' && typeof payload.link_token === 'string' && payload.link_token !== '') {
+      await dataService.markPlaidLinkAttemptReady(payload.link_token, typeof payload.status === 'string' ? payload.status : 'UNKNOWN');
+    }
+    return;
+  }
+
   let item;
   try {
     item = await dataService.getPlaidItemByPlaidItemId(payload.item_id);

@@ -5,6 +5,10 @@ import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 // management), §6 (key ring), §8 (fail-closed rule), §9 (error classes).
 
 const AAD_CONTEXT = 'my-finances:plaid-access-token';
+// Wave 1 Hosted Link: stored Plaid LINK tokens use the same key ring and cipher under their own AAD
+// context, so a link-token ciphertext can never be decrypted as an access token or vice versa, even
+// for the same row id.
+const LINK_TOKEN_AAD_CONTEXT = 'my-finances:plaid-link-token';
 // Single source of truth for both "the version new encryptions are written under" and "the only
 // version reads currently accept" (PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §27, Phase 2b
 // revision) — one constant, so a writer/reader version drifting apart from each other is not a
@@ -227,8 +231,8 @@ export function validateKeyRingOrExit(): void {
 
 // ---- AAD (§4) -----------------------------------------------------------
 
-function buildAad(plaidItemId: string, encVersion: number): Buffer {
-  return Buffer.from(`${AAD_CONTEXT}:v${encVersion}:${plaidItemId}`, 'utf8');
+function buildAad(context: string, rowId: string, encVersion: number): Buffer {
+  return Buffer.from(`${context}:v${encVersion}:${rowId}`, 'utf8');
 }
 
 // ---- Encrypt / decrypt (§5.1, §5.2) -----------------------------------------------------------
@@ -241,6 +245,16 @@ export function encryptAccessToken(
   keyRing: KeyRing,
   plaidItemId: string
 ): EncryptedAccessToken {
+  return encryptBound(AAD_CONTEXT, plaintext, keyRing, plaidItemId);
+}
+
+/** Encrypts a Plaid LINK token (Wave 1 Hosted Link) exactly like an access token, but under its own
+ *  AAD context and bound to its plaid_link_attempts row id. */
+export function encryptLinkToken(plaintext: string, keyRing: KeyRing, linkAttemptId: string): EncryptedAccessToken {
+  return encryptBound(LINK_TOKEN_AAD_CONTEXT, plaintext, keyRing, linkAttemptId);
+}
+
+function encryptBound(context: string, plaintext: string, keyRing: KeyRing, plaidItemId: string): EncryptedAccessToken {
   const keyId = keyRing.currentKeyId;
   const key = keyRing.keys.get(keyId);
   if (!key) {
@@ -251,7 +265,7 @@ export function encryptAccessToken(
 
   const nonce = randomBytes(NONCE_LENGTH_BYTES);
   const cipher = createCipheriv('aes-256-gcm', key, nonce);
-  cipher.setAAD(buildAad(plaidItemId, ENC_VERSION));
+  cipher.setAAD(buildAad(context, plaidItemId, ENC_VERSION));
   const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   const authTag = cipher.getAuthTag();
 
@@ -278,6 +292,16 @@ export function decryptAccessToken(
   keyRing: KeyRing,
   plaidItemId: string
 ): string {
+  return decryptBound(AAD_CONTEXT, enc, keyRing, plaidItemId);
+}
+
+/** Decrypts a stored Plaid LINK token; fails (fixed-message PlaidCredentialError subclasses) for a
+ *  ciphertext of any other row, or one written as an access token. */
+export function decryptLinkToken(enc: EncryptedAccessToken, keyRing: KeyRing, linkAttemptId: string): string {
+  return decryptBound(LINK_TOKEN_AAD_CONTEXT, enc, keyRing, linkAttemptId);
+}
+
+function decryptBound(context: string, enc: EncryptedAccessToken, keyRing: KeyRing, plaidItemId: string): string {
   if (enc.encVersion !== ENC_VERSION) {
     throw new UnsupportedEncryptionVersionError(plaidItemId);
   }
@@ -294,7 +318,7 @@ export function decryptAccessToken(
   if (!key) throw new UnknownKeyIdError(plaidItemId);
 
   const decipher = createDecipheriv('aes-256-gcm', key, nonce);
-  decipher.setAAD(buildAad(plaidItemId, enc.encVersion));
+  decipher.setAAD(buildAad(context, plaidItemId, enc.encVersion));
   decipher.setAuthTag(authTag);
   try {
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');

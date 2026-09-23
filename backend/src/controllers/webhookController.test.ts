@@ -8,9 +8,17 @@ vi.mock('../services/webhookVerification', () => ({ verifyPlaidWebhook: mockVeri
 
 const mockGetPlaidItemByPlaidItemId = vi.hoisted(() => vi.fn());
 const mockSetItemStatus = vi.hoisted(() => vi.fn());
+const mockMarkPlaidLinkAttemptReady = vi.hoisted(() => vi.fn());
+const mockClaimPlaidLinkAttempt = vi.hoisted(() => vi.fn());
+const mockFinishPlaidLinkAttempt = vi.hoisted(() => vi.fn());
+const mockInsertPlaidItem = vi.hoisted(() => vi.fn());
 vi.mock('../services/dataService', () => ({
   getPlaidItemByPlaidItemId: mockGetPlaidItemByPlaidItemId,
   setItemStatus: mockSetItemStatus,
+  markPlaidLinkAttemptReady: mockMarkPlaidLinkAttemptReady,
+  claimPlaidLinkAttempt: mockClaimPlaidLinkAttempt,
+  finishPlaidLinkAttempt: mockFinishPlaidLinkAttempt,
+  insertPlaidItem: mockInsertPlaidItem,
 }));
 
 const mockSyncItemTransactions = vi.hoisted(() => vi.fn());
@@ -179,5 +187,76 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
       safeSummaryFor(err)
     );
     expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-99', 'credential_error');
+  });
+});
+
+describe('handlePlaidWebhook — LINK SESSION_FINISHED (Wave 1 Hosted Link): readiness only', () => {
+  const LINK_TOKEN = 'link-sandbox-placeholder-token';
+  const sessionFinished = (overrides: Record<string, unknown> = {}) => ({
+    webhook_type: 'LINK',
+    webhook_code: 'SESSION_FINISHED',
+    status: 'SUCCESS',
+    link_session_id: 'session-1',
+    link_token: LINK_TOKEN,
+    public_tokens: ['public-token-from-webhook'],
+    environment: 'sandbox',
+    ...overrides,
+  });
+
+  function expectNoLinkSideEffects() {
+    expect(mockClaimPlaidLinkAttempt).not.toHaveBeenCalled();
+    expect(mockFinishPlaidLinkAttempt).not.toHaveBeenCalled();
+    expect(mockInsertPlaidItem).not.toHaveBeenCalled();
+    expect(mockGetPlaidItemByPlaidItemId).not.toHaveBeenCalled();
+    expect(mockSyncItemTransactions).not.toHaveBeenCalled();
+  }
+
+  it('records readiness for the link token and nothing else — its public tokens are never used', async () => {
+    mockMarkPlaidLinkAttemptReady.mockResolvedValue(true);
+    const res = fakeRes();
+    await handlePlaidWebhook(fakeReq(sessionFinished()), res);
+    await flushMicrotasks();
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(mockMarkPlaidLinkAttemptReady).toHaveBeenCalledExactlyOnceWith(LINK_TOKEN, 'SUCCESS');
+    expectNoLinkSideEffects();
+    expect(JSON.stringify(mockMarkPlaidLinkAttemptReady.mock.calls)).not.toContain('public-token-from-webhook');
+  });
+
+  it('duplicate delivery: each is acknowledged, the second records nothing new, and still nothing is exchanged', async () => {
+    mockMarkPlaidLinkAttemptReady.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    for (let i = 0; i < 2; i++) {
+      const res = fakeRes();
+      await handlePlaidWebhook(fakeReq(sessionFinished()), res);
+      expect(res.status).toHaveBeenCalledWith(200);
+    }
+    await flushMicrotasks();
+    expect(mockMarkPlaidLinkAttemptReady).toHaveBeenCalledTimes(2);
+    expectNoLinkSideEffects();
+  });
+
+  it('an unverified SESSION_FINISHED is rejected before anything is recorded', async () => {
+    mockVerifyPlaidWebhook.mockResolvedValue(null);
+    const res = fakeRes();
+    await handlePlaidWebhook(fakeReq(sessionFinished()), res);
+    await flushMicrotasks();
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(mockMarkPlaidLinkAttemptReady).not.toHaveBeenCalled();
+  });
+
+  it('a LINK webhook without a link token, or with another code, is ignored', async () => {
+    await handlePlaidWebhook(fakeReq(sessionFinished({ link_token: undefined })), fakeRes());
+    await handlePlaidWebhook(fakeReq(sessionFinished({ webhook_code: 'EVENTS' })), fakeRes());
+    await flushMicrotasks();
+    expect(mockMarkPlaidLinkAttemptReady).not.toHaveBeenCalled();
+    expectNoLinkSideEffects();
+  });
+
+  it('a failure recording readiness is logged without the link token', async () => {
+    mockMarkPlaidLinkAttemptReady.mockRejectedValue(new Error('Failed to record Plaid Link readiness: connection reset'));
+    await handlePlaidWebhook(fakeReq(sessionFinished()), fakeRes());
+    await flushMicrotasks();
+    expect(console.error).toHaveBeenCalled();
+    expect(JSON.stringify((console.error as unknown as ReturnType<typeof vi.fn>).mock.calls)).not.toContain(LINK_TOKEN);
   });
 });

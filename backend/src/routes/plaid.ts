@@ -7,7 +7,9 @@ export const plaidRouter = Router();
 plaidRouter.use(requireAuth);
 
 plaidRouter.post('/link-token', plaidController.createLinkToken);
+// Retired (Wave 1 review P1): always 410. Kept only so a cached pre-Hosted-Link client gets a clear answer.
 plaidRouter.post('/exchange-public-token', plaidController.exchangePublicToken);
+plaidRouter.post('/link-attempts/:attemptId/complete', plaidController.completeLinkAttempt);
 plaidRouter.get('/items', plaidController.listLinkedItems);
 plaidRouter.get('/summary', plaidController.getSpendingSummary);
 plaidRouter.get('/net-worth-history', plaidController.getNetWorthHistory);

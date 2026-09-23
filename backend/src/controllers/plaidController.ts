@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import * as plaidService from '../services/plaidService';
 import * as dataService from '../services/dataService';
@@ -10,6 +11,7 @@ import { groupAccountsForAssetsSummary, type AssetAccount } from '../services/as
 import { getCurrentMonthRange } from '../services/budgetPeriod';
 import { isReportingRangeId, resolveReportingRange, type ResolvedRange } from '../services/reportingRange';
 import { PlaidCredentialError } from '../services/tokenEncryption';
+import { interpretHostedLinkSessions } from '../services/hostedLink';
 import { summarizeErrorSafely } from '../services/errorSanitizer';
 import { env } from '../config/env';
 
@@ -200,9 +202,10 @@ export async function getNetWorthHistory(req: Request, res: Response, next: Next
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Wave 1: every link token is issued together with a one-time, 30-minute Plaid Link attempt bound
- * to the authenticated user and their current login session (the verified token's `session_id`).
- * exchangePublicToken will only accept a public token alongside that attempt's id.
+ * Wave 1 (Hosted Link): starts linking a bank account. The backend creates a Plaid HOSTED Link
+ * token and stores it — encrypted, never logged, never returned — in a one-time, 30-minute attempt
+ * bound to the verified user AND login session (the verified token's `session_id`). The client
+ * gets only the Hosted Link URL to open and the opaque attempt id to complete later.
  */
 export async function createLinkToken(req: Request, res: Response, next: NextFunction) {
   try {
@@ -211,65 +214,118 @@ export async function createLinkToken(req: Request, res: Response, next: NextFun
       res.status(401).json({ error: 'Sign in again before linking an account.', code: 'session_required' });
       return;
     }
-    const linkAttemptId = await dataService.createPlaidLinkAttempt(userId, sessionId);
-    const linkToken = await plaidService.createLinkToken(userId);
-    res.json({ link_token: linkToken, link_attempt_id: linkAttemptId });
+    const attemptId = randomUUID();
+    const { linkToken, hostedLinkUrl } = await plaidService.createHostedLinkToken(userId);
+    const { expiresAt } = await dataService.createPlaidLinkAttempt({ attemptId, userId, sessionId, linkToken });
+    res.json({ hosted_link_url: hostedLinkUrl, link_attempt_id: attemptId, expires_at: expiresAt });
   } catch (err) {
     next(err);
   }
 }
 
-export async function exchangePublicToken(req: Request, res: Response, next: NextFunction) {
-  try {
-    // The owner is ALWAYS the verified bearer token's user — nothing in the body can change it.
-    const { id: userId, sessionId } = req.user!;
-    const { public_token: publicToken, link_attempt_id: linkAttemptId } = req.body as {
-      public_token?: unknown;
-      link_attempt_id?: unknown;
-    };
+/**
+ * RETIRED (Wave 1 review P1). Accepting a public token from a client let one user exchange a public
+ * token captured from another. Nothing reads the body — whatever it carries — and nothing reaches
+ * the attempt store or Plaid; the route exists only so a cached pre-Hosted-Link frontend gets a
+ * clear, permanent answer.
+ */
+export function exchangePublicToken(_req: Request, res: Response) {
+  res.status(410).json({
+    error: 'This page is out of date. Reload it and link the account again.',
+    code: 'exchange_retired',
+  });
+}
 
-    if (typeof publicToken !== 'string' || publicToken === '') {
-      res.status(400).json({ error: 'public_token is required' });
-      return;
-    }
-    if (typeof linkAttemptId !== 'string' || !UUID_PATTERN.test(linkAttemptId)) {
-      // Also what a cached pre-Wave-1 frontend gets: it never sends an attempt id.
-      res.status(400).json({
-        error: 'This bank link was started from an out-of-date page. Reload the page and link the account again.',
-        code: 'link_attempt_required',
-      });
-      return;
-    }
-    if (!sessionId) {
-      res.status(401).json({ error: 'Sign in again before linking an account.', code: 'session_required' });
-      return;
-    }
-
-    // Spent BEFORE the public token is exchanged, so a replayed, expired, or foreign attempt never
-    // reaches Plaid and never creates an item.
-    //
-    // KNOWN GAP (Wave 1 review P1, unresolved): this proves the caller recently started SOME Link
-    // flow, not that `publicToken` came from it. Embedded Link returns the public token to the
-    // browser and Plaid offers no default server-side way to tie it to its link token, so a public
-    // token captured from another user is still accepted alongside the caller's own attempt. See
-    // README "Wave 1 follow-ups" for the options; do not treat the attempt as token binding.
-    const attempt = await dataService.consumePlaidLinkAttempt(linkAttemptId, userId, sessionId);
-    if (attempt === 'expired') {
-      res.status(410).json({
-        error: 'This bank link took too long and expired. Start linking the account again.',
-        code: 'link_attempt_expired',
-      });
-      return;
-    }
-    if (attempt !== 'consumed') {
+/** The fixed, non-sensitive refusal for each way an attempt cannot be completed. */
+function attemptRefusal(res: Response, outcome: 'invalid' | 'expired' | 'completed' | 'failed' | 'ambiguous' | 'exited') {
+  switch (outcome) {
+    case 'invalid':
       res.status(409).json({
         error: 'This bank link is no longer valid for the signed-in account. Start linking the account again.',
         code: 'link_attempt_invalid',
       });
       return;
+    case 'expired':
+      res.status(410).json({
+        error: 'This bank link took too long and expired. Start linking the account again.',
+        code: 'link_attempt_expired',
+      });
+      return;
+    case 'completed':
+      res.status(409).json({ error: 'This bank link has already been completed.', code: 'link_attempt_already_completed' });
+      return;
+    case 'exited':
+      res.status(409).json({ error: 'Linking was cancelled before it finished. Start again when you are ready.', code: 'link_attempt_exited' });
+      return;
+    case 'ambiguous':
+      res.status(409).json({
+        error: 'Plaid reported more than one account connection for this link. Start linking again.',
+        code: 'link_attempt_ambiguous',
+      });
+      return;
+    case 'failed':
+      res.status(409).json({ error: 'This bank link did not finish. Start linking the account again.', code: 'link_attempt_failed' });
+      return;
+  }
+}
+
+/**
+ * Completes a Hosted Link attempt. The ONLY way a Plaid item is created:
+ *  1. The attempt must be the caller's own — its verified user AND login session — or nothing is
+ *     revealed or touched (409 link_attempt_invalid). Expired -> 410; already completed/failed -> 409.
+ *  2. The backend reads its OWN stored (encrypted) link token and asks Plaid (/link/token/get) for
+ *     the public token of that link token's own session. No public token is ever taken from the
+ *     request: a public token captured from another user has nowhere to go.
+ *  3. Still in progress -> 202 pending (poll again). Exited or ambiguous -> the attempt fails.
+ *  4. Exactly one public token -> the attempt is CLAIMED atomically (pending -> completing, one
+ *     conditional UPDATE). Only the claimer exchanges; a concurrent or duplicate call gets 202
+ *     completing, and later 409 already completed. So an attempt is exchanged and stored at most once.
+ *  5. The claimer exchanges, stores the item and its accounts, and marks the attempt completed; if
+ *     it fails before storing the item, the attempt is marked failed (never re-exchangeable).
+ */
+export async function completeLinkAttempt(req: Request, res: Response, next: NextFunction) {
+  const { id: userId, sessionId } = req.user!;
+  const { attemptId } = req.params;
+  if (typeof attemptId !== 'string' || !UUID_PATTERN.test(attemptId)) {
+    attemptRefusal(res, 'invalid');
+    return;
+  }
+  if (!sessionId) {
+    res.status(401).json({ error: 'Sign in again before linking an account.', code: 'session_required' });
+    return;
+  }
+
+  let claimed = false;
+  let storedItemRowId: string | null = null;
+  try {
+    const attempt = await dataService.readPlaidLinkAttempt(attemptId, userId, sessionId);
+    if (!attempt) return attemptRefusal(res, 'invalid');
+    if (attempt.status === 'completing') {
+      res.status(202).json({ status: 'completing' });
+      return;
+    }
+    if (attempt.status !== 'pending') return attemptRefusal(res, attempt.status);
+    if (attempt.expired) return attemptRefusal(res, 'expired');
+
+    const outcome = interpretHostedLinkSessions(await plaidService.getLinkTokenSessions(attempt.linkToken));
+    if (outcome.kind === 'pending') {
+      res.status(202).json({ status: 'pending' });
+      return;
+    }
+    if (outcome.kind !== 'success') {
+      await dataService.finishPlaidLinkAttempt(attemptId, userId, sessionId, 'failed', null);
+      return attemptRefusal(res, outcome.kind);
     }
 
-    const { accessToken, itemId } = await plaidService.exchangePublicToken(publicToken);
+    const claim = await dataService.claimPlaidLinkAttempt(attemptId, userId, sessionId);
+    if (claim === 'completing') {
+      res.status(202).json({ status: 'completing' });
+      return;
+    }
+    if (claim !== 'claimed') return attemptRefusal(res, claim);
+    claimed = true;
+
+    const { accessToken, itemId } = await plaidService.exchangePublicToken(outcome.publicToken);
     const { institutionId, institutionName } = await plaidService.getItemInstitution(accessToken);
 
     const itemRow = await dataService.insertPlaidItem({
@@ -279,6 +335,7 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
       institutionId,
       institutionName,
     });
+    storedItemRowId = itemRow.id;
 
     const plaidAccounts = await plaidService.getAccounts(accessToken);
     const accountRows = await dataService.upsertAccountsForItem(itemRow.id, plaidAccounts);
@@ -301,8 +358,12 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
     const accountIdByPlaidId = new Map(accountRows.map((a) => [a.plaid_account_id, a.id]));
     await refreshLoansForItem(itemRow.id, accessToken, accountIdByPlaidId);
 
-    // Access token is intentionally never included in the response — it stays server-side.
+    await dataService.finishPlaidLinkAttempt(attemptId, userId, sessionId, 'completed', itemRow.id);
+    claimed = false;
+
+    // Neither the access token nor any Plaid token is ever included in the response.
     res.status(201).json({
+      status: 'completed',
       item: {
         id: itemRow.id,
         institution_id: itemRow.institution_id,
@@ -312,6 +373,13 @@ export async function exchangePublicToken(req: Request, res: Response, next: Nex
       transactions_synced: added,
     });
   } catch (err) {
+    if (claimed) {
+      // Never leave a claimed attempt re-exchangeable. If the item was stored, the link happened
+      // (a later refresh/sync can fill in what failed); otherwise it did not.
+      await dataService
+        .finishPlaidLinkAttempt(attemptId, userId, sessionId, storedItemRowId ? 'completed' : 'failed', storedItemRowId)
+        .catch((finishErr) => console.error('Failed to finish Plaid Link attempt:', summarizeErrorSafely(finishErr)));
+    }
     next(err);
   }
 }

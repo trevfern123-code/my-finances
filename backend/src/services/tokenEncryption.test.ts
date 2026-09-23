@@ -3,7 +3,9 @@ import { createCipheriv, randomBytes } from 'node:crypto';
 import { isReauthRequiredError } from './plaidErrors';
 import {
   decryptAccessToken,
+  decryptLinkToken,
   encryptAccessToken,
+  encryptLinkToken,
   GcmAuthenticationError,
   InvalidKeyConfigurationError,
   loadKeyRing,
@@ -483,5 +485,31 @@ describe('validateKeyRingOrExit — fail-closed at startup, before the server bi
       // carry a stack trace or other detail beyond the safe fixed message) — only strings.
       expect(typeof arg).toBe('string');
     }
+  });
+});
+
+describe('Plaid LINK tokens (Wave 1 Hosted Link)', () => {
+  const ATTEMPT_ID = 'b1b2c3d4-0000-4000-8000-000000000001';
+  const LINK_TOKEN = 'link-sandbox-placeholder-token';
+
+  it('round-trips under the current key, bound to the attempt id', () => {
+    const keyRing = fixtureKeyRing();
+    const enc = encryptLinkToken(LINK_TOKEN, keyRing, ATTEMPT_ID);
+    expect(enc.ciphertextBase64).not.toContain(LINK_TOKEN);
+    expect(decryptLinkToken(enc, keyRing, ATTEMPT_ID)).toBe(LINK_TOKEN);
+  });
+
+  it("cannot be decrypted for another attempt's id", () => {
+    const keyRing = fixtureKeyRing();
+    const enc = encryptLinkToken(LINK_TOKEN, keyRing, ATTEMPT_ID);
+    expect(() => decryptLinkToken(enc, keyRing, 'b1b2c3d4-0000-4000-8000-000000000002')).toThrow(GcmAuthenticationError);
+  });
+
+  it('is domain-separated from access tokens in both directions, even for the same row id', () => {
+    const keyRing = fixtureKeyRing();
+    const linkEnc = encryptLinkToken(LINK_TOKEN, keyRing, ATTEMPT_ID);
+    expect(() => decryptAccessToken(linkEnc, keyRing, ATTEMPT_ID)).toThrow(GcmAuthenticationError);
+    const accessEnc = encryptAccessToken(PLAINTEXT, keyRing, ATTEMPT_ID);
+    expect(() => decryptLinkToken(accessEnc, keyRing, ATTEMPT_ID)).toThrow(GcmAuthenticationError);
   });
 });

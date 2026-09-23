@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import type { AccountBase, RemovedTransaction, Transaction as PlaidTransaction } from 'plaid';
 import { createQueryBuilder } from '../testUtils/supabaseMock';
 import { InvalidPrincipalPortionError } from './semanticEffects';
@@ -51,11 +52,17 @@ import {
   getRelationallyClassifiedTransactionsPage,
   getTransactionsBackfillPage,
   createPlaidLinkAttempt,
-  consumePlaidLinkAttempt,
+  readPlaidLinkAttempt,
+  claimPlaidLinkAttempt,
+  finishPlaidLinkAttempt,
+  markPlaidLinkAttemptReady,
+  hashLinkToken,
 } from './dataService';
 import {
   decryptAccessToken,
+  decryptLinkToken,
   encryptAccessToken,
+  encryptLinkToken,
   GcmAuthenticationError,
   loadKeyRing,
   MissingEncryptedRepresentationError,
@@ -2605,46 +2612,153 @@ describe('getTransactionsBackfillPage — deterministic keyset pagination (Round
   });
 });
 
-describe('Plaid Link attempts (Wave 1)', () => {
+describe('Plaid Hosted Link attempts (Wave 1)', () => {
+  const ATTEMPT_ID = 'b1b2c3d4-0000-4000-8000-000000000001';
+  const LINK_TOKEN = 'link-sandbox-placeholder-token';
+
   beforeEach(() => {
     mockRpc.mockReset();
   });
 
-  it('createPlaidLinkAttempt calls create_plaid_link_attempt with the user and session, returning the id', async () => {
-    mockRpc.mockResolvedValueOnce({ data: 'attempt-1', error: null });
-    await expect(createPlaidLinkAttempt('user-1', 'sid-1')).resolves.toBe('attempt-1');
-    expect(mockRpc).toHaveBeenCalledWith('create_plaid_link_attempt', { p_user_id: 'user-1', p_session_id: 'sid-1' });
-  });
+  it('createPlaidLinkAttempt stores the link token ENCRYPTED (bound to the attempt id) plus its SHA-256 — never the token itself', async () => {
+    mockRpc.mockResolvedValueOnce({ data: '2026-09-22T12:30:00+00:00', error: null });
+    await expect(
+      createPlaidLinkAttempt({ attemptId: ATTEMPT_ID, userId: 'user-1', sessionId: 'sid-1', linkToken: LINK_TOKEN })
+    ).resolves.toEqual({ expiresAt: '2026-09-22T12:30:00+00:00' });
 
-  it('createPlaidLinkAttempt throws on an RPC error or a missing id', async () => {
-    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
-    await expect(createPlaidLinkAttempt('user-1', 'sid-1')).rejects.toThrow('Failed to start Plaid Link attempt: boom');
-    mockRpc.mockResolvedValueOnce({ data: null, error: null });
-    await expect(createPlaidLinkAttempt('user-1', 'sid-1')).rejects.toThrow('no id returned');
-  });
-
-  it.each(['consumed', 'expired', 'invalid'] as const)('consumePlaidLinkAttempt passes %s through verbatim', async (outcome) => {
-    mockRpc.mockResolvedValueOnce({ data: outcome, error: null });
-    await expect(consumePlaidLinkAttempt('attempt-1', 'user-1', 'sid-1')).resolves.toBe(outcome);
-    expect(mockRpc).toHaveBeenCalledWith('consume_plaid_link_attempt', {
-      p_attempt_id: 'attempt-1',
+    const [fn, args] = mockRpc.mock.calls[0];
+    expect(fn).toBe('create_plaid_link_attempt');
+    expect(JSON.stringify(args)).not.toContain(LINK_TOKEN);
+    expect(args).toMatchObject({
+      p_id: ATTEMPT_ID,
       p_user_id: 'user-1',
       p_session_id: 'sid-1',
+      p_link_token_key_id: 'TEST_V1',
+      p_link_token_enc_version: 1,
     });
+    expect(args.p_link_token_hash).toBe(createHash('sha256').update(LINK_TOKEN).digest('hex'));
+    expect(hashLinkToken(LINK_TOKEN)).toBe(args.p_link_token_hash);
+    const enc = {
+      ciphertextBase64: args.p_link_token_ciphertext,
+      nonceBase64: args.p_link_token_nonce,
+      authTagBase64: args.p_link_token_auth_tag,
+      keyId: args.p_link_token_key_id,
+      encVersion: args.p_link_token_enc_version,
+    };
+    expect(decryptLinkToken(enc, TEST_KEY_RING, ATTEMPT_ID)).toBe(LINK_TOKEN);
+    expect(() => decryptLinkToken(enc, TEST_KEY_RING, 'b1b2c3d4-0000-4000-8000-000000000002')).toThrow(GcmAuthenticationError);
   });
 
-  it.each([[null], [''], ['CONSUMED'], [true], [{ status: 'consumed' }]])(
-    'consumePlaidLinkAttempt treats any other result (%j) as an error, never as consumed',
-    async (data) => {
-      mockRpc.mockResolvedValueOnce({ data, error: null });
-      await expect(consumePlaidLinkAttempt('attempt-1', 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
+  it('createPlaidLinkAttempt throws on an RPC error or a missing expiry', async () => {
+    const params = { attemptId: ATTEMPT_ID, userId: 'u', sessionId: 's', linkToken: LINK_TOKEN };
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+    await expect(createPlaidLinkAttempt(params)).rejects.toThrow('Failed to start Plaid Link attempt: boom');
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
+    await expect(createPlaidLinkAttempt(params)).rejects.toThrow('no expiry returned');
+  });
+
+  function storedRow(overrides: Record<string, unknown> = {}) {
+    const enc = encryptLinkToken(LINK_TOKEN, TEST_KEY_RING, ATTEMPT_ID);
+    return {
+      status: 'pending',
+      expired: false,
+      link_token_ciphertext: enc.ciphertextBase64,
+      link_token_nonce: enc.nonceBase64,
+      link_token_auth_tag: enc.authTagBase64,
+      link_token_key_id: enc.keyId,
+      link_token_enc_version: enc.encVersion,
+      ...overrides,
+    };
+  }
+
+  it("readPlaidLinkAttempt decrypts a pending attempt's link token for its own user and session", async () => {
+    mockRpc.mockResolvedValueOnce({ data: [storedRow()], error: null });
+    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toEqual({
+      status: 'pending',
+      expired: false,
+      linkToken: LINK_TOKEN,
+    });
+    expect(mockRpc).toHaveBeenCalledWith('read_plaid_link_attempt', { p_id: ATTEMPT_ID, p_user_id: 'user-1', p_session_id: 'sid-1' });
+  });
+
+  it("readPlaidLinkAttempt returns null when the attempt is not this user's and session's (zero rows)", async () => {
+    mockRpc.mockResolvedValueOnce({ data: [], error: null });
+    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-2', 'sid-2')).resolves.toBeNull();
+  });
+
+  it('readPlaidLinkAttempt never decrypts (or returns) a token for a finished attempt', async () => {
+    const erased = {
+      link_token_ciphertext: null,
+      link_token_nonce: null,
+      link_token_auth_tag: null,
+      link_token_key_id: null,
+      link_token_enc_version: null,
+    };
+    mockRpc.mockResolvedValueOnce({ data: [storedRow({ status: 'completed', ...erased })], error: null });
+    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toEqual({ status: 'completed', expired: false });
+  });
+
+  it('readPlaidLinkAttempt fails closed on a foreign or partial ciphertext, and on unexpected shapes', async () => {
+    const foreign = encryptLinkToken(LINK_TOKEN, TEST_KEY_RING, 'b1b2c3d4-0000-4000-8000-000000000009');
+    mockRpc.mockResolvedValueOnce({
+      data: [
+        storedRow({
+          link_token_ciphertext: foreign.ciphertextBase64,
+          link_token_nonce: foreign.nonceBase64,
+          link_token_auth_tag: foreign.authTagBase64,
+        }),
+      ],
+      error: null,
+    });
+    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow(GcmAuthenticationError);
+    mockRpc.mockResolvedValueOnce({ data: [storedRow({ link_token_nonce: null })], error: null });
+    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow(PartialEncryptedRepresentationError);
+    mockRpc.mockResolvedValueOnce({ data: [storedRow({ status: 'unknown' })], error: null });
+    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
+    mockRpc.mockResolvedValueOnce({ data: [storedRow(), storedRow()], error: null });
+    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'down' } });
+    await expect(readPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('Failed to read Plaid Link attempt: down');
+  });
+
+  it.each(['claimed', 'invalid', 'expired', 'completing', 'completed', 'failed'] as const)(
+    'claimPlaidLinkAttempt passes %s through verbatim',
+    async (outcome) => {
+      mockRpc.mockResolvedValueOnce({ data: outcome, error: null });
+      await expect(claimPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).resolves.toBe(outcome);
+      expect(mockRpc).toHaveBeenCalledWith('claim_plaid_link_attempt', { p_id: ATTEMPT_ID, p_user_id: 'user-1', p_session_id: 'sid-1' });
     }
   );
 
-  it('consumePlaidLinkAttempt throws on an RPC error', async () => {
-    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'connection reset' } });
-    await expect(consumePlaidLinkAttempt('attempt-1', 'user-1', 'sid-1')).rejects.toThrow(
-      'Failed to verify Plaid Link attempt: connection reset'
-    );
+  it.each([[null], [''], ['CLAIMED'], [true], [{ status: 'claimed' }]])(
+    'claimPlaidLinkAttempt treats any other result (%j) as an error, never as claimed',
+    async (data) => {
+      mockRpc.mockResolvedValueOnce({ data, error: null });
+      await expect(claimPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1')).rejects.toThrow('unexpected result');
+    }
+  );
+
+  it('finishPlaidLinkAttempt passes the outcome and item id, and requires a boolean back', async () => {
+    mockRpc.mockResolvedValueOnce({ data: true, error: null });
+    await expect(finishPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1', 'completed', 'row-1')).resolves.toBe(true);
+    expect(mockRpc).toHaveBeenCalledWith('finish_plaid_link_attempt', {
+      p_id: ATTEMPT_ID,
+      p_user_id: 'user-1',
+      p_session_id: 'sid-1',
+      p_outcome: 'completed',
+      p_plaid_item_id: 'row-1',
+    });
+    mockRpc.mockResolvedValueOnce({ data: 'yes', error: null });
+    await expect(finishPlaidLinkAttempt(ATTEMPT_ID, 'user-1', 'sid-1', 'failed', null)).rejects.toThrow('unexpected result');
+  });
+
+  it("markPlaidLinkAttemptReady sends only the SHA-256 of the webhook's link token, never the token", async () => {
+    mockRpc.mockResolvedValueOnce({ data: true, error: null });
+    await expect(markPlaidLinkAttemptReady(LINK_TOKEN, 'SUCCESS')).resolves.toBe(true);
+    const [fn, args] = mockRpc.mock.calls[0];
+    expect(fn).toBe('mark_plaid_link_attempt_ready');
+    expect(args).toEqual({ p_link_token_hash: hashLinkToken(LINK_TOKEN), p_status: 'SUCCESS' });
+    mockRpc.mockResolvedValueOnce({ data: false, error: null });
+    await expect(markPlaidLinkAttemptReady(LINK_TOKEN, 'SUCCESS')).resolves.toBe(false);
   });
 });

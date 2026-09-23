@@ -8,9 +8,11 @@ function required(name: string): string {
   return value;
 }
 
+const frontendUrl = required('FRONTEND_URL');
+
 export const env = {
   port: Number(process.env.PORT ?? 4000),
-  frontendUrl: required('FRONTEND_URL'),
+  frontendUrl,
 
   supabaseUrl: required('SUPABASE_URL'),
   supabaseServiceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY'),
@@ -26,4 +28,11 @@ export const env = {
   // of relying only on manual refresh/sync. Left unset in local dev, where Plaid can't reach
   // localhost anyway.
   backendPublicUrl: process.env.BACKEND_PUBLIC_URL || null,
+
+  // Where Plaid Hosted Link sends the user's browser tab when a Link session ends (Wave 1). A static
+  // page of the frontend (frontend/public/plaid-link-complete.html); it carries nothing — the backend
+  // gets the result from Plaid itself. Must also be allowed in the Plaid Dashboard.
+  plaidHostedLinkCompletionRedirectUri:
+    process.env.PLAID_HOSTED_LINK_COMPLETION_REDIRECT_URI ||
+    `${frontendUrl.replace(/\/+$/, '')}/plaid-link-complete.html`,
 };
