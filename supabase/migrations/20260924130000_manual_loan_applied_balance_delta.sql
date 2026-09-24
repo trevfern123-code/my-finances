@@ -22,50 +22,73 @@
 -- would make the recorded delta differ from p and break exact reversal. The backend cent-normalizes
 -- every principal, so for cent balances the results are identical to before.
 --
--- Rows written before this migration have NULL here, since what they actually applied was never
--- recorded. Unlink, payment delete and Plaid removal keep exactly the previous behaviour for them
--- (restore the full principal_portion, rounded to cents); an edit undoes the full old principal, as
--- before, and records what the new principal applies. There is deliberately no backfill: a legacy
--- row's applied amount cannot be reconstructed (README "Wave 1 follow-ups": manual-loan
--- balance-as-of semantics).
+-- No row may exist without its applied delta (post-audit re-review):
+--   * Gate: what a pre-existing link or payment actually applied was never recorded and cannot be
+--     reconstructed, so this migration refuses to run while any linked transaction or manual loan
+--     payment exists. It raises under the lock taken below, so the whole file rolls back and no
+--     ledger row is written. Run supabase/preflight/20260924130000_applied_delta_preflight.sql
+--     first; reconciling such rows is a product decision (README "Wave 1 follow-ups"), not
+--     something to guess here.
+--   * Guards: manual_loan_payments.balance_applied is NOT NULL, and a linked transaction must carry
+--     loan_balance_applied (transactions_loan_balance_applied_required_check). The backend on
+--     `main` links and creates payments with direct table writes that omit these columns; they are
+--     now rejected, and because that backend writes the row BEFORE adjusting the balance, a rejected
+--     write never reaches the balance. Unlinking (these functions, delete_manual_loan_atomic, the
+--     FK's ON DELETE SET NULL) clears manual_loan_id and still passes.
+--   * Fail closed: should a NULL delta ever be read anyway, every reversal raises
+--     'manual-loan reconciliation required' and writes nothing, rather than restoring the full
+--     principal (which over-restores whenever the original application was clamped).
 --
 -- transactions.loan_balance_applied is meaningful only while manual_loan_id is set. Unlinking
 -- clears it; a row whose loan was deleted (delete_manual_loan_atomic, or the FK's ON DELETE SET
 -- NULL) may keep a stale value, which nothing reads: every reader requires the link first, and
 -- linking always overwrites it.
 --
--- Apart from recording/restoring the applied delta, the seven functions below are unchanged:
--- same signatures, return types, locking order, ownership checks, validation, messages and
--- link outcomes (20260924120000). CREATE OR REPLACE keeps their owner and grants; the postcondition
--- at the end verifies the security properties anyway.
+-- Apart from recording/restoring the applied delta (and the reconciliation-required error), the
+-- seven functions below are unchanged: same signatures, return types, locking order, ownership
+-- checks, validation, messages and link outcomes (20260924120000). CREATE OR REPLACE keeps their
+-- owner and grants; the postcondition at the end verifies the security properties and the guards.
 --
 -- No top-level SET LOCAL / LOCK TABLE here (see README "Replaying the history"): both are inside
 -- the DO block below, and hold until this file's single transaction ends.
 --
--- Deploy order: apply after 20260924120000 and before the backend of the same commit (the backend
--- does not read the new columns; the order only matters for 20260924120000's outcome contract).
+-- Deploy order: apply after 20260924120000, with the backend stopped, then deploy the backend of the
+-- same commit (README "Releasing the post-audit migrations").
 
 do $$
+declare
+  v_links bigint;
+  v_payments bigint;
 begin
   perform set_config('lock_timeout', '15s', true);
   lock table public.manual_loans, public.manual_loan_payments, public.transactions in access exclusive mode;
+
+  -- Counted under the lock: no writer can add a row between this check and the guards below.
+  select count(*) into v_links from public.transactions where manual_loan_id is not null;
+  select count(*) into v_payments from public.manual_loan_payments;
+  if v_links > 0 or v_payments > 0 then
+    raise exception 'manual-loan applied-delta migration refused: % linked transaction(s) and % manual loan payment(s) predate applied-delta tracking; their applied amounts are unknown. Nothing was changed. See supabase/preflight/20260924130000_applied_delta_preflight.sql.',
+      v_links, v_payments;
+  end if;
 end
 $$;
 
 alter table public.transactions
   add column loan_balance_applied numeric
     constraint transactions_loan_balance_applied_check
-    check (loan_balance_applied >= 0 and loan_balance_applied < 'Infinity'::numeric);
+    check (loan_balance_applied >= 0 and loan_balance_applied < 'Infinity'::numeric),
+  add constraint transactions_loan_balance_applied_required_check
+    check (manual_loan_id is null or loan_balance_applied is not null);
 
 alter table public.manual_loan_payments
-  add column balance_applied numeric
+  add column balance_applied numeric not null
     constraint manual_loan_payments_balance_applied_check
     check (balance_applied >= 0 and balance_applied < 'Infinity'::numeric);
 
 comment on column public.transactions.loan_balance_applied is
-  'Amount this linked payment actually took off manual_loans.current_balance (principal_portion, clamped so the balance never goes negative). Restored exactly on unlink/edit/Plaid removal. NULL for links made before 20260924130000 (those restore principal_portion). Meaningful only while manual_loan_id is set.';
+  'Amount this linked payment actually took off manual_loans.current_balance (principal_portion, clamped so the balance never goes negative). Restored exactly on unlink/edit/Plaid removal. Required while manual_loan_id is set; meaningful only then.';
 comment on column public.manual_loan_payments.balance_applied is
-  'Amount this payment actually took off manual_loans.current_balance (principal_portion, clamped so the balance never goes negative). Restored exactly on edit/delete. NULL for payments made before 20260924130000 (those restore principal_portion).';
+  'Amount this payment actually took off manual_loans.current_balance (principal_portion, clamped so the balance never goes negative). Restored exactly on edit/delete.';
 
 create or replace function public.link_transaction_to_manual_loan(
   p_user_id uuid,
@@ -196,6 +219,13 @@ begin
     raise exception 'unlink_transaction_from_manual_loan: manual loan not found or not owned by user';
   end if;
 
+  -- Fail closed before any write: without the recorded delta, restoring the full principal could
+  -- over-restore (see the header).
+  if v_applied is null then
+    raise exception 'manual-loan reconciliation required: unlink_transaction_from_manual_loan: transaction % (principal %) has no recorded applied delta',
+      p_transaction_id, v_principal_portion;
+  end if;
+
   update public.transactions
   set manual_loan_id = null,
       principal_portion = null,
@@ -206,11 +236,9 @@ begin
       classifier_version = p_classifier_version
   where id = p_transaction_id;
 
-  -- Restore exactly what the link took; a legacy link (NULL) keeps the previous behaviour.
+  -- Restore exactly what the link took.
   update public.manual_loans
-  set current_balance = case when v_applied is null
-                             then round((current_balance + coalesce(v_principal_portion, 0))::numeric, 2)
-                             else current_balance + v_applied end,
+  set current_balance = current_balance + v_applied,
       updated_at = now()
   where id = p_loan_id;
 
@@ -276,9 +304,13 @@ begin
     return;
   end if;
 
-  -- Undo the old application exactly (legacy NULL: as before, the full old principal), then apply
-  -- the new principal to that balance.
-  v_restored := v_restored + coalesce(v_old_applied, v_old_principal, 0);
+  if v_old_applied is null then
+    raise exception 'manual-loan reconciliation required: update_linked_payment_principal: transaction % (principal %) has no recorded applied delta',
+      p_transaction_id, v_old_principal;
+  end if;
+
+  -- Undo the old application exactly, then apply the new principal to that balance.
+  v_restored := v_restored + v_old_applied;
   v_applied := least(p_new_principal_portion, greatest(v_restored, 0));
 
   update public.transactions
@@ -396,11 +428,15 @@ begin
     raise exception 'update_manual_loan_payment: interest_portion must be a finite non-negative number';
   end if;
 
-  -- Post-audit blocker 2: undo the old application exactly (legacy NULL: the full old principal),
-  -- then apply the new principal. An unchanged principal moves nothing.
+  -- Post-audit blocker 2: undo the old application exactly, then apply the new principal. An
+  -- unchanged principal (and a date/interest/notes-only edit) moves nothing and needs no delta.
   v_rebalance := p_set_principal_portion and p_principal_portion is distinct from v_old_principal;
+  if v_rebalance and v_old_applied is null then
+    raise exception 'manual-loan reconciliation required: update_manual_loan_payment: payment % (principal %) has no recorded applied delta',
+      p_payment_id, v_old_principal;
+  end if;
   if v_rebalance then
-    v_balance := v_balance + coalesce(v_old_applied, v_old_principal, 0);
+    v_balance := v_balance + v_old_applied;
     v_applied := least(p_principal_portion, greatest(v_balance, 0));
   end if;
 
@@ -450,12 +486,15 @@ begin
     return;
   end if;
 
+  if v_applied is null then
+    raise exception 'manual-loan reconciliation required: delete_manual_loan_payment: payment % (principal %) has no recorded applied delta',
+      p_payment_id, v_principal;
+  end if;
+
   delete from public.manual_loan_payments where id = p_payment_id;
 
   update public.manual_loans
-  set current_balance = case when v_applied is null
-                             then round((current_balance + coalesce(v_principal, 0))::numeric, 2)
-                             else current_balance + v_applied end,
+  set current_balance = current_balance + v_applied,
       updated_at = now()
   where id = p_loan_id;
 end;
@@ -484,10 +523,15 @@ begin
       and t.manual_loan_id is not null
     for update of t
   loop
+    -- Raising here also undoes this call's earlier iterations: the exception aborts the caller's
+    -- whole statement, so no balance is restored and no transaction is deleted.
+    if r.loan_balance_applied is null then
+      raise exception 'manual-loan reconciliation required: delete_transactions_and_restore_loan_balances: transaction % (principal %) has no recorded applied delta',
+        r.id, r.principal_portion;
+    end if;
+
     update public.manual_loans
-    set current_balance = case when r.loan_balance_applied is null
-                               then round((current_balance + coalesce(r.principal_portion, 0))::numeric, 2)
-                               else current_balance + r.loan_balance_applied end,
+    set current_balance = current_balance + r.loan_balance_applied,
         updated_at = now()
     where id = r.manual_loan_id;
   end loop;
@@ -534,6 +578,17 @@ begin
   end loop;
   if v_bad <> '' then
     raise exception 'manual-loan functions lost a security property or changed signature:%', v_bad;
+  end if;
+
+  -- The guards exist and are validated (not NOT VALID), so they hold for every row.
+  if (select count(*) from pg_constraint
+      where convalidated
+        and (conrelid, conname) in (('public.transactions'::regclass, 'transactions_loan_balance_applied_check'),
+                                    ('public.transactions'::regclass, 'transactions_loan_balance_applied_required_check'),
+                                    ('public.manual_loan_payments'::regclass, 'manual_loan_payments_balance_applied_check'))) <> 3
+     or not (select attnotnull from pg_attribute
+             where attrelid = 'public.manual_loan_payments'::regclass and attname = 'balance_applied') then
+    raise exception 'manual-loan applied-delta guards are missing or not validated';
   end if;
 end
 $$;

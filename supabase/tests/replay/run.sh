@@ -19,7 +19,9 @@
 #   R5  a database in production's state (historical path + ledger rows for every version up to
 #       PRODUCTION_HEAD, stored statements from the ORIGINAL files) re-runs none of those: their
 #       ledger rows are byte-for-byte unchanged, exactly the files after PRODUCTION_HEAD apply (the
-#       pending production rollout, rehearsed), and the result matches R1's clean replay
+#       pending production rollout, rehearsed), and the result matches R1's clean replay. While the
+#       post-audit release is pending, the operator's preflight/postflight SQL
+#       (supabase/preflight/20260924130000_applied_delta_preflight.sql) runs before and after it
 # Tier 2 — the real, pinned Supabase CLI (only when SUPABASE_CLI is set):
 #   C0  control: the real CLI rejects the ORIGINAL Phase A file (the rollout failure, reproduced)
 #   C1  `supabase db push --db-url` on a clean database applies every migration
@@ -182,14 +184,32 @@ check_production_push() { # $1 = db suffix, $2 = production ledger digest before
   [ "$applied" = "${PENDING[*]}" ] || { echo "applied [$applied], expected exactly the pending [${PENDING[*]}]"; return 1; }
   echo "production's ${2##* } ledger rows unchanged ($2); applied exactly the pending: ${PENDING[*]:-<none>}"
 }
+# The operator's read-only preflight/postflight for the post-audit release, run as `postgres` (the
+# SQL editor's role) against the production-state database — only while that release is pending.
+OPERATOR_SQL="$ROOT/supabase/preflight/20260924130000_applied_delta_preflight.sql"
+operator_sql() { # $1 = db suffix, $2 = pre | post
+  if [ "$2" = pre ]; then sed '/^-- POSTFLIGHT/,$d' "$OPERATOR_SQL"; else sed -n '/^-- POSTFLIGHT/,$p' "$OPERATOR_SQL"; fi \
+    | docker exec -i "$PREFIX-$1" psql -X -At -v ON_ERROR_STOP=1 -U postgres -d postgres
+}
+post_audit_pending() { printf '%s\n' "${PENDING[@]}" | grep -q '^20260924130000_'; }
 r5() {
   apply_historically prod "$PRODUCTION_DIR" || return 1
   record_ledger prod || return 1
   before_ledger="$(ledger_digest prod)"
+  if post_audit_pending; then
+    pre="$(operator_sql prod pre)" || { echo "operator preflight failed"; return 1; }
+    [ "$pre" = "$PRODUCTION_HEAD|0|0|0|0|0|0|0" ] || { echo "unexpected operator preflight: $pre"; return 1; }
+    echo "operator preflight: $pre"
+  fi
   out="$(emulate prod "$ROOT/supabase/migrations")" || { echo "$out"; return 1; }
   echo "$out"
   echo "$out" | tail -1 | grep -qx "${#PENDING[@]} applied" || { echo "expected ${#PENDING[@]} applied"; return 1; }
   check_production_push prod "$before_ledger" "$out" "apply " || return 1
+  if post_audit_pending; then
+    post="$(operator_sql prod post)" || { echo "operator postflight failed"; return 1; }
+    [ "$post" = "20260924120000,20260924130000|text|3|t|0|0|0" ] || { echo "unexpected operator postflight: $post"; return 1; }
+    echo "operator postflight: $post"
+  fi
   a="$WORK/$PREFIX-emu.schema.sql"; b="$(schema_dump "$PREFIX-prod")"
   [ -s "$a" ] && [ ! -e "$a.invalid" ] && [ ! -e "$b.invalid" ] || return 1
   diff -u "$a" "$b" && echo "production-state schema after the push equals the clean replay's"

@@ -64,8 +64,17 @@ inside a `DO` block instead, as the Phase A migration now does.
   loan payment actually took off a manual loan's balance: `transactions.loan_balance_applied` and
   `manual_loan_payments.balance_applied`. A balance is still never driven below zero. Unlink, edit,
   delete and Plaid removal now restore exactly that amount, not the full principal. Example: a $100
-  payment linked to a $50 balance used to leave $100 behind when unlinked. Rows from before the
-  migration are NULL and keep the old full-principal restore; they are not backfilled.
+  payment linked to a $50 balance used to leave $100 behind when unlinked.
+  - **No row may lack its amount.** An existing link or payment never recorded what it applied, and
+    that can't be reconstructed. So the migration **refuses to run** while any linked transaction
+    or manual payment exists; nothing changes and no ledger row is written.
+  - **Guards:** `balance_applied` is `NOT NULL`, and a linked transaction must carry
+    `loan_balance_applied`. The backend on `main` writes links and payments directly without them,
+    so those writes now fail. They fail before its balance update runs, because that backend writes
+    the row first.
+  - **Fail closed:** if a missing amount were ever read anyway, every reversal raises
+    `manual-loan reconciliation required` and writes nothing. It never falls back to the full
+    principal.
 
 Caveats:
 - **Never run `supabase migration fetch` without reviewing the diff.** It rewrites local migration
@@ -73,6 +82,41 @@ Caveats:
   unreplayable Phase A file. Likewise, never `supabase migration repair` version `20260912120000`.
 - **This checkout is linked to the production project** (`supabase/.temp`). A bare `supabase db push`
   targets production. Test pushes always need an explicit local `--db-url`, as the replay harness uses.
+
+### Releasing the post-audit migrations
+
+This is the planned release of `20260924120000` and `20260924130000` with the backend and frontend
+that need them. Nothing here has been run yet. Merging to `main` **is** the deploy, because Railway
+and Vercel both auto-deploy from it. So the database changes go first, while the backend is stopped.
+Read-only SQL for steps 3 and 6: `supabase/preflight/20260924130000_applied_delta_preflight.sql`.
+
+1. **Codex re-review passes, and CI is green.**
+2. **Plaid Dashboard allows the completion redirect URI** (see "Wave 1 follow-ups" below).
+3. **Production preflight** (PREFLIGHT 1). Expect `ledger_head = 20260922130000`,
+   `pending_post_audit = 0`, and zero linked transactions, manual payments and cross-user rows.
+   Otherwise **stop**: the release needs a reconciliation decision first. Never delete or edit rows
+   to make the preflight pass.
+4. **Stop the backend for the deployment window** by removing Railway's active deployment
+   (dashboard, or `railway down`). Don't use the app or start Plaid Link until step 8.
+   - This keeps the old backend from writing anything between the migrations and the new deploy,
+     including webhook-triggered syncs. It also keeps old and new instances from overlapping.
+   - Plaid webhooks missed meanwhile are harmless: the next sync catches up from Plaid's cursor.
+5. **`supabase db push`** from this linked checkout. It applies `20260924120000`, then
+   `20260924130000`, each as one transaction.
+   - If `20260924130000` refuses, it has changed nothing. `20260924120000` alone is harmless to the
+     old backend, which never calls that function. Redeploy the previous deployment and reassess.
+6. **Production postflight** (POSTFLIGHT). Expect:
+   - both new versions in the ledger;
+   - `link_returns = text` and `guards_validated = 3`;
+   - `balance_applied_not_null = true`;
+   - zero NULL deltas and zero insecure functions.
+7. **Merge the PR.** Railway and Vercel deploy the new backend and frontend.
+8. **Health check:** `/health` responds. Controlled manual-loan smoke test on a scratch loan: log a
+   manual payment larger than the balance, then delete it. The balance must return exactly to its
+   previous value.
+9. **Controlled Plaid Sandbox test** of Hosted Link.
+10. **Advance `PRODUCTION_HEAD`** in `supabase/tests/replay/run.sh` to `20260924130000`, in a
+    follow-up commit.
 
 ## CI
 

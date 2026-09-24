@@ -69,3 +69,33 @@ jobs:
         run: bash supabase/tests/replay/run.sh
         env:
           SUPABASE_CLI: supabase
+
+  database-harness:
+    # The adversarial PostgreSQL suites behind the manual-loan and Plaid-link database code: Phase A
+    # (scaffold and history modes, which include the post-audit t07/t08, c07/c08 and g06/g07 tests)
+    # and access_control. Throwaway local containers only. Each suite runs even if an earlier one
+    # failed, so one run reports all three.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # Phase A's classifier tests call the real backend build.
+      - run: npm install
+
+      - name: Phase A (scaffold)
+        run: bash supabase/tests/phase_a/run.sh
+
+      - name: Phase A (history)
+        if: ${{ !cancelled() }}
+        run: bash supabase/tests/phase_a/run.sh
+        env:
+          PHASE_A_BASE: history
+
+      - name: access_control
+        if: ${{ !cancelled() }}
+        run: bash supabase/tests/access_control/run.sh

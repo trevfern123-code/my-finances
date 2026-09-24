@@ -2,6 +2,8 @@
 -- exactly what its application took off the balance, never more — while the balance still never
 -- goes negative. The first section uses only the functions and balances (no new column), so with
 -- FOLLOWUP_MIGRATIONS="20260924120000_manual_loan_link_idempotency.sql" it fails on the defect itself.
+-- No row may lack its delta: section 11 replays the old backend's direct writes against the guards,
+-- and section 14 requires every reversal to fail closed on a (deliberately fabricated) NULL delta.
 set role service_role;
 
 create function pg_temp.loan(p_id text, p_balance numeric) returns void language sql as $$
@@ -178,41 +180,29 @@ select pg_temp.expect('00000000-0000-0000-0000-000000000207', 1000, 'unchanged p
 select th.assert((select loan_balance_applied = 40 from public.transactions where id = '00000000-0000-0000-0000-000000000309'),
   'and records nothing new');
 
--- 11. Legacy rows (NULL: linked/paid before the migration) keep the previous behaviour.
-select pg_temp.loan('00000000-0000-0000-0000-000000000208', 0);
-insert into public.transactions (id, account_id, plaid_transaction_id, amount, date, name, manual_loan_id, principal_portion,
-  auto_role, role_source, role_confidence, classifier_version) values
-  ('00000000-0000-0000-0000-000000000310', '00000000-0000-0000-0000-0000000000a1', 'delta-310', 100, '2026-09-01', 'Legacy payment',
-   '00000000-0000-0000-0000-000000000208', 100, 'debt_payment', 'manual_loan_link', 'high', 1),
-  ('00000000-0000-0000-0000-000000000311', '00000000-0000-0000-0000-0000000000a1', 'delta-311', 100, '2026-09-02', 'Legacy payment',
-   '00000000-0000-0000-0000-000000000208', 60.004, 'debt_payment', 'manual_loan_link', 'high', 1),
-  ('00000000-0000-0000-0000-000000000312', '00000000-0000-0000-0000-0000000000a1', 'delta-312', 100, '2026-09-03', 'Legacy payment',
-   '00000000-0000-0000-0000-000000000208', 30, 'debt_payment', 'manual_loan_link', 'high', 1);
-insert into public.manual_loan_payments (id, user_id, loan_id, date, principal_portion, interest_portion) values
-  ('00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-0000000000aa', '00000000-0000-0000-0000-000000000208', '2026-09-01', 40, 0),
-  ('00000000-0000-0000-0000-000000000402', '00000000-0000-0000-0000-0000000000aa', '00000000-0000-0000-0000-000000000208', '2026-09-02', 20, 0);
-select th.assert((select count(*) = 3 from public.transactions where loan_balance_applied is null and manual_loan_id = '00000000-0000-0000-0000-000000000208')
-                 and (select count(*) = 2 from public.manual_loan_payments where balance_applied is null and loan_id = '00000000-0000-0000-0000-000000000208'),
-  'legacy rows carry NULL');
-select pg_temp.unlink('00000000-0000-0000-0000-000000000310', '00000000-0000-0000-0000-000000000208');
-select pg_temp.expect('00000000-0000-0000-0000-000000000208', 100, 'legacy unlink restores the full principal, as before');
-select public.delete_transactions_and_restore_loan_balances('00000000-0000-0000-0000-0000000000aa', array['delta-311']);
-select pg_temp.expect('00000000-0000-0000-0000-000000000208', 160, 'legacy Plaid removal: full principal, rounded to cents, as before');
-select pg_temp.unpay('00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000208');
-select pg_temp.expect('00000000-0000-0000-0000-000000000208', 200, 'legacy payment delete: full principal, as before');
-update public.manual_loans set current_balance = 20 where id = '00000000-0000-0000-0000-000000000208';
-select pg_temp.edit('00000000-0000-0000-0000-000000000312', '00000000-0000-0000-0000-000000000208', 10);
-select pg_temp.expect('00000000-0000-0000-0000-000000000208', 40, 'legacy linked edit: undo the full old 30, take 10 (as before)');
-select th.assert((select loan_balance_applied = 10 from public.transactions where id = '00000000-0000-0000-0000-000000000312'),
-  'and records the new application');
-select pg_temp.unlink('00000000-0000-0000-0000-000000000312', '00000000-0000-0000-0000-000000000208');
-select pg_temp.expect('00000000-0000-0000-0000-000000000208', 50, 'which is then restored exactly');
-select pg_temp.edit_pay('00000000-0000-0000-0000-000000000402', '00000000-0000-0000-0000-000000000208', 70);
-select pg_temp.expect('00000000-0000-0000-0000-000000000208', 0, 'legacy payment edit: undo 20, take the remaining 70');
-select th.assert((select balance_applied = 70 from public.manual_loan_payments where id = '00000000-0000-0000-0000-000000000402'),
-  'and records it');
-select pg_temp.unpay('00000000-0000-0000-0000-000000000402', '00000000-0000-0000-0000-000000000208');
-select pg_temp.expect('00000000-0000-0000-0000-000000000208', 70, 'then restores exactly that');
+-- 11. The backend on `main` writes links and payments directly, omitting the delta, and adjusts the
+-- balance only AFTER that write succeeds (dataService.ts linkTransactionToLoan /
+-- createManualLoanPayment on main). Its exact writes are rejected, so the balance is never touched.
+select pg_temp.loan('00000000-0000-0000-0000-000000000208', 50);
+select pg_temp.txn('00000000-0000-0000-0000-000000000310', 100);
+select th.expect_error($q$ update public.transactions
+                          set manual_loan_id = '00000000-0000-0000-0000-000000000208', principal_portion = 100
+                          where id = '00000000-0000-0000-0000-000000000310' $q$,
+  '%transactions_loan_balance_applied_required_check%');
+select th.assert((select manual_loan_id is null and principal_portion is null and loan_balance_applied is null
+                  from public.transactions where id = '00000000-0000-0000-0000-000000000310'), 'old-main link write rejected: row unchanged');
+select th.expect_error($q$ insert into public.manual_loan_payments (user_id, loan_id, date, principal_portion, interest_portion, notes)
+                          values ('00000000-0000-0000-0000-0000000000aa', '00000000-0000-0000-0000-000000000208', '2026-09-10', 100, 0, null)
+                          returning * $q$,
+  '%null value in column "balance_applied"%');
+select th.assert(not exists (select 1 from public.manual_loan_payments where loan_id = '00000000-0000-0000-0000-000000000208'),
+  'old-main payment insert rejected: no payment row');
+select pg_temp.expect('00000000-0000-0000-0000-000000000208', 50, 'neither rejected write reached the balance');
+-- The guard never blocks unlinking: main's own unlink write shape is still accepted.
+select pg_temp.link('00000000-0000-0000-0000-000000000310', '00000000-0000-0000-0000-000000000208', 100);
+update public.transactions set manual_loan_id = null, principal_portion = null where id = '00000000-0000-0000-0000-000000000310';
+select th.assert((select manual_loan_id is null from public.transactions where id = '00000000-0000-0000-0000-000000000310'),
+  'an unlinking write passes the guard');
 
 -- 12. A loan deleted under a link (FK ON DELETE SET NULL) leaves a stale delta nobody reads; relinking
 -- overwrites it.
@@ -238,4 +228,66 @@ select th.expect_error($q$ update public.transactions set loan_balance_applied =
   '%transactions_loan_balance_applied_check%');
 select th.expect_error($q$ update public.manual_loan_payments set balance_applied = 'Infinity' where id = (select id from ids where name = 'p6') $q$,
   '%manual_loan_payments_balance_applied_check%');
+
+-- 14. Fail closed. The guards make a missing delta impossible, so this section removes them inside a
+-- transaction that is rolled back, fabricates NULL-delta rows, and requires every reversal to refuse
+-- them without writing anything — never falling back to the full principal.
+begin;
+reset role;
+alter table public.transactions drop constraint transactions_loan_balance_applied_required_check;
+alter table public.manual_loan_payments alter column balance_applied drop not null;
+set role service_role;
+select pg_temp.loan('00000000-0000-0000-0000-000000000211', 500);
+select pg_temp.txn('00000000-0000-0000-0000-000000000320', 100);
+select pg_temp.txn('00000000-0000-0000-0000-000000000321', 100);
+select pg_temp.link('00000000-0000-0000-0000-000000000321', '00000000-0000-0000-0000-000000000211', 30);
+update public.transactions set manual_loan_id = '00000000-0000-0000-0000-000000000211', principal_portion = 100,
+  auto_role = 'debt_payment', role_source = 'manual_loan_link', role_confidence = 'high'
+  where id = '00000000-0000-0000-0000-000000000320';
+insert into public.manual_loan_payments (id, user_id, loan_id, date, principal_portion, interest_portion)
+values ('00000000-0000-0000-0000-000000000403', '00000000-0000-0000-0000-0000000000aa', '00000000-0000-0000-0000-000000000211', '2026-09-10', 40, 0);
+create temporary table before_fail_closed as
+  select (select current_balance from public.manual_loans where id = '00000000-0000-0000-0000-000000000211') as balance,
+         (select jsonb_agg(to_jsonb(t) order by t.id) from public.transactions t
+           where t.id in ('00000000-0000-0000-0000-000000000320', '00000000-0000-0000-0000-000000000321')) as txns,
+         (select jsonb_agg(to_jsonb(p)) from public.manual_loan_payments p where p.id = '00000000-0000-0000-0000-000000000403') as payments;
+select th.assert((select balance = 470 from before_fail_closed), 'fixture: 500 less the recorded 30');
+
+select th.expect_error($q$ select pg_temp.unlink('00000000-0000-0000-0000-000000000320', '00000000-0000-0000-0000-000000000211') $q$,
+  '%manual-loan reconciliation required: unlink_transaction_from_manual_loan%');
+select th.expect_error($q$ select pg_temp.edit('00000000-0000-0000-0000-000000000320', '00000000-0000-0000-0000-000000000211', 50) $q$,
+  '%manual-loan reconciliation required: update_linked_payment_principal%');
+select th.expect_error($q$ select pg_temp.edit_pay('00000000-0000-0000-0000-000000000403', '00000000-0000-0000-0000-000000000211', 10) $q$,
+  '%manual-loan reconciliation required: update_manual_loan_payment%');
+select th.expect_error($q$ select pg_temp.unpay('00000000-0000-0000-0000-000000000403', '00000000-0000-0000-0000-000000000211') $q$,
+  '%manual-loan reconciliation required: delete_manual_loan_payment%');
+-- Together with a restorable row (321): its restore must not survive the refusal either.
+select th.expect_error($q$ select public.delete_transactions_and_restore_loan_balances('00000000-0000-0000-0000-0000000000aa',
+                                                                                    array['delta-321', 'delta-320']) $q$,
+  '%manual-loan reconciliation required: delete_transactions_and_restore_loan_balances%');
+select th.assert((select current_balance from public.manual_loans where id = '00000000-0000-0000-0000-000000000211')
+                 = (select balance from before_fail_closed), 'no refusal wrote to the balance');
+select th.assert((select jsonb_agg(to_jsonb(t) order by t.id) from public.transactions t
+                  where t.id in ('00000000-0000-0000-0000-000000000320', '00000000-0000-0000-0000-000000000321'))
+                 = (select txns from before_fail_closed), 'no refusal changed, unlinked or deleted a transaction');
+select th.assert((select jsonb_agg(to_jsonb(p)) from public.manual_loan_payments p where p.id = '00000000-0000-0000-0000-000000000403')
+                 = (select payments from before_fail_closed), 'no refusal changed or deleted the payment');
+
+-- Edits that need no delta still work: an unchanged principal, and date/interest/notes.
+select pg_temp.edit('00000000-0000-0000-0000-000000000320', '00000000-0000-0000-0000-000000000211', 100);
+select pg_temp.edit_pay('00000000-0000-0000-0000-000000000403', '00000000-0000-0000-0000-000000000211', 40);
+select public.update_manual_loan_payment('00000000-0000-0000-0000-0000000000aa', '00000000-0000-0000-0000-000000000403',
+  '00000000-0000-0000-0000-000000000211', true, '2026-09-12', false, null, true, 2, true, 'still editable');
+select th.assert((select notes = 'still editable' and interest_portion = 2 and principal_portion = 40 and balance_applied is null
+                  from public.manual_loan_payments where id = '00000000-0000-0000-0000-000000000403'),
+  'non-principal edit applied; principal and (NULL) delta untouched');
+select th.assert((select current_balance from public.manual_loans where id = '00000000-0000-0000-0000-000000000211')
+                 = (select balance from before_fail_closed), 'delta-free edits leave the balance alone');
+select th.assert((select to_jsonb(t) from public.transactions t where t.id = '00000000-0000-0000-0000-000000000320')
+                 = (select e from before_fail_closed, jsonb_array_elements(txns) e where e->>'id' = '00000000-0000-0000-0000-000000000320'),
+  'unchanged linked principal left the NULL-delta row untouched');
+rollback;
+select th.assert((select attnotnull from pg_attribute where attrelid = 'public.manual_loan_payments'::regclass and attname = 'balance_applied')
+                 and exists (select 1 from pg_constraint where conname = 'transactions_loan_balance_applied_required_check'),
+  'guards restored by the rollback');
 reset role;
