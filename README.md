@@ -51,6 +51,15 @@ inside a `DO` block instead, as the Phase A migration now does.
 - **Proof:** `bash supabase/tests/replay/run.sh` checks the replay and the resulting schema; with
   `SUPABASE_CLI="npx -y supabase@2.117.0"` it also runs the real CLI. CI runs both tiers, in the
   `migration-replay` job.
+- **Pending on production:** `PRODUCTION_HEAD` in `supabase/tests/replay/run.sh` (default
+  `20260922130000`) names the newest version production has applied. R5/C3 rehearse the production
+  push: every earlier ledger row stays byte-for-byte unchanged, and exactly the later files apply.
+  Advance it after each production rollout.
+- **`20260924120000_manual_loan_link_idempotency.sql`** (post-audit blocker 1) makes
+  `link_transaction_to_manual_loan` return an explicit outcome instead of linking, and decrementing,
+  a transaction twice. Apply it **before** deploying the backend that reads the outcome: that backend
+  rejects the old `void` result. The backend on `main` never calls the function, so applying it
+  early is safe.
 
 Caveats:
 - **Never run `supabase migration fetch` without reviewing the diff.** It rewrites local migration

@@ -1673,13 +1673,22 @@ export async function getManualLoan(id: string, userId: string): Promise<ManualL
  *  Also sets this transaction's semantic role to debt_payment (manual_loan_link, high confidence)
  *  — precedence step A always wins regardless of the transaction's own Plaid category once a
  *  manual-loan link exists (see transactionClassifier.ts). This never touches
- *  user_role_override. */
+ *  user_role_override.
+ *
+ *  Post-audit blocker 1: callers pick their candidates before the RPC takes its lock, so the
+ *  transaction may already be linked by the time it runs. The RPC re-checks under the lock and
+ *  reports what it found (20260924120000_manual_loan_link_idempotency.sql); only 'linked' wrote
+ *  anything. Any other value — including the pre-repair function's `void` — is rejected, never
+ *  treated as success, which is why that migration must be applied before this code deploys. */
+export const LINK_OUTCOMES = ['linked', 'already_linked', 'already_linked_different_principal', 'linked_to_other_loan'] as const;
+export type LinkOutcome = (typeof LINK_OUTCOMES)[number];
+
 export async function linkTransactionToLoan(
   userId: string,
   transactionId: string,
   loanId: string,
   principalPortion: number
-): Promise<void> {
+): Promise<LinkOutcome> {
   // WRITE-boundary validation (Round 2 remediation §7) — first fetch the transaction's own amount
   // so an impossible principal (negative, or exceeding the payment itself) is rejected outright
   // rather than ever persisted. The RPC re-validates this bound itself too (defense in depth,
@@ -1694,7 +1703,7 @@ export async function linkTransactionToLoan(
   if (!txnRow) throw new Error('Transaction not found');
   const normalizedPrincipal = normalizePrincipalPortion(txnRow.amount as number, principalPortion);
 
-  const { error } = await supabaseAdmin.rpc('link_transaction_to_manual_loan', {
+  const { data, error } = await supabaseAdmin.rpc('link_transaction_to_manual_loan', {
     p_user_id: userId,
     p_transaction_id: transactionId,
     p_loan_id: loanId,
@@ -1702,6 +1711,10 @@ export async function linkTransactionToLoan(
     p_classifier_version: CURRENT_CLASSIFIER_VERSION,
   });
   if (error) throw new Error(`Failed to link transaction to loan: ${error.message}`);
+  if (!(LINK_OUTCOMES as readonly unknown[]).includes(data)) {
+    throw new Error('Failed to link transaction to loan: unexpected outcome from link_transaction_to_manual_loan');
+  }
+  return data as LinkOutcome;
 }
 
 export async function getLinkedPaymentsForLoan(

@@ -249,6 +249,7 @@ describe('linkNewTransactionsToManualLoans', () => {
   beforeEach(() => {
     mockListManualLoans.mockReset();
     mockLinkTransactionToLoan.mockReset();
+    mockLinkTransactionToLoan.mockResolvedValue('linked');
     mockGetUnlinkedTransactionsByPlaidIds.mockReset();
     mockGetUnlinkedTransactionsByPlaidIds.mockResolvedValue([]);
     mockRepairExistingRelationalRoles.mockReset();
@@ -317,12 +318,36 @@ describe('linkNewTransactionsToManualLoans', () => {
 
     expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('user-1', 'txn-1', 'loan-1', 250);
   });
+
+  it.each(['already_linked', 'already_linked_different_principal', 'linked_to_other_loan'])(
+    'a candidate an overlapping caller already linked (%s) is logged and skipped, and the remaining candidates still link (post-audit blocker 1)',
+    async (outcome) => {
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      mockListManualLoans.mockResolvedValue([{ id: 'loan-1', match_text: 'SoFi' }]);
+      mockGetUnlinkedTransactionsByPlaidIds.mockResolvedValue([
+        { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+        { id: 'txn-2', name: 'SoFi Payment', merchant_name: null, amount: 300 },
+      ]);
+      mockLinkTransactionToLoan.mockResolvedValueOnce(outcome);
+
+      await linkNewTransactionsToManualLoans('user-1', ['plaid-txn-1', 'plaid-txn-2']);
+
+      expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(2);
+      expect(mockLinkTransactionToLoan).toHaveBeenLastCalledWith('user-1', 'txn-2', 'loan-1', 300);
+      expect(info).toHaveBeenCalledWith(`Skipped linking transaction txn-1 to manual loan loan-1: ${outcome}`);
+      expect(error).not.toHaveBeenCalled();
+      info.mockRestore();
+      error.mockRestore();
+    }
+  );
 });
 
 describe('backfillMatchesForLoan', () => {
   beforeEach(() => {
     mockGetUnlinkedOutflowTransactionsForUser.mockReset();
     mockLinkTransactionToLoan.mockReset();
+    mockLinkTransactionToLoan.mockResolvedValue('linked');
     mockRepairExistingRelationalRoles.mockReset();
     mockRepairExistingRelationalRoles.mockResolvedValue(undefined);
     mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([]);
@@ -373,6 +398,25 @@ describe('backfillMatchesForLoan', () => {
     expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
     expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
   });
+
+  it.each(['already_linked', 'already_linked_different_principal', 'linked_to_other_loan'])(
+    'a stale candidate (%s) is not a failure: the backfill skips it, links the rest and still runs the sweep (post-audit blocker 1)',
+    async (outcome) => {
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([
+        { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+        { id: 'txn-2', name: 'SoFi Payment', merchant_name: null, amount: 300 },
+      ]);
+      mockLinkTransactionToLoan.mockResolvedValueOnce(outcome);
+
+      await expect(backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' })).resolves.toBeUndefined();
+
+      expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(2);
+      expect(info).toHaveBeenCalledWith(`Skipped linking transaction txn-1 to manual loan loan-1: ${outcome}`);
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+      info.mockRestore();
+    }
+  );
 
   it('does nothing when the loan has no match_text', async () => {
     await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: null });

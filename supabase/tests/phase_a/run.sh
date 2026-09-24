@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Adversarial PostgreSQL harness for supabase/migrations/20260912120000_transaction_semantic_roles.sql.
+# Adversarial PostgreSQL harness for supabase/migrations/20260912120000_transaction_semantic_roles.sql
+# and the later `*_manual_loan_*` migrations that repair its functions (FOLLOWUP_MIGRATIONS below).
 # Nothing here touches any real database: every run uses a throwaway container.
 #
 #   supabase/tests/phase_a/run.sh               run everything (scaffold mode)
@@ -38,6 +39,9 @@
 #                      revision, e.g. `git show <sha>:<path> > /tmp/old.sql`, to watch the
 #                      regression tests fail against the code they were written to catch.
 #   PHASE_A_BASE=...   scaffold (default) or history, as above
+#   FOLLOWUP_MIGRATIONS=<basenames>  migrations applied after the candidate (default: every later
+#                      `*_manual_loan_*` file). "" tests the candidate alone, e.g. to watch t07/c07/c08
+#                      fail without 20260924120000.
 #   PG_IMAGE=<image>   override the mode's image
 #   KEEP=1             leave the container running afterwards
 #   VERBOSE=1          print every test's transcript, not just failing ones
@@ -54,7 +58,13 @@ case "$BASE" in
 esac
 CONTAINER="phase-a-harness-$$"
 LOGS="$(mktemp -d)"
-export HERE ROOT CONTAINER LOGS MIGRATION BASE
+PHASE_A_BASENAME=20260912120000_transaction_semantic_roles.sql
+# Later migrations that repair the candidate's manual-loan functions (applied after it in scaffold
+# mode too). Set FOLLOWUP_MIGRATIONS="" to run the tests against the candidate alone.
+if [ -z "${FOLLOWUP_MIGRATIONS+set}" ]; then
+  FOLLOWUP_MIGRATIONS="$(cd "$ROOT/supabase/migrations" && ls | grep '_manual_loan_' | awk -v a="$PHASE_A_BASENAME" '$0 > a' | tr '\n' ' ')"
+fi
+export HERE ROOT CONTAINER LOGS MIGRATION BASE PHASE_A_BASENAME FOLLOWUP_MIGRATIONS
 
 cleanup_container() {
   if [ "${KEEP:-0}" != 1 ]; then docker rm -f "$CONTAINER" >/dev/null 2>&1; fi
@@ -110,7 +120,17 @@ reset_scaffold() { # $1 = with_migration | pre_migration
     && psql_db < "$HERE/scaffold.sql" >"$LOGS/scaffold.log" 2>&1 \
     && psql_db < "$HERE/helpers.sql" >"$LOGS/helpers.log" 2>&1 \
     && psql_db < "$HERE/seed.sql" >"$LOGS/seed.log" 2>&1 \
-    && if [ "$1" = with_migration ]; then apply_migration "$MIGRATION" explicit >"$LOGS/migration.log" 2>&1; fi
+    && if [ "$1" = with_migration ]; then apply_followups_after "$MIGRATION"; fi
+}
+# The candidate, then the later migrations that repair its manual-loan functions (their names contain
+# "_manual_loan_"; the other later migrations need tables the scaffold does not have). History mode
+# applies every later migration instead — see below.
+apply_followups_after() {
+  apply_migration "$1" explicit >"$LOGS/migration.log" 2>&1 || return 1
+  local f
+  for f in $FOLLOWUP_MIGRATIONS; do
+    apply_migration "$ROOT/supabase/migrations/$f" explicit >>"$LOGS/migration.log" 2>&1 || return 1
+  done
 }
 
 # --- history mode: real migration history once, then reset data only -----------------------------
@@ -194,14 +214,16 @@ if [ "$BASE" = scaffold ]; then
   fi
   echo "migration applies cleanly (explicit transaction): $MIGRATION"
 else
-  # 1. The repository's real migration history, up to (not including) the candidate.
+  # 1. The repository's real migration history BEFORE the candidate, in version order. (Later files
+  #    are applied after the candidate below — applying them first would let the candidate's
+  #    CREATE OR REPLACEs overwrite their repairs.)
   for f in "$ROOT"/supabase/migrations/*.sql; do  # glob order is sorted, and safe with spaces in paths
-    [ "$f" -ef "$ROOT/supabase/migrations/20260912120000_transaction_semantic_roles.sql" ] && continue
+    [ "$(basename "$f")" \< "$PHASE_A_BASENAME" ] || continue
     if ! apply_migration "$f" explicit >>"$LOGS/history.log" 2>&1; then
       echo "FAILED to apply history migration $(basename "$f"):"; tail -20 "$LOGS/history.log"; exit 1
     fi
   done
-  echo "repository migration history applied (as postgres, one transaction per file)"
+  echo "repository migration history before the candidate applied (as postgres, one transaction per file)"
   psql_admin < "$HERE/helpers.sql" >"$LOGS/helpers.log" 2>&1 || { cat "$LOGS/helpers.log"; exit 1; }
   psql_admin < "$HERE/history_seed.sql" >"$LOGS/seed.log" 2>&1 || { cat "$LOGS/seed.log"; exit 1; }
 
@@ -241,6 +263,15 @@ else
   status=$?
   report "h01_history_clean_apply" $status "$log"
   if [ "$status" -ne 0 ]; then echo; echo "cannot continue without the candidate applied"; exit 1; fi
+
+  # 4. Every later migration, in version order, exactly as the Supabase CLI applies them.
+  for f in "$ROOT"/supabase/migrations/*.sql; do
+    [ "$(basename "$f")" \> "$PHASE_A_BASENAME" ] || continue
+    if ! apply_migration "$f" pipeline >>"$LOGS/history.log" 2>&1; then
+      echo "FAILED to apply later migration $(basename "$f"):"; tail -20 "$LOGS/history.log"; exit 1
+    fi
+  done
+  echo "later migrations applied (one CLI pipeline per file)"
 fi
 
 for file in "$HERE"/sql/*.sql; do
@@ -279,10 +310,10 @@ for dir in "$HERE"/concurrency/*/; do
       psql_db < "$dir/contender.sql" >"$LOGS/$name.contender.log" 2>&1 || status=1
       wait "$holder_pid" || status=1
       { echo "--- holder"; cat "$LOGS/$name.holder.log"; echo "--- contender"; cat "$LOGS/$name.contender.log"; } >>"$log"
-      if [ "$status" -eq 0 ]; then
-        echo "--- verify" >>"$log"
-        psql_db < "$dir/verify.sql" >>"$log" 2>&1 || status=1
-      fi
+      # Verified even when a session failed, so a regression also shows its end state (e.g. a
+      # double decrement), not only the first failed assertion.
+      echo "--- verify" >>"$log"
+      psql_db < "$dir/verify.sql" >>"$log" 2>&1 || status=1
     fi
   fi
   report "$name" "$status" "$log"

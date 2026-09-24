@@ -1287,14 +1287,14 @@ describe('clearTransactionSplits', () => {
 describe('linkTransactionToLoan — atomic link + balance decrement (Round 6 remediation, blocker 4)', () => {
   beforeEach(() => {
     mockRpc.mockReset();
-    mockRpc.mockResolvedValue({ data: null, error: null });
+    mockRpc.mockResolvedValue({ data: 'linked', error: null });
   });
 
   it('validates against the transaction amount, then calls the atomic RPC with the normalized principal', async () => {
     const txnFetchQuery = createQueryBuilder({ data: { amount: 500 }, error: null });
     mockFrom.mockReturnValueOnce(txnFetchQuery);
 
-    await linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 200);
+    await expect(linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 200)).resolves.toBe('linked');
 
     expect(mockRpc).toHaveBeenCalledWith('link_transaction_to_manual_loan', {
       p_user_id: 'user-1',
@@ -1345,6 +1345,30 @@ describe('linkTransactionToLoan — atomic link + balance decrement (Round 6 rem
     mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'not found or not owned' } });
 
     await expect(linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 200)).rejects.toThrow('Failed to link transaction to loan');
+  });
+
+  it.each(['already_linked', 'already_linked_different_principal', 'linked_to_other_loan'])(
+    "returns the RPC's no-write outcome %s as-is (post-audit blocker 1)",
+    async (outcome) => {
+      mockFrom.mockReturnValueOnce(createQueryBuilder({ data: { amount: 500 }, error: null }));
+      mockRpc.mockResolvedValueOnce({ data: outcome, error: null });
+
+      await expect(linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 200)).resolves.toBe(outcome);
+    }
+  );
+
+  it.each([
+    ['null (the pre-repair function returns void)', null],
+    ['an unknown string', 'relinked'],
+    ['a differently-cased outcome', 'Linked'],
+    ['a non-string', true],
+  ])('rejects %s rather than treating it as success', async (_label, data) => {
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: { amount: 500 }, error: null }));
+    mockRpc.mockResolvedValueOnce({ data, error: null });
+
+    await expect(linkTransactionToLoan('user-1', 'txn-1', 'loan-1', 200)).rejects.toThrow(
+      'Failed to link transaction to loan: unexpected outcome from link_transaction_to_manual_loan'
+    );
   });
 });
 

@@ -16,14 +16,16 @@
 #   R4  the schema produced by the HISTORICAL path (original Phase A, each file under `psql -1`, as
 #       production was built) is identical to the one produced by the CLI-style replay of the
 #       corrected files (pg_dump --schema-only, migration ledger excluded)
-#   R5  a database in production's state (historical path + ledger rows for every version, stored
-#       statements from the ORIGINAL files) replays nothing: no historical migration re-runs and
-#       the ledger is byte-for-byte unchanged
+#   R5  a database in production's state (historical path + ledger rows for every version up to
+#       PRODUCTION_HEAD, stored statements from the ORIGINAL files) re-runs none of those: their
+#       ledger rows are byte-for-byte unchanged, exactly the files after PRODUCTION_HEAD apply (the
+#       pending production rollout, rehearsed), and the result matches R1's clean replay
 # Tier 2 — the real, pinned Supabase CLI (only when SUPABASE_CLI is set):
 #   C0  control: the real CLI rejects the ORIGINAL Phase A file (the rollout failure, reproduced)
 #   C1  `supabase db push --db-url` on a clean database applies every migration
 #   C2  a second `db push` finds nothing to apply
-#   C3  `db push` against production's state (as R5) applies nothing and leaves the ledger unchanged
+#   C3  `db push` against production's state (as R5) re-runs nothing production already has, leaves
+#       those ledger rows unchanged and applies exactly the pending files
 #   C4  the schema after C1 is identical to R4's historical schema
 #   C5  `supabase db reset` on a clean local environment (scratch project, db only) rebuilds from
 #       the migrations
@@ -31,6 +33,8 @@
 # Requires: docker, bash, node, git.
 #   ORIGINAL_REV=<rev>  revision holding the Phase A file as production applied it (default 367e1a0)
 #   PG_IMAGE=<image>    default public.ecr.aws/supabase/postgres:17.6.1.155 (production's version)
+#   PRODUCTION_HEAD=<v> the newest migration version production has applied (default 20260922130000);
+#                       advance it whenever a later migration is rolled out to production
 #   KEEP=1              leave containers running
 set -uo pipefail
 
@@ -65,6 +69,18 @@ git -C "$ROOT" show "$ORIGINAL_REV:supabase/migrations/$PHASE_A" > "$ORIGINAL_DI
 if cmp -s "$ORIGINAL_DIR/$PHASE_A" "$ROOT/supabase/migrations/$PHASE_A"; then
   echo "note: $PHASE_A is unchanged since $ORIGINAL_REV (the original-file checks are then trivial)"
 fi
+# Production itself: the original files up to PRODUCTION_HEAD. Everything after it is pending there.
+PRODUCTION_HEAD="${PRODUCTION_HEAD:-20260922130000}"
+PRODUCTION_DIR="$WORK/production-migrations"
+mkdir -p "$PRODUCTION_DIR"
+for f in "$ORIGINAL_DIR"/*.sql; do
+  [ "$(basename "$f" | cut -d_ -f1)" \> "$PRODUCTION_HEAD" ] || cp "$f" "$PRODUCTION_DIR/"
+done
+ls "$PRODUCTION_DIR/${PRODUCTION_HEAD}_"*.sql >/dev/null 2>&1 || { echo "PRODUCTION_HEAD $PRODUCTION_HEAD is not a migration version"; exit 2; }
+PENDING=()
+for f in "$ROOT"/supabase/migrations/*.sql; do
+  [ "$(basename "$f" | cut -d_ -f1)" \> "$PRODUCTION_HEAD" ] && PENDING+=("$(basename "$f")")
+done
 
 start_db() { # $1 = name suffix; prints the container name and sets PORT_<suffix>
   local name="$PREFIX-$1"
@@ -90,7 +106,8 @@ apply_historically() { # $1 = db suffix, $2 = migrations dir
       || { echo "historical apply failed at $(basename "$f")"; tail -5 "$WORK/$1.history.log"; return 1; }
   done
 }
-# Production's ledger after the manual rollout: a row per version, statements from the ORIGINAL files.
+# Production's ledger after the manual rollout: a row per version it has, statements from the
+# ORIGINAL files.
 record_ledger() { # $1 = db suffix
   local f v n
   docker exec -i "$PREFIX-$1" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL' >/dev/null
@@ -99,7 +116,7 @@ create table if not exists supabase_migrations.schema_migrations (version text n
 alter table supabase_migrations.schema_migrations add column if not exists statements text[];
 alter table supabase_migrations.schema_migrations add column if not exists name text;
 SQL
-  for f in "$ORIGINAL_DIR"/*.sql; do
+  for f in "$PRODUCTION_DIR"/*.sql; do
     v="$(basename "$f" | cut -d_ -f1)"; n="$(basename "$f" .sql | cut -d_ -f2-)"
     docker cp "$f" "$PREFIX-$1:/tmp/ledger.sql" >/dev/null
     docker exec "$PREFIX-$1" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres \
@@ -110,7 +127,11 @@ SQL
           values ('$v', '$n', array[pg_read_file('/tmp/ledger.sql')])" >/dev/null || return 1
   done
 }
-ledger_digest() { docker exec "$PREFIX-$1" psql -X -At -U postgres -d postgres -c "select md5(string_agg(version || ':' || coalesce(name, '') || ':' || coalesce(array_to_string(statements, '§'), ''), '|' order by version)) || ' / ' || count(*) from supabase_migrations.schema_migrations"; }
+ledger_digest() { # $1 = db suffix, $2 = only versions up to this one (default: every row)
+  docker exec "$PREFIX-$1" psql -X -At -U postgres -d postgres -c "select md5(string_agg(version || ':' || coalesce(name, '') || ':' || coalesce(array_to_string(statements, '§'), ''), '|' order by version)) || ' / ' || count(*) from supabase_migrations.schema_migrations where version <= '${2:-99999999999999}'"
+}
+ledger_versions() { docker exec "$PREFIX-$1" psql -X -At -U postgres -d postgres -c "select string_agg(version, ' ' order by version) from supabase_migrations.schema_migrations"; }
+all_versions() { local f; for f in "$ROOT"/supabase/migrations/*.sql; do basename "$f" | cut -d_ -f1; done | paste -sd' '; }
 schema_dump() { # $1 = container name
   local out="$WORK/$(basename "$1").schema.sql"
   docker exec "$1" pg_dump -U supabase_admin -d postgres --schema-only --exclude-schema=supabase_migrations \
@@ -151,22 +172,33 @@ r4() {
   echo "historical: $(wc -l < "$a") lines   CLI-style replay: $(wc -l < "$b") lines"
   diff -u "$a" "$b" && echo "schemas identical"
 }
+# After a push to production's state: production's own ledger rows are byte-for-byte what they were,
+# the ledger now holds every version, and the push output named exactly the pending files.
+check_production_push() { # $1 = db suffix, $2 = production ledger digest before, $3 = push output, $4 = line prefix of an applied file
+  local p applied
+  [ "$(ledger_digest "$1" "$PRODUCTION_HEAD")" = "$2" ] || { echo "production's ledger rows changed"; return 1; }
+  [ "$(ledger_versions "$1")" = "$(all_versions)" ] || { echo "ledger after push: $(ledger_versions "$1")"; return 1; }
+  applied="$(echo "$3" | grep -oE "^$4 ?[0-9]{14}_[a-z0-9_]+\.sql" | grep -oE '[0-9]{14}_[a-z0-9_]+\.sql' | paste -sd' ')"
+  [ "$applied" = "${PENDING[*]}" ] || { echo "applied [$applied], expected exactly the pending [${PENDING[*]}]"; return 1; }
+  echo "production's ${2##* } ledger rows unchanged ($2); applied exactly the pending: ${PENDING[*]:-<none>}"
+}
 r5() {
-  apply_historically prod "$ORIGINAL_DIR" || return 1
+  apply_historically prod "$PRODUCTION_DIR" || return 1
   record_ledger prod || return 1
-  before_ledger="$(ledger_digest prod)"; before_schema="$(md5sum < "$(schema_dump "$PREFIX-prod")")"
+  before_ledger="$(ledger_digest prod)"
   out="$(emulate prod "$ROOT/supabase/migrations")" || { echo "$out"; return 1; }
   echo "$out"
-  echo "$out" | tail -1 | grep -qx "0 applied" || { echo "something was re-applied"; return 1; }
-  [ "$(ledger_digest prod)" = "$before_ledger" ] || { echo "ledger changed"; return 1; }
-  [ "$(md5sum < "$(schema_dump "$PREFIX-prod")")" = "$before_schema" ] || { echo "schema changed"; return 1; }
-  echo "production-state ledger ($before_ledger) and schema unchanged; nothing re-ran"
+  echo "$out" | tail -1 | grep -qx "${#PENDING[@]} applied" || { echo "expected ${#PENDING[@]} applied"; return 1; }
+  check_production_push prod "$before_ledger" "$out" "apply " || return 1
+  a="$WORK/$PREFIX-emu.schema.sql"; b="$(schema_dump "$PREFIX-prod")"
+  [ -s "$a" ] && [ ! -e "$a.invalid" ] && [ ! -e "$b.invalid" ] || return 1
+  diff -u "$a" "$b" && echo "production-state schema after the push equals the clean replay's"
 }
 check R1_clean_replay "$WORK/r1.log" r1
 check R2_replay_is_idempotent "$WORK/r2.log" r2
 check R3_original_phase_a_fails_like_the_cli "$WORK/r3.log" r3
 check R4_historical_schema_equals_cli_replay "$WORK/r4.log" r4
-check R5_production_ledger_replays_nothing "$WORK/r5.log" r5
+check R5_production_state_applies_only_pending "$WORK/r5.log" r5
 
 if [ -n "${SUPABASE_CLI:-}" ]; then
   # A scratch project: only config.toml (with its own project_id) and the migrations — never the
@@ -185,12 +217,13 @@ if [ -n "${SUPABASE_CLI:-}" ]; then
   c1() { cli db push --db-url "$(url cli)" --yes && [ "$(docker exec "$PREFIX-cli" psql -X -At -U postgres -d postgres -c 'select count(*) from supabase_migrations.schema_migrations')" = "$(ls "$ROOT"/supabase/migrations/*.sql | wc -l | tr -d ' ')" ]; }
   c2() { out="$(cli db push --db-url "$(url cli)" --yes 2>&1)"; echo "$out"; echo "$out" | grep -qi "up to date"; }
   c3() {
-    apply_historically cliprod "$ORIGINAL_DIR" || return 1
+    apply_historically cliprod "$PRODUCTION_DIR" || return 1
     record_ledger cliprod || return 1
     before="$(ledger_digest cliprod)"
-    out="$(cli db push --db-url "$(url cliprod)" --yes 2>&1)"; echo "$out"
-    echo "$out" | grep -qi "up to date" || return 1
-    [ "$(ledger_digest cliprod)" = "$before" ] && echo "ledger unchanged ($before)"
+    out="$(cli db push --db-url "$(url cliprod)" --yes 2>&1)" || { echo "$out"; return 1; }
+    echo "$out"
+    if [ "${#PENDING[@]}" -eq 0 ]; then echo "$out" | grep -qi "up to date" || return 1; fi
+    check_production_push cliprod "$before" "$out" "Applying migration"
   }
   c4() { a="$WORK/$PREFIX-hist.schema.sql"; b="$(schema_dump "$PREFIX-cli")"; [ -s "$a" ] && [ ! -e "$a.invalid" ] && [ ! -e "$b.invalid" ] || return 1; diff -u "$a" "$b" && echo "schemas identical ($(wc -l < "$b") lines)"; }
   c5() {
@@ -214,7 +247,7 @@ if [ -n "${SUPABASE_CLI:-}" ]; then
   check C0_cli_rejects_original_phase_a "$WORK/c0.log" c0
   check C1_cli_db_push_clean "$WORK/c1.log" c1
   check C2_cli_db_push_again_up_to_date "$WORK/c2.log" c2
-  check C3_cli_db_push_production_state_noop "$WORK/c3.log" c3
+  check C3_cli_db_push_production_state_only_pending "$WORK/c3.log" c3
   check C4_cli_schema_equals_historical "$WORK/c4.log" c4
   check C5_cli_db_reset_clean_local "$WORK/c5.log" c5
 fi

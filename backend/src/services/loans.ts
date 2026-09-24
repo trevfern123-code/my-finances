@@ -123,6 +123,17 @@ export function matchTransactionToLoan(
   return match?.id ?? null;
 }
 
+/** Links one candidate chosen from an "unlinked" read. The read happens before the RPC's lock, so
+ *  an overlapping caller (a sync and a loan backfill, two syncs, a retry) may have linked the
+ *  transaction since; the RPC then writes nothing and says so (post-audit blocker 1). That is not a
+ *  failure — the payment is already accounted for exactly once — so it is logged and skipped. */
+async function linkCandidate(userId: string, transactionId: string, loanId: string, principalPortion: number): Promise<void> {
+  const outcome = await dataService.linkTransactionToLoan(userId, transactionId, loanId, principalPortion);
+  if (outcome !== 'linked') {
+    console.info(`Skipped linking transaction ${transactionId} to manual loan ${loanId}: ${outcome}`);
+  }
+}
+
 /**
  * Best-effort by design (wrapped internally, not just by callers) — runs after every
  * transaction sync so newly-synced payments auto-link to the user's manual loans, but a failure
@@ -156,7 +167,7 @@ export async function linkNewTransactionsToManualLoans(userId: string, plaidTran
     for (const txn of candidates) {
       const loanId = matchTransactionToLoan(txn, matchers);
       if (loanId) {
-        await dataService.linkTransactionToLoan(userId, txn.id, loanId, txn.amount);
+        await linkCandidate(userId, txn.id, loanId, txn.amount);
       }
     }
   } catch (err) {
@@ -189,7 +200,7 @@ export async function backfillMatchesForLoan(userId: string, loan: { id: string;
   const matcher = { id: loan.id, match_text: loan.match_text };
   for (const txn of candidates) {
     if (matchTransactionToLoan(txn, [matcher])) {
-      await dataService.linkTransactionToLoan(userId, txn.id, loan.id, txn.amount);
+      await linkCandidate(userId, txn.id, loan.id, txn.amount);
     }
   }
 
