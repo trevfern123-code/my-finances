@@ -60,6 +60,12 @@ inside a `DO` block instead, as the Phase A migration now does.
   a transaction twice. Apply it **before** deploying the backend that reads the outcome: that backend
   rejects the old `void` result. The backend on `main` never calls the function, so applying it
   early is safe.
+- **`20260924130000_manual_loan_applied_balance_delta.sql`** (post-audit blocker 2) records what each
+  loan payment actually took off a manual loan's balance: `transactions.loan_balance_applied` and
+  `manual_loan_payments.balance_applied`. A balance is still never driven below zero. Unlink, edit,
+  delete and Plaid removal now restore exactly that amount, not the full principal. Example: a $100
+  payment linked to a $50 balance used to leave $100 behind when unlinked. Rows from before the
+  migration are NULL and keep the old full-principal restore; they are not backfilled.
 
 Caveats:
 - **Never run `supabase migration fetch` without reviewing the diff.** It rewrites local migration
@@ -663,6 +669,26 @@ When a user reports this message, before they link that bank again:
 1. Note when it happened: `select id, created_at, failure_reason from plaid_link_attempts where user_id = '<user>' and status = 'exchange_unknown';`. The row is swept about 90 minutes after it was created, so run this promptly; otherwise use the time the user reports.
 2. Using the Plaid Dashboard's logs, or Plaid support, check for an Item created around then for that institution. The Link token was created with `client_user_id` = the user's id.
 3. If such an Item exists, ask Plaid support to remove it (this app holds no access token for it). Only then tell the user it is safe to link again.
+
+**Post-audit follow-ups (deferred from the release-audit remediation, in priority order):**
+1. **Highest priority — define manual-loan balance-as-of semantics and historical transaction
+   linking.** Today a new loan's match rule links every earlier unlinked matching payment and
+   decrements the balance the user just entered, which may already reflect those payments. Decide and
+   document:
+   - what `current_balance` means ("as of" when?);
+   - loan creation;
+   - manual balance edits;
+   - banks linked after the loan was created;
+   - delayed or pending Plaid transactions;
+   - unlink behaviour after a balance edit;
+   - reconciliation and reporting for existing loans;
+   - the user-facing wording.
+
+   Blocker 2's recorded deltas make every operation exactly reversible, but they do not settle
+   which payments should be applied in the first place.
+2. **High priority — retain `exchange_unknown` link attempts for 30 days.** They are currently swept
+   about 90 minutes after creation, which leaves little time to investigate a possible orphaned
+   Item (see above).
 
 **Other follow-ups (deliberately out of scope for the Wave 1 corrective pass):**
 - Reconnect button stays stuck on "Reconnecting..." if Plaid Update Mode is closed without
