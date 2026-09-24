@@ -35,6 +35,30 @@ happened yet. Once linked, new schema changes go through `supabase migration new
 reviewed, and get applied with `supabase db push` (or still by hand in the SQL editor for a
 one-off change) — either way, the SQL lives in the repo afterward instead of only in chat history.
 
+**Replaying the history (fresh environment / disaster recovery).** The whole `supabase/migrations/`
+history rebuilds through the supported Supabase CLI: `supabase db reset` locally, or
+`supabase db push --db-url <new database>`. The CLI sends each migration file as ONE extended-protocol
+pipeline: a single implicit transaction, but not a PostgreSQL "transaction block". So a migration
+must never use a top-level `SET LOCAL` (silently ignored) or `LOCK TABLE` (rejected). Put them
+inside a `DO` block instead, as the Phase A migration now does.
+
+- **Phase A fix:** `20260912120000_transaction_semantic_roles.sql` originally began with exactly those
+  two statements. During the 2026-09 rollout the CLI failed there, and production was applied manually
+  in one explicit transaction, then recorded in the migration ledger. The file was corrected in place
+  (same version, originals quoted in its header).
+- **Production is unaffected:** its ledger already records that version, and the CLI selects
+  migrations by version only.
+- **Proof:** `bash supabase/tests/replay/run.sh` checks the replay and the resulting schema; with
+  `SUPABASE_CLI="npx -y supabase@2.117.0"` it also runs the real CLI. CI runs both tiers, in the
+  `migration-replay` job.
+
+Caveats:
+- **Never run `supabase migration fetch` without reviewing the diff.** It rewrites local migration
+  files from the statements stored in the remote ledger, which would restore the original,
+  unreplayable Phase A file. Likewise, never `supabase migration repair` version `20260912120000`.
+- **This checkout is linked to the production project** (`supabase/.temp`). A bare `supabase db push`
+  targets production. Test pushes always need an explicit local `--db-url`, as the replay harness uses.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push/PR to `main`: backend typecheck, backend tests,

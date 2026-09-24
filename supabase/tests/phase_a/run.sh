@@ -15,8 +15,9 @@
 #   history             Image public.ecr.aws/supabase/postgres:17.6.1.155 (Supabase's own PostgreSQL
 #                       17, with the real anon/authenticated/service_role roles, auth schema and
 #                       platform default privileges). Applies the repository's ACTUAL migration
-#                       history, each file in one transaction as the non-superuser `postgres` role,
-#                       exactly as `supabase db push` connects. It then checks the dirty-data gate
+#                       history, each file in one transaction as the non-superuser `postgres` role
+#                       (the role `supabase db push` connects as; its pipeline transport is the
+#                       `pipeline` model below and supabase/tests/replay). It then checks the gate
 #                       once against that authentic schema — refused dirty data under every
 #                       transaction model, schema and data unchanged — then applies the candidate.
 #                       Finally it runs every sql/ and concurrency/ test, resetting DATA (not schema)
@@ -74,14 +75,21 @@ psql_admin() {
     psql_db "$@"
   fi
 }
-# Applies a migration file under one of three transaction models:
+# Applies a migration file under one of four transaction models:
+#   pipeline    what the Supabase CLI (`db push` / `db reset`) actually does: every statement as its
+#               own extended-protocol message in ONE pipeline with a single Sync — an implicit
+#               transaction that is NOT a "transaction block" (supabase/tests/replay/pipeline-replay.cjs)
 #   explicit    BEGIN ... COMMIT around the whole file (psql --single-transaction)
 #   implicit    the whole file sent as ONE simple-protocol query, which PostgreSQL runs as a single
 #               implicit transaction — the model of a runner that submits a file in one request
 #   autocommit  statement by statement, each committed on its own (a runner with no transaction)
+node_path() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
 apply_migration() {
   local file="$1" model="${2:-explicit}"
   case "$model" in
+    pipeline)
+      node "$(node_path "$ROOT/supabase/tests/replay/pipeline-replay.cjs")" --host 127.0.0.1 --port "$PG_PORT" \
+        --user postgres --password harness --db postgres --file "$(node_path "$file")" ;;
     explicit) docker exec -i "$CONTAINER" psql -X -q -1 -v ON_ERROR_STOP=1 -U postgres -d postgres < "$file" ;;
     implicit)
       if [ "$(wc -c < "$file")" -gt 130000 ]; then
@@ -94,11 +102,11 @@ apply_migration() {
     *) echo "unknown model $model"; return 2 ;;
   esac
 }
-export -f psql_db psql_admin apply_migration
+export -f psql_db psql_admin node_path apply_migration
 
 # --- scaffold mode: rebuild the whole public schema per test ------------------------------------
 reset_scaffold() { # $1 = with_migration | pre_migration
-  psql_db -c "drop schema if exists public cascade; drop schema if exists th cascade; create schema public;" </dev/null >"$LOGS/reset.log" 2>&1 \
+  psql_db -c "drop schema if exists public cascade; drop schema if exists th cascade; drop schema if exists supabase_migrations cascade; create schema public;" </dev/null >"$LOGS/reset.log" 2>&1 \
     && psql_db < "$HERE/scaffold.sql" >"$LOGS/scaffold.log" 2>&1 \
     && psql_db < "$HERE/helpers.sql" >"$LOGS/helpers.log" 2>&1 \
     && psql_db < "$HERE/seed.sql" >"$LOGS/seed.log" 2>&1 \
@@ -140,7 +148,10 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
 fi
 
 echo "mode: $BASE   image: $IMAGE   container: $CONTAINER"
-docker run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=harness "$IMAGE" >/dev/null || exit 1
+# The port is published (loopback only) for the pipeline model's client.
+docker run -d --name "$CONTAINER" -p 127.0.0.1::5432 -e POSTGRES_PASSWORD=harness "$IMAGE" >/dev/null || exit 1
+PG_PORT="$(docker port "$CONTAINER" 5432/tcp | head -1 | sed 's/.*://')"
+export PG_PORT
 if [ "$BASE" = scaffold ]; then
   # The official image runs a temporary server during initialization and then restarts it.
   until docker logs "$CONTAINER" 2>&1 | grep -q "PostgreSQL init process complete"; do sleep 1; done
@@ -200,7 +211,7 @@ else
     set -e
     psql_db < "$HERE/gate/dirty_seed.sql" >/dev/null
     schema_before="$(schema_fingerprint)"; data_before="$(data_fingerprint)"
-    for model in explicit implicit autocommit; do
+    for model in pipeline explicit implicit autocommit; do
       if apply_migration "$MIGRATION" "$model" >"$LOGS/h00.$model.log" 2>&1; then fail "applied over dirty data ($model)"; fi
       grep -E "Phase A migration aborted|LOCK TABLE can only be used" "$LOGS/h00.$model.log" | head -1
       [ "$(schema_fingerprint)" = "$schema_before" ] || fail "schema changed ($model)"
@@ -222,8 +233,8 @@ else
     if migration_is_applied; then
       echo "candidate was already applied (it did not refuse the dirty data — see h00)"
     else
-      apply_migration "$MIGRATION" implicit >"$LOGS/h01.apply.log" 2>&1 || { cat "$LOGS/h01.apply.log"; fail "clean apply failed"; }
-      echo "clean data: candidate applied in one implicit transaction"
+      apply_migration "$MIGRATION" pipeline >"$LOGS/h01.apply.log" 2>&1 || { cat "$LOGS/h01.apply.log"; fail "clean apply failed"; }
+      echo "clean data: candidate applied as the Supabase CLI applies it (one pipeline)"
     fi
     migration_is_applied || fail "candidate not applied"
   ) >"$log" 2>&1

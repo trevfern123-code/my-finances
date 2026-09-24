@@ -12,7 +12,7 @@ psql_db -q -c "
   delete from public.manual_loans where id::text like '%00d_';" </dev/null
 data_before="$(data_fingerprint)"
 
-out="$(apply_migration "$MIGRATION" implicit 2>&1)" || { echo "$out" | tail -20; fail "clean migration failed"; }
+out="$(apply_migration "$MIGRATION" pipeline 2>&1)" || { echo "$out" | tail -20; fail "clean migration failed"; }
 migration_is_applied || fail "migration not applied"
 [ "$(data_fingerprint)" = "$data_before" ] || fail "migration modified existing financial data"
 

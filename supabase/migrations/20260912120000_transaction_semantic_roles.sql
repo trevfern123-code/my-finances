@@ -48,12 +48,11 @@
 --     the transactions rewrite and the ADD CONSTRAINTs below need it anyway, and it is held until
 --     commit regardless; taking it up front in a fixed order avoids lock-upgrade deadlocks. Reads
 --     of these three tables wait for the duration of this migration.)
---  2. LOCK TABLE is only permitted inside a transaction block, so as the first statement it also
---     proves this file is running in ONE transaction: a runner that executed it statement by
---     statement in autocommit would fail right here, before anything was changed, rather than
---     leaving the migration half applied. Every model this has been verified against — an explicit
---     BEGIN/COMMIT (`psql -1`), and a single multi-statement query that PostgreSQL runs as one
---     implicit transaction — makes the whole file, gate included, all-or-nothing.
+--  2. The whole file must run as ONE transaction, and every supported runner does: the Supabase
+--     CLI (`supabase db push` / `db reset`) sends a migration file as a single extended-protocol
+--     pipeline — one implicit transaction, committed at its final Sync together with its
+--     migration-history row — and an explicit BEGIN/COMMIT (`psql -1`) or a single multi-statement
+--     query does too. Any failure below rolls the entire file back.
 --  3. If any row violates any of the nine constraints, the DO block raises and the whole
 --     migration rolls back: no column, table, function, grant or constraint from this file
 --     remains. It never corrects, deletes or guesses at financial data. The error lists the
@@ -63,15 +62,32 @@
 --
 -- lock_timeout makes the migration fail cleanly (and roll back) rather than queue indefinitely
 -- behind a long-running transaction while every other session queues behind it.
-set local lock_timeout = '15s';
-
-lock table public.manual_loans, public.manual_loan_payments, public.transactions in access exclusive mode;
-
+--
+-- CLI-replay correction (2026-09-24, post-audit blocker 3). This file originally began with these
+-- two TOP-LEVEL statements, which is how production applied it (manually, as one explicit SQL
+-- transaction, during the 2026-09 rollout):
+--
+--     set local lock_timeout = '15s';
+--     lock table public.manual_loans, public.manual_loan_payments, public.transactions in access exclusive mode;
+--
+-- The Supabase CLI's pipeline is one implicit transaction but not a "transaction block": there a
+-- top-level SET LOCAL only warns and is ignored, and a top-level LOCK TABLE fails ("LOCK TABLE can
+-- only be used in transaction blocks"), so `supabase db push` / `db reset` could not replay this
+-- file. The same timeout and the same lock now run as the first statements of the gate's DO block
+-- below (not top level, so allowed under every runner); both still last until the migration's
+-- transaction ends. The resulting schema is identical (proven by supabase/tests/replay/run.sh).
+-- Production's migration ledger already records this version, and the CLI selects migrations by
+-- version only, so this edit never re-runs there. The one behaviour given up: a runner that commits
+-- each statement separately is no longer stopped before the gate (the gate itself still refuses
+-- dirty data); no supported runner does that.
 do $$
 declare
   v_found text := '';
   v_count bigint;
 begin
+  perform set_config('lock_timeout', '15s', true);
+  lock table public.manual_loans, public.manual_loan_payments, public.transactions in access exclusive mode;
+
   -- Each predicate is exactly its constraint's CHECK expression below; `is false` matches CHECK's
   -- own semantics (a NULL result passes a CHECK constraint).
   select count(*) into v_count from public.manual_loans

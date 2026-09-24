@@ -8,7 +8,7 @@ psql_db < "$HERE/gate/dirty_seed.sql" >/dev/null
 schema_before="$(schema_fingerprint)"
 data_before="$(data_fingerprint)"
 
-for model in explicit implicit; do
+for model in pipeline explicit implicit; do
   echo "--- $model transaction model"
   if out="$(apply_migration "$MIGRATION" "$model" 2>&1)"; then
     fail "migration succeeded over dirty data ($model)"
@@ -25,11 +25,15 @@ for model in explicit implicit; do
 done
 
 echo "--- per-statement autocommit (a runner with no transaction)"
+# Since the CLI-replay correction the lock is taken inside the gate's DO block (a top-level LOCK TABLE
+# cannot run under the Supabase CLI's pipeline), so an autocommit runner is no longer stopped by the
+# lock itself — but the gate is still the file's first statement and still refuses dirty data before
+# anything else runs.
 if out="$(apply_migration "$MIGRATION" autocommit 2>&1)"; then
-  fail "migration ran outside a transaction"
+  fail "migration applied over dirty data (autocommit)"
 fi
 echo "$out" | grep ERROR | head -2
-echo "$out" | grep -q "LOCK TABLE can only be used in transaction blocks" || fail "did not stop at the transaction assertion"
+echo "$out" | grep -q "Phase A migration aborted before making any change" || fail "gate did not refuse first (autocommit)"
 [ "$(schema_fingerprint)" = "$schema_before" ] || fail "schema changed (autocommit)"
 [ "$(data_fingerprint)" = "$data_before" ] || fail "data changed (autocommit)"
-echo "refused at its first statement, nothing applied (autocommit)"
+echo "refused by the gate at its first statement, nothing applied (autocommit)"

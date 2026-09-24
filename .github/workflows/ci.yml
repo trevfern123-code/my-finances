@@ -44,3 +44,28 @@ jobs:
 
       - name: Frontend build
         run: npm run build --workspace frontend
+
+  migration-replay:
+    # The tracked migration history must rebuild through the supported Supabase workflow (post-audit
+    # blocker 3): the pipeline emulator plus the real, pinned CLI's `db push` and `db reset`, each
+    # against throwaway local databases only. See supabase/tests/replay/run.sh.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The harness reads the Phase A file as production applied it from an earlier commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # Pinned by commit (v3.0.0); CLI version pinned to the one used for the production rollout.
+      - uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
+        with:
+          version: 2.117.0
+
+      - name: Replay every migration (emulator, CLI db push, CLI db reset)
+        run: bash supabase/tests/replay/run.sh
+        env:
+          SUPABASE_CLI: supabase
