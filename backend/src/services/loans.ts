@@ -1,8 +1,8 @@
 import type { CreditCardLiability, MortgageLiability, StudentLoan } from 'plaid';
 import * as plaidService from './plaidService';
 import * as dataService from './dataService';
+import { repairExistingRelationalRoles } from './roleReconciliation';
 import { summarizeErrorSafely } from './errorSanitizer';
-import type { InsertedTransaction } from '../types';
 
 export type LoanType = 'student' | 'mortgage' | 'credit';
 
@@ -123,16 +123,38 @@ export function matchTransactionToLoan(
   return match?.id ?? null;
 }
 
+/** Links one candidate chosen from an "unlinked" read. The read happens before the RPC's lock, so
+ *  an overlapping caller (a sync and a loan backfill, two syncs, a retry) may have linked the
+ *  transaction since; the RPC then writes nothing and says so (post-audit blocker 1). That is not a
+ *  failure — the payment is already accounted for exactly once — so it is logged and skipped. */
+async function linkCandidate(userId: string, transactionId: string, loanId: string, principalPortion: number): Promise<void> {
+  const outcome = await dataService.linkTransactionToLoan(userId, transactionId, loanId, principalPortion);
+  if (outcome !== 'linked') {
+    console.info(`Skipped linking transaction ${transactionId} to manual loan ${loanId}: ${outcome}`);
+  }
+}
+
 /**
  * Best-effort by design (wrapped internally, not just by callers) — runs after every
  * transaction sync so newly-synced payments auto-link to the user's manual loans, but a failure
- * here shouldn't fail the sync it's piggybacking on.
+ * here shouldn't fail the sync it's piggybacking on. Per-transaction linking is the only thing
+ * wrapped in the try/catch below — the REPAIR SWEEP a new link could necessitate is deliberately
+ * NOT this function's responsibility (Round 4 remediation §7): syncService.ts runs it centrally,
+ * gated on Plaid's own `added` count rather than on whether THIS call linked anything, which is
+ * what makes the sweep retry-safe (see syncService.ts's own comment for why gating on this
+ * function's own success/failure/no-op breaks that).
+ *
+ * Round 6 remediation (blocker 5's remaining gap): candidates are re-derived from Plaid's OWN
+ * `plaidTransactionIds` (its `added` report for this batch) on every call, not taken from
+ * `applyTransactionChanges`'s own insert/update classification — a link that fails in attempt 1
+ * leaves the row persisted but unlinked; on a retry that row is no longer a fresh INSERT (so the
+ * old `insertedTransactions`-based candidate set would never include it again), but Plaid still
+ * reports the identical `added` composition for the same unadvanced cursor, and
+ * `getUnlinkedTransactionsByPlaidIds` re-queries fresh each time, filtered to still-unlinked —
+ * naturally retrying the failed link and no-op-ing for whatever already succeeded.
  */
-export async function linkNewTransactionsToManualLoans(
-  userId: string,
-  insertedTransactions: InsertedTransaction[]
-): Promise<void> {
-  if (insertedTransactions.length === 0) return;
+export async function linkNewTransactionsToManualLoans(userId: string, plaidTransactionIds: string[]): Promise<void> {
+  if (plaidTransactionIds.length === 0) return;
 
   try {
     const loans = await dataService.listManualLoans(userId);
@@ -141,10 +163,11 @@ export async function linkNewTransactionsToManualLoans(
       .map((l) => ({ id: l.id, match_text: l.match_text }));
     if (matchers.length === 0) return;
 
-    for (const txn of insertedTransactions) {
+    const candidates = await dataService.getUnlinkedTransactionsByPlaidIds(userId, plaidTransactionIds);
+    for (const txn of candidates) {
       const loanId = matchTransactionToLoan(txn, matchers);
       if (loanId) {
-        await dataService.linkTransactionToLoan(txn.id, loanId, txn.amount);
+        await linkCandidate(userId, txn.id, loanId, txn.amount);
       }
     }
   } catch (err) {
@@ -156,24 +179,32 @@ export async function linkNewTransactionsToManualLoans(
  * Scans a user's not-yet-linked outflow transactions for matches against one loan's match_text
  * — run after creating/updating a manual loan so setting or changing match_text picks up
  * payments that were already synced before the match rule existed, not just future ones.
+ *
+ * Round 4 remediation §7 / Round 5 remediation (blocker 5): unlike the sync-triggered auto-link
+ * path (best-effort, piggybacking on a sync whose real job is syncing transactions), this
+ * function is invoked synchronously by a direct user action (create/update loan — see
+ * manualLoanController.ts) and is expected to report the WHOLE operation as incomplete/failed if
+ * ANY step fails, including an individual transaction's link — silently catching one link failure
+ * here would let the request "succeed" while quietly missing a payment the user has no way to
+ * discover short of manually re-checking every transaction. Nothing in this function is caught;
+ * the repair sweep at the end also runs UNCONDITIONALLY — never gated on whether THIS invocation
+ * itself linked anything new, since a retry after a prior successful link whose repair sweep then
+ * failed must still repair that already-linked transaction even though it's no longer an
+ * "unlinked" candidate this time (gating on `candidates.length > 0` would silently defeat that
+ * retry). The caller is expected to propagate any thrown failure as an incomplete operation.
  */
-export async function backfillMatchesForLoan(
-  userId: string,
-  loan: { id: string; match_text: string | null }
-): Promise<void> {
+export async function backfillMatchesForLoan(userId: string, loan: { id: string; match_text: string | null }): Promise<void> {
   if (!loan.match_text) return;
 
-  try {
-    const candidates = await dataService.getUnlinkedOutflowTransactionsForUser(userId);
-    const matcher = { id: loan.id, match_text: loan.match_text };
-    for (const txn of candidates) {
-      if (matchTransactionToLoan(txn, [matcher])) {
-        await dataService.linkTransactionToLoan(txn.id, loan.id, txn.amount);
-      }
+  const candidates = await dataService.getUnlinkedOutflowTransactionsForUser(userId);
+  const matcher = { id: loan.id, match_text: loan.match_text };
+  for (const txn of candidates) {
+    if (matchTransactionToLoan(txn, [matcher])) {
+      await linkCandidate(userId, txn.id, loan.id, txn.amount);
     }
-  } catch (err) {
-    console.error(`Failed to backfill matches for manual loan ${loan.id}:`, err);
   }
+
+  await repairExistingRelationalRoles(userId);
 }
 
 /**

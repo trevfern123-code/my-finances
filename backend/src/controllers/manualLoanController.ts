@@ -1,6 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import * as dataService from '../services/dataService';
 import { backfillMatchesForLoan, computePayoffProgressPct } from '../services/loans';
+import {
+  reconcileAfterRelationalStateChange,
+  reconcileRelationalRoles,
+  repairExistingRelationalRoles,
+} from '../services/roleReconciliation';
 import type { ManualLoanRow } from '../types';
 
 type LifetimeTotals = { principalPaid: number; interestPaid: number };
@@ -49,7 +55,15 @@ interface ManualLoanBody {
   match_text?: string | null;
 }
 
-export async function createManualLoan(req: Request, res: Response, next: NextFunction) {
+/**
+ * Prefix for the keys the LEGACY create route generates on the server. The idempotent route
+ * refuses any client-supplied key carrying it, so a legacy request's key can never collide with,
+ * replay, or be replayed by a key from the new client's pending-attempt protocol.
+ */
+export const LEGACY_SERVER_KEY_PREFIX = 'legacy-server:';
+
+/** Creates the loan through the idempotent RPC under `idempotencyKey`, then backfills matches. */
+async function createLoanUnderKey(req: Request, res: Response, next: NextFunction, idempotencyKey: string) {
   try {
     const userId = req.user!.id;
     const body = req.body as ManualLoanBody;
@@ -59,29 +73,79 @@ export async function createManualLoan(req: Request, res: Response, next: NextFu
       return;
     }
 
-    const loan = await dataService.createManualLoan(userId, {
-      name: body.name,
-      loanType: body.loan_type ?? 'personal',
-      currentBalance: body.current_balance,
-      originationPrincipalAmount: body.origination_principal_amount ?? null,
-      interestRatePercentage: body.interest_rate_percentage ?? null,
-      originationDate: body.origination_date ?? null,
-      termMonths: body.term_months ?? null,
-      minimumPaymentAmount: body.minimum_payment_amount ?? null,
-      nextPaymentDueDate: body.next_payment_due_date ?? null,
-      notes: body.notes ?? null,
-      matchText: body.match_text ?? null,
-    });
+    const loan = await dataService.createManualLoan(
+      userId,
+      {
+        name: body.name,
+        loanType: body.loan_type ?? 'personal',
+        currentBalance: body.current_balance,
+        originationPrincipalAmount: body.origination_principal_amount ?? null,
+        interestRatePercentage: body.interest_rate_percentage ?? null,
+        originationDate: body.origination_date ?? null,
+        termMonths: body.term_months ?? null,
+        minimumPaymentAmount: body.minimum_payment_amount ?? null,
+        nextPaymentDueDate: body.next_payment_due_date ?? null,
+        notes: body.notes ?? null,
+        matchText: body.match_text ?? null,
+      },
+      idempotencyKey
+    );
 
-    // Best-effort (wrapped internally) — picks up already-synced payments that predate this
-    // loan's match_text, so response can just await it rather than racing a background call.
+    // Round 5 remediation: NOT best-effort/swallowed — a failure here must be reported as a
+    // failed request. On the idempotent route the client resends the identical request, key
+    // included, and replays the already-created loan above rather than duplicating it.
     await backfillMatchesForLoan(userId, loan);
     const refreshed = (await dataService.getManualLoan(loan.id, userId)) ?? loan;
 
     res.status(201).json({ loan: await enrichLoan(refreshed) });
   } catch (err) {
+    if (err instanceof dataService.ManualLoanCreationKeyResolvedError) {
+      // Round 12: a definitive outcome for this key (it created a loan that was later deleted), so
+      // the client can stop retrying it — see ManualLoanCreationKeyResolvedError.
+      res.status(409).json({ error: err.message, code: 'idempotency_key_loan_deleted' });
+      return;
+    }
     next(err);
   }
+}
+
+/**
+ * POST /api/manual-loans/idempotent — the ONLY create route the current frontend calls.
+ *
+ * Requires a client-supplied Idempotency-Key and never falls back to non-idempotent behaviour: a
+ * missing, blank, or reserved key is a 400, not a silent downgrade — the frontend's whole
+ * duplicate-prevention protocol (Rounds 8–15) depends on its key reaching the database.
+ */
+export async function createManualLoanIdempotent(req: Request, res: Response, next: NextFunction) {
+  const idempotencyKey = req.header('Idempotency-Key');
+  if (!idempotencyKey || idempotencyKey.trim() === '') {
+    res.status(400).json({ error: 'Idempotency-Key header is required' });
+    return;
+  }
+  if (idempotencyKey.startsWith(LEGACY_SERVER_KEY_PREFIX)) {
+    res.status(400).json({ error: 'Idempotency-Key uses a reserved prefix' });
+    return;
+  }
+  await createLoanUnderKey(req, res, next, idempotencyKey);
+}
+
+/**
+ * POST /api/manual-loans — LEGACY route, kept only for frontend bundles that predate the idempotent
+ * route (Round 16 remediation). The PWA precaches the app shell, so those bundles can keep running
+ * for a long time after a deploy; they send no Idempotency-Key and must keep working.
+ *
+ * Explicitly NOT retry-idempotent — the same as it always was for those clients: every request
+ * gets a fresh server-generated key, so a resubmission creates another loan, exactly as before
+ * Phase A. It goes through the same database RPC (ownership, numeric validation, atomicity) so it
+ * is no weaker than before, but it deliberately does not pretend two requests are one. Any
+ * Idempotency-Key header sent here is ignored: this route never enters the new client's
+ * pending-key protocol, and its keys live under LEGACY_SERVER_KEY_PREFIX, which the idempotent
+ * route rejects.
+ *
+ * Remove once no client can still be running a pre-Round-16 bundle (see the rollout plan).
+ */
+export async function createManualLoanLegacy(req: Request, res: Response, next: NextFunction) {
+  await createLoanUnderKey(req, res, next, `${LEGACY_SERVER_KEY_PREFIX}${randomUUID()}`);
 }
 
 export async function updateManualLoan(req: Request, res: Response, next: NextFunction) {
@@ -129,9 +193,37 @@ export async function updateManualLoan(req: Request, res: Response, next: NextFu
 export async function deleteManualLoan(req: Request, res: Response, next: NextFunction) {
   try {
     const { id } = req.params;
-    await dataService.deleteManualLoan(id, req.user!.id);
+    const userId = req.user!.id;
+    const { affectedTransactionIds, alreadyReconciled } = await dataService.deleteManualLoan(id, userId);
+
+    // Round 10 remediation: this used to run ONLY the repair sweep, which looks backwards — it
+    // fixes rows that depended on the deleted loan's transactions in their OLD state. It never ran
+    // FORWARD reconciliation for the reclassified rows themselves, even though reclassifying a row
+    // off a loan is exactly what can make it newly eligible as a transfer counterpart or refund
+    // original (`transfer_like_unconfirmed` / a refund-eligible `sign_default`). Both directions
+    // are needed, in this order, and this is the same pairing reconcileAfterRelationalStateChange
+    // performs for a single-row relational change.
+    //
+    // This block also runs on a REPLAY (a retry of a deletion that already committed but whose
+    // reconciliation then failed) — deliberately, because that is the only way such a failure ever
+    // gets retried. Both halves are idempotent, so re-running them for an already-reconciled
+    // deletion is safe; it is skipped in that case only to avoid pointless work.
+    if (!alreadyReconciled) {
+      if (affectedTransactionIds.length > 0) {
+        await reconcileRelationalRoles(userId, affectedTransactionIds);
+      }
+      await repairExistingRelationalRoles(userId);
+      // Only now is the deletion genuinely complete. If either call above throws, the tombstone
+      // stays unmarked and a retried DELETE replays the same affected ids and tries again.
+      await dataService.markManualLoanDeletionReconciled(id, userId);
+    }
+
     res.status(204).send();
   } catch (err) {
+    if (err instanceof dataService.ManualLoanNotFoundError) {
+      res.status(404).json({ error: 'Manual loan not found' });
+      return;
+    }
     next(err);
   }
 }
@@ -199,7 +291,7 @@ export async function updateLinkedPayment(req: Request, res: Response, next: Nex
       return;
     }
 
-    await dataService.updateLinkedPaymentPrincipal(req.params.transactionId, loan.id, principalPortion);
+    await dataService.updateLinkedPaymentPrincipal(userId, req.params.transactionId, loan.id, principalPortion);
     const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
     res.json({ loan: await enrichLoan(updatedLoan) });
   } catch (err) {
@@ -216,7 +308,11 @@ export async function unlinkPayment(req: Request, res: Response, next: NextFunct
       return;
     }
 
-    await dataService.unlinkPaymentFromLoan(req.params.transactionId, loan.id);
+    await dataService.unlinkPaymentFromLoan(userId, req.params.transactionId, loan.id);
+    // The unlinked transaction is no longer a manual_loan_link row — it may now be, or may have
+    // previously invalidated, a transfer/refund relationship (Round 3 remediation §2/§3).
+    // Bounded, reuses the same fixed windows as ordinary reconciliation — never a global scan.
+    await reconcileAfterRelationalStateChange(userId, req.params.transactionId);
     const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
     res.json({ loan: await enrichLoan(updatedLoan) });
   } catch (err) {
@@ -276,7 +372,7 @@ export async function updateManualPayment(req: Request, res: Response, next: Nex
     if (body.interest_portion !== undefined) fields.interest_portion = body.interest_portion;
     if (body.notes !== undefined) fields.notes = body.notes;
 
-    const payment = await dataService.updateManualLoanPayment(req.params.paymentId, loan.id, fields);
+    const payment = await dataService.updateManualLoanPayment(userId, req.params.paymentId, loan.id, fields);
     if (!payment) {
       res.status(404).json({ error: 'Manual payment not found' });
       return;
@@ -298,7 +394,7 @@ export async function deleteManualPayment(req: Request, res: Response, next: Nex
       return;
     }
 
-    await dataService.deleteManualLoanPayment(req.params.paymentId, loan.id);
+    await dataService.deleteManualLoanPayment(userId, req.params.paymentId, loan.id);
     const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
     res.json({ loan: await enrichLoan(updatedLoan) });
   } catch (err) {

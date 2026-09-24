@@ -12,11 +12,18 @@ const mockUpsertLoans = vi.hoisted(() => vi.fn());
 const mockListManualLoans = vi.hoisted(() => vi.fn());
 const mockLinkTransactionToLoan = vi.hoisted(() => vi.fn());
 const mockGetUnlinkedOutflowTransactionsForUser = vi.hoisted(() => vi.fn());
+const mockGetUnlinkedTransactionsByPlaidIds = vi.hoisted(() => vi.fn());
 vi.mock('./dataService', () => ({
   upsertLoans: mockUpsertLoans,
   listManualLoans: mockListManualLoans,
   linkTransactionToLoan: mockLinkTransactionToLoan,
   getUnlinkedOutflowTransactionsForUser: mockGetUnlinkedOutflowTransactionsForUser,
+  getUnlinkedTransactionsByPlaidIds: mockGetUnlinkedTransactionsByPlaidIds,
+}));
+
+const mockRepairExistingRelationalRoles = vi.hoisted(() => vi.fn());
+vi.mock('./roleReconciliation', () => ({
+  repairExistingRelationalRoles: mockRepairExistingRelationalRoles,
 }));
 
 import {
@@ -242,54 +249,108 @@ describe('linkNewTransactionsToManualLoans', () => {
   beforeEach(() => {
     mockListManualLoans.mockReset();
     mockLinkTransactionToLoan.mockReset();
+    mockLinkTransactionToLoan.mockResolvedValue('linked');
+    mockGetUnlinkedTransactionsByPlaidIds.mockReset();
+    mockGetUnlinkedTransactionsByPlaidIds.mockResolvedValue([]);
+    mockRepairExistingRelationalRoles.mockReset();
+    mockRepairExistingRelationalRoles.mockResolvedValue(undefined);
   });
 
-  it('links matching inserted transactions to the matching loan', async () => {
+  it("re-derives candidates from Plaid's own transaction ids (Round 6 remediation, blocker 5) rather than a caller-supplied insertedTransactions list, then links matches", async () => {
     mockListManualLoans.mockResolvedValue([
       { id: 'loan-1', match_text: 'SoFi' },
       { id: 'loan-2', match_text: null },
     ]);
-    const inserted = [
+    mockGetUnlinkedTransactionsByPlaidIds.mockResolvedValue([
       { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
       { id: 'txn-2', name: 'Coffee Shop', merchant_name: null, amount: 5 },
-    ];
+    ]);
 
-    await linkNewTransactionsToManualLoans('user-1', inserted);
+    await linkNewTransactionsToManualLoans('user-1', ['plaid-txn-1', 'plaid-txn-2']);
 
+    expect(mockGetUnlinkedTransactionsByPlaidIds).toHaveBeenCalledWith('user-1', ['plaid-txn-1', 'plaid-txn-2']);
     expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
-    expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('txn-1', 'loan-1', 250);
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('user-1', 'txn-1', 'loan-1', 250);
   });
 
-  it('does nothing when there are no inserted transactions', async () => {
-    await linkNewTransactionsToManualLoans('user-1', []);
-    expect(mockListManualLoans).not.toHaveBeenCalled();
-  });
-
-  it('does nothing when no loans have a match_text set', async () => {
-    mockListManualLoans.mockResolvedValue([{ id: 'loan-1', match_text: null }]);
-
-    await linkNewTransactionsToManualLoans('user-1', [
+  it('does NOT run its own repair sweep (Round 4 remediation §7 — syncService.ts owns the sweep centrally, gated on Plaid\'s own added/modified/removed counts rather than on whether this call linked anything, which is what makes it retry-safe)', async () => {
+    mockListManualLoans.mockResolvedValue([{ id: 'loan-1', match_text: 'SoFi' }]);
+    mockGetUnlinkedTransactionsByPlaidIds.mockResolvedValue([
       { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
     ]);
 
+    await linkNewTransactionsToManualLoans('user-1', ['plaid-txn-1']);
+
+    expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when there are no plaid transaction ids to consider', async () => {
+    await linkNewTransactionsToManualLoans('user-1', []);
+    expect(mockListManualLoans).not.toHaveBeenCalled();
+    expect(mockGetUnlinkedTransactionsByPlaidIds).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when no loans have a match_text set (never even queries candidates)', async () => {
+    mockListManualLoans.mockResolvedValue([{ id: 'loan-1', match_text: null }]);
+
+    await linkNewTransactionsToManualLoans('user-1', ['plaid-txn-1']);
+
+    expect(mockGetUnlinkedTransactionsByPlaidIds).not.toHaveBeenCalled();
     expect(mockLinkTransactionToLoan).not.toHaveBeenCalled();
   });
 
   it('swallows a failure rather than throwing (best-effort, piggybacking on a sync)', async () => {
     mockListManualLoans.mockRejectedValue(new Error('db down'));
 
-    await expect(
-      linkNewTransactionsToManualLoans('user-1', [
-        { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
-      ])
-    ).resolves.toBeUndefined();
+    await expect(linkNewTransactionsToManualLoans('user-1', ['plaid-txn-1'])).resolves.toBeUndefined();
   });
+
+  it('a retry re-derives candidates fresh, so a transaction still unlinked from a failed attempt is retried, and one already linked is naturally excluded by the query filter', async () => {
+    mockListManualLoans.mockResolvedValue([{ id: 'loan-1', match_text: 'SoFi' }]);
+    // Simulates attempt 2: the row that failed to link in attempt 1 is still unlinked and still
+    // returned by getUnlinkedTransactionsByPlaidIds (a row that DID succeed in attempt 1 would no
+    // longer come back, since the real query filters manual_loan_id IS NULL).
+    mockGetUnlinkedTransactionsByPlaidIds.mockResolvedValue([
+      { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+    ]);
+
+    await linkNewTransactionsToManualLoans('user-1', ['plaid-txn-1']);
+
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('user-1', 'txn-1', 'loan-1', 250);
+  });
+
+  it.each(['already_linked', 'already_linked_different_principal', 'linked_to_other_loan'])(
+    'a candidate an overlapping caller already linked (%s) is logged and skipped, and the remaining candidates still link (post-audit blocker 1)',
+    async (outcome) => {
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      mockListManualLoans.mockResolvedValue([{ id: 'loan-1', match_text: 'SoFi' }]);
+      mockGetUnlinkedTransactionsByPlaidIds.mockResolvedValue([
+        { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+        { id: 'txn-2', name: 'SoFi Payment', merchant_name: null, amount: 300 },
+      ]);
+      mockLinkTransactionToLoan.mockResolvedValueOnce(outcome);
+
+      await linkNewTransactionsToManualLoans('user-1', ['plaid-txn-1', 'plaid-txn-2']);
+
+      expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(2);
+      expect(mockLinkTransactionToLoan).toHaveBeenLastCalledWith('user-1', 'txn-2', 'loan-1', 300);
+      expect(info).toHaveBeenCalledWith(`Skipped linking transaction txn-1 to manual loan loan-1: ${outcome}`);
+      expect(error).not.toHaveBeenCalled();
+      info.mockRestore();
+      error.mockRestore();
+    }
+  );
 });
 
 describe('backfillMatchesForLoan', () => {
   beforeEach(() => {
     mockGetUnlinkedOutflowTransactionsForUser.mockReset();
     mockLinkTransactionToLoan.mockReset();
+    mockLinkTransactionToLoan.mockResolvedValue('linked');
+    mockRepairExistingRelationalRoles.mockReset();
+    mockRepairExistingRelationalRoles.mockResolvedValue(undefined);
+    mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([]);
   });
 
   it('links unlinked transactions matching the loan match_text', async () => {
@@ -301,19 +362,72 @@ describe('backfillMatchesForLoan', () => {
     await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' });
 
     expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
-    expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('txn-1', 'loan-1', 250);
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledWith('user-1', 'txn-1', 'loan-1', 250);
   });
+
+  it('runs the repair sweep once matching completes (Round 3 remediation §2/§3 — a payment that was previously relational, e.g. an ordinary expense some refund had matched against, can be invalidated by this link)', async () => {
+    mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([
+      { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+    ]);
+
+    await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' });
+
+    expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+  });
+
+  it('runs the repair sweep UNCONDITIONALLY, even when nothing new was linked this call (Round 4 remediation §7 — a retry after a prior successful link whose repair failed must still repair the already-linked row, which by then is no longer an "unlinked" candidate)', async () => {
+    mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([]); // nothing to link this time
+
+    await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' });
+
+    expect(mockLinkTransactionToLoan).not.toHaveBeenCalled();
+    expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+  });
+
+  it('propagates (does NOT swallow) a single failed link — this is a direct, synchronous user action, and the whole operation must be reported incomplete rather than silently missing a payment (Round 5 remediation, blocker 5)', async () => {
+    mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([
+      { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+      { id: 'txn-2', name: 'SoFi Payment', merchant_name: null, amount: 300 },
+    ]);
+    mockLinkTransactionToLoan.mockRejectedValueOnce(new Error('link failed'));
+
+    await expect(backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' })).rejects.toThrow('link failed');
+
+    // The second candidate is never attempted, and the sweep never runs — the caller sees a
+    // clean failure and can retry the whole operation.
+    expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(1);
+    expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
+  });
+
+  it.each(['already_linked', 'already_linked_different_principal', 'linked_to_other_loan'])(
+    'a stale candidate (%s) is not a failure: the backfill skips it, links the rest and still runs the sweep (post-audit blocker 1)',
+    async (outcome) => {
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([
+        { id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 },
+        { id: 'txn-2', name: 'SoFi Payment', merchant_name: null, amount: 300 },
+      ]);
+      mockLinkTransactionToLoan.mockResolvedValueOnce(outcome);
+
+      await expect(backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' })).resolves.toBeUndefined();
+
+      expect(mockLinkTransactionToLoan).toHaveBeenCalledTimes(2);
+      expect(info).toHaveBeenCalledWith(`Skipped linking transaction txn-1 to manual loan loan-1: ${outcome}`);
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+      info.mockRestore();
+    }
+  );
 
   it('does nothing when the loan has no match_text', async () => {
     await backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: null });
     expect(mockGetUnlinkedOutflowTransactionsForUser).not.toHaveBeenCalled();
+    expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
   });
 
-  it('swallows a failure rather than throwing', async () => {
-    mockGetUnlinkedOutflowTransactionsForUser.mockRejectedValue(new Error('db down'));
+  it('propagates (does NOT swallow) a repair-sweep failure — Round 4 remediation §7: the caller must see this as an incomplete operation, not a silent success', async () => {
+    mockGetUnlinkedOutflowTransactionsForUser.mockResolvedValue([]);
+    mockRepairExistingRelationalRoles.mockRejectedValue(new Error('sweep failed'));
 
-    await expect(
-      backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' })
-    ).resolves.toBeUndefined();
+    await expect(backfillMatchesForLoan('user-1', { id: 'loan-1', match_text: 'SoFi' })).rejects.toThrow('sweep failed');
   });
 });

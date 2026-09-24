@@ -8,14 +8,26 @@ import {
 import { plaidClient } from '../config/plaid';
 import { env } from '../config/env';
 
-export { isReauthRequiredError } from './plaidErrors';
+export { isDefinitivePlaidRejection, isReauthRequiredError } from './plaidErrors';
 
 const products = env.plaidProducts.map((p) => p as Products);
 const countryCodes = env.plaidCountryCodes.map((c) => c as CountryCode);
 
 const webhookUrl = env.backendPublicUrl ? `${env.backendPublicUrl}/api/webhooks/plaid` : undefined;
 
-export async function createLinkToken(userId: string): Promise<string> {
+/** Seconds a Hosted Link URL stays usable — the same 30 minutes as the plaid_link_attempts row
+ *  that owns it (see 20260922130000_plaid_link_attempts.sql). */
+export const HOSTED_LINK_LIFETIME_SECONDS = 30 * 60;
+
+/**
+ * Wave 1: creates a Plaid HOSTED Link token. The user completes Link on Plaid's own page
+ * (`hostedLinkUrl`); the public token it produces is retrieved later by the backend itself, with
+ * this link token, via getLinkTokenSessions — it never passes through the browser. The link token
+ * must be stored server-side only and never returned to a client or logged.
+ */
+export async function createHostedLinkToken(
+  userId: string
+): Promise<{ linkToken: string; hostedLinkUrl: string }> {
   const response = await plaidClient.linkTokenCreate({
     user: { client_user_id: userId },
     client_name: 'My Finances',
@@ -23,17 +35,46 @@ export async function createLinkToken(userId: string): Promise<string> {
     country_codes: countryCodes,
     language: 'en',
     webhook: webhookUrl,
+    hosted_link: {
+      completion_redirect_uri: env.plaidHostedLinkCompletionRedirectUri,
+      url_lifetime_seconds: HOSTED_LINK_LIFETIME_SECONDS,
+    },
   });
 
-  return response.data.link_token;
+  const { link_token: linkToken, hosted_link_url: hostedLinkUrl } = response.data;
+  if (!hostedLinkUrl) {
+    // Fail closed: without a Hosted Link URL the only way to finish would be embedded Link, which
+    // hands the public token to the browser.
+    throw new Error('Plaid did not return a Hosted Link URL');
+  }
+  return { linkToken, hostedLinkUrl };
 }
 
+/** The Link sessions Plaid recorded for `linkToken` (/link/token/get), including their public
+ *  tokens. Only ever called with a link token read from this backend's own storage. */
+export async function getLinkTokenSessions(linkToken: string) {
+  const response = await plaidClient.linkTokenGet({ link_token: linkToken });
+  return response.data.link_sessions ?? [];
+}
+
+/** Bounds how long one exchange (or compensating removal) may keep the completion request waiting.
+ *  Hitting it does NOT mean Plaid did nothing — the outcome is then unknown (isDefinitivePlaidRejection
+ *  is false) and the attempt is recorded as exchange_unknown, never retried. Must stay well under the
+ *  two-minute staleness window in 20260922130000_plaid_link_attempts.sql. */
+export const PLAID_EXCHANGE_TIMEOUT_MS = 30_000;
+
 export async function exchangePublicToken(publicToken: string) {
-  const response = await plaidClient.itemPublicTokenExchange({ public_token: publicToken });
+  const response = await plaidClient.itemPublicTokenExchange({ public_token: publicToken }, { timeout: PLAID_EXCHANGE_TIMEOUT_MS });
   return {
     accessToken: response.data.access_token,
     itemId: response.data.item_id,
   };
+}
+
+/** Wave 1 compensation: removes an Item whose access token this backend received but could not
+ *  store. Resolves only when Plaid confirmed the removal; any error means its result is unknown. */
+export async function removeItem(accessToken: string): Promise<void> {
+  await plaidClient.itemRemove({ access_token: accessToken }, { timeout: PLAID_EXCHANGE_TIMEOUT_MS });
 }
 
 /** Confirms `accessToken` is still a live, Plaid-accepted credential by calling **only**

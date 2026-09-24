@@ -14,7 +14,7 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm install
@@ -24,6 +24,14 @@ jobs:
 
       - name: Backend tests
         run: npm run test --workspace backend
+        env:
+          # Safe placeholders: tests must never depend on production credentials, but modules
+          # that exercise the real application graph validate required configuration on import.
+          FRONTEND_URL: http://localhost:5173
+          SUPABASE_URL: https://example.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: test-service-role-key
+          PLAID_CLIENT_ID: test-client-id
+          PLAID_SECRET: test-secret
 
       - name: Backend build
         run: npm run build --workspace backend
@@ -36,3 +44,58 @@ jobs:
 
       - name: Frontend build
         run: npm run build --workspace frontend
+
+  migration-replay:
+    # The tracked migration history must rebuild through the supported Supabase workflow (post-audit
+    # blocker 3): the pipeline emulator plus the real, pinned CLI's `db push` and `db reset`, each
+    # against throwaway local databases only. See supabase/tests/replay/run.sh.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The harness reads the Phase A file as production applied it from an earlier commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # Pinned by commit (v3.0.0); CLI version pinned to the one used for the production rollout.
+      - uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
+        with:
+          version: 2.117.0
+
+      - name: Replay every migration (emulator, CLI db push, CLI db reset)
+        run: bash supabase/tests/replay/run.sh
+        env:
+          SUPABASE_CLI: supabase
+
+  database-harness:
+    # The adversarial PostgreSQL suites behind the manual-loan and Plaid-link database code: Phase A
+    # (scaffold and history modes, which include the post-audit t07/t08, c07/c08 and g06/g07 tests)
+    # and access_control. Throwaway local containers only. Each suite runs even if an earlier one
+    # failed, so one run reports all three.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # Phase A's classifier tests call the real backend build.
+      - run: npm install
+
+      - name: Phase A (scaffold)
+        run: bash supabase/tests/phase_a/run.sh
+
+      - name: Phase A (history)
+        if: ${{ !cancelled() }}
+        run: bash supabase/tests/phase_a/run.sh
+        env:
+          PHASE_A_BASE: history
+
+      - name: access_control
+        if: ${{ !cancelled() }}
+        run: bash supabase/tests/access_control/run.sh

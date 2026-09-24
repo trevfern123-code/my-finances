@@ -1,15 +1,5 @@
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import morgan from 'morgan';
 import { env } from './config/env';
-import { plaidRouter } from './routes/plaid';
-import { budgetCategoriesRouter } from './routes/budgetCategories';
-import { categoryMappingsRouter } from './routes/categoryMappings';
-import { manualLoansRouter } from './routes/manualLoans';
-import { userPreferencesRouter } from './routes/userPreferences';
-import { webhooksRouter } from './routes/webhooks';
-import { errorHandler } from './middleware/errorHandler';
+import { createApp } from './app';
 import { validateKeyRingOrExit } from './services/tokenEncryption';
 import { summarizeErrorSafely } from './services/errorSanitizer';
 
@@ -33,43 +23,7 @@ process.on('uncaughtException', (err) => {
 // than re-reading the environment.
 validateKeyRingOrExit();
 
-const app = express();
-
-app.use(helmet());
-app.use(
-  cors({
-    origin: env.frontendUrl,
-    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
-app.use(
-  express.json({
-    // Plaid webhook signatures are computed over the exact raw request bytes — capture them
-    // alongside normal JSON parsing rather than re-reading the (already-consumed) stream later.
-    verify: (req, _res, buf) => {
-      (req as express.Request).rawBody = buf;
-    },
-  })
-);
-app.use(morgan('dev'));
-
-app.get('/', (_req, res) => {
-  res.json({ status: 'ok' });
-});
-
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
-});
-
-app.use('/api/plaid', plaidRouter);
-app.use('/api/budget-categories', budgetCategoriesRouter);
-app.use('/api/category-mappings', categoryMappingsRouter);
-app.use('/api/manual-loans', manualLoansRouter);
-app.use('/api/user-preferences', userPreferencesRouter);
-app.use('/api/webhooks', webhooksRouter);
-
-app.use(errorHandler);
+const app = createApp({ frontendUrl: env.frontendUrl });
 
 // Binding explicitly to 0.0.0.0 (rather than the implicit default) is required in some
 // container networking setups — Railway's healthcheck couldn't reach the app without it.

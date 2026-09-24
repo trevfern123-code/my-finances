@@ -35,6 +35,89 @@ happened yet. Once linked, new schema changes go through `supabase migration new
 reviewed, and get applied with `supabase db push` (or still by hand in the SQL editor for a
 one-off change) — either way, the SQL lives in the repo afterward instead of only in chat history.
 
+**Replaying the history (fresh environment / disaster recovery).** The whole `supabase/migrations/`
+history rebuilds through the supported Supabase CLI: `supabase db reset` locally, or
+`supabase db push --db-url <new database>`. The CLI sends each migration file as ONE extended-protocol
+pipeline: a single implicit transaction, but not a PostgreSQL "transaction block". So a migration
+must never use a top-level `SET LOCAL` (silently ignored) or `LOCK TABLE` (rejected). Put them
+inside a `DO` block instead, as the Phase A migration now does.
+
+- **Phase A fix:** `20260912120000_transaction_semantic_roles.sql` originally began with exactly those
+  two statements. During the 2026-09 rollout the CLI failed there, and production was applied manually
+  in one explicit transaction, then recorded in the migration ledger. The file was corrected in place
+  (same version, originals quoted in its header).
+- **Production is unaffected:** its ledger already records that version, and the CLI selects
+  migrations by version only.
+- **Proof:** `bash supabase/tests/replay/run.sh` checks the replay and the resulting schema; with
+  `SUPABASE_CLI="npx -y supabase@2.117.0"` it also runs the real CLI. CI runs both tiers, in the
+  `migration-replay` job.
+- **Pending on production:** `PRODUCTION_HEAD` in `supabase/tests/replay/run.sh` (default
+  `20260922130000`) names the newest version production has applied. R5/C3 rehearse the production
+  push: every earlier ledger row stays byte-for-byte unchanged, and exactly the later files apply.
+  Advance it after each production rollout.
+- **`20260924120000_manual_loan_link_idempotency.sql`** (post-audit blocker 1) makes
+  `link_transaction_to_manual_loan` return an explicit outcome instead of linking, and decrementing,
+  a transaction twice. Apply it **before** deploying the backend that reads the outcome: that backend
+  rejects the old `void` result. The backend on `main` never calls the function, so applying it
+  early is safe.
+- **`20260924130000_manual_loan_applied_balance_delta.sql`** (post-audit blocker 2) records what each
+  loan payment actually took off a manual loan's balance: `transactions.loan_balance_applied` and
+  `manual_loan_payments.balance_applied`. A balance is still never driven below zero. Unlink, edit,
+  delete and Plaid removal now restore exactly that amount, not the full principal. Example: a $100
+  payment linked to a $50 balance used to leave $100 behind when unlinked.
+  - **No row may lack its amount.** An existing link or payment never recorded what it applied, and
+    that can't be reconstructed. So the migration **refuses to run** while any linked transaction
+    or manual payment exists; nothing changes and no ledger row is written.
+  - **Guards:** `balance_applied` is `NOT NULL`, and a linked transaction must carry
+    `loan_balance_applied`. The backend on `main` writes links and payments directly without them,
+    so those writes now fail. They fail before its balance update runs, because that backend writes
+    the row first.
+  - **Fail closed:** if a missing amount were ever read anyway, every reversal raises
+    `manual-loan reconciliation required` and writes nothing. It never falls back to the full
+    principal.
+
+Caveats:
+- **Never run `supabase migration fetch` without reviewing the diff.** It rewrites local migration
+  files from the statements stored in the remote ledger, which would restore the original,
+  unreplayable Phase A file. Likewise, never `supabase migration repair` version `20260912120000`.
+- **This checkout is linked to the production project** (`supabase/.temp`). A bare `supabase db push`
+  targets production. Test pushes always need an explicit local `--db-url`, as the replay harness uses.
+
+### Releasing the post-audit migrations
+
+This is the planned release of `20260924120000` and `20260924130000` with the backend and frontend
+that need them. Nothing here has been run yet. Merging to `main` **is** the deploy, because Railway
+and Vercel both auto-deploy from it. So the database changes go first, while the backend is stopped.
+Read-only SQL for steps 3 and 6: `supabase/preflight/20260924130000_applied_delta_preflight.sql`.
+
+1. **Codex re-review passes, and CI is green.**
+2. **Plaid Dashboard allows the completion redirect URI** (see "Wave 1 follow-ups" below).
+3. **Production preflight** (PREFLIGHT 1). Expect `ledger_head = 20260922130000`,
+   `pending_post_audit = 0`, and zero linked transactions, manual payments and cross-user rows.
+   Otherwise **stop**: the release needs a reconciliation decision first. Never delete or edit rows
+   to make the preflight pass.
+4. **Stop the backend for the deployment window** by removing Railway's active deployment
+   (dashboard, or `railway down`). Don't use the app or start Plaid Link until step 8.
+   - This keeps the old backend from writing anything between the migrations and the new deploy,
+     including webhook-triggered syncs. It also keeps old and new instances from overlapping.
+   - Plaid webhooks missed meanwhile are harmless: the next sync catches up from Plaid's cursor.
+5. **`supabase db push`** from this linked checkout. It applies `20260924120000`, then
+   `20260924130000`, each as one transaction.
+   - If `20260924130000` refuses, it has changed nothing. `20260924120000` alone is harmless to the
+     old backend, which never calls that function. Redeploy the previous deployment and reassess.
+6. **Production postflight** (POSTFLIGHT). Expect:
+   - both new versions in the ledger;
+   - `link_returns = text` and `guards_validated = 3`;
+   - `balance_applied_not_null = true`;
+   - zero NULL deltas and zero insecure functions.
+7. **Merge the PR.** Railway and Vercel deploy the new backend and frontend.
+8. **Health check:** `/health` responds. Controlled manual-loan smoke test on a scratch loan: log a
+   manual payment larger than the balance, then delete it. The balance must return exactly to its
+   previous value.
+9. **Controlled Plaid Sandbox test** of Hosted Link.
+10. **Advance `PRODUCTION_HEAD`** in `supabase/tests/replay/run.sh` to `20260924130000`, in a
+    follow-up commit.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push/PR to `main`: backend typecheck, backend tests,
@@ -561,10 +644,107 @@ extracted, since which props each card needs only exists as live app state in `A
 ## Flow
 
 1. User signs in via Supabase Auth in the frontend.
-2. Frontend calls `POST /api/plaid/link-token` (with the user's Supabase JWT) to get a Plaid `link_token`.
-3. Frontend opens Plaid Link with that token; on success Plaid returns a `public_token`.
-4. Frontend calls `POST /api/plaid/exchange-public-token` with the `public_token`. The backend exchanges it for an access token, fetches accounts from Plaid, and stores everything in Supabase (`plaid_items`, `accounts`) — the access token never leaves the backend.
+2. When the user clicks **Link a bank account**, the frontend opens a new tab and calls `POST /api/plaid/link-token` (with the user's Supabase JWT). The backend creates a Plaid **Hosted Link** token (`hosted_link` with a 30-minute `url_lifetime_seconds` and `completion_redirect_uri` = `${FRONTEND_URL}/plaid-link-complete.html`). It stores that link token server-side, encrypted under the Plaid token key ring and bound to the attempt, in a one-time, 30-minute **Link attempt**. The attempt is tied to the verified user *and* their login session (the JWT's `session_id` claim; table `plaid_link_attempts`, service-role only). The response is only `hosted_link_url`, `link_attempt_id` and `expires_at`; the link token never leaves the backend.
+3. The new tab goes to the Hosted Link URL and the user links their bank on Plaid's own page. When it ends, Plaid sends that tab to `plaid-link-complete.html`, which tells the app tab to check now and tries to close itself.
+4. The app tab calls `POST /api/plaid/link-attempts/:link_attempt_id/complete` (every 4 s, on returning to the tab, and when the completion page signals). Only the attempt's own user in its own login session gets anything; anyone else gets 409 `link_attempt_invalid`. The backend reads its stored link token and asks Plaid (`/link/token/get`) for that token's own session result:
+   - Still in progress: 202 `pending`.
+   - Exited: 409 `link_attempt_exited`. More than one result: 409 `link_attempt_ambiguous`. Expired: 410 `link_attempt_expired`.
+   - Exactly one public token: the attempt is atomically **claimed** (with a claim token), then durably marked **exchanging**, and only then exchanged — once. The new item and its encrypted access token are stored **immediately**, in the same database transaction that marks the attempt **completed** (`store_plaid_link_item`), before any other Plaid call. A duplicate or concurrent call gets 202 `completing`; a replay gets 409 `link_attempt_already_completed`.
+   - After that the bank is linked. Institution, accounts, initial sync, the net-worth snapshot and liabilities are follow-ups: if any fails, the response still says `completed` and lists it in `follow_up_incomplete`. **Refresh balances** retries accounts, institution, snapshot and liabilities; **Sync transactions** (or the webhook) retries the sync.
+   - Failures: a Plaid-rejected exchange ends `failed`. An exchange whose outcome is unknown (network error, 30 s timeout, 5xx) ends `exchange_unknown`, 409 `link_attempt_outcome_unknown` — never re-exchanged, since Plaid does not document that as safe. The user is told the outcome could not be confirmed and asked **not to link that bank again yet but to contact support**: Plaid may already have created the Item, so relinking before it is checked could duplicate it (and its billing). If the item cannot be stored and the database definitively stored nothing, the item is removed at Plaid (`/item/remove`): `failed` if Plaid confirms the removal, `exchange_unknown` if not. If whether it was stored is itself unknown, nothing is removed.
+   - Recovery (two minutes): an abandoned claim whose exchange never began is safely re-claimed. An abandoned `exchanging` attempt becomes `exchange_unknown`.
+   - Limit: at most five live attempts per user, counting pending, claimed and exchanging ones. Only pending ones are removed to make room; with five being completed, creation answers 429.
+
+   No endpoint accepts a public token from a client: the retired `POST /api/plaid/exchange-public-token` always answers 410 `exchange_retired`. A verified `SESSION_FINISHED` webhook only records readiness; it never exchanges. The access token never leaves the backend.
 5. Frontend calls `GET /api/plaid/items` to display the user's linked institutions/accounts.
+
+**Every mutation is bound to the session that started it.** Each frontend change request (every
+`lib/api.ts` export that sends POST/PATCH/PUT/DELETE) takes a required owner check, captured when
+the user's action starts (`lib/sessionOwnership.ts`, `App.tsx`'s `captureOwnership`): the same
+user *and* the same Supabase login (`session_id`), still current. `authedFetch` refuses to send a
+mutation without one, and refuses — sending nothing — if a sign-out/sign-in (as anyone, including
+the same user again) happened while the action waited. Multi-step flows (Plaid Link, reconnect)
+also stop between steps, and `PlaidLink` is keyed by login so a sign-in change abandons a pending
+Hosted Link attempt. `lib/sessionOwnership.test.ts` exercises every mutation export this way.
+
+**No direct client access to `plaid_items`.** The browser's Supabase client is used for Auth only.
+`supabase/migrations/20260922120000_restrict_plaid_items_client_access.sql` revokes every
+anon/authenticated privilege on `plaid_items` (table and column level) and drops the old
+owner-select policy, which had let a signed-in user read their own stored Plaid credentials
+straight from Supabase's REST API. The backend's service-role access is unchanged. Proof:
+`bash supabase/tests/access_control/run.sh` (Docker; applies the real migration history to
+Supabase's PostgreSQL 17 image and queries as `anon`/`authenticated`/`service_role` exactly as
+PostgREST would; `EXCLUDE=<migration file>` shows the tests failing without it).
+
+## Wave 1 follow-ups
+
+**P1 — public-token binding: resolved with Plaid Hosted Link.** A Link attempt on its own only proved
+the caller had recently started *a* Link flow. With embedded Link the browser held the public token,
+so user B could exchange a public token captured from user A using B's own fresh attempt.
+(Embedded Link offers no default server-side way to tie a public token to its link token.
+`/link/token/get` returns full session results by default only for Hosted Link.)
+
+Now the backend creates and keeps the Hosted Link token and gets the public token from Plaid itself
+for that exact token. No endpoint accepts a public token from a client, so the attack has nowhere to
+be submitted. The attack is an active test in `backend/src/controllers/plaidController.test.ts`.
+
+**Manual configuration required before deploying (not done by this repository):**
+- **Plaid Dashboard:** allow the completion redirect URI
+  `https://my-finances-frontend-kappa.vercel.app/plaid-link-complete.html`, or whatever
+  `${FRONTEND_URL}/plaid-link-complete.html` (or `PLAID_HOSTED_LINK_COMPLETION_REDIRECT_URI`, if set)
+  resolves to. For local Sandbox testing, also `http://localhost:5173/plaid-link-complete.html`, if
+  the Dashboard accepts it.
+- **Supabase:** apply `20260922120000_restrict_plaid_items_client_access.sql`, then
+  `20260922130000_plaid_link_attempts.sql`, *before* deploying the backend.
+- **Railway:** no new required variables. `FRONTEND_URL` must be the exact frontend origin (it now
+  also forms the redirect URI). `BACKEND_PUBLIC_URL` should stay set so `SESSION_FINISHED` webhooks
+  arrive; they are optional, since completion always asks Plaid directly.
+
+**Residual, unavoidable with Plaid's API: orphaned Items — `exchange_unknown` requires investigation before relinking.** An attempt that ends `exchange_unknown`
+may have left an Item at Plaid whose access token this app never stored (the exchange succeeded but
+the answer was lost, or it could not be stored and its removal was not confirmed). Without that
+access token nothing can call `/item/remove` for it. Plaid documents neither exchange replay nor
+`/item/remove` idempotency, and has no API to list Items per `client_user_id`. Such an Item may keep
+subscription billing (Transactions, Liabilities) running until Plaid support removes it. Monitor it with
+`select failure_reason, count(*) from plaid_link_attempts where status = 'exchange_unknown' group by 1;`
+before rows are swept, an hour after expiry.
+
+When a user reports this message, before they link that bank again:
+1. Note when it happened: `select id, created_at, failure_reason from plaid_link_attempts where user_id = '<user>' and status = 'exchange_unknown';`. The row is swept about 90 minutes after it was created, so run this promptly; otherwise use the time the user reports.
+2. Using the Plaid Dashboard's logs, or Plaid support, check for an Item created around then for that institution. The Link token was created with `client_user_id` = the user's id.
+3. If such an Item exists, ask Plaid support to remove it (this app holds no access token for it). Only then tell the user it is safe to link again.
+
+**Post-audit follow-ups (deferred from the release-audit remediation, in priority order):**
+1. **Highest priority — define manual-loan balance-as-of semantics and historical transaction
+   linking.** Today a new loan's match rule links every earlier unlinked matching payment and
+   decrements the balance the user just entered, which may already reflect those payments. Decide and
+   document:
+   - what `current_balance` means ("as of" when?);
+   - loan creation;
+   - manual balance edits;
+   - banks linked after the loan was created;
+   - delayed or pending Plaid transactions;
+   - unlink behaviour after a balance edit;
+   - reconciliation and reporting for existing loans;
+   - the user-facing wording.
+
+   Blocker 2's recorded deltas make every operation exactly reversible, but they do not settle
+   which payments should be applied in the first place.
+2. **High priority — retain `exchange_unknown` link attempts for 30 days.** They are currently swept
+   about 90 minutes after creation, which leaves little time to investigate a possible orphaned
+   Item (see above).
+
+**Other follow-ups (deliberately out of scope for the Wave 1 corrective pass):**
+- Reconnect button stays stuck on "Reconnecting..." if Plaid Update Mode is closed without
+  finishing (`frontend/src/components/ReconnectButton.tsx`, pre-existing). Update Mode stays embedded
+  Link: it produces no public token.
+- Supabase's default privileges still grant every new `public` table/function to
+  `anon`/`authenticated` (`20260825195130_remote_schema.sql`), so each new object must revoke
+  explicitly. Changing the defaults is a separate, project-wide migration.
+- `supabase/tests/phase_a/sql/t05_acl.sql` checks service_role's exact grants on
+  `manual_loan_creation_requests`/`manual_loan_deletions` via `information_schema`, which does not
+  report PostgreSQL 17's `MAINTAIN`. It should also use `has_table_privilege`, as the Wave 1 tests
+  now do.
 
 ## Budget periods
 
@@ -602,7 +782,7 @@ create policy "Users can only see their own net_worth_snapshots"
   using (auth.uid() = user_id);
 ```
 
-One row per `(user_id, date)`, upserted (`services/dataService.ts`'s `upsertNetWorthSnapshot`, `onConflict: 'user_id,date'`) whenever balances are actually refreshed from Plaid — initial link (`exchangePublicToken`) and manual "Refresh balances" (`refreshAccounts`) — since that's the only time `accounts.current_balance` changes. There's no scheduled/cron snapshot yet, so a user who never clicks refresh won't accumulate history; that's a reasonable follow-up if daily granularity independent of user activity turns out to matter.
+One row per `(user_id, date)`, upserted (`services/dataService.ts`'s `upsertNetWorthSnapshot`, `onConflict: 'user_id,date'`) whenever balances are actually refreshed from Plaid — initial link (`completeLinkAttempt`) and manual "Refresh balances" (`refreshAccounts`) — since that's the only time `accounts.current_balance` changes. There's no scheduled/cron snapshot yet, so a user who never clicks refresh won't accumulate history; that's a reasonable follow-up if daily granularity independent of user activity turns out to matter.
 
 The asset/liability split (`services/netWorth.ts`'s `aggregateAssetsAndLiabilities`) is the same logic `getSpendingSummary` already used — extracted into its own pure, tested module and reused by both, rather than duplicated.
 

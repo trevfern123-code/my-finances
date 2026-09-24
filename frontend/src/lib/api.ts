@@ -1,8 +1,15 @@
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from './supabaseClient';
 import type { ReportingRangeId } from './reportingRange';
+import type { OwnershipCheck } from './sessionOwnership';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
+/** `code` on the error authedFetch throws for a mutation sent without an owner check. */
+export const SESSION_OWNER_REQUIRED = 'session_owner_required';
+/** `code` on the error authedFetch throws when the session no longer matches the operation's owner —
+ *  nothing was sent. */
+export const SESSION_OWNER_MISMATCH = 'session_owner_mismatch';
 
 // Local clock drift can put a freshly-minted session token's issued-at a few seconds ahead of
 // Supabase's own server clock, which it rejects. We don't control that validation (it happens
@@ -23,16 +30,26 @@ function isClockSkewError(message: string): boolean {
  * happens to be current by the time an async session lookup (or its retry, after a real delay)
  * finally resolves — checking ownership once before calling authedFetch is not enough, because the
  * session this function looks up is whatever is current at the moment it actually looks, which can
- * change during either await above. Most callers don't need this at all (only Navigation
- * persistence currently does — see lib/api.ts's updateNavLayout) and simply omit it, leaving every
- * other existing call's behavior completely unchanged.
+ * change during either await above.
+ *
+ * Wave 1: REQUIRED for every mutation (any method other than GET/HEAD) — each exported mutation
+ * below takes one, and this refuses to send a mutation without it. Reads may omit it: a read sent
+ * under a newer session returns that session's own data, which each caller already discards if its
+ * lifecycle has moved on (see App.tsx's session checks).
  */
 async function authedFetch(
   path: string,
   init: RequestInit = {},
   isRetry = false,
-  verifyOwnership?: (session: Session) => boolean
+  verifyOwnership?: OwnershipCheck
 ): Promise<any> {
+  const method = (init.method ?? 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD' && !verifyOwnership) {
+    throw Object.assign(new Error('Refusing to send a change without a signed-in owner'), {
+      code: SESSION_OWNER_REQUIRED,
+    });
+  }
+
   const {
     data: { session },
   } = await supabase.auth.getSession();
@@ -43,7 +60,9 @@ async function authedFetch(
   if (verifyOwnership && !verifyOwnership(session)) {
     // The session just looked up no longer belongs to whoever this specific request was created
     // for. Refuse rather than send it anyway under whatever happens to be current now.
-    throw new Error('Session no longer matches the expected authenticated owner');
+    throw Object.assign(new Error('Session no longer matches the expected authenticated owner'), {
+      code: SESSION_OWNER_MISMATCH,
+    });
   }
 
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -67,7 +86,9 @@ async function authedFetch(
       return authedFetch(path, init, true, verifyOwnership);
     }
 
-    throw new Error(message);
+    // A machine-readable `code`, when the server sends one, lets a caller act on a specific outcome
+    // without parsing the human-readable message (see isManualLoanCreationResolvedError).
+    throw Object.assign(new Error(message), typeof body.code === 'string' ? { code: body.code } : {});
   }
 
   if (response.status === 204) return undefined;
@@ -156,33 +177,58 @@ export interface BudgetCategory {
   recent_avg_spent: number;
 }
 
-export function createLinkToken(): Promise<{ link_token: string }> {
-  return authedFetch('/api/plaid/link-token', { method: 'POST' });
+/** A server-owned Plaid Hosted Link attempt (Wave 1). The Plaid link token stays on the server; this
+ *  app only opens `hosted_link_url` and later asks the server to complete `link_attempt_id`. */
+export interface HostedLinkAttempt {
+  hosted_link_url: string;
+  link_attempt_id: string;
+  expires_at: string;
 }
 
-export function exchangePublicToken(publicToken: string) {
-  return authedFetch('/api/plaid/exchange-public-token', {
-    method: 'POST',
-    body: JSON.stringify({ public_token: publicToken }),
-  });
+/** Starts a one-time, 30-minute Hosted Link attempt bound to this user and login session. */
+export function createHostedLinkAttempt(verifyOwnership: OwnershipCheck): Promise<HostedLinkAttempt> {
+  return authedFetch('/api/plaid/link-token', { method: 'POST' }, false, verifyOwnership);
+}
+
+/**
+ * Asks the server to finish the attempt: it reads Plaid's result for its OWN stored link token and,
+ * the first time Hosted Link has succeeded, exchanges and stores the item. 'pending'/'completing'
+ * mean "ask again shortly". Every refusal is a thrown error carrying the server's `code` (e.g.
+ * link_attempt_expired, link_attempt_exited, link_attempt_invalid, link_attempt_already_completed).
+ * No Plaid token is ever sent or received — this app has no way to submit a public token at all.
+ * On 'completed', `follow_up_incomplete` lists linking steps that did not finish (institution,
+ * accounts, transactions, net_worth_snapshot, liabilities): the bank IS linked, and Refresh balances
+ * / Sync transactions retry them.
+ */
+export function completeLinkAttempt(
+  linkAttemptId: string,
+  verifyOwnership: OwnershipCheck
+): Promise<{ status: 'pending' | 'completing' } | { status: 'completed'; follow_up_incomplete?: string[] }> {
+  return authedFetch(
+    `/api/plaid/link-attempts/${encodeURIComponent(linkAttemptId)}/complete`,
+    { method: 'POST' },
+    false,
+    verifyOwnership
+  );
 }
 
 export function getLinkedItems(): Promise<{ items: LinkedItem[]; is_sandbox: boolean }> {
   return authedFetch('/api/plaid/items');
 }
 
-export function refreshAccountBalances(): Promise<{ items: LinkedItem[]; is_sandbox: boolean }> {
-  return authedFetch('/api/plaid/accounts/refresh', { method: 'POST' });
+export function refreshAccountBalances(verifyOwnership: OwnershipCheck): Promise<{ items: LinkedItem[]; is_sandbox: boolean }> {
+  return authedFetch('/api/plaid/accounts/refresh', { method: 'POST' }, false, verifyOwnership);
 }
 
 export function updateAccountCreditLimit(
   accountId: string,
-  creditLimit: number | null
+  creditLimit: number | null,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ account: LinkedAccount }> {
   return authedFetch(`/api/plaid/accounts/${accountId}/credit-limit`, {
     method: 'PATCH',
     body: JSON.stringify({ credit_limit: creditLimit }),
-  });
+  }, false, verifyOwnership);
 }
 
 export function updateAccountCustomization(
@@ -195,12 +241,13 @@ export function updateAccountCustomization(
     hidden: boolean;
     exclude_from_net_worth: boolean;
     exclude_from_cash_flow: boolean;
-  }>
+  }>,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ account: LinkedAccount }> {
   return authedFetch(`/api/plaid/accounts/${accountId}/customization`, {
     method: 'PATCH',
     body: JSON.stringify(fields),
-  });
+  }, false, verifyOwnership);
 }
 
 export interface SpendingSummary {
@@ -337,19 +384,60 @@ export function getManualLoans(): Promise<{ loans: ManualLoan[] }> {
   return authedFetch('/api/manual-loans');
 }
 
-export function createManualLoan(input: ManualLoanInput): Promise<{ loan: ManualLoan }> {
-  return authedFetch('/api/manual-loans', { method: 'POST', body: JSON.stringify(input) });
+/**
+ * `idempotencyKey` — generated once per create ATTEMPT on the caller's side (see
+ * LoanProgress.tsx's `ManualLoanForm`, which mints one per form mount) and sent as the
+ * `Idempotency-Key` header. The backend persists it alongside the created loan and replays the
+ * same loan on any later request carrying the same key, rather than creating a duplicate — this
+ * is what makes a retry (a double-click before the form closes, or a client-side resend after an
+ * ambiguous timeout) safe even though loan creation also triggers a same-request backfill step
+ * that can itself fail after the loan already persisted.
+ */
+/**
+ * `verifyOwnership` is REQUIRED (Round 14 remediation). A create is initiated under one
+ * authenticated user, but the request is only sent after awaits — the cross-tab Web Lock, then
+ * authedFetch's own session lookup, and possibly its clock-skew retry delay — and authedFetch sends
+ * with whatever session is current when it looks. Without this, a sign-in change during any of
+ * those waits sent user A's loan with user B's bearer token, creating it in B's account.
+ * authedFetch calls this with the session it is about to use, immediately before the first send and
+ * again before any retry, and refuses to send unless it returns true.
+ */
+export function createManualLoan(
+  input: ManualLoanInput,
+  idempotencyKey: string,
+  verifyOwnership: (session: Session) => boolean
+): Promise<{ loan: ManualLoan }> {
+  // Round 16: the dedicated idempotent route, which rejects a missing key rather than silently
+  // creating a non-idempotent loan. POST /api/manual-loans is kept on the backend only for cached
+  // pre-Round-16 bundles, and gives no retry protection — this client must never call it.
+  return authedFetch(
+    '/api/manual-loans/idempotent',
+    {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(input),
+    },
+    false,
+    verifyOwnership
+  );
+}
+
+/** True when a createManualLoan failure is the server's DEFINITIVE answer that this idempotency key
+ *  already created a loan which has since been deleted — i.e. the attempt is resolved, not failed. */
+export function isManualLoanCreationResolvedError(err: unknown): boolean {
+  return err instanceof Error && (err as Error & { code?: unknown }).code === 'idempotency_key_loan_deleted';
 }
 
 export function updateManualLoan(
   id: string,
-  input: Partial<ManualLoanInput>
+  input: Partial<ManualLoanInput>,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ loan: ManualLoan }> {
-  return authedFetch(`/api/manual-loans/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
+  return authedFetch(`/api/manual-loans/${id}`, { method: 'PATCH', body: JSON.stringify(input) }, false, verifyOwnership);
 }
 
-export function deleteManualLoan(id: string): Promise<void> {
-  return authedFetch(`/api/manual-loans/${id}`, { method: 'DELETE' });
+export function deleteManualLoan(id: string, verifyOwnership: OwnershipCheck): Promise<void> {
+  return authedFetch(`/api/manual-loans/${id}`, { method: 'DELETE' }, false, verifyOwnership);
 }
 
 export interface LoanPayment {
@@ -372,16 +460,17 @@ export function getLoanPayments(loanId: string): Promise<{ payments: LoanPayment
 export function updateLinkedLoanPayment(
   loanId: string,
   transactionId: string,
-  principalPortion: number
+  principalPortion: number,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ loan: ManualLoan }> {
   return authedFetch(`/api/manual-loans/${loanId}/payments/${transactionId}`, {
     method: 'PATCH',
     body: JSON.stringify({ principal_portion: principalPortion }),
-  });
+  }, false, verifyOwnership);
 }
 
-export function unlinkLoanPayment(loanId: string, transactionId: string): Promise<{ loan: ManualLoan }> {
-  return authedFetch(`/api/manual-loans/${loanId}/payments/${transactionId}`, { method: 'DELETE' });
+export function unlinkLoanPayment(loanId: string, transactionId: string, verifyOwnership: OwnershipCheck): Promise<{ loan: ManualLoan }> {
+  return authedFetch(`/api/manual-loans/${loanId}/payments/${transactionId}`, { method: 'DELETE' }, false, verifyOwnership);
 }
 
 export interface ManualPaymentInput {
@@ -393,27 +482,29 @@ export interface ManualPaymentInput {
 
 export function createManualPayment(
   loanId: string,
-  input: ManualPaymentInput
+  input: ManualPaymentInput,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ loan: ManualLoan }> {
   return authedFetch(`/api/manual-loans/${loanId}/manual-payments`, {
     method: 'POST',
     body: JSON.stringify(input),
-  });
+  }, false, verifyOwnership);
 }
 
 export function updateManualPayment(
   loanId: string,
   paymentId: string,
-  input: Partial<ManualPaymentInput>
+  input: Partial<ManualPaymentInput>,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ loan: ManualLoan }> {
   return authedFetch(`/api/manual-loans/${loanId}/manual-payments/${paymentId}`, {
     method: 'PATCH',
     body: JSON.stringify(input),
-  });
+  }, false, verifyOwnership);
 }
 
-export function deleteManualPayment(loanId: string, paymentId: string): Promise<{ loan: ManualLoan }> {
-  return authedFetch(`/api/manual-loans/${loanId}/manual-payments/${paymentId}`, { method: 'DELETE' });
+export function deleteManualPayment(loanId: string, paymentId: string, verifyOwnership: OwnershipCheck): Promise<{ loan: ManualLoan }> {
+  return authedFetch(`/api/manual-loans/${loanId}/manual-payments/${paymentId}`, { method: 'DELETE' }, false, verifyOwnership);
 }
 
 export interface AssetAccountSummary {
@@ -452,34 +543,35 @@ export function getAssetsSummary(): Promise<{ groups: AssetGroup[]; total_assets
 
 export function updateAccountSavingsGoal(
   accountId: string,
-  savingsGoal: number | null
+  savingsGoal: number | null,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ account: LinkedAccount }> {
   return authedFetch(`/api/plaid/accounts/${accountId}/savings-goal`, {
     method: 'PATCH',
     body: JSON.stringify({ savings_goal: savingsGoal }),
-  });
+  }, false, verifyOwnership);
 }
 
-export function createReauthLinkToken(itemId: string): Promise<{ link_token: string }> {
-  return authedFetch(`/api/plaid/items/${itemId}/reauth-link-token`, { method: 'POST' });
+export function createReauthLinkToken(itemId: string, verifyOwnership: OwnershipCheck): Promise<{ link_token: string }> {
+  return authedFetch(`/api/plaid/items/${itemId}/reauth-link-token`, { method: 'POST' }, false, verifyOwnership);
 }
 
-export function completeReauth(itemId: string): Promise<{ items: LinkedItem[] }> {
-  return authedFetch(`/api/plaid/items/${itemId}/reauth-complete`, { method: 'POST' });
+export function completeReauth(itemId: string, verifyOwnership: OwnershipCheck): Promise<{ items: LinkedItem[] }> {
+  return authedFetch(`/api/plaid/items/${itemId}/reauth-complete`, { method: 'POST' }, false, verifyOwnership);
 }
 
 /** Sandbox-only testing helper — 404s outside Plaid Sandbox. Forces an item into login_required. */
-export function sandboxResetLogin(itemId: string): Promise<{ items: LinkedItem[] }> {
-  return authedFetch(`/api/plaid/items/${itemId}/sandbox-reset-login`, { method: 'POST' });
+export function sandboxResetLogin(itemId: string, verifyOwnership: OwnershipCheck): Promise<{ items: LinkedItem[] }> {
+  return authedFetch(`/api/plaid/items/${itemId}/sandbox-reset-login`, { method: 'POST' }, false, verifyOwnership);
 }
 
 /** Sandbox-only testing helper — 404s outside Plaid Sandbox. Asks Plaid to actually deliver a test webhook. */
-export function sandboxFireWebhook(itemId: string): Promise<{ fired: boolean }> {
-  return authedFetch(`/api/plaid/items/${itemId}/sandbox-fire-webhook`, { method: 'POST' });
+export function sandboxFireWebhook(itemId: string, verifyOwnership: OwnershipCheck): Promise<{ fired: boolean }> {
+  return authedFetch(`/api/plaid/items/${itemId}/sandbox-fire-webhook`, { method: 'POST' }, false, verifyOwnership);
 }
 
-export function syncTransactions(): Promise<{ added: number; modified: number; removed: number }> {
-  return authedFetch('/api/plaid/transactions/sync', { method: 'POST' });
+export function syncTransactions(verifyOwnership: OwnershipCheck): Promise<{ added: number; modified: number; removed: number }> {
+  return authedFetch('/api/plaid/transactions/sync', { method: 'POST' }, false, verifyOwnership);
 }
 
 export function getTransactions(limit = 50): Promise<{ transactions: TransactionItem[] }> {
@@ -488,30 +580,32 @@ export function getTransactions(limit = 50): Promise<{ transactions: Transaction
 
 export function setTransactionCategory(
   transactionId: string,
-  budgetCategoryId: string | null
+  budgetCategoryId: string | null,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ transaction: TransactionItem }> {
   return authedFetch(`/api/plaid/transactions/${transactionId}/category`, {
     method: 'PATCH',
     body: JSON.stringify({ budget_category_id: budgetCategoryId }),
-  });
+  }, false, verifyOwnership);
 }
 
-export function approveTransaction(transactionId: string): Promise<{ transaction: TransactionItem }> {
-  return authedFetch(`/api/plaid/transactions/${transactionId}/approve`, { method: 'PATCH' });
+export function approveTransaction(transactionId: string, verifyOwnership: OwnershipCheck): Promise<{ transaction: TransactionItem }> {
+  return authedFetch(`/api/plaid/transactions/${transactionId}/approve`, { method: 'PATCH' }, false, verifyOwnership);
 }
 
 export function saveTransactionSplits(
   transactionId: string,
-  splits: { budget_category_id: string; amount: number }[]
+  splits: { budget_category_id: string; amount: number }[],
+  verifyOwnership: OwnershipCheck
 ): Promise<{ splits: TransactionSplit[] }> {
   return authedFetch(`/api/plaid/transactions/${transactionId}/splits`, {
     method: 'PUT',
     body: JSON.stringify({ splits }),
-  });
+  }, false, verifyOwnership);
 }
 
-export function clearTransactionSplits(transactionId: string): Promise<void> {
-  return authedFetch(`/api/plaid/transactions/${transactionId}/splits`, { method: 'DELETE' });
+export function clearTransactionSplits(transactionId: string, verifyOwnership: OwnershipCheck): Promise<void> {
+  return authedFetch(`/api/plaid/transactions/${transactionId}/splits`, { method: 'DELETE' }, false, verifyOwnership);
 }
 
 export function getBudgetCategories(): Promise<{ categories: BudgetCategory[] }> {
@@ -527,8 +621,8 @@ export function createBudgetCategory(params: {
   budget_amount: number;
   color?: string | null;
   emoji?: string | null;
-}): Promise<{ category: BareBudgetCategory }> {
-  return authedFetch('/api/budget-categories', { method: 'POST', body: JSON.stringify(params) });
+}, verifyOwnership: OwnershipCheck): Promise<{ category: BareBudgetCategory }> {
+  return authedFetch('/api/budget-categories', { method: 'POST', body: JSON.stringify(params) }, false, verifyOwnership);
 }
 
 export function updateBudgetCategory(
@@ -540,16 +634,17 @@ export function updateBudgetCategory(
     sort_order: number;
     emoji: string | null;
     archived: boolean;
-  }>
+  }>,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ category: BareBudgetCategory; removed_mapping_ids?: string[] }> {
   return authedFetch(`/api/budget-categories/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(fields),
-  });
+  }, false, verifyOwnership);
 }
 
-export function deleteBudgetCategory(id: string): Promise<void> {
-  return authedFetch(`/api/budget-categories/${id}`, { method: 'DELETE' });
+export function deleteBudgetCategory(id: string, verifyOwnership: OwnershipCheck): Promise<void> {
+  return authedFetch(`/api/budget-categories/${id}`, { method: 'DELETE' }, false, verifyOwnership);
 }
 
 /** Maps one of Plaid's own category values (a transaction's `category` field, e.g.
@@ -574,7 +669,8 @@ export function getPlaidCategories(): Promise<{ categories: string[] }> {
 export function saveCategoryMapping(
   plaidCategory: string,
   budgetCategoryId: string,
-  backfill: boolean
+  backfill: boolean,
+  verifyOwnership: OwnershipCheck
 ): Promise<{ mapping: CategoryMapping; backfilled_count: number }> {
   return authedFetch('/api/category-mappings', {
     method: 'POST',
@@ -583,11 +679,11 @@ export function saveCategoryMapping(
       budget_category_id: budgetCategoryId,
       backfill,
     }),
-  });
+  }, false, verifyOwnership);
 }
 
-export function deleteCategoryMapping(id: string): Promise<void> {
-  return authedFetch(`/api/category-mappings/${id}`, { method: 'DELETE' });
+export function deleteCategoryMapping(id: string, verifyOwnership: OwnershipCheck): Promise<void> {
+  return authedFetch(`/api/category-mappings/${id}`, { method: 'DELETE' }, false, verifyOwnership);
 }
 
 /** One card's saved state in a user's dashboard layout. `id` is a plain string on the wire —

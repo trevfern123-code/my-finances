@@ -13,6 +13,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import type { UserPreferences } from './lib/api';
+import { installFakeWebLocks, removeWebLocks } from './testUtils/fakeWebLocks';
 
 const mockGetSession = vi.hoisted(() => vi.fn());
 const mockOnAuthStateChange = vi.hoisted(() => vi.fn());
@@ -66,6 +67,11 @@ const mockCreateBudgetCategory = vi.hoisted(() => vi.fn());
 const mockSaveCategoryMapping = vi.hoisted(() => vi.fn());
 const mockGetPlaidCategories = vi.hoisted(() => vi.fn());
 const mockGetCategoryMappings = vi.hoisted(() => vi.fn());
+// Wave 1 Hosted Link: controlled so the Plaid Link tests can inspect the attempt id and owner check
+// each request carries, hold attempt creation open across a sign-in change, and decide when Hosted
+// Link "finishes".
+const mockCreateHostedLinkAttempt = vi.hoisted(() => vi.fn());
+const mockCompleteLinkAttempt = vi.hoisted(() => vi.fn());
 
 vi.mock('./lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./lib/api')>();
@@ -125,10 +131,10 @@ vi.mock('./lib/api', async (importOriginal) => {
     updateFinancialPreferences: mockUpdateFinancialPreferences,
     updateReportingRange: vi.fn().mockResolvedValue({ reporting_range: 'last_6_months' }),
     updateNavLayout: mockUpdateNavLayout,
-    // PlaidLink's own two direct dependencies — PlaidLink calls createLinkToken() on mount; the
-    // Plaid-link test in this file drives the rest through the mocked react-plaid-link hook below.
-    createLinkToken: vi.fn().mockResolvedValue({ link_token: 'fake-link-token' }),
-    exchangePublicToken: vi.fn().mockResolvedValue({}),
+    // PlaidLink's own two direct dependencies — it creates a Hosted Link attempt when "Link a bank
+    // account" is clicked, then asks for it to be completed (see openPlaidLink / finishHostedLink).
+    createHostedLinkAttempt: mockCreateHostedLinkAttempt,
+    completeLinkAttempt: mockCompleteLinkAttempt,
     // The four datasets this file actually controls.
     getUserPreferences: mockGetUserPreferences,
     getSpendingSummary: mockGetSpendingSummary,
@@ -137,16 +143,20 @@ vi.mock('./lib/api', async (importOriginal) => {
   };
 });
 
-// react-plaid-link renders real Plaid UI/scripts in a browser — mocked so it never tries to do
-// that in jsdom, and so the Plaid-link test can trigger a "successful link" by capturing and
-// calling PlaidLink's own onSuccess callback directly, exactly as Plaid's real widget would.
-let capturedPlaidOnSuccess: ((publicToken: string) => void) | null = null;
+// react-plaid-link renders real Plaid UI/scripts in a browser — mocked so it never tries to do that
+// in jsdom. Only ReconnectButton (Update Mode) still uses it; bank linking is Hosted Link.
 vi.mock('react-plaid-link', () => ({
-  usePlaidLink: ({ onSuccess }: { onSuccess: (token: string) => void }) => {
-    capturedPlaidOnSuccess = onSuccess;
-    return { open: vi.fn(), ready: true };
-  },
+  usePlaidLink: () => ({ open: vi.fn(), ready: true }),
 }));
+
+/** A stand-in for the tab window.open() returns: records where it was sent and whether it closed. */
+function fakeTab() {
+  return { opener: {} as unknown, location: { replace: vi.fn() }, close: vi.fn() };
+}
+let openedTabs: ReturnType<typeof fakeTab>[] = [];
+function inThirtyMinutes() {
+  return new Date(Date.now() + 30 * 60 * 1000).toISOString();
+}
 
 interface FakeSession {
   user: { id: string };
@@ -185,6 +195,24 @@ let latestLiveCallback: LiveCallback | null = null;
 function emitAuthEvent(session: FakeSession | null) {
   currentFakeSession = session;
   latestLiveCallback!('AUTH_EVENT', session);
+}
+
+/** Wave 1 Hosted Link: a "successful link" is — click "Link a bank account" (the server creates an
+ *  attempt and PlaidLink sends the new tab to its Hosted Link URL), then finishHostedLink(). */
+async function openPlaidLink() {
+  const button = screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  await act(async () => {
+    fireEvent.click(button);
+  });
+  await waitFor(() => expect(screen.getByText(/Finish linking in the Plaid tab/)).toBeTruthy());
+}
+
+/** The user finished Hosted Link: the server's next completion answer is "completed", and returning
+ *  to this tab (focus) makes PlaidLink ask for it right away. */
+function finishHostedLink() {
+  mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed' });
+  window.dispatchEvent(new Event('focus'));
 }
 
 /** Builds a full UserPreferences payload with sensible defaults, so each test only has to override
@@ -456,6 +484,16 @@ async function waitForReady() {
   await waitFor(() => expect(screen.getByText('Customize dashboard')).toBeTruthy());
 }
 
+/** Renders a fresh App, signs `userId` in, waits for readiness and opens the Loans tab. Calling it
+ *  again after cleanup() is the test-level equivalent of a page reload for that user. */
+async function bootToLoans(userId: string) {
+  mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+  render(<App />);
+  act(() => emitAuthEvent(fakeSession(userId, `sid-${userId}`)));
+  await waitForReady();
+  act(() => screen.getByText('Loans').click());
+}
+
 async function waitForLoading() {
   await waitFor(() => expect(screen.getByText('Loading...')).toBeTruthy());
 }
@@ -489,9 +527,12 @@ function readNetWorth(): string | null {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Pending manual-loan creations persist per user in localStorage by design; each test starts clean.
+  localStorage.clear();
+  // jsdom has no Web Locks; every test gets a fresh cross-tab lock manager (see fakeWebLocks.ts).
+  installFakeWebLocks();
   currentFakeSession = null;
   latestLiveCallback = null;
-  capturedPlaidOnSuccess = null;
   mockOnAuthStateChange.mockImplementation((cb: LiveCallback) => {
     latestLiveCallback = cb;
     return { data: { subscription: { unsubscribe: vi.fn() } } };
@@ -510,6 +551,18 @@ beforeEach(() => {
   mockRefreshAccountBalances.mockResolvedValue({ items: [], is_sandbox: true });
   mockGetPlaidCategories.mockResolvedValue({ categories: [] });
   mockGetCategoryMappings.mockResolvedValue({ mappings: [] });
+  mockCreateHostedLinkAttempt.mockResolvedValue({
+    hosted_link_url: 'https://hosted.plaid.test/link/fake',
+    link_attempt_id: 'fake-link-attempt',
+    expires_at: inThirtyMinutes(),
+  });
+  mockCompleteLinkAttempt.mockResolvedValue({ status: 'pending' });
+  openedTabs = [];
+  vi.spyOn(window, 'open').mockImplementation(() => {
+    const tab = fakeTab();
+    openedTabs.push(tab);
+    return tab as unknown as Window;
+  });
 });
 
 afterEach(() => {
@@ -789,9 +842,9 @@ describe('12. successful Plaid link refreshes range data through the same fresh-
     await waitFor(() => expect(readNetWorth()).toBe('$100'));
 
     mockGetSpendingSummary.mockResolvedValueOnce({ ...emptySummary, net_worth: 400 });
-    expect(capturedPlaidOnSuccess).not.toBeNull();
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -824,8 +877,9 @@ describe('13. a successful Plaid link does not unmount PreferencesScope or re-bo
     expect(screen.getByText('Done')).toBeTruthy();
 
     const preferencesCallsBefore = mockGetUserPreferences.mock.calls.length;
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -858,8 +912,9 @@ describe('14. an in-flight Financial Preferences save survives a same-session Pl
     expect(savingsInput.value).toBe('30'); // local edit applies immediately, independent of the PUT
 
     const preferencesCallsBefore = mockGetUserPreferences.mock.calls.length;
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -907,8 +962,9 @@ describe('15. SaveStatusTracker survives a same-session Plaid/background refresh
     fireEvent.blur(savingsInput);
     await waitFor(() => expect(screen.getByText('Saving…')).toBeTruthy());
 
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -933,13 +989,14 @@ describe('16. ordinary background loading no longer sends an already-ready lifec
     expect(screen.queryByText('Refreshing…')).toBeNull();
 
     // Held open so `loading` reliably stays true for this assertion regardless of exactly how many
-    // microtask hops PlaidLink's own onSuccess (which awaits exchangePublicToken before calling
+    // microtask hops PlaidLink's completion check (which awaits completeLinkAttempt before calling
     // onLinked) takes to actually reach refreshFinancialData's setLoading(true).
     const pendingItems = deferred<{ items: unknown[]; is_sandbox: boolean }>();
     mockGetLinkedItems.mockReturnValueOnce(pendingItems.promise);
 
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1041,8 +1098,9 @@ describe('19. a successful Plaid link issues exactly one range-data refresh', ()
     const historyCallsBefore = mockGetNetWorthHistory.mock.calls.length;
     const breakdownCallsBefore = mockGetMonthlyBreakdown.mock.calls.length;
 
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1244,8 +1302,9 @@ describe('27. same-session background refresh does not revert financial lifecycl
 
     const pendingAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
     mockGetAssetsSummary.mockReturnValueOnce(pendingAssets.promise);
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve());
     });
 
@@ -1271,15 +1330,17 @@ describe('28. overlapping background financial refresh invocations: the newer wi
 
     const firstRefresh = deferred<ReturnType<typeof fakeAssetsSummary>>();
     mockGetAssetsSummary.mockReturnValueOnce(firstRefresh.promise);
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token-1');
+      finishHostedLink();
       await Promise.resolve();
     });
 
     const secondRefresh = deferred<ReturnType<typeof fakeAssetsSummary>>();
     mockGetAssetsSummary.mockReturnValueOnce(secondRefresh.promise);
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token-2');
+      finishHostedLink();
       await Promise.resolve();
     });
 
@@ -1460,8 +1521,9 @@ describe('31. a background/Plaid refresh that supersedes the pending initial inv
     // is therefore also readiness-producing (this is the exact fix under test: this would have
     // been forbidden from setting financialOutcome under Round 5's caller-supplied isInitial flag).
     mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Plaid-Bank'));
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1492,8 +1554,9 @@ describe('32. a newer pre-readiness invocation failing establishes the financial
     await waitForFinancialLoading();
 
     mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1523,8 +1586,9 @@ describe('33. background refresh failure after readiness uses actionError, not t
     expect(screen.getByText(/A-Bank Checking/)).toBeTruthy();
 
     mockGetLinkedItems.mockRejectedValueOnce(new Error('down'));
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -1841,6 +1905,533 @@ describe('41. A1 -> A3 (same user, new session): ad-hoc ownership uses session_i
 // other kind had already committed something newer. `resourceVersionsRef` (see its own comment) now
 // gives every reader of a given resource — grouped or targeted — one shared counter to reserve from.
 
+describe('Round 8 remediation: createManualLoan idempotency-key generation', () => {
+  it('blocks a rapid double-submit while the first is still in flight, and any call that lands carries the one key minted for this form mount', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Double-Click Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '500' } });
+
+    mockCreateManualLoan.mockReturnValue(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    // Round 10: the pending-submit guard stops the second click outright. That guard is additive —
+    // the idempotency key is still what makes a retry safe across a genuinely ambiguous failure,
+    // which no client-side guard can cover.
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
+    const keysUsed = new Set(mockCreateManualLoan.mock.calls.map((call) => call[1]));
+    expect(keysUsed.size).toBe(1);
+    expect(typeof mockCreateManualLoan.mock.calls[0][1]).toBe('string');
+    expect((mockCreateManualLoan.mock.calls[0][1] as string).length).toBeGreaterThan(0);
+  });
+
+  it('Round 10 (blocker 4): a FAILED create keeps the form open with its values, and retrying sends the IDENTICAL key and payload — the ambiguous-failure case that used to duplicate the loan', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Ambiguous Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '750' } });
+
+    // Models the real ambiguous failure: the backend PERSISTED the loan, then failed in
+    // backfillMatchesForLoan and reported the request as failed. The client cannot tell this apart
+    // from a create that never happened.
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Failed to backfill loan matches'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    // The form must still be mounted, still holding what the user typed.
+    expect(screen.getByText('Save loan')).toBeTruthy();
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Ambiguous Loan');
+    expect((screen.getByLabelText('Current balance') as HTMLInputElement).value).toBe('750');
+    expect(screen.getByRole('alert').textContent).toContain('Failed to backfill loan matches');
+
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    // The retry: the server replays the loan it already created for this key.
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Ambiguous Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(2);
+
+    // Only now — after a confirmed success — does the form close.
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+  });
+
+  it('Round 10 (blocker 4): the form stays open while the create is still in flight, and closes only once it resolves', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Inflight Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '100' } });
+
+    const pending = deferred<ReturnType<typeof fakeManualLoan>>();
+    mockCreateManualLoan.mockReturnValueOnce(pending.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    // Still open, and the button reflects the in-flight state rather than inviting another submit.
+    expect(screen.getByText('Saving…')).toBeTruthy();
+
+    await act(async () => {
+      pending.resolve(fakeManualLoan('Inflight Loan'));
+      await pending.promise;
+    });
+
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+  });
+
+  // Round 11 remediation (blocker 2). The previous version of this test asserted that Cancel after a
+  // failed create and then reopening minted a NEW key — which is precisely the duplicate-creating
+  // behavior: the failure is ambiguous (the loan may have committed), so abandoning its key is
+  // unsafe. Only confirmed success or an explicit "Discard attempt" may retire a key now.
+  it('Round 11: Cancel after an ambiguous failure, then reopening, RESUMES the same key and payload', async () => {
+    await bootToLoans('user-a');
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'First Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '100' } });
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Failed to backfill loan matches'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    act(() => screen.getByText('Cancel').click());
+    expect(screen.queryByText('Save loan')).toBeNull();
+    act(() => screen.getByText('Add a loan').click());
+
+    // Reopened onto the pending attempt: same values, and edits are locked (a changed payload under
+    // the same key would be rejected by the server; under a new key it could duplicate the loan).
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('First Loan');
+    // Disabled via its <fieldset disabled> ancestor, which the element's own `disabled` property
+    // does not reflect — `:disabled` is the effective state.
+    expect(screen.getByLabelText('Name').matches(':disabled')).toBe(true);
+
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('First Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+  });
+
+  it('Round 11: Cancel is disabled while the create request is in flight', async () => {
+    await bootToLoans('user-a');
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Deferred Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '300' } });
+    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    const cancel = screen.getByText('Cancel') as HTMLButtonElement;
+    expect(cancel.disabled).toBe(true);
+    act(() => cancel.click());
+    // Still open — the outcome is unknown, so the form cannot be dismissed mid-request.
+    expect(screen.getByText('Saving…')).toBeTruthy();
+    expect(screen.getByLabelText('Name')).toBeTruthy();
+  });
+
+  it('Round 11: navigating to another tab mid-request and back resumes the SAME in-flight attempt; after it fails, retry reuses its key and payload', async () => {
+    await bootToLoans('user-a');
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Wandering Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '450' } });
+    const first = deferred<ReturnType<typeof fakeManualLoan>>();
+    mockCreateManualLoan.mockReturnValueOnce(first.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    // Leave the Loans tab entirely — this unmounts LoanProgress and the form with it.
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.queryByText('Saving…')).toBeNull();
+    act(() => screen.getByText('Loans').click());
+
+    // The remounted form opens straight onto the attempt, still shown as in progress.
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Wandering Loan');
+    expect(screen.getByText('Saving…')).toBeTruthy();
+    expect((screen.getByText('Cancel') as HTMLButtonElement).disabled).toBe(true);
+
+    // The original request now fails ambiguously.
+    await act(async () => {
+      first.reject(new Error('network dropped'));
+      await first.promise.catch(() => {});
+    });
+    await waitFor(() => expect(screen.getByText('Save loan')).toBeTruthy());
+
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Wandering Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+  });
+
+  it('Round 11: a full App remount (reload-equivalent) after an ambiguous failure resumes the persisted key and payload, and success clears it', async () => {
+    await bootToLoans('user-a');
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Reloaded Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '900' } });
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Failed to backfill loan matches'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    // Persisted per user in real browser storage, not just component state.
+    const stored = JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null');
+    expect(stored).toEqual({ version: 1, idempotencyKey: firstKey, input: firstPayload });
+
+    // Tear the whole app down and bring it back up — the component tree, App state and the form
+    // are all gone; only what was persisted survives.
+    cleanup();
+    await bootToLoans('user-a');
+
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Reloaded Loan');
+    expect((screen.getByLabelText('Current balance') as HTMLInputElement).value).toBe('900');
+
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Reloaded Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+
+    await waitFor(() => expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull());
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Round 12 remediation. `installFakeLoanServer` stands in for the real endpoint's idempotency
+  // contract (create_manual_loan_idempotent): a key creates exactly one loan, every later request
+  // with it replays that loan, and reusing it with a different payload is rejected. With
+  // `persistThenFailFirst`, the FIRST request persists its loan and THEN reports failure — the
+  // backfill-failed-after-commit case that makes a create failure ambiguous. Tests count the loans
+  // the "server" actually holds, so a duplicate shows up as a second loan, not just as an extra call.
+  // ---------------------------------------------------------------------------------------------
+  function installFakeLoanServer({ persistThenFailFirst = false } = {}) {
+    const loansByKey = new Map<string, { payload: unknown; loan: ReturnType<typeof fakeManualLoan>['loan'] }>();
+    const storedAttemptAtSend: unknown[] = [];
+    let calls = 0;
+    mockCreateManualLoan.mockImplementation(async (payload: { name: string }, key: string) => {
+      calls += 1;
+      // What was durably recorded at the moment the request left — must already be this attempt.
+      storedAttemptAtSend.push(JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null'));
+      const existing = loansByKey.get(key);
+      if (existing) {
+        if (JSON.stringify(existing.payload) !== JSON.stringify(payload)) {
+          throw new Error(`idempotency_key ${key} was already used for a different request payload`);
+        }
+        return { loan: existing.loan };
+      }
+      const loan = { ...fakeManualLoan(payload.name).loan, id: `loan-for-${key}` };
+      loansByKey.set(key, { payload, loan });
+      if (persistThenFailFirst && calls === 1) throw new Error('Failed to backfill loan matches');
+      return { loan };
+    });
+    return { loansByKey, storedAttemptAtSend };
+  }
+
+  async function openAndFill(name: string, balance: string) {
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: name } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: balance } });
+  }
+
+  async function clickSave() {
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+  }
+
+  it('Round 12 (blocker 1): after a create that PERSISTED then errored, no UI action can mint a new key or send changed details — retry resends the identical key and payload and no duplicate loan is created', async () => {
+    const server = installFakeLoanServer({ persistThenFailFirst: true });
+    await bootToLoans('user-a');
+    await openAndFill('Persisted Loan', '700');
+    await clickSave();
+
+    // The server really did create the loan, but the client only saw an error.
+    expect(server.loansByKey.size).toBe(1);
+    expect(screen.getByRole('alert').textContent).toContain('Failed to backfill loan matches');
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    // The only controls on the unresolved attempt are Save (retry) and Cancel (close, keeps the
+    // attempt). "Discard attempt" — which minted a new key — no longer exists.
+    const form = screen.getByText('Add a personal loan').closest('form') as HTMLElement;
+    expect(within(form).getAllByRole('button').map((b) => b.textContent)).toEqual(['Save loan', 'Cancel']);
+    expect(screen.queryByText('Discard attempt')).toBeNull();
+
+    // Every field is disabled; even forcing new values into them (as a script or stale render
+    // could) must not change what the retry sends.
+    expect(screen.getByLabelText('Name').matches(':disabled')).toBe(true);
+    expect(screen.getByLabelText('Current balance').matches(':disabled')).toBe(true);
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Tampered Name' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '1' } });
+
+    await clickSave();
+
+    const [secondPayload, secondKey] = mockCreateManualLoan.mock.calls[1];
+    expect(secondKey).toBe(firstKey);
+    expect(secondPayload).toEqual(firstPayload);
+    // Still exactly one loan on the "server"; the retry replayed it.
+    expect(server.loansByKey.size).toBe(1);
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+    expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
+    expect(screen.getAllByText('Persisted Loan')).toHaveLength(1);
+  });
+
+  it('Round 12 (blocker 1): Cancel + reopen after the persisted-then-errored create also resumes the same key and payload — still one loan', async () => {
+    const server = installFakeLoanServer({ persistThenFailFirst: true });
+    await bootToLoans('user-a');
+    await openAndFill('Reopened Loan', '320');
+    await clickSave();
+    const [firstPayload, firstKey] = mockCreateManualLoan.mock.calls[0];
+
+    act(() => screen.getByText('Cancel').click());
+    act(() => screen.getByText('Add a loan').click());
+    await clickSave();
+
+    expect(mockCreateManualLoan.mock.calls[1][1]).toBe(firstKey);
+    expect(mockCreateManualLoan.mock.calls[1][0]).toEqual(firstPayload);
+    expect(server.loansByKey.size).toBe(1);
+  });
+
+  it('Round 12 (blocker 1): an attempt left unresolved by ANOTHER tab blocks a new key here, and this form then resumes that attempt instead', async () => {
+    const server = installFakeLoanServer();
+    await bootToLoans('user-a');
+    await openAndFill('This Tab Loan', '50');
+
+    // Another tab (same user, same storage) sent an attempt that is still unresolved.
+    const otherTabPayload = {
+      name: 'Other Tab Loan', loan_type: 'personal', current_balance: 80, origination_principal_amount: null,
+      interest_rate_percentage: null, origination_date: null, term_months: null, minimum_payment_amount: null,
+      next_payment_due_date: null, notes: null, match_text: null,
+    };
+    localStorage.setItem('myfinances.pendingManualLoanCreation.user-a',
+      JSON.stringify({ version: 1, idempotencyKey: 'other-tab-key', input: otherTabPayload }));
+
+    await clickSave();
+
+    // Refused before any request: starting a second attempt under a new key while one is unresolved
+    // is exactly how a duplicate gets created.
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert').textContent).toContain('An earlier loan save has not been confirmed yet');
+    // The form has switched to that unresolved attempt, so it can be finished from here.
+    await waitFor(() => expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Other Tab Loan'));
+
+    await clickSave();
+    expect(mockCreateManualLoan.mock.calls[0][1]).toBe('other-tab-key');
+    expect(mockCreateManualLoan.mock.calls[0][0]).toEqual(otherTabPayload);
+    expect(server.loansByKey.size).toBe(1);
+  });
+
+  it('Round 12 (blocker 1): the ONLY key-retiring outcome besides success is the server confirming the key already created a (since-deleted) loan', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Deleted Elsewhere', '90');
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Failed to backfill loan matches'));
+    await clickSave();
+    const firstKey = mockCreateManualLoan.mock.calls[0][1];
+
+    mockCreateManualLoan.mockRejectedValueOnce(
+      Object.assign(new Error('This loan was already created by an earlier attempt and has since been deleted.'), {
+        code: 'idempotency_key_loan_deleted',
+      })
+    );
+    await clickSave();
+
+    expect(mockCreateManualLoan.mock.calls[1][1]).toBe(firstKey);
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+    expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
+    expect(screen.getByText(/already created by an earlier attempt and has since been deleted/)).toBeTruthy();
+  });
+
+  it('Round 12 (blocker 1): an ordinary failure never retires the key, however many times it repeats', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Stubborn Loan', '40');
+    mockCreateManualLoan.mockRejectedValue(new Error('Service unavailable'));
+    await clickSave();
+    await clickSave();
+    await clickSave();
+
+    const keys = new Set(mockCreateManualLoan.mock.calls.map((call) => call[1]));
+    expect(keys.size).toBe(1);
+    expect(JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null')).toMatchObject({
+      idempotencyKey: [...keys][0],
+    });
+  });
+
+  it('Round 12 (blocker 2): when localStorage.setItem throws, the request is NEVER sent and the user sees why', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Private Mode Loan', '250');
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    });
+
+    await clickSave();
+
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert').textContent).toContain("isn't letting the app save data on this device");
+    // Nothing was sent, so there is no attempt to protect: the form stays editable.
+    expect(screen.getByLabelText('Name').matches(':disabled')).toBe(false);
+  });
+
+  it('Round 12 (blocker 2): a storage write that does not read back identically also blocks the request', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Flaky Storage Loan', '250');
+    const realGetItem = Storage.prototype.getItem;
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+      const value = realGetItem.call(this, key);
+      return key.startsWith('myfinances.pendingManualLoanCreation.') && value !== null ? value.slice(0, -1) : value;
+    });
+
+    await clickSave();
+
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert').textContent).toContain("isn't letting the app save data on this device");
+  });
+
+  it('Round 12 (blocker 2): with working storage the attempt is durably recorded BEFORE the request leaves', async () => {
+    const server = installFakeLoanServer();
+    await bootToLoans('user-a');
+    await openAndFill('Normal Loan', '600');
+
+    await clickSave();
+
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
+    const [payload, key] = mockCreateManualLoan.mock.calls[0];
+    expect(server.storedAttemptAtSend[0]).toEqual({ version: 1, idempotencyKey: key, input: payload });
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+    expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
+  });
+
+  it('Round 12: a payload the server would always reject never becomes a locked attempt — it is caught before anything is persisted or sent', async () => {
+    await bootToLoans('user-a');
+    await openAndFill('Negative Loan', '-5');
+
+    await clickSave();
+
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert').textContent).toContain('Current balance must be zero or more.');
+    expect(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a')).toBeNull();
+    // Still editable, so the user can correct it.
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '5' } });
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Negative Loan'));
+    await clickSave();
+    expect(mockCreateManualLoan.mock.calls[0][0]).toMatchObject({ current_balance: 5 });
+  });
+
+  it('Round 11: a pending attempt is scoped to its user — another user neither sees nor reuses it', async () => {
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'A Private Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '5' } });
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('nope'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const aKey = mockCreateManualLoan.mock.calls[0][1];
+
+    cleanup();
+    await bootToLoans('user-b');
+    // No form auto-opened for user B, and opening one starts blank under a fresh key.
+    expect(screen.queryByText('Save loan')).toBeNull();
+    act(() => screen.getByText('Add a loan').click());
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('');
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'B Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '6' } });
+    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    expect(mockCreateManualLoan.mock.calls[1][1]).not.toBe(aKey);
+    // A's attempt is untouched and still waiting for A.
+    expect(JSON.parse(localStorage.getItem('myfinances.pendingManualLoanCreation.user-a') ?? 'null')).toMatchObject({
+      idempotencyKey: aKey,
+    });
+  });
+
+  it('Round 9 verification: a genuinely SUCCESSFUL creation is followed by a new key on the next form mount (not merely an abandoned one)', async () => {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Loans').click());
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Succeeded Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '100' } });
+    // Unlike the two tests above (both use a never-resolving promise), this one actually resolves
+    // the create — the form's own onSubmit closes it synchronously regardless of outcome (see
+    // LoanProgress.tsx's handleCreate), so resolving here isolates "a request that truly
+    // succeeded" from "one merely abandoned mid-flight," confirming the key-per-mount mechanism
+    // doesn't accidentally special-case success.
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Succeeded Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const firstKey = mockCreateManualLoan.mock.calls[0][1];
+
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Next Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '200' } });
+    mockCreateManualLoan.mockReturnValueOnce(deferred<ReturnType<typeof fakeManualLoan>>().promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+    const secondKey = mockCreateManualLoan.mock.calls[1][1];
+
+    expect(secondKey).not.toBe(firstKey);
+  });
+});
+
 describe('42. createManualLoan mutation cross-lifecycle ownership: A -> B (Blocker 1)', () => {
   it("A's pending manual-loan create does not appear once B is ready", async () => {
     mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
@@ -2033,8 +2624,9 @@ describe('46. targeted assets refresh started BEFORE a grouped refresh: the late
     });
 
     mockGetAssetsSummary.mockResolvedValueOnce(fakeAssetsSummary('Grouped-Bank'));
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
     act(() => screen.getByText('Overview').click());
@@ -2060,8 +2652,9 @@ describe('47. grouped refresh started BEFORE a targeted assets refresh: the late
 
     const groupedAssets = deferred<ReturnType<typeof fakeAssetsSummary>>();
     mockGetAssetsSummary.mockReturnValueOnce(groupedAssets.promise);
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve());
     });
 
@@ -2099,8 +2692,9 @@ describe('48. recurring-streams targeted vs. grouped ordering shares the same re
     });
 
     mockGetRecurringStreams.mockResolvedValueOnce(fakeRecurringStreams('Grouped-Subscription'));
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
 
@@ -2134,8 +2728,9 @@ describe('49. account-refresh committer vs. a newer grouped items write (Blocker
     });
 
     mockGetLinkedItems.mockResolvedValueOnce(fakeLinkedItems('Grouped-Bank'));
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
     });
     expect(screen.getByText(/Grouped-Bank/)).toBeTruthy();
@@ -2358,8 +2953,9 @@ describe('53. plaidCategories: same-session overlapping grouped reads settle wit
 
     const secondCategories = deferred<{ categories: string[] }>();
     mockGetPlaidCategories.mockReturnValueOnce(secondCategories.promise);
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve());
     });
 
@@ -2479,8 +3075,9 @@ describe('56. Accounts: an older grouped items read cannot overwrite a newer acc
     // account child operation below does, then holds open.
     const groupedItems = deferred<ReturnType<typeof fakeLinkedItems>>();
     mockGetLinkedItems.mockReturnValueOnce(groupedItems.promise);
+    await openPlaidLink();
     await act(async () => {
-      capturedPlaidOnSuccess!('fake-public-token');
+      finishHostedLink();
       await Promise.resolve().then(() => Promise.resolve());
     });
 
@@ -2606,5 +3203,612 @@ describe('57. handleSaveCategoryMapping: a lifecycle change during the post-back
     expect(screen.getByText(/B-Transaction/)).toBeTruthy();
     expect(screen.queryByText(/A-Transaction/)).toBeNull();
     expect(screen.queryByText(/A-Stale-Transaction/)).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Round 13 remediation: cross-tab acquisition of a pending manual-loan creation.
+//
+// Two App instances rendered into one document stand in for two browser tabs of the same user: they
+// share localStorage and navigator.locks (the FakeLockManager installed in beforeEach), exactly the
+// state real same-origin tabs share, while each has its own React tree, state and form. jsdom runs
+// them on one thread, so the dangerous interleaving is forced deterministically: the storage spy
+// below lets tab A read the (empty) slot, then — before A can act on that read — makes tab B submit.
+// Without a cross-context lock both tabs therefore observe the original empty slot before either
+// has stored its attempt, which is exactly the race a real pair of tabs can hit.
+// -------------------------------------------------------------------------------------------------
+describe('Round 13: two tabs acquiring a pending manual-loan creation at the same time', () => {
+  const SLOT = 'myfinances.pendingManualLoanCreation.user-a';
+
+  /** Fake server honouring the idempotency contract: the first request for a key creates (persists)
+   *  one loan; its response is held open so the attempt stays unresolved for the whole test. */
+  function installHoldingLoanServer() {
+    const loansByKey = new Map<string, unknown>();
+    mockCreateManualLoan.mockImplementation((payload: unknown, key: string) => {
+      if (!loansByKey.has(key)) loansByKey.set(key, payload);
+      return deferred<ReturnType<typeof fakeManualLoan>>().promise;
+    });
+    return { loansByKey };
+  }
+
+  async function bootTwoTabs() {
+    const callbacks: LiveCallback[] = [];
+    mockOnAuthStateChange.mockImplementation((cb: LiveCallback) => {
+      callbacks.push(cb);
+      return { data: { subscription: { unsubscribe: vi.fn() } } };
+    });
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences()).mockResolvedValueOnce(fakePreferences());
+    const tabA = render(<App />).container;
+    const tabB = render(<App />).container;
+    const session = fakeSession('user-a', 'sid-user-a');
+    currentFakeSession = session;
+    act(() => callbacks.forEach((cb) => cb('AUTH_EVENT', session)));
+    await waitFor(() => {
+      expect(within(tabA).getByText('Customize dashboard')).toBeTruthy();
+      expect(within(tabB).getByText('Customize dashboard')).toBeTruthy();
+    });
+    act(() => within(tabA).getByText('Loans').click());
+    act(() => within(tabB).getByText('Loans').click());
+    return { tabA, tabB };
+  }
+
+  function fill(tab: HTMLElement, name: string, balance: string) {
+    act(() => within(tab).getByText('Add a loan').click());
+    fireEvent.change(within(tab).getByLabelText('Name'), { target: { value: name } });
+    fireEvent.change(within(tab).getByLabelText('Current balance'), { target: { value: balance } });
+  }
+
+  /** The first read of the user's slot (by whichever tab reads it first) returns what storage held
+   *  at that instant, but only AFTER running `interleave` — so the reader acts on a value that the
+   *  interleaved contender may already have invalidated. */
+  function interleaveAfterFirstSlotRead(interleave: () => void) {
+    const realGetItem = Storage.prototype.getItem;
+    let armed = true;
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+      const observed = realGetItem.call(this, key);
+      if (armed && key === SLOT) {
+        armed = false;
+        interleave();
+      }
+      return observed;
+    });
+  }
+
+  it('exactly one tab acquires the attempt, exactly one new-key request is sent, and the loser adopts the winner without overwriting it', async () => {
+    const server = installHoldingLoanServer();
+    const { tabA, tabB } = await bootTwoTabs();
+    fill(tabA, 'Tab A Loan', '111');
+    fill(tabB, 'Tab B Loan', '222');
+
+    // Tab B submits at the precise moment tab A has read the empty slot but not yet stored its key.
+    interleaveAfterFirstSlotRead(() => fireEvent.click(within(tabB).getByText('Save loan')));
+    await act(async () => {
+      fireEvent.click(within(tabA).getByText('Save loan'));
+    });
+    await waitFor(() => expect(within(tabB).getByRole('alert').textContent).toContain('An earlier loan save has not been confirmed yet'));
+
+    // 1 & 2. One attempt acquired, one request sent, one loan on the server.
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
+    const [winnerPayload, winnerKey] = mockCreateManualLoan.mock.calls[0];
+    expect(winnerPayload).toMatchObject({ name: 'Tab A Loan', current_balance: 111 });
+    expect(server.loansByKey.size).toBe(1);
+
+    // 3. The slot still holds the winner — the loser never overwrote it.
+    expect(JSON.parse(localStorage.getItem(SLOT) ?? 'null')).toEqual({ version: 1, idempotencyKey: winnerKey, input: winnerPayload });
+
+    // 4. The loser converged on the winner's attempt, and finishing it from there reuses the SAME key.
+    await waitFor(() => expect((within(tabB).getByLabelText('Name') as HTMLInputElement).value).toBe('Tab A Loan'));
+    await act(async () => {
+      fireEvent.click(within(tabB).getByText('Save loan'));
+    });
+    await waitFor(() => expect(mockCreateManualLoan).toHaveBeenCalledTimes(2));
+    expect(mockCreateManualLoan.mock.calls[1][1]).toBe(winnerKey);
+    expect(mockCreateManualLoan.mock.calls[1][0]).toEqual(winnerPayload);
+    expect(server.loansByKey.size).toBe(1);
+  });
+
+  it('a non-empty but malformed slot blocks creation and is left byte-for-byte untouched', async () => {
+    for (const corrupt of [
+      '{"idempotencyKey":42,"input":{}}',
+      '{not json',
+      '{"version":2,"attempt":{}}',
+      // Round 14: a valid envelope whose PAYLOAD is empty / wrongly typed must fail closed too.
+      '{"version":1,"idempotencyKey":"k0","input":{}}',
+      '{"version":1,"idempotencyKey":"k0","input":{"name":"X","loan_type":"personal","current_balance":"100","origination_principal_amount":null,"interest_rate_percentage":null,"origination_date":null,"term_months":null,"minimum_payment_amount":null,"next_payment_due_date":null,"notes":null,"match_text":null}}',
+    ]) {
+      cleanup();
+      mockCreateManualLoan.mockClear();
+      localStorage.clear();
+      localStorage.setItem(SLOT, corrupt);
+      await bootToLoans('user-a');
+      await act(async () => {
+        screen.getByText('Add a loan').click();
+      });
+      fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Blocked Loan' } });
+      fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '10' } });
+      await act(async () => {
+        fireEvent.click(screen.getByText('Save loan'));
+      });
+
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('unreadable'));
+      expect(mockCreateManualLoan).not.toHaveBeenCalled();
+      expect(localStorage.getItem(SLOT)).toBe(corrupt);
+    }
+  });
+
+  it('without Web Locks the tab refuses to create at all — nothing is stored and nothing is sent', async () => {
+    removeWebLocks();
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'No Locks Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '10' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain("can't coordinate"));
+    expect(mockCreateManualLoan).not.toHaveBeenCalled();
+    expect(localStorage.getItem(SLOT)).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Round 14 remediation: a manual-loan create begun by user A must never be sent under user B.
+//
+// `installVerifyingLoanServer` makes the mocked createManualLoan behave like the real one at its
+// send point: it calls the verifier App passes in with the session that is current AT THAT MOMENT
+// (currentFakeSession — what supabase.auth.getSession would return) and refuses before "sending" if
+// it fails, exactly as authedFetch does. Accepted requests record whose credentials they carried.
+// -------------------------------------------------------------------------------------------------
+describe('Round 14: manual-loan creation is bound to the initiating user and session', () => {
+  const SLOT_A = 'myfinances.pendingManualLoanCreation.user-a';
+  const SLOT_B = 'myfinances.pendingManualLoanCreation.user-b';
+
+  function installVerifyingLoanServer({ failFirst = false } = {}) {
+    const sentAs: { user: string; key: string }[] = [];
+    let calls = 0;
+    mockCreateManualLoan.mockImplementation(
+      async (payload: { name: string }, key: string, verifyOwnership: (session: unknown) => boolean) => {
+        calls += 1;
+        if (!currentFakeSession || !verifyOwnership(currentFakeSession)) {
+          throw new Error('Session no longer matches the expected authenticated owner');
+        }
+        sentAs.push({ user: currentFakeSession.user.id, key });
+        if (failFirst && calls === 1) throw new Error('Failed to backfill loan matches');
+        return { loan: { ...fakeManualLoan(payload.name).loan, id: `loan-for-${key}` } };
+      }
+    );
+    return { sentAs };
+  }
+
+  async function switchTo(userId: string, sessionId: string) {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    act(() => emitAuthEvent(fakeSession(userId, sessionId)));
+    // activeTab persists as 'loans'; its "Add a loan" button reappears once this lifecycle is ready.
+    await waitFor(() => expect(screen.getByText('Add a loan')).toBeTruthy());
+  }
+
+  it('A begins a create while the Web Lock is held; switching to B before release sends NOTHING, and A\'s pending record survives for A to retry', async () => {
+    const locks = installFakeWebLocks();
+    const server = installVerifyingLoanServer({ failFirst: true });
+    await bootToLoans('user-a');
+
+    // A's first attempt persists server-side but reports failure: A now has an unresolved record.
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'A Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '400' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(server.sentAs).toHaveLength(1);
+    const aRecord = localStorage.getItem(SLOT_A);
+    const aKey = JSON.parse(aRecord!).idempotencyKey;
+
+    // Another tab of A's is holding the cross-tab lock, so A's retry has to wait for it.
+    let releaseLock!: () => void;
+    void locks.request('myfinances.pendingManualLoanCreation.lock.user-a', () => new Promise<void>((r) => (releaseLock = r)));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+
+    // While A's retry is still queued on the lock, the browser signs in as B.
+    await switchTo('user-b', 'sid-b1');
+    await act(async () => {
+      releaseLock();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // Nothing at all was attempted under B: the only request ever made is A's original one.
+    expect(mockCreateManualLoan).toHaveBeenCalledTimes(1);
+    expect(server.sentAs.every((r) => r.user === 'user-a')).toBe(true);
+    // A's record is byte-for-byte what it was; B has no record; B's screen shows nothing of A's.
+    expect(localStorage.getItem(SLOT_A)).toBe(aRecord);
+    expect(localStorage.getItem(SLOT_B)).toBeNull();
+    expect(screen.queryByText(/signed out before this loan was sent/)).toBeNull();
+    expect(screen.queryByDisplayValue('A Loan')).toBeNull();
+
+    // A returns (a brand-new session lifecycle): the pending attempt resumes, and the retry goes out
+    // under A with the SAME key and payload — replaying the loan A's first attempt created.
+    await switchTo('user-a', 'sid-a2');
+    await waitFor(() => expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('A Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+    await waitFor(() => expect(server.sentAs).toHaveLength(2));
+    expect(server.sentAs[1]).toEqual({ user: 'user-a', key: aKey });
+    await waitFor(() => expect(localStorage.getItem(SLOT_A)).toBeNull());
+  });
+
+  it('the verifier handed to createManualLoan accepts ONLY the initiating user in the initiating session', async () => {
+    installVerifyingLoanServer();
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Bound Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '5' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+    await waitFor(() => expect(mockCreateManualLoan).toHaveBeenCalledTimes(1));
+
+    const verify = mockCreateManualLoan.mock.calls[0][2] as (session: unknown) => boolean;
+    expect(verify(fakeSession('user-a', 'sid-user-a'))).toBe(true);
+    expect(verify(fakeSession('user-b', 'sid-user-a'))).toBe(false); // another user
+    expect(verify(fakeSession('user-a', 'sid-a-other'))).toBe(false); // same user, another session
+  });
+
+  it('a verifier refusal at send time (identity changed after the lock) sends nothing and keeps the pending record', async () => {
+    // Simulates the change landing in the last possible window — after App's post-lock check, while
+    // authedFetch looks up the session — by switching identity inside the send itself.
+    mockCreateManualLoan.mockImplementation(async (_p: unknown, _k: string, verify: (s: unknown) => boolean) => {
+      currentFakeSession = fakeSession('user-b', 'sid-b1');
+      if (!verify(currentFakeSession)) throw new Error('Session no longer matches the expected authenticated owner');
+      throw new Error('UNREACHABLE: request sent under the wrong identity');
+    });
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Late Switch Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '7' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('no longer matches'));
+    expect(JSON.parse(localStorage.getItem(SLOT_A) ?? 'null')).toMatchObject({ input: { name: 'Late Switch Loan' } });
+  });
+
+  it('same user, same session: create and ambiguous-failure retry still work under one key', async () => {
+    const server = installVerifyingLoanServer({ failFirst: true });
+    await bootToLoans('user-a');
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Same User Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '12' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+    });
+
+    await waitFor(() => expect(screen.queryByText('Save loan')).toBeNull());
+    expect(server.sentAs.map((r) => r.user)).toEqual(['user-a', 'user-a']);
+    expect(new Set(server.sentAs.map((r) => r.key)).size).toBe(1);
+    expect(localStorage.getItem(SLOT_A)).toBeNull();
+  });
+});
+
+// --- Wave 1: every mutation, and every Plaid Link flow, is bound to the session that started it ---
+describe('Wave 1: Plaid Hosted Link is server-owned and bound to the initiating user and login session', () => {
+  type Verify = (session: unknown) => boolean;
+
+  async function bootAs(userId: string, sessionId: string) {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession(userId, sessionId)));
+    await waitForReady();
+  }
+  async function pollNow() {
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  it('opens Plaid in a new tab it cannot reach back from, and completes by attempt id alone — both requests bound to the initiating session', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+
+    const tab = openedTabs[0];
+    expect(window.open).toHaveBeenCalledWith('', '_blank');
+    expect(tab.opener).toBeNull();
+    expect(tab.location.replace).toHaveBeenCalledWith('https://hosted.plaid.test/link/fake');
+
+    await act(async () => {
+      finishHostedLink();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Link a bank account' })).toBeTruthy());
+
+    const createVerify = mockCreateHostedLinkAttempt.mock.calls[0][0] as Verify;
+    const [attemptId, completeVerify] = mockCompleteLinkAttempt.mock.calls[0] as [string, Verify];
+    expect(attemptId).toBe('fake-link-attempt');
+    for (const verify of [createVerify, completeVerify]) {
+      expect(verify(fakeSession('user-a', 'sid-a1'))).toBe(true);
+      expect(verify(fakeSession('user-b', 'sid-a1'))).toBe(false); // another user
+      expect(verify(fakeSession('user-a', 'sid-a2'))).toBe(false); // same user, a later login
+    }
+    // Nothing but the attempt id and the owner check is ever handed to the completion call.
+    expect(mockCompleteLinkAttempt.mock.calls[0]).toHaveLength(2);
+  });
+
+  it('pending keeps waiting; the completion page\'s broadcast or returning to the tab checks again; success refreshes the data', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    const linkedItemsCallsBefore = mockGetLinkedItems.mock.calls.length;
+
+    await pollNow();
+    expect(mockCompleteLinkAttempt).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/Finish linking in the Plaid tab/)).toBeTruthy();
+    expect(mockGetLinkedItems.mock.calls.length).toBe(linkedItemsCallsBefore);
+
+    mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed' });
+    await pollNow();
+    await waitFor(() => expect(mockGetLinkedItems.mock.calls.length).toBeGreaterThan(linkedItemsCallsBefore));
+    expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull();
+  });
+
+  it('an attempt is single-use: linking again starts a fresh attempt', async () => {
+    mockCreateHostedLinkAttempt
+      .mockResolvedValueOnce({ hosted_link_url: 'https://hosted.plaid.test/link/1', link_attempt_id: 'attempt-1', expires_at: inThirtyMinutes() })
+      .mockResolvedValueOnce({ hosted_link_url: 'https://hosted.plaid.test/link/2', link_attempt_id: 'attempt-2', expires_at: inThirtyMinutes() });
+    await bootAs('user-a', 'sid-a1');
+    for (let i = 0; i < 2; i++) {
+      await openPlaidLink();
+      await act(async () => {
+        finishHostedLink();
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull());
+    }
+    expect(mockCreateHostedLinkAttempt).toHaveBeenCalledTimes(2);
+    expect(mockCompleteLinkAttempt.mock.calls.map((call) => call[0])).toEqual(['attempt-1', 'attempt-2']);
+  });
+
+  it('logout/login as B mid-flow: A\'s attempt is never polled again, and B starts with an idle button', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitForReady();
+    const callsAtSwitch = mockCompleteLinkAttempt.mock.calls.length;
+
+    await pollNow();
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(callsAtSwitch);
+    expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull();
+    expect((screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('the same user signing out and back in mid-flow: the old attempt is abandoned, not completed under the new login', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    act(() => emitAuthEvent(null));
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a2')));
+    await waitForReady();
+    const callsAtSwitch = mockCompleteLinkAttempt.mock.calls.length;
+
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(callsAtSwitch);
+  });
+
+  it('a login change while the attempt is being created: the tab is closed and nothing is polled', async () => {
+    const pending = deferred<{ hosted_link_url: string; link_attempt_id: string; expires_at: string }>();
+    mockCreateHostedLinkAttempt.mockReturnValueOnce(pending.promise);
+    await bootAs('user-a', 'sid-a1');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Link a bank account' }));
+    });
+
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitForReady();
+    await act(async () => {
+      pending.resolve({ hosted_link_url: 'https://hosted.plaid.test/link/a', link_attempt_id: 'attempt-for-a', expires_at: inThirtyMinutes() });
+      await pending.promise;
+    });
+
+    expect(openedTabs[0].close).toHaveBeenCalled();
+    expect(openedTabs[0].location.replace).not.toHaveBeenCalled();
+    await pollNow();
+    expect(mockCompleteLinkAttempt).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an old backend that still returns a link token', { link_token: 'link-sandbox-x', link_attempt_id: 'attempt-x' }],
+    ['a non-https Hosted Link URL', { hosted_link_url: 'javascript:alert(1)', link_attempt_id: 'attempt-x', expires_at: 'x' }],
+    ['no attempt id', { hosted_link_url: 'https://hosted.plaid.test/link/x', expires_at: 'x' }],
+  ])('fails closed for %s: the tab is closed and no attempt starts', async (_label, response) => {
+    mockCreateHostedLinkAttempt.mockResolvedValueOnce(response);
+    await bootAs('user-a', 'sid-a1');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Link a bank account' }));
+    });
+    await waitFor(() => expect(screen.getByText(/Could not start linking right now/)).toBeTruthy());
+    expect(openedTabs[0].close).toHaveBeenCalled();
+    expect(openedTabs[0].location.replace).not.toHaveBeenCalled();
+    await pollNow();
+    expect(mockCompleteLinkAttempt).not.toHaveBeenCalled();
+  });
+
+  it('a server refusal (expired) is shown, polling stops, and the next click starts a new attempt', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    mockCompleteLinkAttempt.mockRejectedValueOnce(
+      Object.assign(new Error('This bank link took too long and expired. Start linking the account again.'), { code: 'link_attempt_expired' })
+    );
+    await pollNow();
+    await waitFor(() => expect(screen.getByText(/took too long and expired/)).toBeTruthy());
+    const calls = mockCompleteLinkAttempt.mock.calls.length;
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(calls);
+
+    await openPlaidLink();
+    expect(mockCreateHostedLinkAttempt).toHaveBeenCalledTimes(2);
+  });
+
+  it('link_attempt_already_completed (a lost response, then a retry) is treated as linked', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    const before = mockGetLinkedItems.mock.calls.length;
+    mockCompleteLinkAttempt.mockRejectedValueOnce(
+      Object.assign(new Error('This bank link has already been completed.'), { code: 'link_attempt_already_completed' })
+    );
+    await pollNow();
+    await waitFor(() => expect(mockGetLinkedItems.mock.calls.length).toBeGreaterThan(before));
+    expect(screen.queryByText(/already been completed/)).toBeNull();
+  });
+
+  it('a transient failure (no server code) keeps waiting and succeeds on the next check', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    mockCompleteLinkAttempt.mockRejectedValueOnce(new Error('Failed to fetch'));
+    await pollNow();
+    expect(screen.getByText(/Finish linking in the Plaid tab/)).toBeTruthy();
+    mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed' });
+    await pollNow();
+    await waitFor(() => expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull());
+  });
+
+  it('Cancel stops waiting, closes the Plaid tab, and never polls again', async () => {
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    });
+    expect(openedTabs[0].close).toHaveBeenCalled();
+    await pollNow();
+    expect(mockCompleteLinkAttempt).not.toHaveBeenCalled();
+    expect((screen.getByRole('button', { name: 'Link a bank account' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('a blocked popup offers a plain link to the Hosted Link URL (noopener) and still completes', async () => {
+    vi.mocked(window.open).mockImplementation(() => null);
+    await bootAs('user-a', 'sid-a1');
+    await openPlaidLink();
+    const link = screen.getByRole('link', { name: 'Open Plaid to link your bank' }) as HTMLAnchorElement;
+    expect(link.href).toBe('https://hosted.plaid.test/link/fake');
+    expect(link.rel).toContain('noopener');
+    await act(async () => {
+      finishHostedLink();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull());
+  });
+});
+
+describe('Wave 1: App mutations carry an owner check bound to the lifecycle that started them', () => {
+  it("approveTransaction's owner check accepts only A's own login while it is current — after a switch to B it refuses every session", async () => {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactionNeedingReview('txn-1', 'A-Transaction', true));
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    const pendingApprove = deferred<{ transaction: unknown }>();
+    mockApproveTransaction.mockReturnValueOnce(pendingApprove.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Approve'));
+      await Promise.resolve();
+    });
+    const verify = mockApproveTransaction.mock.calls[0][1] as (session: unknown) => boolean;
+    expect(verify(fakeSession('user-a', 'sid-a1'))).toBe(true);
+    expect(verify(fakeSession('user-a', 'sid-a2'))).toBe(false);
+
+    mockGetTransactions.mockResolvedValueOnce(fakeTransactionNeedingReview('txn-1', 'B-Transaction', true));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText('B-Transaction')).toBeTruthy());
+
+    // Any send or clock-skew retry authedFetch attempts from here on is refused — under B, and even
+    // under A's own old token, since that login is no longer the app's current one.
+    expect(verify(fakeSession('user-b', 'sid-b1'))).toBe(false);
+    expect(verify(fakeSession('user-a', 'sid-a1'))).toBe(false);
+    await act(async () => {
+      pendingApprove.resolve({ transaction: {} });
+      await pendingApprove.promise;
+    });
+  });
+});
+
+describe('Wave 1 Hosted Link recovery outcomes, as the user sees them', () => {
+  async function bootAndOpen() {
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    await openPlaidLink();
+  }
+  async function pollNow() {
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  it('linked with some follow-up unfinished: data refreshes and a non-error hint points to Refresh balances / Sync', async () => {
+    await bootAndOpen();
+    const before = mockGetLinkedItems.mock.calls.length;
+    mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed', follow_up_incomplete: ['accounts', 'transactions', 'liabilities'] });
+    await pollNow();
+    await waitFor(() => expect(mockGetLinkedItems.mock.calls.length).toBeGreaterThan(before));
+    expect(screen.getByText(/Bank linked\. Some details are still loading/)).toBeTruthy();
+    expect(document.querySelector('.error')).toBeNull();
+  });
+
+  it('linked with every follow-up done: no hint', async () => {
+    await bootAndOpen();
+    mockCompleteLinkAttempt.mockResolvedValueOnce({ status: 'completed', follow_up_incomplete: [] });
+    await pollNow();
+    await waitFor(() => expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull());
+    expect(screen.queryByText(/Some details are still loading/)).toBeNull();
+  });
+
+  it('an unknown exchange outcome is final: it shows the server\'s guidance (unconfirmed, don\'t relink yet, contact support), never polls again or starts another attempt, and claims neither success nor absence', async () => {
+    // The backend's LINK_OUTCOME_UNKNOWN_MESSAGE, verbatim.
+    const guidance =
+      "We couldn't confirm whether this bank connection was completed. Please don't try linking this bank again yet — contact support so the connection can be checked first.";
+    await bootAndOpen();
+    const before = mockGetLinkedItems.mock.calls.length;
+    mockCompleteLinkAttempt.mockRejectedValueOnce(Object.assign(new Error(guidance), { code: 'link_attempt_outcome_unknown' }));
+    await pollNow();
+    await waitFor(() => expect(screen.getByText(guidance)).toBeTruthy());
+
+    // Final: the waiting state is gone, and no trigger — focus, the completion page's broadcast,
+    // or time passing — ever asks about this attempt again or starts a new one on its own.
+    expect(screen.queryByText(/Finish linking in the Plaid tab/)).toBeNull();
+    const completeCalls = mockCompleteLinkAttempt.mock.calls.length;
+    await pollNow();
+    await act(async () => {
+      const channel = new BroadcastChannel('my-finances-plaid-link');
+      channel.postMessage('finished');
+      channel.close();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    await pollNow();
+    expect(mockCompleteLinkAttempt.mock.calls.length).toBe(completeCalls);
+    expect(mockCreateHostedLinkAttempt).toHaveBeenCalledTimes(1);
+    expect(openedTabs).toHaveLength(1);
+    // Neither success (no data refresh, no success hint) nor a claim that nothing was added.
+    expect(mockGetLinkedItems.mock.calls.length).toBe(before);
+    expect(screen.queryByText(/Some details are still loading/)).toBeNull();
+    const shown = screen.getByText(guidance).textContent ?? '';
+    expect(shown).not.toMatch(/was not added|wasn't added|not linked|start linking|try again/i);
+    expect(shown).toMatch(/don't try linking this bank again yet/i);
+    expect(shown).toMatch(/contact support/i);
   });
 });

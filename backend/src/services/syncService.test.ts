@@ -26,6 +26,13 @@ vi.mock('./loans', () => ({
   linkNewTransactionsToManualLoans: mockLinkNewTransactionsToManualLoans,
 }));
 
+const mockReconcileRelationalRoles = vi.hoisted(() => vi.fn());
+const mockRepairExistingRelationalRoles = vi.hoisted(() => vi.fn());
+vi.mock('./roleReconciliation', () => ({
+  reconcileRelationalRoles: mockReconcileRelationalRoles,
+  repairExistingRelationalRoles: mockRepairExistingRelationalRoles,
+}));
+
 const item = {
   id: 'item-row-1',
   user_id: 'user-1',
@@ -37,8 +44,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockGetAccountIdMapForItem.mockResolvedValue(new Map([['plaid-acc-1', 'account-row-1']]));
   mockSyncTransactions.mockResolvedValue({ added: [], modified: [], removed: [], cursor: 'new-cursor' });
-  mockApplyTransactionChanges.mockResolvedValue([]);
+  mockApplyTransactionChanges.mockResolvedValue({ insertedTransactions: [], touchedTransactionIds: [] });
   mockGetRecurringStreams.mockResolvedValue({ inflowStreams: [], outflowStreams: [] });
+  mockReconcileRelationalRoles.mockResolvedValue(undefined);
+  mockRepairExistingRelationalRoles.mockResolvedValue(undefined);
 });
 
 describe('syncItemTransactions', () => {
@@ -120,12 +129,148 @@ describe('syncItemTransactions', () => {
     expect(mockSetItemStatus).toHaveBeenCalledWith('item-row-1', 'active');
   });
 
-  it('links newly-inserted transactions to the user\'s manual loans', async () => {
-    const insertedTransactions = [{ id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 }];
-    mockApplyTransactionChanges.mockResolvedValue(insertedTransactions);
+  it("passes Plaid's own added+modified transaction ids to linkNewTransactionsToManualLoans (Round 6 remediation, blocker 5) — not our own insertedTransactions dedup, which changes between sync attempts", async () => {
+    const added = [{ transaction_id: 'plaid-txn-1' }];
+    const modified = [{ transaction_id: 'plaid-txn-2' }];
+    mockSyncTransactions.mockResolvedValue({ added, modified, removed: [], cursor: 'new-cursor' });
+    mockApplyTransactionChanges.mockResolvedValue({
+      insertedTransactions: [{ id: 'txn-1', name: 'SoFi Payment', merchant_name: null, amount: 250 }],
+      touchedTransactionIds: ['txn-1'],
+    });
 
     await syncItemTransactions(item);
 
-    expect(mockLinkNewTransactionsToManualLoans).toHaveBeenCalledWith('user-1', insertedTransactions);
+    expect(mockLinkNewTransactionsToManualLoans).toHaveBeenCalledWith('user-1', ['plaid-txn-1', 'plaid-txn-2']);
+  });
+
+  it('runs relational role reconciliation over exactly the transactions touched by this batch, after loan auto-linking', async () => {
+    const insertedTransactions = [{ id: 'txn-1', name: 'Transfer', merchant_name: null, amount: 100 }];
+    mockApplyTransactionChanges.mockResolvedValue({
+      insertedTransactions,
+      touchedTransactionIds: ['txn-1', 'txn-2'],
+    });
+
+    await syncItemTransactions(item);
+
+    expect(mockReconcileRelationalRoles).toHaveBeenCalledWith('user-1', ['txn-1', 'txn-2']);
+    expect(mockReconcileRelationalRoles.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mockLinkNewTransactionsToManualLoans.mock.invocationCallOrder[0]
+    );
+  });
+
+  describe('the relational repair sweep (Round 3 remediation §2/§3/§4/§6)', () => {
+    it('runs repairExistingRelationalRoles when the batch contains a modified transaction', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [{ transaction_id: 't2' }], removed: [], cursor: 'new-cursor' });
+
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledTimes(1);
+    });
+
+    it('runs repairExistingRelationalRoles when the batch contains a removed transaction', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [], removed: [{ transaction_id: 't3' }], cursor: 'new-cursor' });
+
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+    });
+
+    it('DOES run the sweep for a pure-insert batch (Round 4 remediation §7) — a newly-inserted row can get auto-linked to a manual loan, and gating the sweep on our OWN insert/update dedup (rather than on Plaid\'s own added/modified/removed report) breaks retry: an already-linked row is no longer "inserted" on a retry, so a narrower gate would never re-trigger its repair', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [{ transaction_id: 't1' }], modified: [], removed: [], cursor: 'new-cursor' });
+
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledWith('user-1');
+    });
+
+    it('does NOT run the sweep when the batch is entirely empty', async () => {
+      await syncItemTransactions(item);
+      expect(mockRepairExistingRelationalRoles).not.toHaveBeenCalled();
+    });
+
+    it('a sweep failure propagates (a retryable sync failure) and does NOT advance the cursor, exactly like an ordinary reconciliation failure', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [{ transaction_id: 't2' }], removed: [], cursor: 'new-cursor' });
+      mockRepairExistingRelationalRoles.mockRejectedValue(new Error('sweep failed'));
+
+      await expect(syncItemTransactions(item)).rejects.toThrow('sweep failed');
+      expect(mockUpdateItemCursor).not.toHaveBeenCalled();
+    });
+
+    it('runs the sweep AFTER the ordinary forward pass, before the cursor advances', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [{ transaction_id: 't2' }], removed: [], cursor: 'new-cursor' });
+
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles.mock.invocationCallOrder[0]).toBeGreaterThan(
+        mockReconcileRelationalRoles.mock.invocationCallOrder[0]
+      );
+      expect(mockRepairExistingRelationalRoles.mock.invocationCallOrder[0]).toBeLessThan(
+        mockUpdateItemCursor.mock.invocationCallOrder[0]
+      );
+    });
+
+    it('is retry-safe: retrying after a sweep failure re-triggers the sweep even though the DB already reflects the new values (Round 3 remediation §6)', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [{ transaction_id: 't2' }], removed: [], cursor: 'new-cursor' });
+      mockRepairExistingRelationalRoles.mockRejectedValueOnce(new Error('transient failure')).mockResolvedValueOnce(undefined);
+
+      await expect(syncItemTransactions(item)).rejects.toThrow('transient failure');
+      expect(mockUpdateItemCursor).not.toHaveBeenCalled();
+
+      // Retry: same old cursor, same Plaid batch — the sweep is gated purely on "did this batch
+      // contain a modification," not on a same-attempt before/after comparison, so it re-runs and
+      // this time succeeds, advancing the cursor exactly once.
+      await syncItemTransactions(item);
+
+      expect(mockRepairExistingRelationalRoles).toHaveBeenCalledTimes(2);
+      expect(mockUpdateItemCursor).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('a reconciliation failure propagates (a retryable sync failure) and does NOT advance the cursor', async () => {
+    mockReconcileRelationalRoles.mockRejectedValue(new Error('reconciliation query failed'));
+
+    await expect(syncItemTransactions(item)).rejects.toThrow('reconciliation query failed');
+
+    expect(mockUpdateItemCursor).not.toHaveBeenCalled();
+  });
+
+  it('cursor advances only after reconciliation has actually succeeded', async () => {
+    mockApplyTransactionChanges.mockResolvedValue({
+      insertedTransactions: [],
+      touchedTransactionIds: ['txn-1'],
+    });
+    let reconciled = false;
+    mockReconcileRelationalRoles.mockImplementation(async () => {
+      reconciled = true;
+    });
+    mockUpdateItemCursor.mockImplementation(async () => {
+      expect(reconciled).toBe(true);
+    });
+
+    await syncItemTransactions(item);
+
+    expect(mockUpdateItemCursor).toHaveBeenCalledWith('item-row-1', 'new-cursor');
+  });
+
+  it('retrying after a reconciliation failure is safe: a retry reprocesses the same batch and advances the cursor exactly once, on the successful attempt', async () => {
+    const added = [{ transaction_id: 't1' }];
+    mockSyncTransactions.mockResolvedValue({ added, modified: [], removed: [], cursor: 'new-cursor' });
+    mockApplyTransactionChanges.mockResolvedValue({
+      insertedTransactions: [{ id: 'txn-1', name: 'Store', merchant_name: null, amount: 10 }],
+      touchedTransactionIds: ['txn-1'],
+    });
+    mockReconcileRelationalRoles.mockRejectedValueOnce(new Error('transient failure')).mockResolvedValueOnce(undefined);
+
+    await expect(syncItemTransactions(item)).rejects.toThrow('transient failure');
+    expect(mockUpdateItemCursor).not.toHaveBeenCalled();
+
+    // Retry with the SAME (unadvanced) cursor — applyTransactionChanges and loan auto-linking are
+    // called again with the identical batch, exactly as a real retry (same old cursor) would
+    // naturally re-request the same data from Plaid.
+    await syncItemTransactions(item);
+
+    expect(mockUpdateItemCursor).toHaveBeenCalledTimes(1);
+    expect(mockUpdateItemCursor).toHaveBeenCalledWith('item-row-1', 'new-cursor');
   });
 });

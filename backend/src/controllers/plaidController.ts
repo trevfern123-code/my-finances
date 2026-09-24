@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import * as plaidService from '../services/plaidService';
 import * as dataService from '../services/dataService';
@@ -10,6 +11,7 @@ import { groupAccountsForAssetsSummary, type AssetAccount } from '../services/as
 import { getCurrentMonthRange } from '../services/budgetPeriod';
 import { isReportingRangeId, resolveReportingRange, type ResolvedRange } from '../services/reportingRange';
 import { PlaidCredentialError } from '../services/tokenEncryption';
+import { interpretHostedLinkSessions } from '../services/hostedLink';
 import { summarizeErrorSafely } from '../services/errorSanitizer';
 import { env } from '../config/env';
 
@@ -197,67 +199,295 @@ export async function getNetWorthHistory(req: Request, res: Response, next: Next
   }
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Wave 1 (Hosted Link): starts linking a bank account. The backend creates a Plaid HOSTED Link
+ * token and stores it — encrypted, never logged, never returned — in a one-time, 30-minute attempt
+ * bound to the verified user AND login session (the verified token's `session_id`). The client
+ * gets only the Hosted Link URL to open and the opaque attempt id to complete later.
+ */
 export async function createLinkToken(req: Request, res: Response, next: NextFunction) {
   try {
-    const userId = req.user!.id;
-    const linkToken = await plaidService.createLinkToken(userId);
-    res.json({ link_token: linkToken });
+    const { id: userId, sessionId } = req.user!;
+    if (!sessionId) {
+      res.status(401).json({ error: 'Sign in again before linking an account.', code: 'session_required' });
+      return;
+    }
+    const attemptId = randomUUID();
+    const { linkToken, hostedLinkUrl } = await plaidService.createHostedLinkToken(userId);
+    const { expiresAt } = await dataService.createPlaidLinkAttempt({ attemptId, userId, sessionId, linkToken });
+    res.json({ hosted_link_url: hostedLinkUrl, link_attempt_id: attemptId, expires_at: expiresAt });
   } catch (err) {
+    if (err instanceof dataService.TooManyPlaidLinkAttemptsError) {
+      res.status(429).json({ error: err.message, code: 'link_attempts_in_progress' });
+      return;
+    }
     next(err);
   }
 }
 
-export async function exchangePublicToken(req: Request, res: Response, next: NextFunction) {
-  try {
-    const userId = req.user!.id;
-    const { public_token: publicToken } = req.body as { public_token?: string };
+/**
+ * RETIRED (Wave 1 review P1). Accepting a public token from a client let one user exchange a public
+ * token captured from another. Nothing reads the body — whatever it carries — and nothing reaches
+ * the attempt store or Plaid; the route exists only so a cached pre-Hosted-Link frontend gets a
+ * clear, permanent answer.
+ */
+export function exchangePublicToken(_req: Request, res: Response) {
+  res.status(410).json({
+    error: 'This page is out of date. Reload it and link the account again.',
+    code: 'exchange_retired',
+  });
+}
 
-    if (!publicToken) {
-      res.status(400).json({ error: 'public_token is required' });
+/**
+ * exchange_unknown: Plaid may have created the Item even though its access token was never stored
+ * here, so the connection may exist at Plaid. Deliberately does NOT say it was not added, and does
+ * NOT invite linking again — relinking before the uncertain Item is checked could create a
+ * duplicate Item (and duplicate billing). It asks the user to wait and contact support instead.
+ */
+export const LINK_OUTCOME_UNKNOWN_MESSAGE =
+  "We couldn't confirm whether this bank connection was completed. Please don't try linking this bank again yet — contact support so the connection can be checked first.";
+
+type AttemptRefusal ='invalid' | 'expired' | 'completed' | 'failed' | 'ambiguous' | 'exited' | 'exchange_unknown';
+
+/** The fixed, non-sensitive refusal for each way an attempt cannot be completed. */
+function attemptRefusal(res: Response, outcome: AttemptRefusal) {
+  switch (outcome) {
+    case 'invalid':
+      res.status(409).json({
+        error: 'This bank link is no longer valid for the signed-in account. Start linking the account again.',
+        code: 'link_attempt_invalid',
+      });
+      return;
+    case 'expired':
+      res.status(410).json({
+        error: 'This bank link took too long and expired. Start linking the account again.',
+        code: 'link_attempt_expired',
+      });
+      return;
+    case 'completed':
+      res.status(409).json({ error: 'This bank link has already been completed.', code: 'link_attempt_already_completed' });
+      return;
+    case 'exited':
+      res.status(409).json({ error: 'Linking was cancelled before it finished. Start again when you are ready.', code: 'link_attempt_exited' });
+      return;
+    case 'ambiguous':
+      res.status(409).json({
+        error: 'Plaid reported more than one account connection for this link. Start linking again.',
+        code: 'link_attempt_ambiguous',
+      });
+      return;
+    case 'failed':
+      res.status(409).json({ error: 'This bank link did not finish. Start linking the account again.', code: 'link_attempt_failed' });
+      return;
+    case 'exchange_unknown':
+      res.status(409).json({ error: LINK_OUTCOME_UNKNOWN_MESSAGE, code: 'link_attempt_outcome_unknown' });
+      return;
+  }
+}
+
+/** Responds to a claim that was not won: another call is on it (202), or it has already ended. */
+function claimRefusal(res: Response, outcome: Exclude<dataService.PlaidLinkClaim['outcome'], 'claimed'>) {
+  if (outcome === 'in_progress') {
+    res.status(202).json({ status: 'completing' });
+    return;
+  }
+  attemptRefusal(res, outcome);
+}
+
+function logLinkFailure(step: string, err: unknown) {
+  // Never the raw error: a Plaid/Axios error carries the outgoing request (tokens included).
+  console.error(`Plaid Link completion: ${step} failed:`, summarizeErrorSafely(err));
+}
+
+/**
+ * Completes a Hosted Link attempt. The ONLY way a Plaid item is created:
+ *  1. The attempt must be the caller's own — its verified user AND login session — or nothing is
+ *     revealed or touched (409 link_attempt_invalid). Ended attempts get their final answer.
+ *  2. The backend reads its OWN stored (encrypted) link token and asks Plaid (/link/token/get) for
+ *     the public token of that link token's own session. No public token is ever taken from the
+ *     request. Still in progress -> 202 pending; exited or ambiguous -> the attempt fails.
+ *  3. Exactly one public token -> CLAIM (one conditional UPDATE, with a claim token): only the
+ *     claimer continues. It then durably records that the exchange may start (exchanging) and only
+ *     then calls /item/public_token/exchange — once. Plaid does not document re-exchanging a public
+ *     token as safe, so an attempt that reached `exchanging` is never exchanged again.
+ *  4. The Item is stored IMMEDIATELY after the exchange — encrypted access token, in the same
+ *     database transaction that completes the attempt — before any other Plaid call. From then on
+ *     it is linked: institution, accounts, initial sync, net-worth snapshot and liabilities are
+ *     best-effort follow-ups that can be retried (Refresh balances / Sync transactions / webhooks)
+ *     and never undo the link; the response lists any that did not finish (follow_up_incomplete).
+ *  5. If the exchange is rejected by Plaid -> failed. If its outcome is unknown (network error,
+ *     timeout) -> exchange_unknown. If the Item could not be stored and the database definitively
+ *     stored nothing -> /item/remove at Plaid; failed if confirmed, exchange_unknown if not. If
+ *     whether it was stored is itself unknown -> nothing is removed (it might be stored), and the
+ *     attempt resolves on a later call: completed, or exchange_unknown once stale.
+ *  6. Recovery: a claim older than two minutes whose exchange never began is safely re-claimed; an
+ *     exchange older than two minutes with no stored item becomes exchange_unknown.
+ */
+export async function completeLinkAttempt(req: Request, res: Response, next: NextFunction) {
+  const { id: userId, sessionId } = req.user!;
+  const { attemptId } = req.params;
+  if (typeof attemptId !== 'string' || !UUID_PATTERN.test(attemptId)) {
+    attemptRefusal(res, 'invalid');
+    return;
+  }
+  if (!sessionId) {
+    res.status(401).json({ error: 'Sign in again before linking an account.', code: 'session_required' });
+    return;
+  }
+
+  try {
+    const attempt = await dataService.readPlaidLinkAttempt(attemptId, userId, sessionId);
+    if (!attempt) return attemptRefusal(res, 'invalid');
+    switch (attempt.status) {
+      case 'completed':
+      case 'failed':
+      case 'exchange_unknown':
+        return attemptRefusal(res, attempt.status);
+      case 'exchanging':
+        if (!attempt.stale) {
+          res.status(202).json({ status: 'completing' });
+          return;
+        }
+      {
+        // Its process is presumed gone mid-exchange: the claim records exchange_unknown (or reports
+        // completed, if that exchange's store committed meanwhile). Never re-claimed.
+        const recovered = await dataService.claimPlaidLinkAttempt(attemptId, userId, sessionId);
+        if (recovered.outcome === 'claimed') {
+          res.status(202).json({ status: 'completing' }); // cannot happen for an exchanging attempt
+          return;
+        }
+        return claimRefusal(res, recovered.outcome);
+      }
+      case 'claimed':
+        if (!attempt.stale) {
+          res.status(202).json({ status: 'completing' });
+          return;
+        }
+        break; // Abandoned before its exchange began: safe to take over, like a pending attempt.
+      case 'pending':
+        break;
+    }
+    if (attempt.expired) return attemptRefusal(res, 'expired');
+
+    const outcome = interpretHostedLinkSessions(await plaidService.getLinkTokenSessions(attempt.linkToken));
+    if (outcome.kind === 'pending') {
+      res.status(202).json({ status: 'pending' });
+      return;
+    }
+    if (outcome.kind !== 'success') {
+      await dataService.failPlaidLinkAttempt(attemptId, userId, sessionId, null, outcome.kind);
+      return attemptRefusal(res, outcome.kind);
+    }
+
+    const claim = await dataService.claimPlaidLinkAttempt(attemptId, userId, sessionId);
+    if (claim.outcome !== 'claimed') return claimRefusal(res, claim.outcome);
+    const { claimToken } = claim;
+    if (!(await dataService.beginPlaidLinkExchange(attemptId, userId, sessionId, claimToken))) {
+      res.status(202).json({ status: 'completing' });
       return;
     }
 
-    const { accessToken, itemId } = await plaidService.exchangePublicToken(publicToken);
-    const { institutionId, institutionName } = await plaidService.getItemInstitution(accessToken);
+    // ---- The exchange: attempted exactly once, never retried. -----------------------------------
+    let exchanged: { accessToken: string; itemId: string };
+    try {
+      exchanged = await plaidService.exchangePublicToken(outcome.publicToken);
+    } catch (err) {
+      const rejected = plaidService.isDefinitivePlaidRejection(err);
+      logLinkFailure(rejected ? 'exchange (rejected by Plaid)' : 'exchange (outcome unknown)', err);
+      await dataService
+        .failPlaidLinkAttempt(attemptId, userId, sessionId, claimToken, rejected ? 'exchange_rejected' : 'exchange_outcome_unknown')
+        .catch((failErr) => logLinkFailure('recording the exchange failure', failErr));
+      return attemptRefusal(res, rejected ? 'failed' : 'exchange_unknown');
+    }
+    const { accessToken, itemId } = exchanged;
 
-    const itemRow = await dataService.insertPlaidItem({
-      userId,
-      itemId,
-      accessToken,
-      institutionId,
-      institutionName,
+    // ---- Durable immediately: item + completion in one transaction. ----------------------------
+    let stored: Awaited<ReturnType<typeof dataService.storePlaidLinkItem>>;
+    try {
+      stored = await dataService.storePlaidLinkItem({ attemptId, userId, sessionId, claimToken, plaidItemId: itemId, accessToken });
+    } catch (err) {
+      if (err instanceof PlaidCredentialError) {
+        // Encryption failed before anything was sent: definitively not stored.
+        logLinkFailure('storing the item (encryption)', err);
+        stored = { outcome: 'rejected' };
+      } else {
+        // Unknown whether it was stored, so it must NOT be removed at Plaid. The attempt stays
+        // exchanging: a later call finds it completed, or (once stale) records exchange_unknown.
+        logLinkFailure('storing the item (outcome unknown)', err);
+        res.status(202).json({ status: 'completing' });
+        return;
+      }
+    }
+    if (stored.outcome !== 'stored') {
+      // Definitively not stored: compensate at Plaid, and never claim success we cannot confirm.
+      let removed = false;
+      try {
+        await plaidService.removeItem(accessToken);
+        removed = true;
+      } catch (err) {
+        logLinkFailure('removing the unstored item at Plaid', err);
+      }
+      await dataService
+        .failPlaidLinkAttempt(attemptId, userId, sessionId, claimToken, removed ? 'store_failed_item_removed' : 'store_failed_remove_unknown')
+        .catch((failErr) => logLinkFailure('recording the store failure', failErr));
+      return attemptRefusal(res, removed ? 'failed' : 'exchange_unknown');
+    }
+    const { itemRowId } = stored;
+
+    // ---- Linked. Everything below is retryable follow-up work that never undoes the link. -------
+    const followUpIncomplete: string[] = [];
+    async function followUp<T>(step: string, work: () => Promise<T>): Promise<T | undefined> {
+      try {
+        return await work();
+      } catch (err) {
+        followUpIncomplete.push(step);
+        logLinkFailure(`follow-up '${step}' for item ${itemRowId}`, err);
+        return undefined;
+      }
+    }
+
+    const institution = await followUp('institution', async () => {
+      const found = await plaidService.getItemInstitution(accessToken);
+      await dataService.updatePlaidItemInstitution(itemRowId, found.institutionId, found.institutionName);
+      return found;
     });
+    const accountRows = await followUp('accounts', async () =>
+      dataService.upsertAccountsForItem(itemRowId, await plaidService.getAccounts(accessToken))
+    );
+    let transactionsSynced = 0;
+    if (accountRows) {
+      // Pull initial transaction history right away so the dashboard isn't empty until the
+      // webhook (or a manual sync) delivers the next update.
+      const synced = await followUp('transactions', () =>
+        syncService.syncItemTransactions({ id: itemRowId, user_id: userId, access_token: accessToken, transactions_cursor: null })
+      );
+      transactionsSynced = synced?.added ?? 0;
+    } else {
+      followUpIncomplete.push('transactions');
+    }
+    // Today's net worth, now that the item exists — a total across all the user's items.
+    await followUp('net_worth_snapshot', () => netWorthService.recordSnapshotForUser(userId));
+    if (accountRows) {
+      // Only produces data if the `liabilities` product is enabled and this item has loan accounts.
+      const accountIdByPlaidId = new Map(accountRows.map((a) => [a.plaid_account_id, a.id]));
+      await followUp('liabilities', () => refreshLoansForItem(itemRowId, accessToken, accountIdByPlaidId));
+    } else {
+      followUpIncomplete.push('liabilities');
+    }
 
-    const plaidAccounts = await plaidService.getAccounts(accessToken);
-    const accountRows = await dataService.upsertAccountsForItem(itemRow.id, plaidAccounts);
-
-    // Pull initial transaction history right away so the dashboard isn't empty until the
-    // webhook (or a manual sync) delivers the next update.
-    const { added } = await syncService.syncItemTransactions({
-      id: itemRow.id,
-      user_id: userId,
-      access_token: accessToken,
-      transactions_cursor: null,
-    });
-
-    // Record today's net worth now that we have fresh balances — covers both a user's very
-    // first linked item and an additional one (net worth is a total across all their items).
-    await netWorthService.recordSnapshotForUser(userId);
-
-    // Best-effort: only produces data if the `liabilities` product is enabled and this item
-    // actually has credit/mortgage/student-loan accounts.
-    const accountIdByPlaidId = new Map(accountRows.map((a) => [a.plaid_account_id, a.id]));
-    await refreshLoansForItem(itemRow.id, accessToken, accountIdByPlaidId);
-
-    // Access token is intentionally never included in the response — it stays server-side.
+    // Neither the access token nor any Plaid token is ever included in the response.
     res.status(201).json({
+      status: 'completed',
       item: {
-        id: itemRow.id,
-        institution_id: itemRow.institution_id,
-        institution_name: itemRow.institution_name,
+        id: itemRowId,
+        institution_id: institution?.institutionId ?? null,
+        institution_name: institution?.institutionName ?? null,
       },
-      accounts: accountRows,
-      transactions_synced: added,
+      accounts: accountRows ?? [],
+      transactions_synced: transactionsSynced,
+      follow_up_incomplete: followUpIncomplete,
     });
   } catch (err) {
     next(err);
@@ -278,12 +508,25 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
   try {
     const userId = req.user!.id;
     const items = await dataService.getPlaidItemsForUser(userId);
+    // Wave 1: institution enrichment is a follow-up of linking; retry it for any item still missing it.
+    const missingInstitution = await dataService.getPlaidItemIdsMissingInstitution(userId).catch((err) => {
+      console.error('Failed to check items for missing institutions:', summarizeErrorSafely(err));
+      return new Set<string>();
+    });
 
     for (const item of items) {
       try {
         const plaidAccounts = await plaidService.getAccounts(item.access_token);
         const updatedAccounts = await dataService.upsertAccountsForItem(item.id, plaidAccounts);
         await dataService.setItemStatus(item.id, 'active');
+
+        if (missingInstitution.has(item.id)) {
+          // Best-effort, like the webhook backfill below.
+          await plaidService
+            .getItemInstitution(item.access_token)
+            .then((found) => dataService.updatePlaidItemInstitution(item.id, found.institutionId, found.institutionName))
+            .catch((err) => console.error(`Failed to backfill institution for item ${item.id}:`, summarizeErrorSafely(err)));
+        }
 
         // Best-effort: backfills the webhook URL onto items linked before webhooks were
         // configured. Not critical, so a failure here shouldn't fail the whole refresh.
