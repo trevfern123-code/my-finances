@@ -24,6 +24,14 @@ jobs:
 
       - name: Backend tests
         run: npm run test --workspace backend
+        env:
+          # Safe placeholders: tests must never depend on production credentials, but modules
+          # that exercise the real application graph validate required configuration on import.
+          FRONTEND_URL: http://localhost:5173
+          SUPABASE_URL: https://example.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: test-service-role-key
+          PLAID_CLIENT_ID: test-client-id
+          PLAID_SECRET: test-secret
 
       - name: Backend build
         run: npm run build --workspace backend
