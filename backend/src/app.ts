@@ -64,8 +64,23 @@ export function createApp(options: {
 }): express.Express {
   const app = express();
 
+  // Order matters (and is pinned by app.test.ts):
+  //   1. helmet, then CORS — CORS answers every OPTIONS preflight itself, so a preflight never
+  //      reaches the compatibility check or anything after it;
+  //   2. request logging, so even requests refused below are logged;
+  //   3. the client-API-level check on the covered prefixes — BEFORE the body is parsed, so a
+  //      malformed or oversized body can never pre-empt `client_update_required` or the
+  //      compatibility response headers;
+  //   4. JSON body parsing (body-parser failures become client errors in errorHandler);
+  //   5. the routers, each with its own requireAuth, then the global error handler.
   app.use(helmet());
   app.use(cors(buildCorsOptions(options.frontendUrl)));
+  if (options.logRequests !== false) app.use(morgan('dev'));
+
+  // Before every covered router (and therefore before body parsing, requireAuth and any handler):
+  // an unsupported client is refused before anything is read or written for it.
+  app.use(CLIENT_API_ROUTES, requireSupportedClientApiLevel(options.clientApiLevelPolicy ?? DEFAULT_CLIENT_API_LEVEL_POLICY));
+
   app.use(
     express.json({
       // Plaid webhook signatures are computed over the exact raw request bytes — capture them
@@ -75,7 +90,6 @@ export function createApp(options: {
       },
     })
   );
-  if (options.logRequests !== false) app.use(morgan('dev'));
 
   app.get('/', (_req, res) => {
     res.json({ status: 'ok' });
@@ -84,10 +98,6 @@ export function createApp(options: {
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok' });
   });
-
-  // Before every covered router (and therefore before requireAuth and any handler): an unsupported
-  // client is refused before anything is read or written for it.
-  app.use(CLIENT_API_ROUTES, requireSupportedClientApiLevel(options.clientApiLevelPolicy ?? DEFAULT_CLIENT_API_LEVEL_POLICY));
 
   app.use('/api/plaid', plaidRouter);
   app.use('/api/budget-categories', budgetCategoriesRouter);

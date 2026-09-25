@@ -67,6 +67,9 @@ vi.mock('./services/dataService', async (importOriginal) => {
 });
 
 import { createApp } from './app';
+import { supabaseAdmin } from './config/supabase';
+
+const getUser = supabaseAdmin.auth.getUser as unknown as ReturnType<typeof vi.fn>;
 
 const FRONTEND = 'https://app.example.test';
 let server: Server;
@@ -142,5 +145,51 @@ describe('a supported client level never replaces authentication or ownership', 
   it('a supported client under the stricter policy still goes through authentication (401 without a token)', async () => {
     const res = await patchLoan(strictBase, 'loan-a', { 'X-Client-Api-Level': '2' });
     expect(res.status).toBe(401);
+  });
+});
+
+function patchRaw(root: string, loanId: string, rawBody: string, headers: Record<string, string>) {
+  return fetch(`${root}/api/manual-loans/${loanId}`, {
+    method: 'PATCH',
+    headers: { Origin: FRONTEND, 'Content-Type': 'application/json', Authorization: 'Bearer token-a', ...headers },
+    body: rawBody,
+  });
+}
+
+describe('a compatibility-rejected request never reaches Supabase authentication', () => {
+  it('below-minimum client (strict policy), even with a valid session and a malformed body: 409, getUser never called', async () => {
+    getUser.mockClear();
+    updates.calls.length = 0;
+    const res = await patchRaw(strictBase, 'loan-a', '{"name":', { 'X-Client-Api-Level': '1' });
+
+    expect(res.status).toBe(409);
+    expect(getUser).not.toHaveBeenCalled();
+    expect(updates.calls).toHaveLength(0);
+  });
+
+  it('invalid client-level header: 400, getUser never called', async () => {
+    getUser.mockClear();
+    const res = await patchRaw(base, 'loan-a', JSON.stringify({ name: 'X' }), { 'X-Client-Api-Level': 'abc' });
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { code: unknown }).code).toBe('invalid_client_api_level');
+    expect(getUser).not.toHaveBeenCalled();
+  });
+
+  it('a supported client with a malformed body is refused by the parser (400) before authentication runs', async () => {
+    getUser.mockClear();
+    const res = await patchRaw(base, 'loan-a', '{"name":', { 'X-Client-Api-Level': '1' });
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { code: unknown }).code).toBe('malformed_json');
+    expect(getUser).not.toHaveBeenCalled();
+  });
+
+  it('control: a supported client with a valid body does reach authentication', async () => {
+    getUser.mockClear();
+    const res = await patchRaw(base, 'loan-a', JSON.stringify({ name: 'X' }), { 'X-Client-Api-Level': '1' });
+
+    expect(res.status).toBe(200);
+    expect(getUser).toHaveBeenCalledTimes(1);
   });
 });

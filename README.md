@@ -867,8 +867,16 @@ and refuses clients that are too old, explicitly instead of letting them misbeha
   `X-Min-Client-Api-Level`, including 401s, 404s and 500s. CORS allows the request header and
   exposes both response headers, with the same single allowed origin as before.
 - **Refusal:** a client below the minimum gets **409** `{ code: 'client_update_required' }` before
-  authentication or any handler runs, so nothing is read or written for it. Reads are refused too:
-  an old client can misread a response as easily as it can send a bad write.
+  body parsing, authentication or any handler runs, so nothing is read or written for it. Reads are
+  refused too: an old client can misread a response as easily as it can send a bad write.
+- **Order** (`createApp`): helmet → CORS (answers every `OPTIONS` preflight itself) → request
+  logging → client-API-level check on the covered prefixes → JSON body parsing → routers (each with
+  its own `requireAuth`) → error handler. The check deliberately precedes parsing, so a malformed or
+  oversized body can never pre-empt it or its headers.
+- **Body errors are client errors:** malformed JSON → **400** `malformed_json`; a body over the
+  parser's limit (100 kB) → **413** `payload_too_large`; unsupported encoding or charset → 415;
+  truncated or mis-sized bodies → 400. Messages are fixed and never quote the parser or the body.
+  Every other error keeps the existing 500 behaviour.
 - **Covered routes:** `/api/plaid`, `/api/budget-categories`, `/api/category-mappings`,
   `/api/manual-loans`, `/api/user-preferences` (`CLIENT_API_ROUTES` in `app.ts`). **Not covered**,
   each keeping its own checks: `/` and `/health`, `/api/webhooks` (Plaid's signed JWT), and

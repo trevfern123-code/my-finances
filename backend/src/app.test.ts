@@ -76,7 +76,7 @@ vi.mock('./services/loans', async (importOriginal) => ({
   backfillMatchesForLoan: vi.fn(async () => undefined),
 }));
 
-import { createApp } from './app';
+import { CLIENT_API_ROUTES, createApp } from './app';
 import { LEGACY_SERVER_KEY_PREFIX } from './controllers/manualLoanController';
 
 const FRONTEND = 'https://app.example.test';
@@ -458,5 +458,180 @@ describe('Client API level contract — a stricter minimum (isolated test policy
     expect(health.status).toBe(200);
     expect(webhook.status).toBe(400);
     expect(await webhook.json()).toEqual({ error: 'Missing signature or body' });
+  });
+});
+
+// ---- Ordering: the compatibility check runs BEFORE the JSON body is parsed (Codex review) ---------
+
+const MALFORMED_JSON = '{"name": "Broken", "current_balance": 100,';
+// express.json()'s default limit is 100kb.
+const OVERSIZED_JSON = JSON.stringify({ name: 'Huge', current_balance: 100, notes: 'x'.repeat(150 * 1024) });
+
+function postRaw(root: string, path: string, rawBody: string, headers: Record<string, string> = {}) {
+  return fetch(`${root}${path}`, {
+    method: 'POST',
+    headers: { Origin: FRONTEND, 'Content-Type': 'application/json', Authorization: 'Bearer test', ...headers },
+    body: rawBody,
+  });
+}
+
+describe('Client API level runs before body parsing, and body-parser failures are client errors', () => {
+  let strictServer: Server;
+  let strictBase: string;
+
+  beforeAll(async () => {
+    strictServer = createApp({
+      frontendUrl: FRONTEND,
+      logRequests: false,
+      clientApiLevelPolicy: { apiLevel: 3, minClientApiLevel: 2 },
+    }).listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => strictServer.once('listening', () => resolve()));
+    strictBase = `http://127.0.0.1:${(strictServer.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => strictServer.close(() => resolve()));
+  });
+
+  it('a below-minimum client with a malformed body gets 409 client_update_required: the body is never parsed', async () => {
+    const res = await postRaw(strictBase, '/api/manual-loans/idempotent', MALFORMED_JSON, {
+      'Idempotency-Key': 'k-order-1',
+      'X-Client-Api-Level': '1',
+    });
+
+    expect(res.status).toBe(409);
+    expectCompatHeaders(res, '3', '2');
+    expect(((await res.json()) as { code: unknown }).code).toBe('client_update_required');
+    expect(store.keysSeen).toHaveLength(0);
+  });
+
+  it('a below-minimum client with an oversized body also gets 409, not a parser error', async () => {
+    const res = await postRaw(strictBase, '/api/manual-loans/idempotent', OVERSIZED_JSON, {
+      'Idempotency-Key': 'k-order-2',
+      'X-Client-Api-Level': '1',
+    });
+
+    expect(res.status).toBe(409);
+    expectCompatHeaders(res, '3', '2');
+  });
+
+  it('an invalid client-level header with a malformed body gets 400 invalid_client_api_level: level validation wins', async () => {
+    const res = await postRaw(base, '/api/manual-loans/idempotent', MALFORMED_JSON, {
+      'Idempotency-Key': 'k-order-3',
+      'X-Client-Api-Level': 'abc',
+    });
+
+    expect(res.status).toBe(400);
+    expectCompatHeaders(res, '1', '0');
+    expect(((await res.json()) as { code: unknown }).code).toBe('invalid_client_api_level');
+  });
+
+  it.each([
+    ['a level-1 client', { 'X-Client-Api-Level': '1' }],
+    ['a legacy client (no header)', {}],
+  ])('%s with a malformed body reaches parsing and gets 400 malformed_json with the compatibility headers', async (_label, levelHeader) => {
+    const res = await postRaw(base, '/api/manual-loans/idempotent', MALFORMED_JSON, {
+      'Idempotency-Key': 'k-order-4',
+      ...(levelHeader as Record<string, string>),
+    });
+
+    expect(res.status).toBe(400);
+    expectCompatHeaders(res, '1', '0');
+    const body = (await res.json()) as { error: string; code: string };
+    expect(body).toEqual({ error: 'The request body is not valid JSON', code: 'malformed_json' });
+    expect(store.keysSeen).toHaveLength(0);
+  });
+
+  it('a supported client with an oversized body gets 413 payload_too_large with the compatibility headers', async () => {
+    const res = await postRaw(base, '/api/manual-loans/idempotent', OVERSIZED_JSON, {
+      'Idempotency-Key': 'k-order-5',
+      'X-Client-Api-Level': '1',
+    });
+
+    expect(res.status).toBe(413);
+    expectCompatHeaders(res, '1', '0');
+    expect(await res.json()).toEqual({ error: 'The request body is too large', code: 'payload_too_large' });
+    expect(store.keysSeen).toHaveLength(0);
+  });
+
+  it('a parser failure never exposes parser internals or a stack trace', async () => {
+    const res = await postRaw(base, '/api/manual-loans/idempotent', MALFORMED_JSON, { 'X-Client-Api-Level': '1' });
+    const text = await res.text();
+
+    expect(text).not.toMatch(/Unexpected|position|SyntaxError|at .*\.js/);
+  });
+
+  it('the malformed-body response is still readable cross-origin (CORS headers and exposed headers present)', async () => {
+    const res = await postRaw(base, '/api/manual-loans/idempotent', MALFORMED_JSON, { 'X-Client-Api-Level': '1' });
+
+    expect(res.headers.get('access-control-allow-origin')).toBe(FRONTEND);
+    expect((res.headers.get('access-control-expose-headers') ?? '').toLowerCase()).toContain('x-api-level');
+  });
+
+  it('webhooks (not covered) also get a clean 400 for a malformed body, and no compatibility headers', async () => {
+    const res = await postRaw(base, '/api/webhooks/plaid', MALFORMED_JSON);
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { code: unknown }).code).toBe('malformed_json');
+    expect(res.headers.get('x-api-level')).toBeNull();
+  });
+
+  it('unrelated application errors keep their existing 500 behaviour', async () => {
+    const res = await post('/api/manual-loans/idempotent', { name: 'Explode', current_balance: 100 }, {
+      'Idempotency-Key': 'k-order-6',
+      'X-Client-Api-Level': '1',
+    });
+
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: 'database unavailable' });
+  });
+});
+
+describe('Every covered prefix is gated (a future omission from CLIENT_API_ROUTES is caught)', () => {
+  const PROTECTED_PREFIXES = [
+    '/api/plaid',
+    '/api/budget-categories',
+    '/api/category-mappings',
+    '/api/manual-loans',
+    '/api/user-preferences',
+  ];
+  let strictServer: Server;
+  let strictBase: string;
+
+  beforeAll(async () => {
+    strictServer = createApp({
+      frontendUrl: FRONTEND,
+      logRequests: false,
+      clientApiLevelPolicy: { apiLevel: 3, minClientApiLevel: 2 },
+    }).listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => strictServer.once('listening', () => resolve()));
+    strictBase = `http://127.0.0.1:${(strictServer.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => strictServer.close(() => resolve()));
+  });
+
+  it('CLIENT_API_ROUTES is exactly the five protected prefixes (adding or dropping one must be a deliberate change here)', () => {
+    expect([...CLIENT_API_ROUTES].sort()).toEqual([...PROTECTED_PREFIXES].sort());
+  });
+
+  it.each(PROTECTED_PREFIXES.flatMap((prefix) => [
+    [prefix, 'GET'],
+    [prefix, 'POST'],
+  ]))('%s (%s) refuses a below-minimum client with 409 and the compatibility headers', async (prefix, method) => {
+    const res = await fetch(`${strictBase}${prefix}/anything`, {
+      method,
+      headers: { Origin: FRONTEND, 'Content-Type': 'application/json', Authorization: 'Bearer test', 'X-Client-Api-Level': '1' },
+      body: method === 'POST' ? '{}' : undefined,
+    });
+
+    expect(res.status).toBe(409);
+    expectCompatHeaders(res, '3', '2');
+  });
+
+  it.each(['/', '/health'])('the excluded path %s is never gated, even for a below-minimum client', async (path) => {
+    const res = await fetch(`${strictBase}${path}`, { headers: { 'X-Client-Api-Level': '1' } });
+    expect(res.status).toBe(200);
   });
 });
