@@ -51,16 +51,16 @@ inside a `DO` block instead, as the Phase A migration now does.
 - **Proof:** `bash supabase/tests/replay/run.sh` checks the replay and the resulting schema; with
   `SUPABASE_CLI="npx -y supabase@2.117.0"` it also runs the real CLI. CI runs both tiers, in the
   `migration-replay` job.
-- **Pending on production:** `PRODUCTION_HEAD` in `supabase/tests/replay/run.sh` (default
-  `20260922130000`) names the newest version production has applied. R5/C3 rehearse the production
-  push: every earlier ledger row stays byte-for-byte unchanged, and exactly the later files apply.
+- **Production head:** `PRODUCTION_HEAD` in `supabase/tests/replay/run.sh` (default
+  `20260924130000`) names the newest version production has applied. R5/C3 rehearse the next
+  production push: every earlier ledger row stays byte-for-byte unchanged, and exactly the later
+  files apply. With nothing pending, they check that a push to production's state is a no-op.
   Advance it after each production rollout.
-- **`20260924120000_manual_loan_link_idempotency.sql`** (post-audit blocker 1) makes
-  `link_transaction_to_manual_loan` return an explicit outcome instead of linking, and decrementing,
-  a transaction twice. Apply it **before** deploying the backend that reads the outcome: that backend
-  rejects the old `void` result. The backend on `main` never calls the function, so applying it
-  early is safe.
-- **`20260924130000_manual_loan_applied_balance_delta.sql`** (post-audit blocker 2) records what each
+- **`20260924120000_manual_loan_link_idempotency.sql`** (post-audit blocker 1, applied 2026-09-24)
+  makes `link_transaction_to_manual_loan` return an explicit outcome instead of linking, and
+  decrementing, a transaction twice. The backend rejects the old `void` result.
+- **`20260924130000_manual_loan_applied_balance_delta.sql`** (post-audit blocker 2, applied
+  2026-09-24) records what each
   loan payment actually took off a manual loan's balance: `transactions.loan_balance_applied` and
   `manual_loan_payments.balance_applied`. A balance is still never driven below zero. Unlink, edit,
   delete and Plaid removal now restore exactly that amount, not the full principal. Example: a $100
@@ -83,40 +83,58 @@ Caveats:
 - **This checkout is linked to the production project** (`supabase/.temp`). A bare `supabase db push`
   targets production. Test pushes always need an explicit local `--db-url`, as the replay harness uses.
 
-### Releasing the post-audit migrations
+### Releasing the post-audit migrations (completed 2026-09-24)
 
-This is the planned release of `20260924120000` and `20260924130000` with the backend and frontend
-that need them. Nothing here has been run yet. Merging to `main` **is** the deploy, because Railway
-and Vercel both auto-deploy from it. So the database changes go first, while the backend is stopped.
-Read-only SQL for steps 3 and 6: `supabase/preflight/20260924130000_applied_delta_preflight.sql`.
+`20260924120000` and `20260924130000` shipped together with the backend and frontend that need them,
+as merge commit `d2cf720` (PR #1). The sequence below is the record, and the template for any future
+release that changes the database. Merging to `main` **is** the deploy, because Railway and Vercel
+both auto-deploy from it. So the database changes go first, while the backend is stopped.
+Read-only SQL for the preflight/postflight: `supabase/preflight/20260924130000_applied_delta_preflight.sql`.
 
-1. **Codex re-review passes, and CI is green.**
-2. **Plaid Dashboard allows the completion redirect URI** (see "Wave 1 follow-ups" below).
-3. **Production preflight** (PREFLIGHT 1). Expect `ledger_head = 20260922130000`,
-   `pending_post_audit = 0`, and zero linked transactions, manual payments and cross-user rows.
-   Otherwise **stop**: the release needs a reconciliation decision first. Never delete or edit rows
-   to make the preflight pass.
-4. **Stop the backend for the deployment window** by removing Railway's active deployment
-   (dashboard, or `railway down`). Don't use the app or start Plaid Link until step 8.
-   - This keeps the old backend from writing anything between the migrations and the new deploy,
-     including webhook-triggered syncs. It also keeps old and new instances from overlapping.
-   - Plaid webhooks missed meanwhile are harmless: the next sync catches up from Plaid's cursor.
-5. **`supabase db push`** from this linked checkout. It applies `20260924120000`, then
-   `20260924130000`, each as one transaction.
-   - If `20260924130000` refuses, it has changed nothing. `20260924120000` alone is harmless to the
-     old backend, which never calls that function. Redeploy the previous deployment and reassess.
-6. **Production postflight** (POSTFLIGHT). Expect:
-   - both new versions in the ledger;
-   - `link_returns = text` and `guards_validated = 3`;
-   - `balance_applied_not_null = true`;
-   - zero NULL deltas and zero insecure functions.
+1. **Independent review passes, and CI is green.**
+2. **External configuration confirmed** (here: the Plaid Dashboard completion redirect URI).
+3. **Production preflight** (read-only): the ledger head is the expected version, and no row blocks
+   the migration's gate. If anything blocks it, **stop** and decide how to reconcile it. Never
+   delete or edit rows just to make a preflight pass.
+4. **Stop the backend** for the window by removing Railway's active deployment, so the old backend
+   writes nothing between the migrations and the new deploy (webhook-triggered syncs included), and
+   old and new instances never overlap. Missed Plaid webhooks are harmless: the next sync catches up
+   from Plaid's cursor.
+5. **`supabase db push --dry-run`**, then **`supabase db push`**, from the linked checkout at the
+   release head. The dry run must list exactly the expected files.
+6. **Production postflight** (read-only).
 7. **Merge the PR.** Railway and Vercel deploy the new backend and frontend.
-8. **Health check:** `/health` responds. Controlled manual-loan smoke test on a scratch loan: log a
-   manual payment larger than the balance, then delete it. The balance must return exactly to its
-   previous value.
-9. **Controlled Plaid Sandbox test** of Hosted Link.
-10. **Advance `PRODUCTION_HEAD`** in `supabase/tests/replay/run.sh` to `20260924130000`, in a
-    follow-up commit.
+8. **Health check and smoke tests** in a **fresh browser session** (see "Lessons" below): `/health`
+   responds; a controlled manual-loan test (a payment larger than the balance, then deleted,
+   restores the balance exactly); a controlled Plaid Sandbox link.
+9. **Advance `PRODUCTION_HEAD`** in `supabase/tests/replay/run.sh`.
+
+What actually happened on 2026-09-24:
+- The preflight found one legacy manual-loan link (a payment linked before applied amounts were
+  recorded), which the migration's gate would have refused. It was detached by a one-time, guarded
+  statement that verified every expected value first and kept the loan's balance exactly as
+  entered. Its applied amount was unknowable, so it was not re-linked.
+- `db push` applied both migrations; the postflight and a final check of that loan passed.
+- The manual-loan and Plaid Sandbox smoke tests passed. The Sandbox test's First Platypus Bank
+  item, its 14 accounts, 49 transactions, recurring streams, liability records and the day's
+  contaminated net-worth snapshot were then removed by a second one-time guarded statement. The
+  other institutions and every manual loan were verified unchanged.
+
+Lessons (reusable):
+- **A browser tab or installed app opened before a deploy keeps running the previous frontend**,
+  and the service worker serves the previous build once more on the first reload. The first Plaid
+  smoke test therefore ran the retired embedded-Link flow against the new backend. Run release
+  smoke tests in a fresh (e.g. Incognito) session, and check which bundle is loaded (DevTools →
+  Network). A proper update mechanism is a planned release-hardening task.
+- **One-time production data fixes are guarded single statements**: one `DO` block that locks what
+  it touches (the same per-user advisory lock the app uses), re-verifies every expected value,
+  refuses on any mismatch, and proves afterwards that nothing else changed (before/after
+  fingerprints). Each is preceded and followed by a read-only check. They are not kept in the
+  repository once run, because they carry production identifiers.
+- **Run each SQL part on its own in the Supabase SQL editor.** It executes the whole editor, and
+  shows only the last result.
+- **There is no in-app way to remove a linked institution yet** (planned V1 feature). Test
+  institutions linked to production must be removed by hand until it exists.
 
 ## CI
 
@@ -126,6 +144,12 @@ every backend test mocks its Supabase/Plaid config imports, so the suite passes 
 environment variables set (verified: `env -i npx vitest run` passes clean). This doesn't deploy
 anything itself — Railway and Vercel still deploy independently on push — it just catches a
 broken build/test before that happens.
+
+Two database jobs run alongside it, each against throwaway local containers only:
+- `migration-replay`: rebuilds the whole migration history through the pipeline emulator and the
+  real, pinned Supabase CLI (`db push`, `db reset`); see "Replaying the history" above.
+- `database-harness`: the adversarial PostgreSQL suites, `supabase/tests/phase_a` (scaffold and
+  history modes) and `supabase/tests/access_control`.
 
 ## Financial precision
 
@@ -688,17 +712,18 @@ Now the backend creates and keeps the Hosted Link token and gets the public toke
 for that exact token. No endpoint accepts a public token from a client, so the attack has nowhere to
 be submitted. The attack is an active test in `backend/src/controllers/plaidController.test.ts`.
 
-**Manual configuration required before deploying (not done by this repository):**
-- **Plaid Dashboard:** allow the completion redirect URI
-  `https://my-finances-frontend-kappa.vercel.app/plaid-link-complete.html`, or whatever
-  `${FRONTEND_URL}/plaid-link-complete.html` (or `PLAID_HOSTED_LINK_COMPLETION_REDIRECT_URI`, if set)
-  resolves to. For local Sandbox testing, also `http://localhost:5173/plaid-link-complete.html`, if
+**Configuration this depends on (all in place in production as of 2026-09-24; not managed by this
+repository):**
+- **Plaid Dashboard:** the completion redirect URI
+  `https://my-finances-frontend-kappa.vercel.app/plaid-link-complete.html` is allowed. It must match
+  `${FRONTEND_URL}/plaid-link-complete.html` (or `PLAID_HOSTED_LINK_COMPLETION_REDIRECT_URI`, if
+  set). For local Sandbox testing, also allow `http://localhost:5173/plaid-link-complete.html`, if
   the Dashboard accepts it.
-- **Supabase:** apply `20260922120000_restrict_plaid_items_client_access.sql`, then
-  `20260922130000_plaid_link_attempts.sql`, *before* deploying the backend.
-- **Railway:** no new required variables. `FRONTEND_URL` must be the exact frontend origin (it now
-  also forms the redirect URI). `BACKEND_PUBLIC_URL` should stay set so `SESSION_FINISHED` webhooks
-  arrive; they are optional, since completion always asks Plaid directly.
+- **Supabase:** `20260922120000_restrict_plaid_items_client_access.sql` and
+  `20260922130000_plaid_link_attempts.sql` are applied.
+- **Railway:** no extra variables. `FRONTEND_URL` must be the exact frontend origin (it also forms
+  the redirect URI). `BACKEND_PUBLIC_URL` should stay set so `SESSION_FINISHED` webhooks arrive;
+  they are optional, since completion always asks Plaid directly.
 
 **Residual, unavoidable with Plaid's API: orphaned Items — `exchange_unknown` requires investigation before relinking.** An attempt that ends `exchange_unknown`
 may have left an Item at Plaid whose access token this app never stored (the exchange succeeded but
@@ -714,11 +739,15 @@ When a user reports this message, before they link that bank again:
 2. Using the Plaid Dashboard's logs, or Plaid support, check for an Item created around then for that institution. The Link token was created with `client_user_id` = the user's id.
 3. If such an Item exists, ask Plaid support to remove it (this app holds no access token for it). Only then tell the user it is safe to link again.
 
-**Post-audit follow-ups (deferred from the release-audit remediation, in priority order):**
+**Post-audit follow-ups (deferred from the release-audit remediation; the full V1 roadmap is in
+"Roadmap to V1" below):**
 1. **Highest priority — define manual-loan balance-as-of semantics and historical transaction
    linking.** Today a new loan's match rule links every earlier unlinked matching payment and
-   decrements the balance the user just entered, which may already reflect those payments. Decide and
-   document:
+   decrements the balance the user just entered, which may already reflect those payments.
+   Until this is settled, **don't set a match text on a loan whose historical payments are already
+   reflected in its balance** (for example the SoFi loan), and don't create a loan whose match text
+   matches such payments. Either links them at their full amount. Edits that leave the match text
+   empty never re-link anything. Decide and document:
    - what `current_balance` means ("as of" when?);
    - loan creation;
    - manual balance edits;
@@ -741,10 +770,46 @@ When a user reports this message, before they link that bank again:
 - Supabase's default privileges still grant every new `public` table/function to
   `anon`/`authenticated` (`20260825195130_remote_schema.sql`), so each new object must revoke
   explicitly. Changing the defaults is a separate, project-wide migration.
-- `supabase/tests/phase_a/sql/t05_acl.sql` checks service_role's exact grants on
-  `manual_loan_creation_requests`/`manual_loan_deletions` via `information_schema`, which does not
-  report PostgreSQL 17's `MAINTAIN`. It should also use `has_table_privilege`, as the Wave 1 tests
-  now do.
+- ~~`t05_acl.sql` cannot see PostgreSQL 17's `MAINTAIN`~~ Resolved 2026-09-25: it now checks
+  effective privileges with `has_table_privilege` across every table privilege, `MAINTAIN` included.
+
+## Roadmap to V1
+
+V1 is **personal/private use first**; public-SaaS requirements are out of scope unless security
+needs them. Status as of the audited production baseline (`d2cf720`, 2026-09-24):
+
+- **Foundation / financial correctness**
+  - **Financial Semantics Phase B.** Phase A classifies and stores a role for every transaction
+    (transfer, credit-card payment, debt payment, refund, …), but no calculation reads it yet:
+    spend and income are still sign-based, so card payments and transfers between your own
+    accounts count as spending or income. For V1, every meaningful user-facing financial
+    calculation adopts the roles, and users can correct a role (`user_role_override` exists but has
+    no API or UI yet).
+  - **Manual-loan balance-as-of semantics** (follow-up 1 above): design first, then implement.
+- **Required V1 functionality**
+  - **Linked institution management**: one backend capability, with entry points on the Accounts
+    page and in Settings → Connections (the section is already reserved in `settingsSections.ts`).
+    List institutions with status, account count and last sync; reconnect; and a **destructive
+    remove** (V1 has no "disconnect but keep history"). Removal needs explicit confirmation, Plaid
+    `/item/remove`, retry/idempotency, a deletion record, and one atomic local cleanup: restore
+    manual-loan balances by their recorded applied amounts, delete accounts, transactions, splits,
+    recurring streams and liability records, repair relational roles, recompute today's net-worth
+    snapshot. It also covers ownership and sync-race protections, and `USER_PERMISSION_REVOKED`.
+  - Reconnect stuck-state fix; user role correction; transaction pagination (the API caps a request
+    at 200 rows).
+- **Release hardening**
+  - Service-worker update / frontend-backend version compatibility (see the release lessons above);
+    then retire the legacy routes kept for stale bundles.
+  - Retain terminal `exchange_unknown` attempts for about 30 days (follow-up 2 above).
+  - Plaid token encryption Phase 3: confirm no plaintext tokens remain, then remove the plaintext
+    fallback and column.
+  - Review whether public sign-up should be disabled or gated; default-privileges migration;
+    remove the obsolete Railway "frontend" service (the root `railway.json` builds the backend for
+    any service built from this repository, so that service can only fail).
+- **V1 UX / polish**: Settings → Dashboard section, custom date ranges, accessibility pass on the
+  later features.
+- **Post-V1**: mobile app; investments/portfolio tracking (Plaid Investments, holdings, cost basis;
+  kept out of V1 and the initial mobile scope); multi-currency; category groups.
 
 ## Budget periods
 
@@ -804,7 +869,7 @@ Two webhook types are handled (`backend/src/controllers/webhookController.ts`):
 
 ## Plaid access-token encryption
 
-🟢 **Phase 1 + Phase 2a live in production, verified, and the V1 → V2 key rotation fully complete** — schema migration applied, dual-write/dual-read encryption running against real traffic, all 3 items encrypted under `RAILWAY_PROD_V2`, and the exposed `RAILWAY_PROD_V1` key fully removed from Railway (the app redeployed successfully running on V2 only). See §21 of `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` for the original Phase 2a production verification, §23 for the rotation/backfill/V1-removal completion record, and §25 for the exact post-soak checklist that was followed. Phase 2b (encrypted-only writes for new items) has **not** started — a finalized, execution-ready implementation plan exists (§27 of the design doc) but is not approved or implemented; every existing and newly-linked item still gets both representations. Full design in `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` (read that before touching any of this — this section is a pointer, not the source of truth).
+🟢 **Phase 1 + Phase 2a live in production, verified, and the V1 → V2 key rotation fully complete** — schema migration applied, dual-write/dual-read encryption running against real traffic, all 3 items encrypted under `RAILWAY_PROD_V2`, and the exposed `RAILWAY_PROD_V1` key fully removed from Railway (the app redeployed successfully running on V2 only). See §21 of `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` for the original Phase 2a production verification, §23 for the rotation/backfill/V1-removal completion record, and §25 for the exact post-soak checklist that was followed. **Phase 2b (encrypted-only writes for new items) is also done**: Codex-approved and merged to `main` as `ca05fa3` (§27 of the design doc), so newly-linked items never get a plaintext token; Hosted Link's `store_plaid_link_item` stores the encrypted token only. Full design in `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` (read that before touching any of this — this section is a pointer, not the source of truth).
 
 **What's implemented**: `backend/src/services/tokenEncryption.ts` — AES-256-GCM, a fresh random 12-byte nonce per encryption, an AAD binding each ciphertext to its own `plaid_items.id` (so one row's ciphertext can never be decrypted as another row's), a versioned logical key ring (`PLAID_TOKEN_KEY_<ID>` env vars + `PLAID_TOKEN_CURRENT_KEY_ID`), and a family of typed errors (`PlaidCredentialError` and its subclasses) with fixed, non-sensitive messages. `dataService.ts`'s four Plaid-item functions are the *only* place any of this is encryption-aware (§6.1 of the design doc) — every other consumer (`plaidService.ts`, `syncService.ts`, `loans.ts`, every controller) still just receives a plain decrypted string, unchanged. New items are written with **both** the plaintext and the encrypted representation together (Phase 2a, a deliberately brief dual-write kept only for initial rollback safety — see the design doc §7); existing/updated items are read via dual-read, preferring the encrypted representation whenever present and never falling back to plaintext if decryption fails (the fail-closed rule, §8).
 
@@ -816,4 +881,4 @@ Two webhook types are handled (`backend/src/controllers/webhookController.ts`):
 
 **Done**: the Phase 1 migration is applied to production Supabase; Phase 2a is deployed and live-verified (§21); the two originally plaintext-only items were backfilled and, along with the third item, rotated from `RAILWAY_PROD_V1` to `RAILWAY_PROD_V2` after V1 was accidentally exposed (§23) — all 3 rows encrypted under V2, plaintext still present on all 3 (Phase 2a dual-write unchanged by the rotation), zero anomalies. Two purpose-built, Codex-audited one-off scripts did this work: `backend/src/scripts/rotateTartanTokenKey.ts` and a retargeted `backend/src/scripts/backfillTokenEncryption.ts` — both inert (never imported by the running server, guarded by `require.main === module`). **`RAILWAY_PROD_V1` has since been fully removed from Railway** (§25), confirmed via a clean redeploy running on V2 alone.
 
-**Not yet done, and deliberately not started without your explicit go-ahead**: Phase 2b (flipping to encrypted-only writes for newly-linked items) — a finalized, execution-ready implementation plan exists (§27 of the design doc: exact code change, files affected, required tests, deployment sequence, rollback boundary, production verification plan) but is not approved or implemented.
+**Not yet done (Phase 3, release hardening)**: items linked before Phase 2b may still carry their plaintext `access_token`, and the read path keeps its explicit legacy plaintext-only fallback (`dataService.ts`). Before removing either, confirm with a read-only production query which rows still hold plaintext; then clear it, remove the fallback, and finally drop the column. See "Roadmap to V1".

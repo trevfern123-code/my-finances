@@ -35,7 +35,7 @@
 # Requires: docker, bash, node, git.
 #   ORIGINAL_REV=<rev>  revision holding the Phase A file as production applied it (default 367e1a0)
 #   PG_IMAGE=<image>    default public.ecr.aws/supabase/postgres:17.6.1.155 (production's version)
-#   PRODUCTION_HEAD=<v> the newest migration version production has applied (default 20260922130000);
+#   PRODUCTION_HEAD=<v> the newest migration version production has applied (default 20260924130000);
 #                       advance it whenever a later migration is rolled out to production
 #   KEEP=1              leave containers running
 set -uo pipefail
@@ -72,7 +72,7 @@ if cmp -s "$ORIGINAL_DIR/$PHASE_A" "$ROOT/supabase/migrations/$PHASE_A"; then
   echo "note: $PHASE_A is unchanged since $ORIGINAL_REV (the original-file checks are then trivial)"
 fi
 # Production itself: the original files up to PRODUCTION_HEAD. Everything after it is pending there.
-PRODUCTION_HEAD="${PRODUCTION_HEAD:-20260922130000}"
+PRODUCTION_HEAD="${PRODUCTION_HEAD:-20260924130000}"
 PRODUCTION_DIR="$WORK/production-migrations"
 mkdir -p "$PRODUCTION_DIR"
 for f in "$ORIGINAL_DIR"/*.sql; do
