@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 
 // A curated set covering the things budget categories and accounts most commonly need an icon
 // for (food, transport, housing/bills, shopping, entertainment, health, travel, education,
@@ -44,6 +45,7 @@ export function EmojiPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [customEmoji, setCustomEmoji] = useState('');
+  useUpdateGuard('unsaved_edit', open && customEmoji !== '');
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {

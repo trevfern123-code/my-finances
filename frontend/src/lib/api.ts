@@ -2,8 +2,14 @@ import type { Session } from '@supabase/supabase-js';
 import { supabase } from './supabaseClient';
 import type { ReportingRangeId } from './reportingRange';
 import type { OwnershipCheck } from './sessionOwnership';
+import { appUpdate, CLIENT_API_LEVEL, parseLevelHeader } from './appUpdate';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
+/** `code` on the error for a request the backend refused because this build is too old
+ *  (HTTP 409 from backend/src/middleware/clientApiLevel.ts), and on the error authedFetch throws
+ *  WITHOUT sending when an update is already known to be required. */
+export const CLIENT_UPDATE_REQUIRED = 'client_update_required';
 
 /** `code` on the error authedFetch throws for a mutation sent without an owner check. */
 export const SESSION_OWNER_REQUIRED = 'session_owner_required';
@@ -44,55 +50,83 @@ async function authedFetch(
   verifyOwnership?: OwnershipCheck
 ): Promise<any> {
   const method = (init.method ?? 'GET').toUpperCase();
-  if (method !== 'GET' && method !== 'HEAD' && !verifyOwnership) {
+  const isMutation = method !== 'GET' && method !== 'HEAD';
+  if (isMutation && !verifyOwnership) {
     throw Object.assign(new Error('Refusing to send a change without a signed-in owner'), {
       code: SESSION_OWNER_REQUIRED,
     });
   }
-
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
-
-  if (!session) {
-    throw new Error('Not signed in');
-  }
-  if (verifyOwnership && !verifyOwnership(session)) {
-    // The session just looked up no longer belongs to whoever this specific request was created
-    // for. Refuse rather than send it anyway under whatever happens to be current now.
-    throw Object.assign(new Error('Session no longer matches the expected authenticated owner'), {
-      code: SESSION_OWNER_MISMATCH,
+  // Service-worker/version compatibility: once the backend has said this build is too old, no new
+  // change is even attempted — the app updates as soon as it safely can (see appUpdate.ts).
+  if (isMutation && appUpdate.isUpdateRequired()) {
+    throw Object.assign(new Error('This version of the app is out of date. Reload to update before saving.'), {
+      code: CLIENT_UPDATE_REQUIRED,
     });
   }
 
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${session.access_token}`,
-      ...init.headers,
-    },
-  });
+  // A mutation holds an update guard for its whole lifecycle (session lookup, request, response,
+  // and the clock-skew retry below), so the app never reloads with a change in flight.
+  const releaseGuard = isMutation ? appUpdate.acquireGuard('mutation') : null;
+  try {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
 
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    const message = body.error ?? `Request failed: ${response.status}`;
-
-    if (!isRetry && isClockSkewError(message)) {
-      await new Promise((resolve) => setTimeout(resolve, CLOCK_SKEW_RETRY_DELAY_MS));
-      // Re-verify on the retry too — the delay here is exactly the window a since-superseded
-      // request could otherwise slip through under a different session that became current while
-      // it waited.
-      return authedFetch(path, init, true, verifyOwnership);
+    if (!session) {
+      throw new Error('Not signed in');
+    }
+    if (verifyOwnership && !verifyOwnership(session)) {
+      // The session just looked up no longer belongs to whoever this specific request was created
+      // for. Refuse rather than send it anyway under whatever happens to be current now.
+      throw Object.assign(new Error('Session no longer matches the expected authenticated owner'), {
+        code: SESSION_OWNER_MISMATCH,
+      });
     }
 
-    // A machine-readable `code`, when the server sends one, lets a caller act on a specific outcome
-    // without parsing the human-readable message (see isManualLoanCreationResolvedError).
-    throw Object.assign(new Error(message), typeof body.code === 'string' ? { code: body.code } : {});
-  }
+    // A network or CORS failure rejects here and propagates as-is: never retried automatically.
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${session.access_token}`,
+        'X-Client-Api-Level': String(CLIENT_API_LEVEL),
+        ...init.headers,
+      },
+    });
 
-  if (response.status === 204) return undefined;
-  return response.json();
+    appUpdate.reportServerLevels(
+      parseLevelHeader(response.headers.get('X-Api-Level')),
+      parseLevelHeader(response.headers.get('X-Min-Client-Api-Level'))
+    );
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      const message = body.error ?? `Request failed: ${response.status}`;
+
+      if (body.code === CLIENT_UPDATE_REQUIRED) {
+        // Final for this request: it is never replayed after the update.
+        appUpdate.markUpdateRequired();
+        throw Object.assign(new Error(message), { code: CLIENT_UPDATE_REQUIRED });
+      }
+
+      if (!isRetry && isClockSkewError(message)) {
+        await new Promise((resolve) => setTimeout(resolve, CLOCK_SKEW_RETRY_DELAY_MS));
+        // Re-verify on the retry too — the delay here is exactly the window a since-superseded
+        // request could otherwise slip through under a different session that became current while
+        // it waited. (The server rejected the first attempt at authentication, before processing it.)
+        return await authedFetch(path, init, true, verifyOwnership);
+      }
+
+      // A machine-readable `code`, when the server sends one, lets a caller act on a specific outcome
+      // without parsing the human-readable message (see isManualLoanCreationResolvedError).
+      throw Object.assign(new Error(message), typeof body.code === 'string' ? { code: body.code } : {});
+    }
+
+    if (response.status === 204) return undefined;
+    return await response.json();
+  } finally {
+    releaseGuard?.();
+  }
 }
 
 export interface LinkedAccount {

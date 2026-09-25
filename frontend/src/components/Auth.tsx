@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import { supabase } from '../lib/supabaseClient';
 
 export function Auth() {
@@ -7,6 +8,8 @@ export function Auth() {
   const [mode, setMode] = useState<'sign-in' | 'sign-up'>('sign-in');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Typed credentials, or a sign-in in progress, hold off an automatic app-update reload.
+  useUpdateGuard('unsaved_edit', email !== '' || password !== '' || loading);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();

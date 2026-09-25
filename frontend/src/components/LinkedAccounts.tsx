@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import type { LinkedAccount, LinkedItem } from '../lib/api';
 import { refreshAccountBalances, sandboxFireWebhook, sandboxResetLogin } from '../lib/api';
 import { accountDisplayName, sortAccountsByOrder } from '../lib/accountDisplay';
@@ -41,6 +42,8 @@ function CreditUtilization({
   onUpdateCreditLimit: (accountId: string, creditLimit: number | null) => void;
 }) {
   const [editing, setEditing] = useState<string | undefined>(undefined);
+  // A value typed but not yet committed (on blur) holds off an automatic app-update reload.
+  useUpdateGuard('unsaved_edit', editing !== undefined);
   const balance = account.current_balance ?? 0;
   const limit = account.credit_limit;
   const hasLimit = limit !== null && limit > 0;
@@ -94,6 +97,7 @@ function AccountCustomizationRow({
   onUpdateCustomization: (accountId: string, fields: CustomizationFields) => void;
 }) {
   const [nicknameDraft, setNicknameDraft] = useState<string | undefined>(undefined);
+  useUpdateGuard('unsaved_edit', nicknameDraft !== undefined);
 
   return (
     <div className="account-customization">

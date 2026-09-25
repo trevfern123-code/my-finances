@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { usePlaidLink, type PlaidLinkOnSuccess } from 'react-plaid-link';
+import { usePlaidLink, type PlaidLinkOnExit, type PlaidLinkOnSuccess } from 'react-plaid-link';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import { completeReauth, createReauthLinkToken, type LinkedItem } from '../lib/api';
 import type { SessionOwnership } from '../lib/sessionOwnership';
 
@@ -21,6 +22,9 @@ export function ReconnectButton({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const ownershipRef = useRef<SessionOwnership | null>(null);
+  // An app update must not reload this tab while a reconnect is being started, is open in Plaid
+  // Link, or is being completed (lib/appUpdate.ts).
+  useUpdateGuard('reconnect', busy);
 
   const onSuccess: PlaidLinkOnSuccess = async () => {
     const ownership = ownershipRef.current;
@@ -44,7 +48,15 @@ export function ReconnectButton({
     }
   };
 
-  const { open, ready } = usePlaidLink({ token: linkToken ?? '', onSuccess });
+  // Closing Link without finishing (or Link reporting an error) ends this reconnect. Without this the
+  // button stayed "Reconnecting..." until the page was reloaded.
+  const onExit: PlaidLinkOnExit = (err) => {
+    setBusy(false);
+    setLinkToken(null);
+    if (err) setError(err.display_message || 'Reconnection did not finish. Please try again.');
+  };
+
+  const { open, ready } = usePlaidLink({ token: linkToken ?? '', onSuccess, onExit });
 
   // Update Mode's link token is fetched on demand (per institution) rather than up front —
   // open Link as soon as a fresh token is ready.

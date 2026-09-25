@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import type { AssetAccountSummary, AssetGroup, RecurringStream } from '../lib/api';
 import { accountDisplayName } from '../lib/accountDisplay';
 import { formatCurrency } from '../lib/currency';
@@ -97,6 +98,8 @@ function SavingsGoalRow({
   onUpdateSavingsGoal: (accountId: string, savingsGoal: number | null) => void;
 }) {
   const [editing, setEditing] = useState<string | undefined>(undefined);
+  // A value typed but not yet committed (on blur) holds off an automatic app-update reload.
+  useUpdateGuard('unsaved_edit', editing !== undefined);
   const balance = account.current_balance ?? 0;
   const goal = account.savings_goal;
   const hasGoal = goal !== null && goal > 0;
