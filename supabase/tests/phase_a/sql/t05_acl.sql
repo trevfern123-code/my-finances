@@ -21,16 +21,23 @@ select th.assert(not exists (
     or not has_function_privilege('service_role', p.oid, 'execute'))),
   'every function: security invoker, search_path pinned empty, executable by service_role only');
 
-select th.assert((select string_agg(privilege_type, ',' order by privilege_type) from information_schema.role_table_grants
-                  where table_name = 'manual_loan_creation_requests' and grantee = 'service_role') = 'INSERT,SELECT',
-  'manual_loan_creation_requests: service_role SELECT, INSERT only');
-select th.assert((select string_agg(privilege_type, ',' order by privilege_type) from information_schema.role_table_grants
-                  where table_name = 'manual_loan_deletions' and grantee = 'service_role') = 'INSERT,SELECT,UPDATE',
-  'manual_loan_deletions: service_role SELECT, INSERT, UPDATE only');
-select th.assert(not exists (select 1 from information_schema.role_table_grants
-                             where table_name in ('manual_loan_creation_requests', 'manual_loan_deletions')
-                               and grantee in ('PUBLIC', 'anon', 'authenticated')),
-  'no table grant to PUBLIC/anon/authenticated');
+-- Effective table privileges via has_table_privilege, over every PostgreSQL 17 privilege.
+-- information_schema.role_table_grants does not report MAINTAIN, so a MAINTAIN grant would have
+-- slipped past a check built on it.
+create function pg_temp.table_privileges(p_role text, p_table text) returns text language sql as $$
+  select coalesce(string_agg(priv, ',' order by priv), '')
+  from unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']) priv
+  where has_table_privilege(p_role, p_table, priv)
+$$;
+select th.assert(pg_temp.table_privileges('service_role', 'public.manual_loan_creation_requests') = 'INSERT,SELECT',
+  'manual_loan_creation_requests: service_role SELECT, INSERT only (no MAINTAIN either)');
+select th.assert(pg_temp.table_privileges('service_role', 'public.manual_loan_deletions') = 'INSERT,SELECT,UPDATE',
+  'manual_loan_deletions: service_role SELECT, INSERT, UPDATE only (no MAINTAIN either)');
+select th.assert(not exists (select 1
+                             from unnest(array['public', 'anon', 'authenticated']) r,
+                                  unnest(array['public.manual_loan_creation_requests', 'public.manual_loan_deletions']) t
+                             where pg_temp.table_privileges(r, t) <> ''),
+  'no table privilege at all (MAINTAIN included) for PUBLIC/anon/authenticated');
 
 -- Runtime refusal, not just catalog state.
 set role authenticated;
