@@ -624,3 +624,71 @@ describe('NavigationWriteCoordinator — same-session remount (attachment identi
     vi.useRealTimers();
   });
 });
+
+describe('NavigationWriteCoordinator — app-update guard (queued or failed layouts are not durable)', () => {
+  function guardedCoordinator(save: (layout: NavTabEntry[]) => Promise<unknown>) {
+    let held = 0;
+    const coordinator = new NavigationWriteCoordinator({
+      save: save as never,
+      acquireGuard: () => {
+        held++;
+        return () => void held--;
+      },
+    });
+    return { coordinator, held: () => held };
+  }
+
+  it('stays held from the first submit, across the in-flight → queued hand-off, until the newest layout is saved', async () => {
+    const calls: Array<ReturnType<typeof deferred<void>>> = [];
+    const { coordinator, held } = guardedCoordinator(() => {
+      const d = deferred<void>();
+      calls.push(d);
+      return d.promise;
+    });
+    const { attachmentId } = attachRecorder(coordinator, 's1');
+    expect(held()).toBe(0);
+    coordinator.submit(LAYOUT_A, 's1', attachmentId, ALWAYS_VALID);
+    expect(held()).toBe(1);
+    coordinator.submit(LAYOUT_B, 's1', attachmentId, ALWAYS_VALID); // queued
+    calls[0].resolve();
+    await calls[0].promise;
+    await Promise.resolve();
+    expect(calls).toHaveLength(2); // the queued layout is on its way
+    expect(held()).toBe(1);
+    calls[1].resolve();
+    await calls[1].promise;
+    await Promise.resolve();
+    expect(held()).toBe(0);
+  });
+
+  it('a failure keeps it held until Retry succeeds', async () => {
+    let fail = true;
+    const { coordinator, held } = guardedCoordinator(() => (fail ? Promise.reject(new Error('x')) : Promise.resolve()));
+    const { attachmentId, statuses } = attachRecorder(coordinator, 's1');
+    coordinator.submit(LAYOUT_C, 's1', attachmentId, ALWAYS_VALID);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(statuses.at(-1)).toBe('error');
+    expect(held()).toBe(1);
+    fail = false;
+    coordinator.retry('s1', attachmentId);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(statuses.at(-1)).toBe('saved');
+    expect(held()).toBe(0);
+  });
+
+  it('detach drops a queued layout and a failure with it; a request already on the wire holds only until it settles', async () => {
+    const first = deferred<void>();
+    const { coordinator, held } = guardedCoordinator(() => first.promise);
+    const { attachmentId } = attachRecorder(coordinator, 's1');
+    coordinator.submit(LAYOUT_A, 's1', attachmentId, ALWAYS_VALID);
+    coordinator.submit(LAYOUT_B, 's1', attachmentId, ALWAYS_VALID);
+    coordinator.detach('s1', attachmentId);
+    expect(held()).toBe(1); // the in-flight write
+    first.reject(new Error('late'));
+    await first.promise.catch(() => {});
+    await Promise.resolve();
+    expect(held()).toBe(0); // its failure belongs to a scope that no longer exists
+  });
+});

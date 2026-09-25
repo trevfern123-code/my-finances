@@ -99,6 +99,7 @@ import { Settings } from './components/Settings';
 import { DashboardCustomizer } from './components/DashboardCustomizer';
 import { ReportingRangeSelector } from './components/ReportingRangeSelector';
 import { TabNav } from './components/TabNav';
+import { SaveStatusIndicator } from './components/SaveStatusIndicator';
 import './App.css';
 
 // The backend caps /api/plaid/transactions at 200 regardless of what's requested — fetching the
@@ -153,6 +154,9 @@ export type FinancialFetchOutcome = { status: 'ready' } | { status: 'error' };
 // same-shaped copy. See lib/navigationWriteCoordinator.ts's own doc comment for the full guarantee.
 export const navigationWriteCoordinator = new NavigationWriteCoordinator({
   save: (layout, verify) => updateNavLayout({ tabs: layout }, verify),
+  // A layout that isn't durably saved yet (sending, queued, or failed with Retry) holds off an
+  // automatic app-update reload (lib/appUpdate.ts).
+  acquireGuard: () => appUpdate.acquireGuard('pending_save'),
 });
 
 /**
@@ -1948,6 +1952,19 @@ export default function App() {
               return (
                 <>
                   <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
+
+                  {/* These two save silently when all is well; a failed save is shown on every tab
+                      with Retry, since it also holds off app updates until it's saved. */}
+                  {dashboardLayout.saveStatus === 'error' && (
+                    <p className="hint">
+                      Dashboard layout: <SaveStatusIndicator status="error" onRetry={dashboardLayout.retry} />
+                    </p>
+                  )}
+                  {reportingRange.saveStatus === 'error' && (
+                    <p className="hint">
+                      Reporting range: <SaveStatusIndicator status="error" onRetry={reportingRange.retry} />
+                    </p>
+                  )}
 
                   {activeTab === 'overview' && (
                     <div className="tab-panel">

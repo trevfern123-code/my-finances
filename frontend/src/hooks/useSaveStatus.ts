@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { appUpdate } from '../lib/appUpdate';
 import { SaveStatusTracker, type SaveStatus } from '../lib/saveStatus';
 
 export type { SaveStatus };
@@ -12,10 +13,19 @@ export function useSaveStatus() {
   const [status, setStatus] = useState<SaveStatus>('idle');
   const trackerRef = useRef<SaveStatusTracker | null>(null);
   if (!trackerRef.current) {
-    trackerRef.current = new SaveStatusTracker({ onStatusChange: setStatus });
+    trackerRef.current = new SaveStatusTracker({
+      onStatusChange: setStatus,
+      // A change not yet durably saved (being sent, or failed with Retry) holds off an automatic
+      // app-update reload until it is saved or the user explicitly discards it (lib/appUpdate.ts).
+      acquireGuard: () => appUpdate.acquireGuard('pending_save'),
+    });
   }
 
-  useEffect(() => () => trackerRef.current?.dispose(), []);
+  useEffect(() => {
+    const tracker = trackerRef.current!;
+    tracker.enableGuard();
+    return () => tracker.dispose();
+  }, []);
 
   return {
     status,

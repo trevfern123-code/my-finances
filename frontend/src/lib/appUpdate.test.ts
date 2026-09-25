@@ -31,7 +31,7 @@ function fakeTab(opts: {
   let visibility = opts.visibility ?? 'visible';
   const controllerListeners: Array<() => void> = [];
   const visibilityListeners: Array<() => void> = [];
-  const preloadListeners: Array<() => void> = [];
+  const preloadListeners: Array<(event: { preventDefault(): void }) => void> = [];
   const timers: Array<{ fn: () => void; ms: number; id: number; cleared: boolean }> = [];
   const timeouts: Array<{ fn: () => void; ms: number; fired: boolean }> = [];
   const update = vi.fn(() => Promise.resolve());
@@ -94,8 +94,11 @@ function fakeTab(opts: {
       visibility = v;
       visibilityListeners.forEach((l) => l());
     },
+    /** Dispatches a cancelable `vite:preloadError`-like event; returns it for inspection. */
     preloadError() {
-      preloadListeners.forEach((l) => l());
+      const event = { defaultPrevented: false, preventDefault: vi.fn(() => void (event.defaultPrevented = true)) };
+      preloadListeners.forEach((l) => l(event));
+      return event;
     },
     /** Moves time forward to each pending one-shot timer and runs it. */
     fireTimeouts() {
@@ -230,7 +233,10 @@ describe('app update manager — activation', () => {
     await tab.start();
     tab.advance(LAUNCH_WINDOW_MS);
     const release = tab.manager.acquireGuard('unsaved_edit');
-    tab.preloadError();
+    const event = tab.preloadError();
+    // Recovery is the manager's: Vite must not also rethrow the failed import.
+    expect(event.preventDefault).toHaveBeenCalledTimes(1);
+    expect(event.defaultPrevented).toBe(true);
     expect(tab.update).toHaveBeenCalledTimes(2);
     expect(tab.manager.getSnapshot().updateAvailable).toBe(true);
     expect(tab.reload).not.toHaveBeenCalled(); // guarded, and visible
@@ -241,7 +247,7 @@ describe('app update manager — activation', () => {
 });
 
 describe('app update manager — guards', () => {
-  it.each(['mutation', 'hosted_link', 'reconnect', 'unsaved_edit'] as const)(
+  it.each(['mutation', 'hosted_link', 'reconnect', 'unsaved_edit', 'pending_save'] as const)(
     'a %s guard defers the reload, and releasing it resumes the update',
     async (kind) => {
       const tab = fakeTab({ visibility: 'hidden' });
@@ -252,12 +258,26 @@ describe('app update manager — guards', () => {
       expect(tab.manager.reloadNow()).toBe(false); // an explicit Reload is refused too
       expect(describeUpdateBanner(tab.manager.getSnapshot())).toMatchObject({
         title: 'A new version is ready — finish your current edit first.',
-        actions: [],
+        // Only the user's own unsaved changes may be explicitly discarded.
+        actions: kind === 'unsaved_edit' || kind === 'pending_save' ? ['discard_and_reload'] : [],
       });
       release();
       expect(tab.reload).toHaveBeenCalledTimes(1);
     }
   );
+
+  it('a pending_save guard is explained as waiting for the save, with Retry', async () => {
+    const tab = fakeTab();
+    await tab.start();
+    tab.advance(LAUNCH_WINDOW_MS);
+    tab.manager.acquireGuard('pending_save');
+    tab.newWorkerTakesControl();
+    expect(describeUpdateBanner(tab.manager.getSnapshot())?.detail).toBe(
+      'The app will update after your changes are saved (if saving failed, use Retry).'
+    );
+    expect(tab.manager.discardAndReload()).toBe(true); // the explicit way out
+    expect(tab.reload).toHaveBeenCalledTimes(1);
+  });
 
   it('counts nested guards and tolerates a double release', async () => {
     const tab = fakeTab({ visibility: 'hidden' });
@@ -570,4 +590,41 @@ describe('parseLevelHeader', () => {
       expect(parseLevelHeader(bad)).toBeNull();
     }
   });
+});
+
+describe('update required, unsaved changes, and no newer build yet (Codex re-review A)', () => {
+  it.each(['unsaved_edit', 'pending_save'] as const)(
+    'with %s: never offers a destructive discard that would only reload the same build',
+    async (kind) => {
+      const tab = fakeTab();
+      await tab.start();
+      tab.advance(LAUNCH_WINDOW_MS);
+      const release = tab.manager.acquireGuard(kind);
+      tab.manager.markUpdateRequired(); // e.g. a 409 client_update_required; no new worker yet
+
+      const banner = describeUpdateBanner(tab.manager.getSnapshot());
+      expect(banner).toEqual({
+        severity: 'required',
+        title: "Update required — the newer version isn't available yet.",
+        detail: 'Saving is turned off. Your unsaved changes stay on screen while the app keeps checking for the update.',
+        actions: [],
+      });
+      expect(tab.manager.discardAndReload()).toBe(false); // refused even if called directly
+      expect(tab.manager.isUpdateRequired()).toBe(true); // mutations stay blocked
+      expect(tab.reload).not.toHaveBeenCalled();
+
+      // Still checking: once now, and every minute.
+      const checks = tab.update.mock.calls.length;
+      tab.fireIntervals(REQUIRED_UPDATE_CHECK_INTERVAL_MS);
+      expect(tab.update.mock.calls.length).toBe(checks + 1);
+
+      // The newer build arrives: now, and only now, discarding is offered.
+      tab.newWorkerTakesControl();
+      expect(tab.reload).not.toHaveBeenCalled(); // still guarded
+      expect(describeUpdateBanner(tab.manager.getSnapshot())?.actions).toEqual(['discard_and_reload']);
+      expect(tab.manager.discardAndReload()).toBe(true);
+      expect(tab.reload).toHaveBeenCalledTimes(1);
+      release();
+    }
+  );
 });

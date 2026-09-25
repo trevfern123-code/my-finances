@@ -10,6 +10,7 @@ import {
   type DashboardCard,
   type PresetId,
 } from '../lib/dashboardLayout';
+import { useSaveStatus } from './useSaveStatus';
 
 /**
  * Owns the Overview dashboard's card layout — visibility, order, and persistence — entirely
@@ -57,11 +58,13 @@ export function useDashboardLayout(
   const verifyOwnershipRef = useRef(verifyOwnership);
   verifyOwnershipRef.current = verifyOwnership;
 
+  const { status: saveStatus, track, retry } = useSaveStatus();
+
   function persist(next: DashboardCard[]) {
-    updateDashboardLayout({ cards: next }, (session) => verifyOwnershipRef.current(session)).catch(() => {
-      // Best-effort — the change stays applied locally for this session even if the save
-      // failed; the user isn't blocked, and the next successful save catches it up.
-    });
+    // The change stays applied locally even if the save fails; the user isn't blocked, and Retry
+    // or the next successful save catches it up. track() reports the real outcome, and until the
+    // latest layout is saved it holds off an automatic app-update reload (useSaveStatus).
+    track(() => updateDashboardLayout({ cards: next }, (session) => verifyOwnershipRef.current(session)));
   }
 
   function toggleVisibility(cardId: CardId) {
@@ -85,5 +88,5 @@ export function useDashboardLayout(
     persist(next);
   }
 
-  return { layout, customizing, setCustomizing, toggleVisibility, move, applyPreset };
+  return { layout, customizing, setCustomizing, toggleVisibility, move, applyPreset, saveStatus, retry };
 }

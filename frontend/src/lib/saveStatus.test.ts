@@ -174,3 +174,85 @@ describe('getSaveStatusDisplay', () => {
     expect(display.showRetry).toBe(true);
   });
 });
+
+describe('SaveStatusTracker — app-update guard (a change is not durable until its save succeeds)', () => {
+  function guardSpy() {
+    const events: string[] = [];
+    let held = 0;
+    return {
+      events,
+      held: () => held,
+      acquireGuard: () => {
+        held++;
+        events.push('acquire');
+        return () => {
+          held--;
+          events.push('release');
+        };
+      },
+    };
+  }
+
+  it('holds the guard from the moment a save starts, through a failure, until Retry succeeds', async () => {
+    const g = guardSpy();
+    const { tracker } = makeTracker({ acquireGuard: g.acquireGuard });
+    const attempts = [deferred<void>(), deferred<void>()];
+    let call = 0;
+    tracker.track(() => attempts[call++].promise); // the same save, re-run by Retry
+    expect(g.held()).toBe(1); // synchronously, before the request even starts
+    attempts[0].reject(new Error('boom'));
+    await attempts[0].promise.catch(() => {});
+    await Promise.resolve();
+    expect(tracker.getStatus()).toBe('error');
+    expect(g.held()).toBe(1); // a failed change still needs saving
+
+    tracker.retry();
+    expect(tracker.getStatus()).toBe('saving');
+    expect(g.held()).toBe(1); // never released between the failure and the retry
+    attempts[1].resolve();
+    await attempts[1].promise;
+    await Promise.resolve();
+    expect(tracker.getStatus()).toBe('saved');
+    expect(g.held()).toBe(0);
+    expect(g.events).toEqual(['acquire', 'release']); // one continuous hold
+  });
+
+  it('a superseded attempt settling never releases the newer attempt\'s guard', async () => {
+    const g = guardSpy();
+    const { tracker } = makeTracker({ acquireGuard: g.acquireGuard });
+    const older = deferred<void>();
+    const newer = deferred<void>();
+    tracker.track(() => older.promise);
+    tracker.track(() => newer.promise);
+    older.resolve();
+    await older.promise;
+    await Promise.resolve();
+    expect(g.held()).toBe(1);
+    newer.resolve();
+    await newer.promise;
+    await Promise.resolve();
+    expect(g.held()).toBe(0);
+  });
+
+  it('dispose() releases the guard, and a save settling afterwards never re-acquires it', async () => {
+    const g = guardSpy();
+    const { tracker } = makeTracker({ acquireGuard: g.acquireGuard });
+    const save = deferred<void>();
+    tracker.track(() => save.promise);
+    tracker.dispose();
+    expect(g.held()).toBe(0);
+    save.reject(new Error('late failure'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(g.held()).toBe(0);
+  });
+
+  it('enableGuard() after a StrictMode-style dispose() resumes guarding', () => {
+    const g = guardSpy();
+    const { tracker } = makeTracker({ acquireGuard: g.acquireGuard });
+    tracker.dispose();
+    tracker.enableGuard();
+    tracker.track(() => new Promise(() => {}));
+    expect(g.held()).toBe(1);
+  });
+});

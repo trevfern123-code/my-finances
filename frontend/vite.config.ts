@@ -1,27 +1,24 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
+import { resolveBuildId } from './scripts/build-id.mjs';
 
-/**
- * A build identity for diagnostics and reload-loop decisions (src/lib/appUpdate.ts). Vercel exposes
- * the deployed commit to the build as VERCEL_GIT_COMMIT_SHA when "Automatically expose System
- * Environment Variables" is on; the deployment id is the next best. A local build gets a timestamp,
- * so two local builds always differ. None of these is secret.
- */
-function resolveBuildId(): string {
-  const sha = process.env.VERCEL_GIT_COMMIT_SHA;
-  if (sha && /^[0-9a-f]{7,40}$/i.test(sha)) return sha.slice(0, 12);
-  const deployment = process.env.VERCEL_DEPLOYMENT_ID;
-  if (deployment && /^[A-Za-z0-9_-]{1,64}$/.test(deployment)) return deployment;
-  return `local-${Date.now().toString(36)}`;
-}
+// One build identity (scripts/build-id.mjs: the Vercel commit, else the deployment id, else a local
+// timestamp), resolved once so the bundle and index.html always agree.
+const BUILD_ID = resolveBuildId();
 
 export default defineConfig({
   define: {
-    __APP_BUILD_ID__: JSON.stringify(resolveBuildId()),
+    __APP_BUILD_ID__: JSON.stringify(BUILD_ID),
   },
   plugins: [
     react(),
+    {
+      // <meta name="app-build" content="…"> in index.html: which build a deployment serves, readable
+      // without running it (release checks, scripts/verify-pwa-build.mjs). Not secret.
+      name: 'app-build-meta',
+      transformIndexHtml: () => [{ tag: 'meta', attrs: { name: 'app-build', content: BUILD_ID }, injectTo: 'head' }],
+    },
     VitePWA({
       // The generated worker still activates immediately and claims open pages (skipWaiting +
       // clientsClaim); the page itself decides when it is safe to reload onto the new build.

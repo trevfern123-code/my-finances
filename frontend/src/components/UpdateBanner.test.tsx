@@ -63,13 +63,15 @@ describe('UpdateBanner', () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
-  it('"finish your current edit first" while guarded, with no reload offered', () => {
+  it('"finish your current edit first" while guarded: no Reload, only an explicit discard', () => {
     const { manager, newBuild } = manualManager();
     const release = manager.acquireGuard('unsaved_edit');
     render(<UpdateBanner manager={manager} />);
     newBuild();
     expect(screen.getByRole('status').textContent).toContain('finish your current edit first');
-    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Reload' })).toBeNull();
+    // The only way past the user's own unsaved changes is their explicit choice to discard them.
+    expect(screen.getByRole('button', { name: 'Discard unsaved changes and reload' })).toBeTruthy();
     act(() => release());
     expect(screen.getByRole('button', { name: 'Reload' })).toBeTruthy();
   });

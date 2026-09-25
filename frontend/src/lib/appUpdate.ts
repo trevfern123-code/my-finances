@@ -39,8 +39,17 @@ export const RELOAD_HISTORY_WINDOW_MS = 10 * 60 * 1000;
 export const MAX_AUTO_RELOADS_IN_WINDOW = 3;
 export const RELOAD_HISTORY_KEY = 'my-finances:update-reloads';
 
-/** What can make a reload unsafe right now. Only `unsaved_edit` may be discarded by the user. */
-export type GuardKind = 'mutation' | 'hosted_link' | 'reconnect' | 'unsaved_edit';
+/**
+ * What can make a reload unsafe right now:
+ * - `mutation`: a request that changes data is in flight (held by authedFetch);
+ * - `hosted_link` / `reconnect`: a Plaid flow this tab is completing;
+ * - `unsaved_edit`: a form or field holds typed values that have not been submitted;
+ * - `pending_save`: a change already applied on screen is not yet durably saved — being sent,
+ *   queued behind another save, or failed and waiting for Retry (held by the save trackers, from
+ *   the edit until the save succeeds, so it outlives the request's own `mutation` guard).
+ * Only `unsaved_edit` and `pending_save` may be discarded, and only by the user's explicit choice.
+ */
+export type GuardKind = 'mutation' | 'hosted_link' | 'reconnect' | 'unsaved_edit' | 'pending_save';
 
 export interface UpdateSnapshot {
   buildId: string;
@@ -78,7 +87,8 @@ export interface UpdateManagerDeps {
   serviceWorker: ServiceWorkerContainerLike | null;
   getVisibility(): 'visible' | 'hidden';
   onVisibilityChange(listener: () => void): void;
-  onPreloadError(listener: () => void): void;
+  /** Vite's `vite:preloadError` (a lazy chunk failed to load, usually because a deploy replaced it). */
+  onPreloadError(listener: (event: { preventDefault(): void }) => void): void;
   reload(): void;
   storage: StorageLike | null;
   now(): number;
@@ -106,7 +116,8 @@ export interface AppUpdateManager {
   isUpdateRequired(): boolean;
   /** Explicit user reload. Refused while any guard is active. */
   reloadNow(): boolean;
-  /** Explicit user choice to lose unsaved edits. Refused while a non-discardable guard is active. */
+  /** Explicit user choice to lose unsaved edits. Refused while a non-discardable guard is active,
+   *  and while no newer build is available (it would only reload onto this same build). */
   discardAndReload(): boolean;
 }
 
@@ -307,7 +318,10 @@ export function createAppUpdateManager(deps: UpdateManagerDeps): AppUpdateManage
         if (deps.getVisibility() === 'visible') checkForUpdate(false);
         evaluate();
       });
-      deps.onPreloadError(() => {
+      deps.onPreloadError((event) => {
+        // Recovery is ours from here (a guarded reload onto the new build), so Vite must not also
+        // rethrow the import error. The app has no lazy chunks today; this covers any added later.
+        event.preventDefault();
         checkForUpdate(true);
         markAvailable();
       });
@@ -382,6 +396,7 @@ export function createAppUpdateManager(deps: UpdateManagerDeps): AppUpdateManage
     },
 
     discardAndReload() {
+      if (!updateAvailable) return false;
       if (activeGuards().some((g) => NON_DISCARDABLE.includes(g))) return false;
       doReload(false);
       return true;
@@ -404,12 +419,14 @@ function waitingFor(guards: GuardKind[]): string {
   if (guards.includes('mutation')) return 'your changes finish saving';
   if (guards.includes('hosted_link')) return 'you finish linking your bank';
   if (guards.includes('reconnect')) return 'you finish reconnecting your bank';
+  if (guards.includes('pending_save')) return 'your changes are saved (if saving failed, use Retry)';
   return 'you save or cancel your unsaved changes';
 }
 
 export function describeUpdateBanner(s: UpdateSnapshot): BannerDescription | null {
   if (!s.updateAvailable && !s.updateRequired) return null;
   const blocking = s.guards.filter((g) => NON_DISCARDABLE.includes(g));
+  const dirty = s.guards.length > 0 && blocking.length === 0; // only discardable guards
 
   if (!s.updateRequired) {
     if (s.guards.length > 0) {
@@ -417,7 +434,8 @@ export function describeUpdateBanner(s: UpdateSnapshot): BannerDescription | nul
         severity: 'info',
         title: 'A new version is ready — finish your current edit first.',
         detail: `The app will update after ${waitingFor(s.guards)}.`,
-        actions: [],
+        // Discarding is offered only when nothing but the user's own unsaved changes is waiting.
+        actions: dirty ? ['discard_and_reload'] : [],
       };
     }
     return { severity: 'info', title: 'A new version is ready.', detail: 'Reload to start using it.', actions: ['reload'] };
@@ -431,7 +449,17 @@ export function describeUpdateBanner(s: UpdateSnapshot): BannerDescription | nul
       actions: [],
     };
   }
-  if (s.guards.includes('unsaved_edit')) {
+  if (dirty) {
+    if (!s.updateAvailable) {
+      // Reloading now would only load this same, incompatible build: never invite the user to
+      // throw their changes away for that. Wait for the newer build to arrive.
+      return {
+        severity: 'required',
+        title: "Update required — the newer version isn't available yet.",
+        detail: 'Saving is turned off. Your unsaved changes stay on screen while the app keeps checking for the update.',
+        actions: [],
+      };
+    }
     return {
       severity: 'required',
       title: 'Update required — this version is out of date.',
@@ -485,7 +513,7 @@ function browserDeps(): UpdateManagerDeps {
       if (hasDocument) document.addEventListener('visibilitychange', listener);
     },
     onPreloadError: (listener) => {
-      if (hasWindow) window.addEventListener('vite:preloadError', listener);
+      if (hasWindow) window.addEventListener('vite:preloadError', (event) => listener(event));
     },
     reload: () => window.location.reload(),
     storage,

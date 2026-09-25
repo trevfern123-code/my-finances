@@ -903,10 +903,13 @@ the worker, so an open tab kept running its old bundle indefinitely.)
   `generateSW` with `skipWaiting` + `clientsClaim`: a new worker activates at once and takes control
   of open pages. Both are set explicitly in `vite.config.ts`, because the plugin drops them silently
   when it doesn't inject the registration itself. `npm run verify:pwa --workspace frontend` (in CI
-  after the build) checks this, the missing `registerSW.js`, and the completion page below.
+  after the build) checks this, the missing `registerSW.js`, the completion page below, and the
+  build id.
 - **Update checks:** at startup, every 30 minutes, when the tab becomes visible (at most once a
   minute), when a response reports a newer `X-Api-Level`, when a lazy chunk fails to load
-  (`vite:preloadError`), and every minute while an update is required.
+  (`vite:preloadError`), and every minute while an update is required. A preload error is taken
+  over by the manager (`preventDefault()`, so Vite doesn't also rethrow it) and recovered through
+  the same guarded reload. The app has no lazy chunks today.
 - **Detecting a new build:** `controllerchange` on a page that already had a controlling worker (or
   had an active one it bypassed, e.g. after Shift+Reload). The first installation claiming a page is
   not an update.
@@ -920,27 +923,44 @@ the worker, so an open tab kept running its old bundle indefinitely.)
   - a Hosted Link attempt, from the click until it completes, is cancelled, fails or unmounts;
   - the Reconnect (Update Mode) flow, from the click until Link exits or the completion settles
     (`onExit` now also clears the stuck "Reconnecting..." state);
-  - unsaved edits: the add/edit loan form, manual payment add/edit, a linked payment's principal,
-    the split editor, add-category and budget amounts, credit limit, savings goal, the Financial
-    Preferences numbers, account nickname, a custom emoji, and typed sign-in details.
-- **Unsaved edits and a required update (no dead end):** the banner says saving is turned off and
-  offers **"Discard unsaved changes and reload"**. Discarding is always explicit, and the edits are
-  lost, except an unconfirmed "Add loan" save, which is already persisted per user
-  (`pendingManualLoanCreation.ts`) and is resumed, never auto-sent, after the reload. Discard is
-  never offered over a mutation, Hosted Link attempt or reconnect in progress; the banner waits for
-  those.
+  - unsaved edits (`unsaved_edit`): the add/edit loan form, manual payment add/edit, a linked
+    payment's principal, the split editor, add-category and budget amounts, credit limit, savings
+    goal, the Financial Preferences numbers, account nickname, a custom emoji, and typed sign-in
+    details;
+  - changes applied on screen but not yet durably saved (`pending_save`). The request's own guard
+    ends when the request ends, which is too early for these:
+    - Financial Preferences, Safe to Spend toggles, appearance, dashboard layout and reporting
+      range: held by their save tracker (`useSaveStatus`) from the edit until the latest value
+      saves. A failed save keeps it until Retry succeeds or a newer change saves. Dashboard layout
+      and reporting range used to fail silently; they now show "Couldn't save. Retry".
+    - Navigation: held by the navigation write queue while a layout is in flight, queued behind
+      another, or failed awaiting Retry.
+    - Unmounting (sign-out) releases it: those changes go with the component.
+- **Discarding (never automatic, never a dead end):** when only the user's own unsaved changes are
+  holding an update back, the banner offers **"Discard unsaved changes and reload"**. This applies
+  both when a new version is ready and when an update is required: once an update is required,
+  saving is turned off, so Retry can't help. Discarded changes are lost, except an unconfirmed
+  "Add loan" save, which is already persisted per user (`pendingManualLoanCreation.ts`) and is
+  resumed, never auto-sent, after the reload. Discard is never offered:
+  - over a mutation, Hosted Link attempt or reconnect in progress (the banner waits for those);
+  - while no newer build is available. An update-required page with unsaved changes says **"the
+    newer version isn't available yet"**, keeps its changes on screen and saving turned off, and
+    keeps checking. Discarding would only reload the same incompatible build.
 - **Reload-loop protection** (per-tab `sessionStorage`, `my-finances:update-reloads`): each update
   reload records the build it left. If the page comes back on the **same** build within 5 minutes,
   automatic reloads stop for that page until a genuinely new worker takes control. Other limits: at
   most 3 automatic reloads in 10 minutes, 30 s between automatic reloads (a user's own Reload
   doesn't count), and no automatic reload at all if the record can't be read or written. The banner
   always keeps a manual Reload.
-- **Build id:** `__APP_BUILD_ID__` is `VERCEL_GIT_COMMIT_SHA` (first 12 characters), else
-  `VERCEL_DEPLOYMENT_ID`, else `local-<timestamp>`. It's exposed as
-  `<html data-app-build="…">`. None of these is secret. After a Vercel deploy, confirm
-  `document.documentElement.dataset.appBuild` matches the deployed commit. If it shows
-  `local-…`, the system variables aren't exposed to the build. Updates and loop protection still
-  work (every build gets a unique id), but diagnostics are weaker.
+- **Build id** (`frontend/scripts/build-id.mjs`): `VERCEL_GIT_COMMIT_SHA` (first 12 characters),
+  else `VERCEL_DEPLOYMENT_ID`, else `local-<timestamp>`. None of these is secret. It's baked into
+  the bundle (`<html data-app-build="…">` at runtime) and into `index.html` as
+  `<meta name="app-build" content="…">`. The verifier checks that both agree, that the id has a
+  valid form, and that it's the id the environment should produce (`EXPECTED_APP_BUILD_ID`
+  overrides). After a Vercel deploy, confirm the deployed commit without running the app:
+  `curl -s https://<frontend>/ | grep app-build`. A `local-…` id means the system variables aren't
+  exposed to the build. Updates and loop protection still work (every build gets a unique id), but
+  diagnostics are weaker.
 - **Plaid completion page:** `/plaid-link-complete.html` is precached as itself and excluded from
   the SPA navigation fallback, with or without a query string (and in its extension-less form), so
   Hosted Link's redirect always gets the real completion page.

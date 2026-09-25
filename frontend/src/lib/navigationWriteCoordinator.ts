@@ -26,6 +26,10 @@ export interface NavigationWriteCoordinatorOptions {
   savedDisplayMs?: number;
   setTimeoutFn?: SetTimeoutFn;
   clearTimeoutFn?: ClearTimeoutFn;
+  /** Holds the app-update `pending_save` guard (lib/appUpdate.ts) and returns its release. Held
+   *  while any layout the user chose is not yet durably saved: a write in flight, a newer layout
+   *  queued behind it, or the attached scope's last write failed and awaits Retry. */
+  acquireGuard?: () => () => void;
 }
 
 interface Submission {
@@ -96,9 +100,14 @@ export class NavigationWriteCoordinator {
   private readonly savedDisplayMs: number;
   private readonly setTimeoutFn: SetTimeoutFn;
   private readonly clearTimeoutFn: ClearTimeoutFn;
+  private readonly acquireGuard: (() => () => void) | null;
+  private releaseGuard: (() => void) | null = null;
+  /** The attached scope's most recent write failed and nothing newer has been sent since. */
+  private failed = false;
 
   constructor(options: NavigationWriteCoordinatorOptions) {
     this.save = options.save;
+    this.acquireGuard = options.acquireGuard ?? null;
     this.savedDisplayMs = options.savedDisplayMs ?? DEFAULT_SAVED_DISPLAY_MS;
     this.setTimeoutFn = options.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimeoutFn = options.clearTimeoutFn ?? ((id) => clearTimeout(id));
@@ -124,6 +133,8 @@ export class NavigationWriteCoordinator {
     this.onStatusChange = onStatusChange;
     this.pending = null;
     this.lastAttempted = null;
+    this.failed = false;
+    this.syncGuard();
     return attachmentId;
   }
 
@@ -153,8 +164,10 @@ export class NavigationWriteCoordinator {
       this.onStatusChange = null;
       this.pending = null;
       this.lastAttempted = null;
+      this.failed = false;
       this.clearTimeoutFn(this.resetTimer);
       this.resetTimer = undefined;
+      this.syncGuard();
     }
   }
 
@@ -165,7 +178,27 @@ export class NavigationWriteCoordinator {
   submit(layout: NavTabEntry[], sessionId: string, attachmentId: AttachmentId, verify: (session: Session) => boolean): void {
     if (sessionId !== this.attachedSessionId || attachmentId !== this.attachedAttachmentId) return;
     this.pending = { layout, sessionId, attachmentId, verify };
+    this.syncGuard();
     if (!this.inFlight) this.dispatchNext();
+  }
+
+  /**
+   * Keeps the app-update guard in step with whether the user's newest layout is durable. Called
+   * after every state change, synchronously: a request's own network guard is released just before
+   * its outcome arrives here, and a queued newer layout (or a failure awaiting Retry) must already
+   * be covered at that moment. What detach()/attach() drop — the queued layout and Retry target of
+   * a scope that is going away — no longer holds it; a write already on the wire does, until it
+   * settles.
+   */
+  private syncGuard(): void {
+    const needed = this.inFlight || this.pending !== null || this.failed;
+    if (needed && !this.releaseGuard && this.acquireGuard) {
+      this.releaseGuard = this.acquireGuard();
+    } else if (!needed && this.releaseGuard) {
+      const release = this.releaseGuard;
+      this.releaseGuard = null;
+      release();
+    }
   }
 
   /** Reports a status transition only to the attachment that actually owns it — checking
@@ -197,6 +230,8 @@ export class NavigationWriteCoordinator {
     this.pending = null;
     this.lastAttempted = submission;
     this.inFlight = true;
+    this.failed = false;
+    this.syncGuard();
     this.report(submission.sessionId, submission.attachmentId, 'saving');
 
     // `save` must behave like an async function (never throw synchronously) for the `.then()`
@@ -224,6 +259,7 @@ export class NavigationWriteCoordinator {
           this.dispatchNext();
           return;
         }
+        this.syncGuard();
         this.report(submission.sessionId, submission.attachmentId, 'saved');
         this.resetTimer = this.setTimeoutFn(() => {
           this.resetTimer = undefined;
@@ -240,6 +276,10 @@ export class NavigationWriteCoordinator {
           this.dispatchNext();
           return;
         }
+        // Retryable only while this is still the attached scope's own Retry target; a failure of a
+        // write whose scope has since detached leaves nothing on screen to protect.
+        this.failed = this.lastAttempted === submission;
+        this.syncGuard();
         this.report(submission.sessionId, submission.attachmentId, 'error');
       }
     );
