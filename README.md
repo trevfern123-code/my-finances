@@ -798,7 +798,9 @@ needs them. Status as of the audited production baseline (`d2cf720`, 2026-09-24)
   - Reconnect stuck-state fix; user role correction; transaction pagination (the API caps a request
     at 200 rows).
 - **Release hardening**
-  - Service-worker update / frontend-backend version compatibility (see the release lessons above);
+  - Service-worker update / frontend-backend version compatibility (see the release lessons above).
+    Phase 1, the backend API-level contract, is described in "Frontend/backend compatibility
+    contract"; phase 2 is the frontend update manager;
     then retire the legacy routes kept for stale bundles.
   - Retain terminal `exchange_unknown` attempts for about 30 days (follow-up 2 above).
   - Plaid token encryption Phase 3: confirm no plaintext tokens remain, then remove the plaintext
@@ -850,6 +852,38 @@ create policy "Users can only see their own net_worth_snapshots"
 One row per `(user_id, date)`, upserted (`services/dataService.ts`'s `upsertNetWorthSnapshot`, `onConflict: 'user_id,date'`) whenever balances are actually refreshed from Plaid — initial link (`completeLinkAttempt`) and manual "Refresh balances" (`refreshAccounts`) — since that's the only time `accounts.current_balance` changes. There's no scheduled/cron snapshot yet, so a user who never clicks refresh won't accumulate history; that's a reasonable follow-up if daily granularity independent of user activity turns out to matter.
 
 The asset/liability split (`services/netWorth.ts`'s `aggregateAssetsAndLiabilities`) is the same logic `getSpendingSummary` already used — extracted into its own pure, tested module and reused by both, rather than duplicated.
+
+## Frontend/backend compatibility contract
+
+An open browser tab or installed PWA window can keep running an older frontend bundle after a new
+backend deploys (see the post-audit release lessons). The backend therefore publishes an API level
+and refuses clients that are too old, explicitly instead of letting them misbehave
+(`backend/src/middleware/clientApiLevel.ts`).
+
+- **Request:** the client sends `X-Client-Api-Level: <integer>`. No header means a legacy client:
+  level 0. A malformed value (anything but a canonical non-negative integer, including a header
+  sent twice) gets **400** `{ code: 'invalid_client_api_level' }`.
+- **Response:** every response on a covered route carries `X-Api-Level` and
+  `X-Min-Client-Api-Level`, including 401s, 404s and 500s. CORS allows the request header and
+  exposes both response headers, with the same single allowed origin as before.
+- **Refusal:** a client below the minimum gets **409** `{ code: 'client_update_required' }` before
+  authentication or any handler runs, so nothing is read or written for it. Reads are refused too:
+  an old client can misread a response as easily as it can send a bad write.
+- **Covered routes:** `/api/plaid`, `/api/budget-categories`, `/api/category-mappings`,
+  `/api/manual-loans`, `/api/user-preferences` (`CLIENT_API_ROUTES` in `app.ts`). **Not covered**,
+  each keeping its own checks: `/` and `/health`, `/api/webhooks` (Plaid's signed JWT), and
+  preflight `OPTIONS` requests.
+- **Metadata only:** a supported level never replaces authentication, session ownership, resource
+  ownership or financial validation.
+- **Current values:** `API_LEVEL = 1`, `MIN_CLIENT_API_LEVEL = 0`, so every existing client is
+  served. They're code constants, not configuration: changing them is a reviewed release decision.
+- **Release rule:** raise `API_LEVEL` when a backend change alters a request or response an older
+  client depends on. Raise `MIN_CLIENT_API_LEVEL` only in a release that must refuse older clients
+  (for example, when retiring the legacy routes kept for pre-contract bundles).
+- **Deployment order:** Railway and Vercel don't deploy atomically. Backend support for a header
+  must be live, and verified, **before** a frontend release starts sending it; otherwise the
+  browser's preflight fails and every request errors. Frontends never retry a request without the
+  header, or retry a mutation after a network/CORS error.
 
 ## Frontend resilience note
 
