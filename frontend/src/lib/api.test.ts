@@ -6,7 +6,9 @@ vi.mock('./supabaseClient', () => ({
 }));
 
 import {
+  CLIENT_UPDATE_REQUIRED,
   createManualLoan,
+  getLinkedItems,
   isManualLoanCreationResolvedError,
   updateNavLayout,
   updateDashboardLayout,
@@ -14,21 +16,24 @@ import {
   updateFinancialPreferences,
   updateReportingRange,
 } from './api';
+import { appUpdate, CLIENT_API_LEVEL } from './appUpdate';
 
 const SESSION_A = { user: { id: 'user-a' }, access_token: 'a-token' };
 const SESSION_B = { user: { id: 'user-b' }, access_token: 'b-token' };
 
 function okResponse(body: unknown) {
-  return { ok: true, status: 200, json: () => Promise.resolve(body) };
+  return { ok: true, headers: new Headers(), status: 200, json: () => Promise.resolve(body) };
 }
 
 function clockSkewErrorResponse() {
-  return { ok: false, status: 401, json: () => Promise.resolve({ error: 'issued at future' }) };
+  return { ok: false, headers: new Headers(), status: 401, json: () => Promise.resolve({ error: 'issued at future' }) };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubGlobal('fetch', vi.fn());
+  // The shared update manager: a response reporting this level as supported clears "required".
+  appUpdate.reportServerLevels(CLIENT_API_LEVEL, 0);
 });
 
 /**
@@ -189,7 +194,7 @@ describe('createManualLoan — server resolution codes (Round 12 remediation)', 
   it("carries the server's code onto the thrown error, so a since-deleted key is recognized as resolved", async () => {
     mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
     vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
+      ok: false, headers: new Headers(),
       status: 409,
       json: () => Promise.resolve({ error: 'already created and since deleted', code: 'idempotency_key_loan_deleted' }),
     } as never);
@@ -205,7 +210,7 @@ describe('createManualLoan — server resolution codes (Round 12 remediation)', 
   it('an ordinary failure (no code) is NOT treated as resolved', async () => {
     mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
     vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
+      ok: false, headers: new Headers(),
       status: 500,
       json: () => Promise.resolve({ error: 'Failed to backfill loan matches' }),
     } as never);
@@ -312,5 +317,132 @@ describe('createManualLoan — request bound to the initiating owner (Round 14 r
 
     expect(verify).toHaveBeenCalledWith(SESSION_A);
     expect(verify.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(fetch).mock.invocationCallOrder[0]);
+  });
+});
+
+/** Service-worker/version compatibility, phase 2: the client side of backend/src/middleware/clientApiLevel.ts. */
+describe('authedFetch — client API level', () => {
+  const verifyA = (session: { user: { id: string } }) => session.user.id === 'user-a';
+
+  function levelResponse(body: unknown, api: string, min: string, init: { ok?: boolean; status?: number } = {}) {
+    return {
+      ok: init.ok ?? true,
+      status: init.status ?? 200,
+      headers: new Headers({ 'X-Api-Level': api, 'X-Min-Client-Api-Level': min }),
+      json: () => Promise.resolve(body),
+    };
+  }
+
+  beforeEach(() => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+  });
+
+  it('sends X-Client-Api-Level on reads and on mutations', async () => {
+    vi.mocked(fetch).mockResolvedValue(okResponse({ items: [], is_sandbox: false }) as never);
+    await getLinkedItems();
+    await updateNavLayout({ tabs: [] }, verifyA);
+    for (const call of vi.mocked(fetch).mock.calls) {
+      const headers = (call[1] as RequestInit).headers as Record<string, string>;
+      expect(headers['X-Client-Api-Level']).toBe(String(CLIENT_API_LEVEL));
+      expect(headers['X-Client-Api-Level']).toBe('1');
+    }
+  });
+
+  it('reads both levels from every response', async () => {
+    // Distinct from the values beforeEach resets to, so this only passes if the headers were read.
+    vi.mocked(fetch).mockResolvedValue(levelResponse({ items: [] }, '7', '1') as never);
+    await getLinkedItems();
+    expect(appUpdate.getSnapshot()).toMatchObject({ serverApiLevel: 7, minClientApiLevel: 1, updateRequired: false });
+  });
+
+  it('a newer server level alone does not block: mutations still go out', async () => {
+    vi.mocked(fetch).mockResolvedValue(levelResponse({ items: [] }, '2', '1') as never);
+    await getLinkedItems();
+    expect(appUpdate.isUpdateRequired()).toBe(false);
+    await updateNavLayout({ tabs: [] }, verifyA);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('a minimum above this client blocks new mutations before they are sent (reads still work)', async () => {
+    vi.mocked(fetch).mockResolvedValue(levelResponse({ items: [] }, '2', '2') as never);
+    await getLinkedItems();
+    expect(appUpdate.isUpdateRequired()).toBe(true);
+
+    await expect(updateNavLayout({ tabs: [] }, verifyA)).rejects.toMatchObject({ code: CLIENT_UPDATE_REQUIRED });
+    await expect(createManualLoan({ name: 'x' } as never, 'key-1', verifyA)).rejects.toMatchObject({
+      code: CLIENT_UPDATE_REQUIRED,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1); // only the read
+    await getLinkedItems();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('409 client_update_required marks the update required, throws coded, and is never replayed', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      levelResponse({ error: 'This version of the app is out of date', code: 'client_update_required' }, '1', '0', {
+        ok: false,
+        status: 409,
+      }) as never
+    );
+    await expect(updateNavLayout({ tabs: [] }, verifyA)).rejects.toMatchObject({ code: CLIENT_UPDATE_REQUIRED });
+    expect(appUpdate.isUpdateRequired()).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    // Nothing resends it later either: the next mutation is refused locally.
+    await expect(updateNavLayout({ tabs: [] }, verifyA)).rejects.toMatchObject({ code: CLIENT_UPDATE_REQUIRED });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('a network/CORS failure on a mutation is not retried', async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await expect(createManualLoan({ name: 'x' } as never, 'key-1', verifyA)).rejects.toThrow('Failed to fetch');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(appUpdate.getSnapshot().guards).toEqual([]);
+  });
+
+  it('a mutation holds the update guard for its whole lifecycle, including the clock-skew retry', async () => {
+    vi.useFakeTimers();
+    let resolveSecond!: (v: unknown) => void;
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(clockSkewErrorResponse() as never)
+      .mockImplementationOnce(() => new Promise((r) => (resolveSecond = r)) as never);
+    const guardsSeen: string[][] = [];
+    mockGetSession.mockImplementation(() => {
+      guardsSeen.push(appUpdate.getSnapshot().guards);
+      return Promise.resolve({ data: { session: SESSION_A } });
+    });
+
+    const pending = updateNavLayout({ tabs: [] }, verifyA);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(appUpdate.getSnapshot().guards).toEqual(['mutation']); // waiting out the retry delay
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(appUpdate.getSnapshot().guards).toEqual(['mutation']); // the retry is in flight
+    resolveSecond(okResponse({ nav_layout: { tabs: [] } }));
+    await pending;
+    expect(guardsSeen.every((g) => g.includes('mutation'))).toBe(true);
+    expect(appUpdate.getSnapshot().guards).toEqual([]);
+    vi.useRealTimers();
+  });
+
+  it('releases the guard when the mutation fails', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      headers: new Headers(),
+      json: () => Promise.resolve({ error: 'boom' }),
+    } as never);
+    await expect(updateNavLayout({ tabs: [] }, verifyA)).rejects.toThrow('boom');
+    expect(appUpdate.getSnapshot().guards).toEqual([]);
+  });
+
+  it('reads never take the mutation guard', async () => {
+    let resolveFetch!: (v: unknown) => void;
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise((r) => (resolveFetch = r)) as never);
+    const pending = getLinkedItems();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(appUpdate.getSnapshot().guards).toEqual([]);
+    resolveFetch(okResponse({ items: [], is_sandbox: false }));
+    await pending;
   });
 });

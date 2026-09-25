@@ -16,6 +16,10 @@ export interface SaveStatusTrackerOptions {
   onStatusChange: (status: SaveStatus) => void;
   setTimeoutFn?: SetTimeoutFn;
   clearTimeoutFn?: ClearTimeoutFn;
+  /** Holds the app-update `pending_save` guard (lib/appUpdate.ts) and returns its release. While
+   *  the latest change is not durably saved — 'saving', or 'error' awaiting Retry — the tracker
+   *  holds it, so an automatic update reload can never throw that change away. */
+  acquireGuard?: () => () => void;
 }
 
 /**
@@ -38,8 +42,12 @@ export class SaveStatusTracker {
   private readonly onStatusChange: (status: SaveStatus) => void;
   private readonly setTimeoutFn: SetTimeoutFn;
   private readonly clearTimeoutFn: ClearTimeoutFn;
+  private readonly acquireGuard: (() => () => void) | null;
+  private releaseGuard: (() => void) | null = null;
+  private guardEnabled = true;
 
   constructor(options: SaveStatusTrackerOptions) {
+    this.acquireGuard = options.acquireGuard ?? null;
     this.savedDisplayMs = options.savedDisplayMs ?? DEFAULT_SAVED_DISPLAY_MS;
     this.onStatusChange = options.onStatusChange;
     // Wrapped in a fresh arrow function rather than assigned directly (`options.setTimeoutFn ??
@@ -59,7 +67,29 @@ export class SaveStatusTracker {
 
   private setStatus(next: SaveStatus): void {
     this.status = next;
+    // Synchronously, before anything else observes the new status: a save's own request guard is
+    // released just before its outcome reaches this tracker, so a failure must already be covered.
+    this.syncGuard();
     this.onStatusChange(next);
+  }
+
+  /** The change is not durable while it is being saved, or after its save failed (Retry pending). */
+  private syncGuard(): void {
+    const needed = this.guardEnabled && (this.status === 'saving' || this.status === 'error');
+    if (needed && !this.releaseGuard && this.acquireGuard) {
+      this.releaseGuard = this.acquireGuard();
+    } else if (!needed && this.releaseGuard) {
+      const release = this.releaseGuard;
+      this.releaseGuard = null;
+      release();
+    }
+  }
+
+  /** (Re-)enables the guard on mount — including React StrictMode's re-mount after its simulated
+   *  cleanup called dispose(). */
+  enableGuard(): void {
+    this.guardEnabled = true;
+    this.syncGuard();
   }
 
   /** Starts tracking a new save attempt: 'saving' immediately, then 'saved' or 'error' once
@@ -89,9 +119,13 @@ export class SaveStatusTracker {
     if (this.lastAttempt) this.track(this.lastAttempt);
   }
 
-  /** Releases the pending idle-reset timer, if any — call on unmount. */
+  /** Releases the pending idle-reset timer and the update guard, if any — call on unmount. The
+   *  changes the guard covered go away with the component, and a save still settling afterwards
+   *  never re-acquires it. */
   dispose(): void {
     this.clearTimeoutFn(this.resetTimer);
+    this.guardEnabled = false;
+    this.syncGuard();
   }
 }
 

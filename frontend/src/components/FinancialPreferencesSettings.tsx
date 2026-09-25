@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import type { SaveStatus } from '../hooks/useSaveStatus';
 import { SaveStatusIndicator } from './SaveStatusIndicator';
 import {
@@ -33,6 +34,8 @@ function PreferenceRow({
   // keystroke round-tripping through the clamp + persist path — only committed on blur, same
   // pattern as the savings-goal input in IncomeSavings.
   const [editing, setEditing] = useState<string | undefined>(undefined);
+  // A value typed but not yet committed (on blur) holds off an automatic app-update reload.
+  useUpdateGuard('unsaved_edit', editing !== undefined);
 
   return (
     <div className="appearance-section financial-prefs-row">

@@ -131,7 +131,7 @@ describe.each(MUTATIONS)('$name — a mutation is only ever sent under the sessi
   it('sends exactly once, with A\'s own token, while A\'s login is still current', async () => {
     const session = fakeSession('user-a', 'sid-a1');
     mockGetSession.mockResolvedValue({ data: { session } });
-    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve({}) } as never);
+    vi.mocked(fetch).mockResolvedValue({ ok: true, headers: new Headers(), status: 200, json: () => Promise.resolve({}) } as never);
 
     await call(ownerA().verify);
 

@@ -893,6 +893,131 @@ and refuses clients that are too old, explicitly instead of letting them misbeha
   browser's preflight fails and every request errors. Frontends never retry a request without the
   header, or retry a mutation after a network/CORS error.
 
+### Frontend: service-worker updates
+
+`frontend/src/lib/appUpdate.ts` registers the service worker and decides when an open page moves
+onto a new build. (It replaced vite-plugin-pwa's injected `registerSW.js`, which only registered
+the worker, so an open tab kept running its old bundle indefinitely.)
+
+- **Worker:** still `/sw.js` (same URL, so installed copies upgrade in place), Workbox
+  `generateSW` with `skipWaiting` + `clientsClaim`: a new worker activates at once and takes control
+  of open pages. Both are set explicitly in `vite.config.ts`, because the plugin drops them silently
+  when it doesn't inject the registration itself. `npm run verify:pwa --workspace frontend` (in CI
+  after the build) checks this, the missing `registerSW.js`, the completion page below, and the
+  build id.
+- **Update checks:** at startup, every 30 minutes, when the tab becomes visible (at most once a
+  minute), when a response reports a newer `X-Api-Level`, when a lazy chunk fails to load
+  (`vite:preloadError`), and every minute while an update is required. A preload error is taken
+  over by the manager (`preventDefault()`, so Vite doesn't also rethrow it) and recovered through
+  the same guarded reload. The app has no lazy chunks today.
+- **Detecting a new build:** `controllerchange` on a page that already had a controlling worker (or
+  had an active one it bypassed, e.g. after Shift+Reload). The first installation claiming a page is
+  not an update.
+- **When it reloads:** never while a guard is active in that tab (below). If it's safe, it reloads
+  automatically within 15 s of launch or while the tab is hidden. A safe, visible tab shows
+  **"A new version is ready — Reload"** instead. An update-required tab reloads as soon as it's safe
+  and a newer build has actually arrived.
+- **Guards** (per tab; tabs never coordinate or lock each other):
+  - any non-GET request, for its whole lifecycle (session lookup, request, response, the clock-skew
+    retry);
+  - a Hosted Link attempt, from the click until it completes, is cancelled, fails or unmounts;
+  - the Reconnect (Update Mode) flow, from the click until Link exits or the completion settles
+    (`onExit` now also clears the stuck "Reconnecting..." state);
+  - unsaved edits (`unsaved_edit`): the add/edit loan form, manual payment add/edit, a linked
+    payment's principal, the split editor, add-category and budget amounts, credit limit, savings
+    goal, the Financial Preferences numbers, account nickname, a custom emoji, and typed sign-in
+    details;
+  - changes applied on screen but not yet durably saved (`pending_save`). The request's own guard
+    ends when the request ends, which is too early for these:
+    - Financial Preferences, Safe to Spend toggles, appearance, dashboard layout and reporting
+      range: held by their save tracker (`useSaveStatus`) from the edit until the latest value
+      saves. A failed save keeps it until Retry succeeds or a newer change saves. Dashboard layout
+      and reporting range used to fail silently; they now show "Couldn't save. Retry".
+    - Navigation: held by the navigation write queue while a layout is in flight, queued behind
+      another, or failed awaiting Retry.
+    - Unmounting (sign-out) releases it: those changes go with the component.
+- **Discarding (never automatic, never a dead end):** when only the user's own unsaved changes are
+  holding an update back, the banner offers **"Discard unsaved changes and reload"**. This applies
+  both when a new version is ready and when an update is required: once an update is required,
+  saving is turned off, so Retry can't help. Discarded changes are lost, except an unconfirmed
+  "Add loan" save, which is already persisted per user (`pendingManualLoanCreation.ts`) and is
+  resumed, never auto-sent, after the reload. Discard is never offered:
+  - over a mutation, Hosted Link attempt or reconnect in progress (the banner waits for those);
+  - while no newer build is available. An update-required page with unsaved changes says **"the
+    newer version isn't available yet"**, keeps its changes on screen and saving turned off, and
+    keeps checking. Discarding would only reload the same incompatible build.
+- **Reload-loop protection** (per-tab `sessionStorage`, `my-finances:update-reloads`): each update
+  reload records the build it left. If the page comes back on the **same** build within 5 minutes,
+  automatic reloads stop for that page until a genuinely new worker takes control. Other limits: at
+  most 3 automatic reloads in 10 minutes, 30 s between automatic reloads (a user's own Reload
+  doesn't count), and no automatic reload at all if the record can't be read or written. The banner
+  always keeps a manual Reload.
+- **Build id** (`frontend/scripts/build-id.mjs`): `VERCEL_GIT_COMMIT_SHA` (first 12 characters),
+  else `VERCEL_DEPLOYMENT_ID`, else `local-<timestamp>`. None of these is secret. It's baked into
+  the bundle (`<html data-app-build="…">` at runtime) and into `index.html` as
+  `<meta name="app-build" content="…">`. The verifier checks that both agree, that the id has a
+  valid form, and that it's the id the environment should produce (`EXPECTED_APP_BUILD_ID`
+  overrides). After a Vercel deploy, confirm the deployed commit without running the app:
+  `curl -s https://<frontend>/ | grep app-build`. A `local-…` id means the system variables aren't
+  exposed to the build. Updates and loop protection still work (every build gets a unique id), but
+  diagnostics are weaker.
+- **Plaid completion page:** `/plaid-link-complete.html` is precached as itself and excluded from
+  the SPA navigation fallback, with or without a query string (and in its extension-less form), so
+  Hosted Link's redirect always gets the real completion page.
+
+### Frontend: client API level
+
+- Every app API request (`authedFetch` in `lib/api.ts`, the only caller of `fetch`) sends
+  `X-Client-Api-Level: 1` (`CLIENT_API_LEVEL`). The Supabase client doesn't send it.
+- Every response's `X-Api-Level` / `X-Min-Client-Api-Level` is read, strictly (a malformed value is
+  ignored):
+  - **`X-Api-Level` above the client's level:** check for an update (throttled); nothing is blocked.
+  - **`X-Min-Client-Api-Level` above the client's level, or a 409 `client_update_required`:**
+    **update required.** The banner shows **"Update required — reload to continue"**, a check runs
+    now and every minute, and every new mutation is refused **before it is sent**. Reads continue
+    (the backend refuses them itself). A later response putting the minimum back at or below the
+    client clears the state (e.g. after a backend rollback).
+- Nothing is replayed: a request refused with 409 is final. A network/CORS failure propagates
+  without a retry. No request is ever re-sent without the header. A Hosted Link attempt or reconnect
+  whose completion is refused ends with its error, and must be started again after the update.
+
+### Release rules for API levels and service workers
+
+- **Backend first.** Backend support for a header or level ships and is verified before any
+  frontend sends or requires it. (Phase 1, `a8265f9`, is live, so the frontend may send level 1.)
+- **Raising `MIN_CLIENT_API_LEVEL` to N** is allowed only when all of these hold:
+  1. a frontend sending level ≥ N has been live in production long enough for open tabs to update;
+  2. the installed-PWA check below passed on that release;
+  3. it's accepted that any tab still running a build older than this update manager can't update
+     itself. It will show the 409 message until the user reloads it.
+
+  Raising it also blocks completing any Hosted Link attempt or reconnect started from an older
+  client.
+- **Rollback limitation:** this frontend sends `X-Client-Api-Level`. A backend rolled back to before
+  `a8265f9` doesn't allow that header in CORS, so every request from this frontend would fail its
+  preflight. Keep backend rollbacks at or after `a8265f9`; otherwise roll the frontend back first.
+  Rolling the frontend back to a pre-update-manager build works while `MIN_CLIENT_API_LEVEL = 0`
+  (open tabs reload onto it), but reinstates the stale-tab problem. After the minimum is raised, a
+  frontend below it can't be rolled back to without lowering the minimum first.
+- **Manual installed-PWA release check** (automation can't cover an installed app window):
+  1. With the production PWA installed and open on the current build, note
+     `document.documentElement.dataset.appBuild` (DevTools: Ctrl+Shift+I in the app window).
+  2. Deploy the new frontend.
+  3. Minimise the window for over a minute, then restore it: it should be on the new build (hidden
+     and safe means an automatic reload).
+  4. Repeat with a half-typed form visible: it must show "finish your current edit first" and keep
+     the text.
+  5. Clear the field: it must offer Reload.
+- **Local two-build check:**
+  1. Build twice with `VITE_UPDATE_DEBUG=1` (this exposes `window.__appUpdate`; normal builds never
+     set it) and dummy `VITE_*` values.
+  2. Serve the first build, open two tabs, then switch the server to the second build.
+  3. Call `navigator.serviceWorker.getRegistration().then(r => r.update())`.
+  4. Observe the hidden tab reloading, and a tab with a dirty form deferring.
+
+  On Windows, give a headless browser a short profile path: Cache Storage fails under `MAX_PATH`
+  and the worker never installs.
+
 ## Frontend resilience note
 
 `App.tsx`'s `refreshAll` uses `Promise.allSettled`, not `Promise.all` — with five parallel dashboard fetches, one endpoint failing (as `net-worth-history` currently does, pending the migration above) used to reject the whole batch and leave every section on its empty initial state, silently, with only an uncaught promise rejection in the console. Now each successful fetch still updates its own section, and a single error banner (`actionError`) surfaces if anything failed — check the browser console for which endpoint, since the banner doesn't say.

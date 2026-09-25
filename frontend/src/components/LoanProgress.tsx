@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { LoanPayment, ManualPaymentInput, Loan, ManualLoan, ManualLoanInput } from '../lib/api';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import { formatCurrency } from '../lib/currency';
 import type { PendingManualLoanCreation } from '../lib/pendingManualLoanCreation';
 
@@ -69,6 +70,8 @@ function ManualPaymentForm({
   onSubmit: (input: ManualPaymentInput) => void;
 }) {
   const [form, setForm] = useState(initial);
+  // Unsaved edits hold off an automatic app-update reload (lib/appUpdate.ts).
+  useUpdateGuard('unsaved_edit', JSON.stringify(form) !== JSON.stringify(initial));
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -135,6 +138,7 @@ function LinkedPaymentRow({
 }) {
   const [principal, setPrincipal] = useState(String(payment.principal_portion));
   const dirty = Number(principal) !== payment.principal_portion;
+  useUpdateGuard('unsaved_edit', dirty);
   const amount = payment.principal_portion + payment.interest_portion;
 
   return (
@@ -573,6 +577,10 @@ function ManualLoanForm({
   }
 
   const busy = submitting || inFlight;
+  // Unsaved edits hold off an automatic app-update reload (lib/appUpdate.ts). A locked attempt is
+  // already persisted per user (pendingManualLoanCreation.ts) and resumes after a reload, so it does
+  // not; a request in flight is covered by authedFetch's own mutation guard.
+  useUpdateGuard('unsaved_edit', !locked && JSON.stringify(form) !== JSON.stringify(initial));
 
   return (
     <form className="card manual-loan-form" onSubmit={handleSubmit}>

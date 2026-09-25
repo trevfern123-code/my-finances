@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import type { BudgetCategory, TransactionSplit } from '../lib/api';
 import { budgetCategoryLabel, selectableCategories } from '../lib/categoryLabels';
 import { computeSplitBalance, hasIncompleteRow } from '../lib/splitValidation';
@@ -24,7 +25,7 @@ export function SplitEditor({
   onClear: () => Promise<void>;
   onCancel: () => void;
 }) {
-  const [rows, setRows] = useState<DraftSplit[]>(() =>
+  const [initialRows] = useState<DraftSplit[]>(() =>
     initialSplits.length > 0
       ? initialSplits.map((s) => ({ budget_category_id: s.budget_category_id, amount: String(s.amount) }))
       : [
@@ -32,6 +33,9 @@ export function SplitEditor({
           { budget_category_id: '', amount: '' },
         ]
   );
+  const [rows, setRows] = useState<DraftSplit[]>(initialRows);
+  // Unsaved edits hold off an automatic app-update reload (lib/appUpdate.ts).
+  useUpdateGuard('unsaved_edit', JSON.stringify(rows) !== JSON.stringify(initialRows));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 

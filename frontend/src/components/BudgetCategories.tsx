@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import type { BudgetCategory, TransactionItem } from '../lib/api';
 import { getCurrentMonthCategoryItems } from '../lib/budgetDrilldown';
 import { computeReorder } from '../lib/reorder';
@@ -39,6 +40,8 @@ function AddCategoryForm({
   const [amount, setAmount] = useState('');
   const [emoji, setEmoji] = useState<string | null>(null);
   const [color, setColor] = useState<string | null>(null);
+  // Unsaved edits hold off an automatic app-update reload (lib/appUpdate.ts).
+  useUpdateGuard('unsaved_edit', name !== '' || amount !== '' || emoji !== null || color !== null);
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -163,6 +166,12 @@ export function BudgetCategories({
   // takes effect immediately once the underlying values update, with no separate refetch.
   const sorted = categories.filter((c) => c.archived_at === null).sort((a, b) => a.sort_order - b.sort_order);
   const archived = categories.filter((c) => c.archived_at !== null).sort((a, b) => a.name.localeCompare(b.name));
+  // A typed amount that is not (yet) the saved one — mid-edit, or left behind by a failed save —
+  // holds off an automatic app-update reload (lib/appUpdate.ts).
+  useUpdateGuard(
+    'unsaved_edit',
+    categories.some((c) => editing[c.id] !== undefined && Number(editing[c.id]) !== c.budget_amount)
+  );
 
   function handleCreate(name: string, budgetAmount: number, emoji: string | null, color: string | null) {
     onCreate(name, budgetAmount, emoji, color);

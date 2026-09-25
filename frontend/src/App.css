@@ -824,6 +824,52 @@ button:disabled {
   color: var(--text-on-warn);
 }
 
+/* ---- App update notice (components/UpdateBanner.tsx) ---- */
+
+/* Not colour-only: the label text ("Update available" / "Update required") carries the meaning. */
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  max-width: 1080px;
+  margin: 0 auto 0.75rem;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--accent);
+  border-left-width: 4px;
+  border-radius: var(--radius-sm);
+  background: rgba(var(--accent-rgb), 0.1);
+  font-size: 0.85rem;
+}
+
+.update-banner-required {
+  border-color: var(--warn);
+  background: rgba(var(--warn-rgb), 0.12);
+}
+
+.update-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.update-banner-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.update-banner-actions button {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.7rem;
+}
+
+.update-banner-required .update-banner-actions button {
+  background: var(--warn-strong);
+  color: var(--text-on-warn);
+}
+
 /* ---- Transactions ---- */
 
 .transaction-filters {

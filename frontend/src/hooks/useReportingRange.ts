@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { updateReportingRange } from '../lib/api';
 import { normalizeReportingRange, type ReportingRangeId } from '../lib/reportingRange';
+import { useSaveStatus } from './useSaveStatus';
 
 /**
  * Owns the Date-Range Customization v1 preference — which of the 5 reporting-range presets drives
@@ -45,6 +46,7 @@ export function useReportingRange(
   verifyOwnershipRef.current = verifyOwnership;
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
+  const { status: saveStatus, track, retry } = useSaveStatus();
 
   // Fires the initial range-data fetch exactly once, on mount, with this lifecycle's real
   // (already-hydrated, per the state initializer above) starting range — see this hook's own doc
@@ -60,11 +62,11 @@ export function useReportingRange(
   function setRange(next: ReportingRangeId) {
     setRangeState(next);
     onReadyRef.current(next);
-    updateReportingRange({ reporting_range: next }, (session) => verifyOwnershipRef.current(session)).catch(() => {
-      // Best-effort — stays applied locally this session even if the save failed, same as
-      // useAppearance/useFinancialPreferences.
-    });
+    // Stays applied locally this session even if the save fails, same as useAppearance/
+    // useFinancialPreferences; track() reports the real outcome (with Retry), and until the latest
+    // range is saved it holds off an automatic app-update reload (useSaveStatus).
+    track(() => updateReportingRange({ reporting_range: next }, (session) => verifyOwnershipRef.current(session)));
   }
 
-  return { range, setRange };
+  return { range, setRange, saveStatus, retry };
 }

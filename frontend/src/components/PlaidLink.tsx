@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useUpdateGuard } from '../hooks/useAppUpdate';
 import { completeLinkAttempt, createHostedLinkAttempt } from '../lib/api';
 import type { SessionOwnership } from '../lib/sessionOwnership';
 
@@ -48,6 +49,9 @@ export function PlaidLink({
   // App's handler is recreated every render; the polling effect must not restart for that.
   const onLinkedRef = useRef(onLinked);
   onLinkedRef.current = onLinked;
+  // An app update must not reload this tab while an attempt is being created or is waiting: the
+  // reload would drop the attempt this tab is completing (lib/appUpdate.ts).
+  useUpdateGuard('hosted_link', preparing || attempt !== null);
 
   async function handleClick() {
     const ownership = captureOwnership();

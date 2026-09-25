@@ -62,7 +62,7 @@ function deferred<T>() {
 }
 
 function okResponse(body: unknown) {
-  return { ok: true, status: 200, json: () => Promise.resolve(body) };
+  return { ok: true, headers: new Headers(), status: 200, json: () => Promise.resolve(body) };
 }
 
 /** Whether a PUT to a URL containing `urlSubstring` was ever sent on the shared `fetch` mock — used
@@ -850,7 +850,7 @@ describe('10. StrictMode / real-unmount bootstrap invalidation (Blocker 1)', () 
 
 describe('11. NavigationWriteCoordinator lifetime — survives a full harness (App-level) remount (Blocker 3)', () => {
   it('an already-in-flight A1 write and a freshly-mounted A3 harness still serialize through the same real, exported coordinator: wire order A1 -> A3', async () => {
-    const fetchCall1 = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    const fetchCall1 = deferred<{ ok: boolean; status: number; headers?: Headers; json: () => Promise<unknown> }>();
     vi.mocked(fetch).mockImplementationOnce(() => fetchCall1.promise as never).mockResolvedValueOnce(
       okResponse({ nav_layout: { tabs: [] } }) as never
     );
@@ -895,7 +895,7 @@ describe('11. NavigationWriteCoordinator lifetime — survives a full harness (A
   });
 
   it('stale A1 completion cannot report status into the newly attached A3 scope', async () => {
-    const fetchCall1 = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    const fetchCall1 = deferred<{ ok: boolean; status: number; headers?: Headers; json: () => Promise<unknown> }>();
     vi.mocked(fetch).mockImplementationOnce(() => fetchCall1.promise as never);
 
     const framesA1: Frame[] = [];
@@ -930,8 +930,8 @@ describe('11. NavigationWriteCoordinator lifetime — survives a full harness (A
   // that case needs its own coverage, since sessionId alone is exactly what the previous round's
   // coordinator used to gate status/detach/retry ownership on.
   it('a full remount under the SAME session_id still gets a distinct attachment: the old attachment\'s success never reports into the new one, and wire order stays old -> new', async () => {
-    const fetchCall1 = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
-    const fetchCall2 = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    const fetchCall1 = deferred<{ ok: boolean; status: number; headers?: Headers; json: () => Promise<unknown> }>();
+    const fetchCall2 = deferred<{ ok: boolean; status: number; headers?: Headers; json: () => Promise<unknown> }>();
     vi.mocked(fetch)
       .mockImplementationOnce(() => fetchCall1.promise as never)
       .mockImplementationOnce(() => fetchCall2.promise as never);
@@ -993,7 +993,7 @@ describe('11. NavigationWriteCoordinator lifetime — survives a full harness (A
   });
 
   it('an old attachment\'s failure under the SAME session_id cannot surface a false Error (with a nonfunctional Retry) in the new attachment', async () => {
-    const fetchCall1 = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    const fetchCall1 = deferred<{ ok: boolean; status: number; headers?: Headers; json: () => Promise<unknown> }>();
     vi.mocked(fetch).mockImplementationOnce(() => fetchCall1.promise as never);
 
     const framesOld: Frame[] = [];
@@ -1015,7 +1015,7 @@ describe('11. NavigationWriteCoordinator lifetime — survives a full harness (A
     // failure (a non-ok response), not a mocked coordinator-level rejection, so this exercises the
     // exact production failure path.
     await act(async () => {
-      fetchCall1.resolve({ ok: false, status: 500, json: () => Promise.resolve({ error: 'stale failure' }) });
+      fetchCall1.resolve({ ok: false, headers: new Headers(), status: 500, json: () => Promise.resolve({ error: 'stale failure' }) });
       await fetchCall1.promise.catch(() => {});
     });
     await Promise.resolve();
@@ -1198,7 +1198,7 @@ describe('14. Appearance — stale save completion and Retry cannot cross into a
     });
     await waitFor(() => expect(frames.some((f) => f.sessionId === 'sid-a1')).toBe(true));
 
-    const fetchCall = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+    const fetchCall = deferred<{ ok: boolean; status: number; headers?: Headers; json: () => Promise<unknown> }>();
     vi.mocked(fetch).mockReturnValueOnce(fetchCall.promise as never);
     act(() => getByTestId('set-theme-dark').click()); // A's save dispatched, held open
     await waitFor(() => expect(getByTestId('appearance-status').textContent).toBe('saving'));
@@ -1237,7 +1237,7 @@ describe('14. Appearance — stale save completion and Retry cannot cross into a
     vi.mocked(fetch).mockClear(); // drop A's hydration-triggered range-data GET from the count below
 
     vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
+      ok: false, headers: new Headers(),
       status: 500,
       json: () => Promise.resolve({ error: 'network down' }),
     } as never);

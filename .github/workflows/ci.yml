@@ -45,6 +45,9 @@ jobs:
       - name: Frontend build
         run: npm run build --workspace frontend
 
+      - name: Frontend PWA build contract
+        run: npm run verify:pwa --workspace frontend
+
   migration-replay:
     # The tracked migration history must rebuild through the supported Supabase workflow (post-audit
     # blocker 3): the pipeline emulator plus the real, pinned CLI's `db push` and `db reset`, each

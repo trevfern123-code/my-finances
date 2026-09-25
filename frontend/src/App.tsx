@@ -78,6 +78,8 @@ import { useNavLayout } from './hooks/useNavLayout';
 import { useReportingRange } from './hooks/useReportingRange';
 import { Auth } from './components/Auth';
 import { PlaidLink } from './components/PlaidLink';
+import { UpdateBanner } from './components/UpdateBanner';
+import { appUpdate } from './lib/appUpdate';
 import { LinkedAccounts } from './components/LinkedAccounts';
 import { TransactionsFeed } from './components/TransactionsFeed';
 import { BudgetCategories } from './components/BudgetCategories';
@@ -97,6 +99,7 @@ import { Settings } from './components/Settings';
 import { DashboardCustomizer } from './components/DashboardCustomizer';
 import { ReportingRangeSelector } from './components/ReportingRangeSelector';
 import { TabNav } from './components/TabNav';
+import { SaveStatusIndicator } from './components/SaveStatusIndicator';
 import './App.css';
 
 // The backend caps /api/plaid/transactions at 200 regardless of what's requested — fetching the
@@ -151,6 +154,9 @@ export type FinancialFetchOutcome = { status: 'ready' } | { status: 'error' };
 // same-shaped copy. See lib/navigationWriteCoordinator.ts's own doc comment for the full guarantee.
 export const navigationWriteCoordinator = new NavigationWriteCoordinator({
   save: (layout, verify) => updateNavLayout({ tabs: layout }, verify),
+  // A layout that isn't durably saved yet (sending, queued, or failed with Retry) holds off an
+  // automatic app-update reload (lib/appUpdate.ts).
+  acquireGuard: () => appUpdate.acquireGuard('pending_save'),
 });
 
 /**
@@ -1497,6 +1503,10 @@ export default function App() {
     // retry's input is the stored payload, which passed this same check when it was first sent.)
     const invalid = validateManualLoanInput(input);
     if (invalid) refuse(invalid);
+    // Nor must a save this build is not allowed to send (authedFetch would refuse it anyway, but only
+    // after the attempt had been claimed and locked). If an update becomes required between here and
+    // the send, the claimed attempt stays pending and is finished with Save after the reload.
+    if (appUpdate.isUpdateRequired()) refuse('This version of the app is out of date. Reload to update before saving.');
 
     // Round 13 remediation: claiming the attempt is one step under a cross-tab lock (see
     // acquirePendingManualLoanCreation), not a read here followed by a write. Round 12's
@@ -1717,11 +1727,17 @@ export default function App() {
   }
 
   if (!session) {
-    return <Auth />;
+    return (
+      <>
+        <UpdateBanner />
+        <Auth />
+      </>
+    );
   }
 
   return (
     <div className="dashboard">
+      <UpdateBanner />
       <header className="app-header">
         <h1>My Finances</h1>
         <div className="app-header-actions">
@@ -1936,6 +1952,19 @@ export default function App() {
               return (
                 <>
                   <TabNav tabs={TABS} activeTab={activeTab} onChange={setActiveTab} />
+
+                  {/* These two save silently when all is well; a failed save is shown on every tab
+                      with Retry, since it also holds off app updates until it's saved. */}
+                  {dashboardLayout.saveStatus === 'error' && (
+                    <p className="hint">
+                      Dashboard layout: <SaveStatusIndicator status="error" onRetry={dashboardLayout.retry} />
+                    </p>
+                  )}
+                  {reportingRange.saveStatus === 'error' && (
+                    <p className="hint">
+                      Reporting range: <SaveStatusIndicator status="error" onRetry={reportingRange.retry} />
+                    </p>
+                  )}
 
                   {activeTab === 'overview' && (
                     <div className="tab-panel">
