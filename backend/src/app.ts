@@ -9,6 +9,14 @@ import { manualLoansRouter } from './routes/manualLoans';
 import { userPreferencesRouter } from './routes/userPreferences';
 import { webhooksRouter } from './routes/webhooks';
 import { errorHandler } from './middleware/errorHandler';
+import {
+  API_LEVEL_HEADER,
+  CLIENT_API_LEVEL_HEADER,
+  DEFAULT_CLIENT_API_LEVEL_POLICY,
+  MIN_CLIENT_API_LEVEL_HEADER,
+  requireSupportedClientApiLevel,
+  type ClientApiLevelPolicy,
+} from './middleware/clientApiLevel';
 
 /**
  * The CORS policy for browser calls from the frontend. `Idempotency-Key` must be listed because the
@@ -16,26 +24,63 @@ import { errorHandler } from './middleware/errorHandler';
  * 4000 locally), so any custom request header triggers a preflight. Without it here the browser
  * never sends the manual-loan create at all (Round 16 remediation — the Round 8–15 idempotency
  * work was unreachable from a real browser because this list only had Content-Type and
- * Authorization).
+ * Authorization). The same applies to `X-Client-Api-Level` (see middleware/clientApiLevel.ts):
+ * this backend must allow it BEFORE any frontend release starts sending it. The two compatibility
+ * response headers must be exposed, or a cross-origin browser script cannot read them.
  */
 export function buildCorsOptions(frontendUrl: string): CorsOptions {
   return {
     origin: frontendUrl,
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', CLIENT_API_LEVEL_HEADER],
+    exposedHeaders: [API_LEVEL_HEADER, MIN_CLIENT_API_LEVEL_HEADER],
   };
 }
+
+/**
+ * The routes the frontend (and a future mobile client) calls. The client-API-level contract covers
+ * exactly these. Deliberately NOT covered, each keeping its own existing checks: `/` and `/health`
+ * (platform health checks), `/api/webhooks` (Plaid, verified by its signed JWT). The Plaid Hosted
+ * Link completion page is a static frontend file and never reaches this backend.
+ */
+export const CLIENT_API_ROUTES = [
+  '/api/plaid',
+  '/api/budget-categories',
+  '/api/category-mappings',
+  '/api/manual-loans',
+  '/api/user-preferences',
+];
 
 /**
  * Builds the complete Express app — every middleware and route, in production order — without
  * binding a port, so tests can exercise the real configuration. index.ts adds startup checks and
  * listen().
  */
-export function createApp(options: { frontendUrl: string; logRequests?: boolean }): express.Express {
+export function createApp(options: {
+  frontendUrl: string;
+  logRequests?: boolean;
+  /** Tests only: a stricter policy than production's code constants. index.ts never passes one. */
+  clientApiLevelPolicy?: ClientApiLevelPolicy;
+}): express.Express {
   const app = express();
 
+  // Order matters (and is pinned by app.test.ts):
+  //   1. helmet, then CORS — CORS answers every OPTIONS preflight itself, so a preflight never
+  //      reaches the compatibility check or anything after it;
+  //   2. request logging, so even requests refused below are logged;
+  //   3. the client-API-level check on the covered prefixes — BEFORE the body is parsed, so a
+  //      malformed or oversized body can never pre-empt `client_update_required` or the
+  //      compatibility response headers;
+  //   4. JSON body parsing (body-parser failures become client errors in errorHandler);
+  //   5. the routers, each with its own requireAuth, then the global error handler.
   app.use(helmet());
   app.use(cors(buildCorsOptions(options.frontendUrl)));
+  if (options.logRequests !== false) app.use(morgan('dev'));
+
+  // Before every covered router (and therefore before body parsing, requireAuth and any handler):
+  // an unsupported client is refused before anything is read or written for it.
+  app.use(CLIENT_API_ROUTES, requireSupportedClientApiLevel(options.clientApiLevelPolicy ?? DEFAULT_CLIENT_API_LEVEL_POLICY));
+
   app.use(
     express.json({
       // Plaid webhook signatures are computed over the exact raw request bytes — capture them
@@ -45,7 +90,6 @@ export function createApp(options: { frontendUrl: string; logRequests?: boolean 
       },
     })
   );
-  if (options.logRequests !== false) app.use(morgan('dev'));
 
   app.get('/', (_req, res) => {
     res.json({ status: 'ok' });
