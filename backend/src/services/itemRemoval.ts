@@ -70,6 +70,8 @@ export type RunItemRemovalResult =
   | { kind: 'preview_stale' }
   | { kind: 'connection_needs_attention' }
   | { kind: 'manual_loan_reconciliation_required' }
+  /** A transaction of this item is linked to a manual loan that is not this user's. */
+  | { kind: 'manual_loan_ownership_mismatch' }
   /** `removal.finished` tells complete from stopped-at-a-retryable-point. */
   | { kind: 'progressed'; removal: ItemRemovalView };
 
@@ -145,6 +147,16 @@ export async function runItemRemoval(userId: string, itemId: string, previewDige
 
 /** One Plaid /item/remove attempt for a requested operation, recorded whatever its outcome. */
 async function removeAtPlaid(userId: string, itemId: string): Promise<ItemRemovalRecord> {
+  // begin_plaid_item_removal refused these under its lock; they are re-checked before EVERY Plaid
+  // attempt (a retry of a requested operation included), so the irreversible Plaid removal never
+  // happens when the local cleanup is already known to be impossible. No write path creates either
+  // condition, so this only fires if data was written some other way.
+  const blocker = await dataService.getItemRemovalBlocker(userId, itemId);
+  if (blocker) {
+    console.error(`Institution removal for item ${itemId} stopped before Plaid: ${blocker}`);
+    return dataService.recordItemRemovalAttempt(userId, itemId, 'needs_attention', blocker.toUpperCase());
+  }
+
   let accessToken: string;
   try {
     const item = await dataService.getPlaidItemForUser(itemId, userId);

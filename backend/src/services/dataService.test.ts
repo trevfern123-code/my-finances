@@ -41,6 +41,7 @@ import {
   recordItemSyncedAt,
   recordItemPendingExpiration,
   beginItemRemoval,
+  getItemRemovalBlocker,
   removeItemLocally,
   listUnfinishedItemRemovals,
   getPlaidItemByPlaidItemId,
@@ -2905,6 +2906,16 @@ describe('Linked Institution Management — item status writes and removal wrapp
     expect(expiry.update).toHaveBeenCalledWith({ consent_expires_at: '2026-10-02T12:00:00.000Z' });
     expect(expiry.neq).toHaveBeenCalledWith('status', 'removing');
     expect(transition.in).toHaveBeenCalledWith('status', ['active']);
+  });
+
+  it('getItemRemovalBlocker returns the database blocker, or null', async () => {
+    mockRpc.mockResolvedValueOnce({ data: 'manual_loan_ownership_mismatch', error: null });
+    expect(await getItemRemovalBlocker('user-1', 'item-1')).toBe('manual_loan_ownership_mismatch');
+    expect(mockRpc).toHaveBeenLastCalledWith('plaid_item_removal_blocker', { p_user_id: 'user-1', p_item_id: 'item-1' });
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
+    expect(await getItemRemovalBlocker('user-1', 'item-1')).toBeNull();
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
+    await expect(getItemRemovalBlocker('user-1', 'item-1')).rejects.toThrow('boom');
   });
 
   it('beginItemRemoval passes user, item and digest to the RPC', async () => {

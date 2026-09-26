@@ -126,7 +126,11 @@ export function RemoveInstitutionPanel({
       const message = err instanceof Error ? err.message : 'The removal did not start.';
       if (code === 'preview_stale') {
         await loadPreview(message);
-      } else if (code === 'connection_needs_attention' || code === 'manual_loan_reconciliation_required') {
+      } else if (
+        code === 'connection_needs_attention' ||
+        code === 'manual_loan_reconciliation_required' ||
+        code === 'manual_loan_ownership_mismatch'
+      ) {
         setPhase({ kind: 'blocked', message });
       } else {
         // Unknown whether the removal started (e.g. the connection dropped): show what the server
@@ -177,8 +181,8 @@ export function RemoveInstitutionPanel({
           {phase.preview.loan_restorations.length > 0 && (
             <div className="remove-institution-loans">
               <p>
-                These manual loans had payments from this bank applied to them. Removing the payments adds exactly those amounts
-                back:
+                These manual loans had payments from this bank applied to them. Removing the payments adds back exactly what
+                they took off (as recorded now; the confirmation afterwards shows the final amounts):
               </p>
               <ul>
                 {phase.preview.loan_restorations.map((r) => (
@@ -209,7 +213,9 @@ export function RemoveInstitutionPanel({
 
       {phase.kind === 'blocked' && (
         <>
-          <p className="error">{phase.message}</p>
+          <p className="error" role="alert">
+            {phase.message}
+          </p>
           {onClose && (
             <button type="button" className="link-button" onClick={onClose}>
               Close
@@ -224,16 +230,7 @@ export function RemoveInstitutionPanel({
         </p>
       )}
 
-      {phase.kind === 'progress' && (
-        <>
-          <p role="status">{describeRemovalProgress(phase.removal).message}</p>
-          {describeRemovalProgress(phase.removal).actionLabel && (
-            <button type="button" onClick={() => void submit(null)}>
-              {describeRemovalProgress(phase.removal).actionLabel}
-            </button>
-          )}
-        </>
-      )}
+      {phase.kind === 'progress' && <RemovalProgress removal={phase.removal} onResume={() => void submit(null)} />}
 
       {phase.kind === 'error' && (
         <>
@@ -251,6 +248,20 @@ export function RemoveInstitutionPanel({
         </>
       )}
     </section>
+  );
+}
+
+function RemovalProgress({ removal, onResume }: { removal: InstitutionRemoval; onResume: () => void }) {
+  const view = describeRemovalProgress(removal);
+  return (
+    <>
+      <p role="status">{view.message}</p>
+      {view.actionLabel && (
+        <button type="button" className={view.actionEmphasis === 'secondary' ? 'link-button' : undefined} onClick={onResume}>
+          {view.actionLabel}
+        </button>
+      )}
+    </>
   );
 }
 

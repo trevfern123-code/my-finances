@@ -1,7 +1,7 @@
 -- Linked Institution Management V1: connection lifecycle statuses and destructive institution removal.
 --
 -- Additive only: two nullable columns and a status CHECK on plaid_items, a trigger, one new table and
--- six new functions. No existing row is modified. Apply BEFORE deploying the backend that calls these
+-- seven new functions. No existing row is modified. Apply BEFORE deploying the backend that calls these
 -- functions; the current backend only ever writes 'active' / 'login_required' / 'credential_error',
 -- all of which the new CHECK allows, and never writes 'removing', so the trigger is inert for it.
 --
@@ -41,8 +41,9 @@
 -- transactions.loan_balance_applied (20260924130000). Cleanup restores, per loan, the sum of that
 -- column over every linked transaction of the item at cleanup time: whatever those rows took, they
 -- give back — including both a pending and a posted row if both were linked. A linked row without a
--- recorded amount makes both begin and cleanup refuse (fail closed): nothing is removed at Plaid and
--- nothing is deleted locally.
+-- recorded amount, or one linked to a loan that is not this user's, makes begin refuse before
+-- anything exists or reaches Plaid (plaid_item_removal_blocker), and cleanup refuse again as defense
+-- in depth (fail closed): nothing is removed at Plaid and nothing is deleted locally.
 --
 -- Every function: SECURITY INVOKER, search_path pinned empty, the per-user advisory lock every other
 -- balance- or sync-affecting writer takes, executable by service_role only. The table: service_role
@@ -55,6 +56,7 @@
 --   drop function public.begin_plaid_item_removal(uuid, uuid, text);
 --   drop function public.preview_plaid_item_removal(uuid, uuid);
 --   drop function public.plaid_item_removal_digest(uuid, uuid);
+--   drop function public.plaid_item_removal_blocker(uuid, uuid);
 --   drop table public.plaid_item_removals;
 --   drop trigger plaid_items_keep_removing on public.plaid_items;
 --   drop function public.plaid_items_keep_removing();
@@ -121,10 +123,31 @@ create table public.plaid_item_removals (
   plaid_removed_at  timestamp with time zone null,
   cleaned_at        timestamp with time zone null,
   reconciled_at     timestamp with time zone null,
-  check ((status = 'requested') = (plaid_removed_at is null and plaid_outcome is null)),
-  check ((status = 'cleaned') = (cleaned_at is not null)),
-  check ((status = 'cleaned') = (loan_adjustments is not null and deleted_counts is not null)),
-  check (reconciled_at is null or status = 'cleaned')
+  -- Every status fixes exactly which lifecycle fields are set, so no inconsistent row can exist:
+  --   requested      nothing past the request; last_outcome may record a failed Plaid attempt
+  --   plaid_removed  Plaid's answer recorded; nothing local yet
+  --   cleaned        everything recorded; reconciled_at once the follow-ups finished
+  constraint plaid_item_removals_state_check check (
+    (status = 'requested'
+      and plaid_removed_at is null and plaid_outcome is null and cleaned_at is null
+      and loan_adjustments is null and deleted_counts is null and reconciled_at is null)
+    or (status = 'plaid_removed'
+      and plaid_removed_at is not null and plaid_outcome is not null and cleaned_at is null
+      and loan_adjustments is null and deleted_counts is null and reconciled_at is null
+      and last_outcome is null)
+    or (status = 'cleaned'
+      and plaid_removed_at is not null and plaid_outcome is not null and cleaned_at is not null
+      and loan_adjustments is not null and deleted_counts is not null and last_outcome is null)
+  ),
+  constraint plaid_item_removals_result_shape_check check (
+    (loan_adjustments is null or jsonb_typeof(loan_adjustments) = 'array')
+    and (deleted_counts is null or jsonb_typeof(deleted_counts) = 'object')
+  ),
+  constraint plaid_item_removals_order_check check (
+    (plaid_removed_at is null or plaid_removed_at >= requested_at)
+    and (cleaned_at is null or cleaned_at >= plaid_removed_at)
+    and (reconciled_at is null or reconciled_at >= cleaned_at)
+  )
 );
 
 create index plaid_item_removals_user_id_idx on public.plaid_item_removals (user_id);
@@ -165,6 +188,40 @@ as $$
               join public.plaid_items pi on pi.id = a.item_id
               where a.item_id = p_item_id and pi.user_id = p_user_id and t.manual_loan_id is not null), ''),
     'UTF8')), 'hex');
+$$;
+
+-- Why local cleanup of this item could not run, or null when it could. Evaluated over EVERY linked
+-- transaction of the item's accounts — deliberately with no join that filters by the loan's owner, so
+-- no malformed row can be hidden:
+--   manual_loan_ownership_mismatch       a transaction of this user's item is linked to a manual loan
+--                                         that is not this user's (or no longer exists) — cleanup
+--                                         refuses to touch another user's loan
+--   manual_loan_reconciliation_required  a linked transaction has no recorded applied amount, so its
+--                                         restoration cannot be exact
+-- preview reports it; begin refuses on it under the per-user lock, before the operation exists, the
+-- item is marked removing, or anything is sent to Plaid; the backend re-checks it before every Plaid
+-- attempt. So no operation reaches plaid_removed while its cleanup is already known to be impossible.
+-- Neither condition can be created through this schema's own write paths (the link functions check
+-- ownership and record the amount), so both mean data was written some other way; the codes never
+-- name another user's rows.
+create function public.plaid_item_removal_blocker(p_user_id uuid, p_item_id uuid) returns text
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select case
+    when exists (select 1 from public.transactions t
+                 join public.accounts a on a.id = t.account_id
+                 left join public.manual_loans ml on ml.id = t.manual_loan_id
+                 where a.item_id = p_item_id and t.manual_loan_id is not null
+                   and (ml.id is null or ml.user_id is distinct from p_user_id))
+      then 'manual_loan_ownership_mismatch'
+    when exists (select 1 from public.transactions t
+                 join public.accounts a on a.id = t.account_id
+                 where a.item_id = p_item_id and t.manual_loan_id is not null and t.loan_balance_applied is null)
+      then 'manual_loan_reconciliation_required'
+  end;
 $$;
 
 -- Read-only: what removing this item would do. Null when the item does not exist for this user.
@@ -215,13 +272,20 @@ begin
     -- Linked rows without a recorded applied amount: removal would be refused (fail closed).
     'unrestorable_links', (select count(*) from public.transactions t join public.accounts a on a.id = t.account_id
                            where a.item_id = p_item_id and t.manual_loan_id is not null and t.loan_balance_applied is null),
+    -- Linked rows whose loan is not this user's: removal would be refused (fail closed). Counted
+    -- without revealing anything about that loan (loan_restorations above lists only this user's).
+    'ownership_mismatch_links', (select count(*) from public.transactions t join public.accounts a on a.id = t.account_id
+                                 left join public.manual_loans ml on ml.id = t.manual_loan_id
+                                 where a.item_id = p_item_id and t.manual_loan_id is not null
+                                   and (ml.id is null or ml.user_id is distinct from p_user_id)),
+    'blocker', public.plaid_item_removal_blocker(p_user_id, p_item_id),
     'digest', public.plaid_item_removal_digest(p_user_id, p_item_id));
 end;
 $$;
 
 -- Starts the removal (or returns the existing operation: one per item, resumed, never restarted).
 -- Returns {outcome: started | existing | not_found | connection_needs_attention | preview_stale |
--- manual_loan_reconciliation_required, removal?}.
+-- manual_loan_reconciliation_required | manual_loan_ownership_mismatch, removal?}.
 create function public.begin_plaid_item_removal(p_user_id uuid, p_item_id uuid, p_preview_digest text) returns jsonb
 language plpgsql
 security invoker
@@ -230,6 +294,7 @@ as $$
 declare
   v_removal public.plaid_item_removals;
   v_item record;
+  v_blocker text;
 begin
   perform pg_advisory_xact_lock(hashtext(p_user_id::text));
 
@@ -256,10 +321,12 @@ begin
     return jsonb_build_object('outcome', 'connection_needs_attention');
   end if;
 
-  -- Fail closed before anything happens at Plaid: cleanup could not restore these rows exactly.
-  if exists (select 1 from public.transactions t join public.accounts a on a.id = t.account_id
-             where a.item_id = p_item_id and t.manual_loan_id is not null and t.loan_balance_applied is null) then
-    return jsonb_build_object('outcome', 'manual_loan_reconciliation_required');
+  -- Fail closed before anything happens at Plaid, while holding the lock every link/unlink/re-price
+  -- writer takes: if cleanup could not run (another user's loan, or an unrecorded applied amount),
+  -- nothing is created, the item stays as it is, and Plaid is never asked to remove it.
+  v_blocker := public.plaid_item_removal_blocker(p_user_id, p_item_id);
+  if v_blocker is not null then
+    return jsonb_build_object('outcome', v_blocker);
   end if;
 
   if p_preview_digest is null or p_preview_digest is distinct from public.plaid_item_removal_digest(p_user_id, p_item_id) then
@@ -371,10 +438,13 @@ begin
       p_item_id;
   end if;
 
+  -- Defense in depth: begin already refused this (plaid_item_removal_blocker), and no write path
+  -- creates it, but cleanup must never touch another user's loan even if it somehow appeared.
   if exists (select 1 from public.transactions t join public.accounts a on a.id = t.account_id
-             join public.manual_loans ml on ml.id = t.manual_loan_id
-             where a.item_id = p_item_id and ml.user_id is distinct from p_user_id) then
-    raise exception 'remove_plaid_item_local: item % has a transaction linked to another user''s loan', p_item_id;
+             left join public.manual_loans ml on ml.id = t.manual_loan_id
+             where a.item_id = p_item_id and t.manual_loan_id is not null
+               and (ml.id is null or ml.user_id is distinct from p_user_id)) then
+    raise exception 'manual_loan_ownership_mismatch: remove_plaid_item_local: item % has a transaction linked to a loan that is not this user''s', p_item_id;
   end if;
 
   v_adjustments := '[]'::jsonb;
@@ -443,12 +513,14 @@ $$;
 -- (see 20260912120000's note): revoke from each role explicitly, not just from PUBLIC.
 revoke all on function public.plaid_items_keep_removing() from public, anon, authenticated, service_role;
 revoke all on function public.plaid_item_removal_digest(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.plaid_item_removal_blocker(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.preview_plaid_item_removal(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.begin_plaid_item_removal(uuid, uuid, text) from public, anon, authenticated;
 revoke all on function public.record_plaid_item_removal_attempt(uuid, uuid, text, text) from public, anon, authenticated;
 revoke all on function public.remove_plaid_item_local(uuid, uuid) from public, anon, authenticated;
 revoke all on function public.mark_plaid_item_removal_reconciled(uuid, uuid) from public, anon, authenticated;
 grant execute on function public.plaid_item_removal_digest(uuid, uuid) to service_role;
+grant execute on function public.plaid_item_removal_blocker(uuid, uuid) to service_role;
 grant execute on function public.preview_plaid_item_removal(uuid, uuid) to service_role;
 grant execute on function public.begin_plaid_item_removal(uuid, uuid, text) to service_role;
 grant execute on function public.record_plaid_item_removal_attempt(uuid, uuid, text, text) to service_role;
@@ -463,6 +535,7 @@ declare
 begin
   foreach v_fn in array array[
     'public.plaid_item_removal_digest(uuid, uuid)',
+    'public.plaid_item_removal_blocker(uuid, uuid)',
     'public.preview_plaid_item_removal(uuid, uuid)',
     'public.begin_plaid_item_removal(uuid, uuid, text)',
     'public.record_plaid_item_removal_attempt(uuid, uuid, text, text)',
@@ -490,9 +563,37 @@ begin
              where has_table_privilege(r.role, 'public.plaid_item_removals', p.priv)) then
     raise exception 'plaid_item_removals is accessible to a client role';
   end if;
-  if has_table_privilege('service_role', 'public.plaid_item_removals', 'delete')
-     or has_table_privilege('service_role', 'public.plaid_item_removals', 'truncate') then
-    raise exception 'plaid_item_removals must be append/update-only for service_role';
+  if exists (select 1 from (values ('public'), ('anon'), ('authenticated')) r(role)
+             cross join pg_attribute a
+             cross join (values ('select'), ('insert'), ('update'), ('references')) p(priv)
+             where a.attrelid = 'public.plaid_item_removals'::regclass and a.attnum > 0 and not a.attisdropped
+               and has_column_privilege(r.role, 'public.plaid_item_removals', a.attname, p.priv)) then
+    raise exception 'plaid_item_removals has a column privilege for a client role';
+  end if;
+  if (select array_agg(p.priv order by p.priv)
+      from (values ('select'), ('insert'), ('update'), ('delete'), ('truncate'), ('references'), ('trigger'), ('maintain')) p(priv)
+      where has_table_privilege('service_role', 'public.plaid_item_removals', p.priv)) is distinct from array['insert', 'select'] then
+    raise exception 'plaid_item_removals: service_role must have exactly SELECT and INSERT at table level (no DELETE, TRUNCATE, MAINTAIN, ...)';
+  end if;
+  if (select array_agg(a.attname::text order by a.attname) from pg_attribute a
+      where a.attrelid = 'public.plaid_item_removals'::regclass and a.attnum > 0 and not a.attisdropped
+        and has_column_privilege('service_role', 'public.plaid_item_removals', a.attname, 'update'))
+     is distinct from array['attempts', 'cleaned_at', 'deleted_counts', 'last_attempt_at', 'last_error_code', 'last_outcome',
+                            'loan_adjustments', 'plaid_outcome', 'plaid_removed_at', 'reconciled_at', 'status'] then
+    raise exception 'plaid_item_removals: service_role may UPDATE only the lifecycle columns';
+  end if;
+  if not (select relrowsecurity from pg_class where oid = 'public.plaid_item_removals'::regclass)
+     or exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'plaid_item_removals') then
+    raise exception 'plaid_item_removals must have row level security enabled and no policies';
+  end if;
+  if exists (select 1 from pg_proc p where p.oid = 'public.plaid_items_keep_removing()'::regprocedure
+             and (p.prosecdef or p.proconfig is distinct from array['search_path=""']
+                  or has_function_privilege('anon', p.oid, 'execute') or has_function_privilege('authenticated', p.oid, 'execute'))) then
+    raise exception 'plaid_items_keep_removing lacks a security property';
+  end if;
+  if (select count(*) from pg_constraint where conrelid = 'public.plaid_item_removals'::regclass and convalidated
+      and conname in ('plaid_item_removals_state_check', 'plaid_item_removals_result_shape_check', 'plaid_item_removals_order_check')) <> 3 then
+    raise exception 'plaid_item_removals state constraints are missing or not validated';
   end if;
   if exists (select 1 from pg_attribute a where a.attrelid = 'public.plaid_item_removals'::regclass
              and a.attnum > 0 and not a.attisdropped and a.attname like '%token%') then

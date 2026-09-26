@@ -10,6 +10,8 @@ const db = vi.hoisted(() => ({
   removal: null as null | Record<string, unknown>,
   digest: 'digest-now',
   cleanupError: null as null | Error,
+  // plaid_item_removal_blocker's answer (proven against PostgreSQL 17 by access_control a05).
+  blocker: null as null | string,
   calls: [] as string[],
 }));
 
@@ -22,11 +24,16 @@ vi.mock('./dataService', () => ({
     return { id: db.item.id, status: db.item.status, access_token: db.item.access_token };
   }),
   transitionItemStatus: mockTransitionItemStatus,
+  getItemRemovalBlocker: vi.fn(async () => {
+    db.calls.push('blocker-check');
+    return db.blocker;
+  }),
   beginItemRemoval: vi.fn(async (_u: string, itemId: string, digest: string | null) => {
     db.calls.push('begin');
     if (db.removal) return { outcome: 'existing', removal: { ...db.removal } };
     if (!db.item) return { outcome: 'not_found' };
     if (db.item.status === 'credential_error') return { outcome: 'connection_needs_attention' };
+    if (db.blocker) return { outcome: db.blocker };
     if (digest !== db.digest) return { outcome: 'preview_stale' };
     db.removal = {
       item_id: itemId, institution_name: 'Test Bank', status: 'requested', attempts: 0, last_outcome: null, last_error_code: null,
@@ -89,6 +96,7 @@ beforeEach(() => {
   db.removal = null;
   db.digest = 'digest-now';
   db.cleanupError = null;
+  db.blocker = null;
   db.calls = [];
   mockRemoveItem.mockResolvedValue(undefined);
   mockRepair.mockResolvedValue({ resolved: [], unresolved: [] });
@@ -100,7 +108,7 @@ describe('runItemRemoval — the happy path', () => {
   it('Plaid first, then local cleanup, then the follow-ups: finished', async () => {
     const result = await runItemRemoval('user-1', 'item-1', 'digest-now');
     expect(result).toMatchObject({ kind: 'progressed', removal: { status: 'cleaned', finished: true, plaid_outcome: 'removed' } });
-    expect(db.calls).toEqual(['begin', 'attempt:removed', 'cleanup', 'reconciled']);
+    expect(db.calls).toEqual(['begin', 'blocker-check', 'attempt:removed', 'cleanup', 'reconciled']);
     expect(mockRemoveItem).toHaveBeenCalledExactlyOnceWith('access-sandbox-placeholder');
     expect(mockRemoveItem.mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked((await import('./dataService')).removeItemLocally).mock.invocationCallOrder[0]
@@ -113,7 +121,7 @@ describe('runItemRemoval — the happy path', () => {
     mockRemoveItem.mockRejectedValueOnce(plaidError(400, 'ITEM_NOT_FOUND'));
     const result = await runItemRemoval('user-1', 'item-1', 'digest-now');
     expect(result).toMatchObject({ kind: 'progressed', removal: { finished: true, plaid_outcome: 'already_removed' } });
-    expect(db.calls).toEqual(['begin', 'attempt:already_removed', 'cleanup', 'reconciled']);
+    expect(db.calls).toEqual(['begin', 'blocker-check', 'attempt:already_removed', 'cleanup', 'reconciled']);
   });
 
   it('forward-reconciles exactly the rows the repair sweep reset (deduplicated)', async () => {
@@ -155,6 +163,42 @@ describe('runItemRemoval — refusals (nothing happens at Plaid or locally)', ()
     db.item!.status = 'credential_error';
     expect(await runItemRemoval('user-1', 'item-1', 'digest-now')).toEqual({ kind: 'connection_needs_attention' });
     expect(mockRemoveItem).not.toHaveBeenCalled();
+  });
+});
+
+describe('runItemRemoval — a cleanup that is known to be impossible never reaches Plaid (Codex review of bc87477)', () => {
+  it.each(['manual_loan_ownership_mismatch', 'manual_loan_reconciliation_required'])(
+    'begin refuses with %s: no operation, and Plaid /item/remove is never called',
+    async (blocker) => {
+      db.blocker = blocker;
+      expect(await runItemRemoval('user-1', 'item-1', 'digest-now')).toEqual({ kind: blocker });
+      expect(mockRemoveItem).not.toHaveBeenCalled();
+      expect(db.removal).toBeNull();
+      expect(db.item!.status).toBe('active');
+    }
+  );
+
+  it('a requested operation re-checks before every Plaid attempt: a blocker stops it at needs_attention, Plaid untouched', async () => {
+    db.removal = {
+      item_id: 'item-1', institution_name: 'Test Bank', status: 'requested', attempts: 1, last_outcome: 'retryable', last_error_code: null,
+      plaid_outcome: null, loan_adjustments: null, deleted_counts: null, requested_at: 'x', cleaned_at: null, reconciled_at: null,
+    };
+    db.item!.status = 'removing';
+    db.blocker = 'manual_loan_ownership_mismatch';
+    const result = await runItemRemoval('user-1', 'item-1', null);
+    expect(result).toMatchObject({
+      kind: 'progressed',
+      removal: { status: 'requested', last_outcome: 'needs_attention', last_error_code: 'MANUAL_LOAN_OWNERSHIP_MISMATCH' },
+    });
+    expect(mockRemoveItem).not.toHaveBeenCalled();
+    expect(db.calls).not.toContain('cleanup');
+    expect(db.calls).not.toContain('attempt:removed');
+  });
+
+  it('the re-check happens BEFORE the Plaid call on the normal path', async () => {
+    await runItemRemoval('user-1', 'item-1', 'digest-now');
+    const blockerCheck = vi.mocked((await import('./dataService')).getItemRemovalBlocker).mock.invocationCallOrder[0];
+    expect(blockerCheck).toBeLessThan(mockRemoveItem.mock.invocationCallOrder[0]);
   });
 });
 

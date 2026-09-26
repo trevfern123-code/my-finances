@@ -231,6 +231,10 @@ export interface InstitutionRemovalPreview {
     balance_after: number;
   }[];
   unrestorable_links: number;
+  /** Linked payments whose loan is not this account's (never identified further). */
+  ownership_mismatch_links?: number;
+  /** Why removal would be refused before anything happens, or null. */
+  blocker?: 'manual_loan_ownership_mismatch' | 'manual_loan_reconciliation_required' | null;
   /** Must be sent back when confirming: the server refuses if what would be removed has changed. */
   digest: string;
 }

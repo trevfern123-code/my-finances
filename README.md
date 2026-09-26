@@ -932,17 +932,54 @@ They read the item's status without decrypting its token. `SYNC_UPDATES_AVAILABL
      by cascade, and the encrypted token with the row;
   3. records `loan_adjustments` and `deleted_counts`.
 
-  All three happen in one transaction. A linked row without a recorded amount makes both begin and
-  cleanup **refuse** (fail closed): nothing is removed at Plaid and nothing is deleted. A replay
-  returns the recorded result and restores nothing twice.
+  All three happen in one transaction. A replay returns the recorded result and restores nothing
+  twice.
+- **Blockers: refused before anything happens** (`plaid_item_removal_blocker`, fail closed). Removal
+  is refused when any of the item's transactions:
+  - is linked to a manual loan that is missing or belongs to another user
+    (`manual_loan_ownership_mismatch`, checked first). Restoring it would either skip that link or
+    change another user's loan.
+  - is linked without a recorded applied amount (`manual_loan_reconciliation_required`).
+
+  The check reads every linked transaction's `manual_loan_id`, with a left join and no ownership
+  filter, so an invalid link can't be hidden by a join. It runs:
+  - in the preview (as `blocker`, and as a count in `ownership_mismatch_links`);
+  - in `begin_plaid_item_removal`, under the per-user lock, **before** the removal row is created,
+    the item becomes `removing` or Plaid is called. The result is only `{outcome: <code>}`, which
+    never names the other user's loan;
+  - in the orchestrator before every Plaid attempt, including a retry of `requested`. A blocker
+    found there stops the operation with `needs_attention` and the code upper-cased, and Plaid is
+    not called;
+  - in `remove_plaid_item_local` again, as defense in depth. It raises and deletes nothing.
+
+  Neither condition can arise through the app's own write paths: the link RPC checks ownership, and
+  a CHECK requires the applied amount. So no operation is sent to Plaid, and none reaches
+  `plaid_removed`, while cleanup is known to be impossible.
+- **State constraints.** Three CHECKs make impossible combinations unrepresentable, and `a03` tests
+  them:
+  - `plaid_item_removals_state_check`:
+    - `requested` has no Plaid, cleanup or reconcile fields;
+    - `plaid_removed` has `plaid_removed_at` and `plaid_outcome`, no `last_outcome`, and no cleanup
+      fields;
+    - `cleaned` has all of those, plus `cleaned_at`, `loan_adjustments` and `deleted_counts`, and no
+      `last_outcome`;
+    - `reconciled_at` is set only when `cleaned`.
+  - `plaid_item_removals_result_shape_check`: `loan_adjustments` is a JSON array and `deleted_counts`
+    an object.
+  - `plaid_item_removals_order_check`: requested ≤ plaid_removed ≤ cleaned ≤ reconciled.
 - **Follow-ups** run after the cleanup commits (the classifier is TypeScript): the relational repair
   sweep (surviving rows whose transfer/refund partner was deleted), a forward reconciliation of the
   rows it reset, and **today's** net-worth snapshot. Historical snapshots are kept as recorded.
   Until they finish, the operation is listed in `unfinished_removals`, and the same POST finishes
   it, even though the item is gone.
-- **Preview digest.** The preview hashes the item's account ids and each linked transaction's
-  (id, loan, applied amount). The confirmation must carry it, so the user always confirms the
-  restorations that will be made. An ordinary new unlinked transaction doesn't change it.
+- **Preview digest; the preview is a point-in-time view.** The preview hashes the item's account ids
+  and each linked transaction's (id, loan, applied amount). The confirmation must carry it, so a
+  confirmation made against a different set of accounts or loan restorations is refused
+  (`preview_stale`). This is all the digest protects. Sync can keep adding transactions until the
+  item becomes `removing`, and a link can race the cleanup (`c07`). So the preview's counts and
+  predicted loan balances are **not** guaranteed to be the final ones. The cleanup restores exactly
+  what is linked when it runs. The completion message shows the recorded `loan_adjustments`, and
+  the UI calls the preview "as recorded now".
 - **Refused:** `credential_error` items (409 `connection_needs_attention`). Without a readable
   token the Item can't be removed at Plaid, and V1 never removes locally alone.
 
@@ -955,8 +992,9 @@ They read the item's status without decrypting its token. `SYNC_UPDATES_AVAILABL
   `blocked_reason`/`blocked_message`. Returns 409 `removal_in_progress` if an operation exists.
 - `POST /items/:itemId/removal` with body `{ preview_digest }`: starts the removal, or resumes it
   (no digest needed). Returns 200 when complete, and 202 when stopped at a retryable point
-  (including `removal_incomplete`). 409 means `preview_stale`, `connection_needs_attention` or
-  `manual_loan_reconciliation_required`; 404 means not found.
+  (including `removal_incomplete`). 409 means `preview_stale`, `connection_needs_attention`,
+  `manual_loan_ownership_mismatch` or `manual_loan_reconciliation_required`. A refusal body is only
+  `{ error, code }`. 404 means not found.
 - `GET /items/:itemId/removal`: the operation's state; works after the item is deleted.
 - Reconnect (`reauth-link-token`, `reauth-complete`) returns 409 `connection_being_removed` for a
   `removing` item, and 409 `reconnect_unavailable` when revoked access can't be restored.
@@ -975,18 +1013,30 @@ mapping. Remove opens an inline confirmation showing:
 There is no typed confirmation and no re-authentication (personal V1). During the request the
 button is replaced by progress, and double clicks are ignored. The request holds the app-update
 `mutation` guard, so the page is never reloaded mid-removal. An unfinished removal is shown with
-what happened ("Nothing has been deleted…") and a Retry, including after a reload. A lost response
+what happened ("Nothing has been deleted…") and a Retry, including after a reload.
+`needs_attention` is different. It explains the recorded cause (Plaid's refusal code, an unreadable
+credential, or a loan-link blocker) and says that trying again right away is unlikely to help. It
+offers only a low-key "Check again" link, and never a local-only deletion. A blocked preview, or a
+refusal at confirmation, is announced (`role="alert"`) and has no Remove button. A lost response
 is never retried automatically: the panel re-reads the recorded operation. When it finishes, every
 dataset is refreshed and the user is told what was added back to which loan.
 
 ### Tests
 
-- `supabase/tests/access_control`: `a03` (ACL, MAINTAIN, immutable columns, backstop) and `a04`
-  (every state rule, exact restoration incl. clamped and pending+posted, other items and users
-  untouched, fail closed, replay).
+- `supabase/tests/access_control`:
+  - `a03`: ACL, MAINTAIN, immutable columns, the backstop, and the invalid-state matrix for the
+    three CHECKs.
+  - `a04`: every state rule; exact restoration, including clamped and pending+posted rows; other
+    items and users untouched; fail closed; replay.
+  - `a05`: a transaction linked to another user's loan. Preview and begin (and a retried begin)
+    refuse with `manual_loan_ownership_mismatch`: no removal row, the item still `active`, no
+    balance changed, nothing deleted, and nothing about the other user's loan leaked. The forced
+    cleanup refuses too.
+- `a05` fails against the pre-remediation migration (bc87477), where begin returned `started`.
 - Concurrency: `c07` (a link racing the cleanup is restored exactly), `c08` (a sync batch after
   cleanup writes nothing), `c09` (a double cleanup restores once).
-- Backend: `itemStatus`, `itemRemoval`, `plaidErrors`, controller and webhook tests.
+- Backend: `itemStatus`, `itemRemoval`, `plaidErrors`, controller and webhook tests. `itemRemoval`
+  proves that a blocker at begin, or on a retry of `requested`, never calls `plaidService.removeItem`.
 - Frontend: `connectionStatus`, `institutionRemoval.test.tsx`, API tests.
 
 ### Runbook
@@ -1003,6 +1053,12 @@ dataset is refreshed and the user is told what was added back to which loan.
 - **Cleanup refusing with `manual-loan reconciliation required`.** A linked transaction has no
   recorded applied amount, which the schema should make impossible. Stop and investigate the row;
   never delete it or null the link to get past the check.
+- **`manual_loan_ownership_mismatch`** (a 409, or `needs_attention` with
+  `MANUAL_LOAN_OWNERSHIP_MISMATCH`). One of the item's transactions is linked to a loan that is
+  missing or belongs to another user. Nothing was removed at Plaid and nothing was deleted. This is
+  data corruption: find the row with the preflight `cross_user_links` query, then work out how it
+  happened before changing anything. Once the link is corrected (with approval), the removal can be
+  started, or the stopped one retried.
 - **Unfinished follow-ups (`cleaned`, `reconciled_at` null).** The user's Retry (or `POST
   /items/:id/removal`) reruns them; they are idempotent.
 
@@ -1010,10 +1066,18 @@ dataset is refreshed and the user is told what was added back to which loan.
 
 1. Independent review; CI green (`build-and-test`, `migration-replay`, `database-harness`).
 2. Read-only preflight: `supabase/preflight/20260926120000_linked_institution_management_preflight.sql`
-   (PREFLIGHT 1–3). Stop on any unexpected value.
+   (PREFLIGHT 0–3). PREFLIGHT 0 must be all false: no partial table, column, constraint, trigger or
+   function from an earlier attempt. Stop on any unexpected value.
 3. `supabase db push --dry-run`, then `supabase db push`, from the linked checkout. The migration is
    additive and compatible with the currently deployed backend, so the backend doesn't need to be
-   stopped. Then POSTFLIGHT 1.
+   stopped. The migration asserts its own security postconditions and aborts the whole file
+   otherwise. Then run POSTFLIGHT 1, the independent check that it holds:
+   - RLS on, no policies;
+   - no client table or column privileges, including MAINTAIN;
+   - service_role has exactly {INSERT, SELECT} plus the listed UPDATE columns;
+   - the 7 functions are SECURITY INVOKER with a pinned `search_path`, executable by service_role
+     only;
+   - the three state CHECKs are validated.
 4. Merge. Railway deploys the backend and Vercel the frontend. The backend is compatible with the
    previous frontend (new fields and statuses are additive). If the new frontend is live first, its
    removal calls fail until Railway finishes.

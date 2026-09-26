@@ -403,12 +403,27 @@ export interface ItemRemovalPreview {
     balance_after: number;
   }[];
   unrestorable_links: number;
+  /** Linked transactions whose manual loan is not this user's (never identified further). */
+  ownership_mismatch_links: number;
+  /** Why local cleanup could not run (removal would be refused before anything happens), or null. */
+  blocker: ItemRemovalBlocker | null;
   digest: string;
 }
 
+/** plaid_item_removal_blocker: a condition under which local cleanup could not run. */
+export type ItemRemovalBlocker = 'manual_loan_ownership_mismatch' | 'manual_loan_reconciliation_required';
+
 export type BeginItemRemovalResult =
   | { outcome: 'started' | 'existing'; removal: ItemRemovalRecord }
-  | { outcome: 'not_found' | 'connection_needs_attention' | 'preview_stale' | 'manual_loan_reconciliation_required' };
+  | { outcome: 'not_found' | 'connection_needs_attention' | 'preview_stale' | ItemRemovalBlocker };
+
+/** Re-checks, outside begin's lock, whether local cleanup could still run — asked before every Plaid
+ *  removal attempt, so an operation never reaches plaid_removed when its cleanup is known impossible. */
+export async function getItemRemovalBlocker(userId: string, itemId: string): Promise<ItemRemovalBlocker | null> {
+  const { data, error } = await supabaseAdmin.rpc('plaid_item_removal_blocker', { p_user_id: userId, p_item_id: itemId });
+  if (error) throw new Error(`Failed to check institution removal preconditions: ${error.message}`);
+  return (data as ItemRemovalBlocker | null) ?? null;
+}
 
 /** Read-only: what removing the item would delete and restore, plus the digest the removal request
  *  must echo. Null when the item does not exist for this user. */

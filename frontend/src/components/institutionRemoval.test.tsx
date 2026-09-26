@@ -177,10 +177,54 @@ describe('RemoveInstitutionPanel', () => {
   });
 
   it('an operation already under way is resumed, not previewed again', async () => {
-    renderPanel({ existingRemoval: removal({ last_outcome: 'needs_attention', last_error_code: 'INVALID_ACCESS_TOKEN' }), onClose: undefined });
-    expect(screen.getByRole('status').textContent).toMatch(/INVALID_ACCESS_TOKEN.*Nothing has been deleted/);
+    renderPanel({ existingRemoval: removal(), onClose: undefined });
+    expect(screen.getByRole('status').textContent).toMatch(/Nothing has been deleted/);
     expect(mockGetPreview).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Try removal again' })).toBeTruthy();
+  });
+
+  it('a definitive Plaid refusal (needs attention) does not suggest an immediate retry will help', async () => {
+    renderPanel({ existingRemoval: removal({ last_outcome: 'needs_attention', last_error_code: 'INVALID_ACCESS_TOKEN' }), onClose: undefined });
+    const status = screen.getByRole('status').textContent ?? '';
+    expect(status).toMatch(/INVALID_ACCESS_TOKEN.*Nothing has been deleted.*unlikely to help/);
+    expect(screen.queryByRole('button', { name: 'Try removal again' })).toBeNull();
+    const check = screen.getByRole('button', { name: 'Check again' });
+    expect(check.className).toBe('link-button'); // a low-key action, not the primary one
+    expect(screen.queryByRole('button', { name: /remove/i })).toBeNull(); // never a local-only removal
+  });
+
+  it.each([
+    ['CREDENTIAL_UNREADABLE', /can’t read this connection’s stored credential/],
+    ['MANUAL_LOAN_OWNERSHIP_MISMATCH', /linked to a loan that doesn’t belong to this account/],
+    ['MANUAL_LOAN_RECONCILIATION_REQUIRED', /no recorded applied amount/],
+  ])('needs attention because of %s explains that cause', (code, text) => {
+    renderPanel({ existingRemoval: removal({ last_outcome: 'needs_attention', last_error_code: code }), onClose: undefined });
+    expect(screen.getByRole('status').textContent).toMatch(text);
+    expect(screen.getByRole('status').textContent).toMatch(/Nothing has been deleted/);
+  });
+
+  it('a blocked preview is announced (role=alert) and offers no Remove button', async () => {
+    mockGetPreview.mockResolvedValue({
+      preview: preview({ ownership_mismatch_links: 1, blocker: 'manual_loan_ownership_mismatch', loan_restorations: [] }),
+      blocked_reason: 'manual_loan_ownership_mismatch',
+      blocked_message: "This institution has a payment linked to a loan that doesn't belong to this account, so it can't be removed safely. Nothing was removed.",
+    });
+    renderPanel();
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/doesn't belong to this account.*Nothing was removed/);
+    expect(screen.queryByRole('button', { name: 'Remove institution' })).toBeNull();
+  });
+
+  it('an ownership refusal at confirmation shows the blocked message (announced), never a retry', async () => {
+    mockGetPreview.mockResolvedValue({ preview: preview(), blocked_reason: null, blocked_message: null });
+    mockRemoveInstitution.mockRejectedValueOnce(
+      coded("This institution has a payment linked to a loan that doesn't belong to this account, so it can't be removed safely. Nothing was removed.", 'manual_loan_ownership_mismatch')
+    );
+    renderPanel();
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove institution' }));
+    expect((await screen.findByRole('alert')).textContent).toMatch(/Nothing was removed/);
+    expect(screen.queryByRole('button', { name: /again/i })).toBeNull();
+    expect(mockGetRemoval).not.toHaveBeenCalled();
   });
 
   it('a preview refused because a removal already exists switches to that operation', async () => {

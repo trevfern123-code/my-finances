@@ -974,7 +974,8 @@ describe('Linked Institution Management — connections, removal and reconnect g
 
     it.each([
       ['credential_error', { status: 'credential_error' }, 'connection_needs_attention'],
-      ['an unrestorable loan link', { unrestorable_links: 1 }, 'manual_loan_reconciliation_required'],
+      ['an unrestorable loan link', { unrestorable_links: 1, blocker: 'manual_loan_reconciliation_required' }, 'manual_loan_reconciliation_required'],
+      ["a payment linked to another user's loan", { ownership_mismatch_links: 1, blocker: 'manual_loan_ownership_mismatch' }, 'manual_loan_ownership_mismatch'],
     ])('shows why removal is blocked (%s) before the user confirms', async (_label, overrides, reason) => {
       mockGetItemRemoval.mockResolvedValue(null);
       mockPreviewItemRemoval.mockResolvedValue(preview(overrides));
@@ -1031,12 +1032,22 @@ describe('Linked Institution Management — connections, removal and reconnect g
       ['preview_stale', 409],
       ['connection_needs_attention', 409],
       ['manual_loan_reconciliation_required', 409],
+      ['manual_loan_ownership_mismatch', 409],
     ])('%s -> %i with that code', async (kind, status) => {
       mockRunItemRemoval.mockResolvedValue({ kind });
       const res = fakeRes();
       await removeInstitution(itemReq('item-1', { preview_digest: 'd' }), res, next);
       expect(res.status).toHaveBeenCalledWith(status);
       expect(jsonBody(res)).toMatchObject({ code: kind, error: expect.any(String) });
+    });
+
+    it('the ownership refusal says nothing was removed and names no other user or loan', async () => {
+      mockRunItemRemoval.mockResolvedValue({ kind: 'manual_loan_ownership_mismatch' });
+      const res = fakeRes();
+      await removeInstitution(itemReq('item-1', { preview_digest: 'd' }), res, next);
+      const body = jsonBody(res);
+      expect(body.error).toMatch(/Nothing was removed/);
+      expect(Object.keys(body).sort()).toEqual(['code', 'error']);
     });
 
     it('a failure after the operation began is 202 removal_incomplete with the persisted state (sanitized log)', async () => {

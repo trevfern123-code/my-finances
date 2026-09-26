@@ -56,6 +56,11 @@ describe('describeRemovalProgress', () => {
 
   it('offers the right action for each unfinished state', () => {
     expect(describeRemovalProgress(removal({})).actionLabel).toBe('Try removal again');
+    expect(describeRemovalProgress(removal({})).actionEmphasis).toBe('primary');
+    expect(describeRemovalProgress(removal({ last_outcome: 'needs_attention', last_error_code: 'INVALID_ACCESS_TOKEN' }))).toMatchObject({
+      actionLabel: 'Check again',
+      actionEmphasis: 'secondary',
+    });
     expect(describeRemovalProgress(removal({ status: 'plaid_removed', last_outcome: null })).actionLabel).toBe('Finish removal');
     expect(describeRemovalProgress(removal({ status: 'cleaned', last_outcome: null })).actionLabel).toBe('Finish removal');
     expect(describeRemovalProgress(removal({ status: 'cleaned', finished: true })).actionLabel).toBeNull();

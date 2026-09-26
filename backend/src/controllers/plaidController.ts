@@ -886,12 +886,18 @@ const REMOVAL_REFUSALS = {
     status: 409,
     error: "This institution has a loan payment whose applied amount wasn't recorded, so its loan balance can't be restored exactly. Nothing was removed.",
   },
+  // Never names the other loan or its owner.
+  manual_loan_ownership_mismatch: {
+    status: 409,
+    error: "This institution has a payment linked to a loan that doesn't belong to this account, so it can't be removed safely. Nothing was removed.",
+  },
 } as const;
 
-/** Why this item cannot be removed right now, if anything — shown with the preview, before confirming. */
-function removalBlockedReason(status: string, unrestorableLinks: number): keyof typeof REMOVAL_REFUSALS | null {
+/** Why this item cannot be removed right now, if anything — shown with the preview, before confirming.
+ *  The blocker is the same check begin refuses on (plaid_item_removal_blocker). */
+function removalBlockedReason(status: string, blocker: string | null | undefined): keyof typeof REMOVAL_REFUSALS | null {
   if (status === 'credential_error') return 'connection_needs_attention';
-  if (unrestorableLinks > 0) return 'manual_loan_reconciliation_required';
+  if (blocker === 'manual_loan_ownership_mismatch' || blocker === 'manual_loan_reconciliation_required') return blocker;
   return null;
 }
 
@@ -912,7 +918,7 @@ export async function previewItemRemoval(req: Request, res: Response, next: Next
       res.status(404).json({ error: REMOVAL_REFUSALS.not_found.error, code: 'not_found' });
       return;
     }
-    const blocked = removalBlockedReason(preview.status, preview.unrestorable_links);
+    const blocked = removalBlockedReason(preview.status, preview.blocker);
     res.json({
       preview,
       blocked_reason: blocked,

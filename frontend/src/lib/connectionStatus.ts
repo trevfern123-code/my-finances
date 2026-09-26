@@ -96,33 +96,58 @@ export function describeConnectionStatus(
   }
 }
 
+export interface RemovalProgressView {
+  message: string;
+  /** The button that resumes the operation, or null when there is nothing to do. */
+  actionLabel: string | null;
+  /** 'primary' when retrying is the expected next step; 'secondary' when a retry is only worth it
+   *  after the cause has been dealt with (it is never presented as likely to fix things by itself). */
+  actionEmphasis: 'primary' | 'secondary';
+}
+
+/** What a stopped "needs attention" removal means, by its recorded cause. None of these is fixed by
+ *  retrying straight away, and none of them ever makes local deletion available. */
+function needsAttentionMessage(code: string | null): string {
+  switch (code) {
+    case 'CREDENTIAL_UNREADABLE':
+      return 'This app can’t read this connection’s stored credential, so it can’t ask Plaid to remove it. Nothing has been deleted. We’ve been notified; once it’s fixed, you can finish the removal.';
+    case 'MANUAL_LOAN_OWNERSHIP_MISMATCH':
+      return 'A payment from this bank is linked to a loan that doesn’t belong to this account, so removal stopped before anything was removed. Nothing has been deleted. This needs investigating before it can continue.';
+    case 'MANUAL_LOAN_RECONCILIATION_REQUIRED':
+      return 'A loan payment from this bank has no recorded applied amount, so its loan balance couldn’t be restored exactly. Removal stopped before anything was removed. Nothing has been deleted. This needs investigating before it can continue.';
+    default:
+      return `Plaid refused to remove this connection${code ? ` (${code})` : ''}. Nothing has been deleted. Trying again right away is unlikely to help — this connection needs attention first.`;
+  }
+}
+
 /** What an unfinished removal needs from the user, in plain words. Nothing here ever implies data was
  *  deleted when it was not: until `cleaned`, every imported record is still in place. */
-export function describeRemovalProgress(removal: InstitutionRemoval): { message: string; actionLabel: string | null } {
+export function describeRemovalProgress(removal: InstitutionRemoval): RemovalProgressView {
   if (removal.finished) {
-    return { message: 'This institution was removed.', actionLabel: null };
+    return { message: 'This institution was removed.', actionLabel: null, actionEmphasis: 'secondary' };
   }
   if (removal.status === 'requested') {
     if (removal.last_outcome === 'needs_attention') {
-      return {
-        message: `Plaid couldn't remove this connection${removal.last_error_code ? ` (${removal.last_error_code})` : ''}. Nothing has been deleted. You can try again; if it keeps failing, this connection needs attention.`,
-        actionLabel: 'Try removal again',
-      };
+      // A definitive refusal: offered only as a low-key "check again" once the cause is dealt with.
+      return { message: needsAttentionMessage(removal.last_error_code), actionLabel: 'Check again', actionEmphasis: 'secondary' };
     }
     return {
       message: "We couldn't confirm the removal with Plaid yet. Nothing has been deleted. Try again to finish removing it.",
       actionLabel: 'Try removal again',
+      actionEmphasis: 'primary',
     };
   }
   if (removal.status === 'plaid_removed') {
     return {
       message: 'The connection was removed at Plaid, but deleting its data here didn’t finish. Try again to finish.',
       actionLabel: 'Finish removal',
+      actionEmphasis: 'primary',
     };
   }
   return {
     message: 'This institution’s data was removed, but a final update of your reports didn’t finish. Try again to finish.',
     actionLabel: 'Finish removal',
+    actionEmphasis: 'primary',
   };
 }
 
