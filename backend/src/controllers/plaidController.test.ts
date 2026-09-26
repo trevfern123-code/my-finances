@@ -5,13 +5,24 @@ import {
   completeReauth,
   createLinkToken,
   exchangePublicToken,
+  createReauthLinkToken,
+  getItemRemoval,
   LINK_OUTCOME_UNKNOWN_MESSAGE,
+  listLinkedItems,
+  previewItemRemoval,
   refreshAccounts,
+  removeInstitution,
+  syncTransactions,
 } from './plaidController';
+import { ItemRemovalIncompleteError } from '../services/itemRemoval';
 import { UnknownKeyIdError, PlaidCredentialError } from '../services/tokenEncryption';
 
 const mockGetPlaidItemForUser = vi.hoisted(() => vi.fn());
-const mockSetItemStatus = vi.hoisted(() => vi.fn());
+const mockTransitionItemStatus = vi.hoisted(() => vi.fn());
+const mockGetPlaidItemStatusForUser = vi.hoisted(() => vi.fn());
+const mockListUnfinishedItemRemovals = vi.hoisted(() => vi.fn());
+const mockGetItemRemoval = vi.hoisted(() => vi.fn());
+const mockPreviewItemRemoval = vi.hoisted(() => vi.fn());
 const mockGetLinkedItemsForUser = vi.hoisted(() => vi.fn());
 const mockInsertPlaidItem = vi.hoisted(() => vi.fn());
 const mockUpsertAccountsForItem = vi.hoisted(() => vi.fn());
@@ -44,7 +55,11 @@ vi.mock('../services/dataService', () => ({
   getPlaidItemIdsMissingInstitution: mockGetPlaidItemIdsMissingInstitution,
   ...dataServiceErrors,
   getPlaidItemForUser: mockGetPlaidItemForUser,
-  setItemStatus: mockSetItemStatus,
+  transitionItemStatus: mockTransitionItemStatus,
+  getPlaidItemStatusForUser: mockGetPlaidItemStatusForUser,
+  listUnfinishedItemRemovals: mockListUnfinishedItemRemovals,
+  getItemRemoval: mockGetItemRemoval,
+  previewItemRemoval: mockPreviewItemRemoval,
   getLinkedItemsForUser: mockGetLinkedItemsForUser,
   insertPlaidItem: mockInsertPlaidItem,
   upsertAccountsForItem: mockUpsertAccountsForItem,
@@ -56,6 +71,7 @@ const mockGetItemInstitution = vi.hoisted(() => vi.fn());
 const mockPlaidCreateHostedLinkToken = vi.hoisted(() => vi.fn());
 const mockGetLinkTokenSessions = vi.hoisted(() => vi.fn());
 const mockRemoveItem = vi.hoisted(() => vi.fn());
+const mockCreateReauthLinkToken = vi.hoisted(() => vi.fn());
 const mockUpdateItemWebhook = vi.hoisted(() => vi.fn());
 vi.mock('../services/plaidService', async () => {
   const errors = await vi.importActual<typeof import('../services/plaidErrors')>('../services/plaidErrors');
@@ -65,6 +81,7 @@ vi.mock('../services/plaidService', async () => {
     getAccounts: mockGetAccounts,
     exchangePublicToken: mockExchangePublicToken,
     removeItem: mockRemoveItem,
+    createReauthLinkToken: mockCreateReauthLinkToken,
     updateItemWebhook: mockUpdateItemWebhook,
     getItemInstitution: mockGetItemInstitution,
     isReauthRequiredError: errors.isReauthRequiredError,
@@ -78,6 +95,12 @@ vi.mock('../services/syncService', () => ({ syncItemTransactions: mockSyncItemTr
 
 const mockRecordSnapshotForUser = vi.hoisted(() => vi.fn());
 vi.mock('../services/netWorth', () => ({ recordSnapshotForUser: mockRecordSnapshotForUser }));
+
+const mockRunItemRemoval = vi.hoisted(() => vi.fn());
+vi.mock('../services/itemRemoval', async () => {
+  const actual = await vi.importActual<typeof import('../services/itemRemoval')>('../services/itemRemoval');
+  return { ...actual, runItemRemoval: mockRunItemRemoval };
+});
 
 const mockRefreshLoansForItem = vi.hoisted(() => vi.fn());
 vi.mock('../services/loans', () => ({
@@ -98,6 +121,7 @@ const next = vi.fn() as unknown as NextFunction;
 beforeEach(() => {
   vi.clearAllMocks();
   vi.spyOn(console, 'error').mockImplementation(() => {});
+  mockListUnfinishedItemRemovals.mockResolvedValue([]);
 });
 
 describe('completeReauth — controller-level credential_error vs login_required (§9/§10)', () => {
@@ -108,8 +132,8 @@ describe('completeReauth — controller-level credential_error vs login_required
 
     await completeReauth(req, res, next);
 
-    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'credential_error');
-    expect(mockSetItemStatus).not.toHaveBeenCalledWith('row-1', 'login_required');
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'credential_error');
+    expect(mockTransitionItemStatus).not.toHaveBeenCalledWith('row-1', 'login_required');
     expect(res.status).toHaveBeenCalledWith(409);
     expect(mockGetAccounts).not.toHaveBeenCalled(); // never reached Plaid at all
     expect(next).not.toHaveBeenCalled();
@@ -123,7 +147,7 @@ describe('completeReauth — controller-level credential_error vs login_required
 
     await completeReauth(req, res, next);
 
-    expect(mockSetItemStatus).not.toHaveBeenCalled(); // stays login_required — nothing to flip yet
+    expect(mockTransitionItemStatus).not.toHaveBeenCalled(); // stays login_required — nothing to flip yet
     expect(res.status).toHaveBeenCalledWith(409);
   });
 
@@ -136,7 +160,7 @@ describe('completeReauth — controller-level credential_error vs login_required
 
     await completeReauth(req, res, next);
 
-    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'active');
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'reauth_completed');
   });
 
   it('never logs the raw error object for a credential failure — only a safe summary', async () => {
@@ -804,7 +828,7 @@ describe('refreshAccounts — retries the institution follow-up for items still 
     mockGetPlaidItemIdsMissingInstitution.mockResolvedValue(new Set(['row-missing']));
     mockUpdateItemWebhook.mockResolvedValue(undefined);
     mockGetLinkedItemsForUser.mockResolvedValue([]);
-    mockSetItemStatus.mockResolvedValue(undefined);
+    mockTransitionItemStatus.mockResolvedValue(undefined);
   });
 
   it('looks up and stores the institution only for the item that has none', async () => {
@@ -898,5 +922,248 @@ describe('exchange_unknown guidance: the Item may exist at Plaid, so never say i
     expect(mockRemoveItem).toHaveBeenCalledTimes(1);
     await expectTerminal(attemptId);
     expect(mockRemoveItem).toHaveBeenCalledTimes(1); // no repeated compensation either
+  });
+});
+
+// ---- Linked Institution Management V1 ------------------------------------------------------------
+describe('Linked Institution Management — connections, removal and reconnect guards', () => {
+  const removalRecord = (overrides: Record<string, unknown> = {}) => ({
+    id: 'op-1', user_id: 'user-a', item_id: 'item-1', plaid_item_id: 'plaid-item-secret-id', institution_name: 'Test Bank',
+    status_before: 'active', status: 'requested', preview_digest: 'the-digest', attempts: 1, last_attempt_at: null,
+    last_outcome: 'retryable', last_error_code: null, plaid_outcome: null, loan_adjustments: null, deleted_counts: null,
+    requested_at: '2026-09-26T00:00:00Z', plaid_removed_at: null, cleaned_at: null, reconciled_at: null,
+    ...overrides,
+  });
+  const itemReq = (itemId: string, body?: unknown) => authedReq(userA, { params: { itemId }, body });
+
+  describe('GET /items', () => {
+    it("attaches each item's removal and lists unfinished removals — including one whose item is already gone", async () => {
+      mockGetLinkedItemsForUser.mockResolvedValue([
+        { id: 'item-1', status: 'removing', accounts: [] },
+        { id: 'item-2', status: 'active', accounts: [] },
+      ]);
+      mockListUnfinishedItemRemovals.mockResolvedValue([
+        removalRecord(),
+        removalRecord({ item_id: 'item-gone', status: 'cleaned', cleaned_at: 'x', loan_adjustments: [], deleted_counts: {} }),
+      ]);
+      const res = fakeRes();
+      await listLinkedItems(authedReq(userA), res, next);
+      const body = jsonBody(res);
+      expect(body.items[0].removal).toMatchObject({ item_id: 'item-1', status: 'requested', finished: false });
+      expect(body.items[1].removal).toBeNull();
+      expect(body.unfinished_removals.map((r: { item_id: string }) => r.item_id)).toEqual(['item-1', 'item-gone']);
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain('the-digest');
+      expect(serialized).not.toContain('plaid-item-secret-id');
+    });
+  });
+
+  describe('GET /items/:itemId/removal-preview', () => {
+    const preview = (overrides: Record<string, unknown> = {}) => ({
+      item_id: 'item-1', institution_name: 'Test Bank', status: 'active', accounts: [], counts: {}, loan_restorations: [],
+      unrestorable_links: 0, digest: 'the-digest', ...overrides,
+    });
+
+    it('returns the preview with its digest', async () => {
+      mockGetItemRemoval.mockResolvedValue(null);
+      mockPreviewItemRemoval.mockResolvedValue(preview());
+      const res = fakeRes();
+      await previewItemRemoval(itemReq('item-1'), res, next);
+      expect(jsonBody(res)).toMatchObject({ preview: { digest: 'the-digest' }, blocked_reason: null });
+    });
+
+    it.each([
+      ['credential_error', { status: 'credential_error' }, 'connection_needs_attention'],
+      ['an unrestorable loan link', { unrestorable_links: 1 }, 'manual_loan_reconciliation_required'],
+    ])('shows why removal is blocked (%s) before the user confirms', async (_label, overrides, reason) => {
+      mockGetItemRemoval.mockResolvedValue(null);
+      mockPreviewItemRemoval.mockResolvedValue(preview(overrides));
+      const res = fakeRes();
+      await previewItemRemoval(itemReq('item-1'), res, next);
+      expect(jsonBody(res)).toMatchObject({ blocked_reason: reason, blocked_message: expect.any(String) });
+    });
+
+    it("404s for an unknown (or another user's) item", async () => {
+      mockGetItemRemoval.mockResolvedValue(null);
+      mockPreviewItemRemoval.mockResolvedValue(null);
+      const res = fakeRes();
+      await previewItemRemoval(itemReq('item-x'), res, next);
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+
+    it('409 removal_in_progress with the operation when a removal already exists', async () => {
+      mockGetItemRemoval.mockResolvedValue(removalRecord());
+      const res = fakeRes();
+      await previewItemRemoval(itemReq('item-1'), res, next);
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(jsonBody(res)).toMatchObject({ code: 'removal_in_progress', removal: { status: 'requested' } });
+      expect(mockPreviewItemRemoval).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /items/:itemId/removal', () => {
+    it('passes the confirmed digest; 200 when finished', async () => {
+      mockRunItemRemoval.mockResolvedValue({ kind: 'progressed', removal: { status: 'cleaned', finished: true } });
+      const res = fakeRes();
+      await removeInstitution(itemReq('item-1', { preview_digest: 'the-digest' }), res, next);
+      expect(mockRunItemRemoval).toHaveBeenCalledWith('user-a', 'item-1', 'the-digest');
+      expect(res.status).toHaveBeenCalledWith(200);
+    });
+
+    it('202 when it stopped at a retryable point', async () => {
+      mockRunItemRemoval.mockResolvedValue({ kind: 'progressed', removal: { status: 'requested', finished: false, last_outcome: 'retryable' } });
+      const res = fakeRes();
+      await removeInstitution(itemReq('item-1', {}), res, next);
+      expect(mockRunItemRemoval).toHaveBeenCalledWith('user-a', 'item-1', null);
+      expect(res.status).toHaveBeenCalledWith(202);
+    });
+
+    it('ignores a malformed digest (the request is then simply stale)', async () => {
+      mockRunItemRemoval.mockResolvedValue({ kind: 'preview_stale' });
+      const res = fakeRes();
+      await removeInstitution(itemReq('item-1', { preview_digest: 42 }), res, next);
+      expect(mockRunItemRemoval).toHaveBeenCalledWith('user-a', 'item-1', null);
+      expect(res.status).toHaveBeenCalledWith(409);
+    });
+
+    it.each([
+      ['not_found', 404],
+      ['preview_stale', 409],
+      ['connection_needs_attention', 409],
+      ['manual_loan_reconciliation_required', 409],
+    ])('%s -> %i with that code', async (kind, status) => {
+      mockRunItemRemoval.mockResolvedValue({ kind });
+      const res = fakeRes();
+      await removeInstitution(itemReq('item-1', { preview_digest: 'd' }), res, next);
+      expect(res.status).toHaveBeenCalledWith(status);
+      expect(jsonBody(res)).toMatchObject({ code: kind, error: expect.any(String) });
+    });
+
+    it('a failure after the operation began is 202 removal_incomplete with the persisted state (sanitized log)', async () => {
+      const cause = Object.assign(new Error('db down'), { config: { data: 'access-sandbox-secret-for-a' } });
+      mockRunItemRemoval.mockRejectedValue(new ItemRemovalIncompleteError({ status: 'plaid_removed', finished: false } as never, cause));
+      const res = fakeRes();
+      await removeInstitution(itemReq('item-1', {}), res, next);
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(jsonBody(res)).toMatchObject({ code: 'removal_incomplete', removal: { status: 'plaid_removed' } });
+      expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain('access-sandbox-secret-for-a');
+      expect(next).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /items/:itemId/removal', () => {
+    it('returns the operation, even after the item is gone', async () => {
+      mockGetItemRemoval.mockResolvedValue(
+        removalRecord({ status: 'cleaned', cleaned_at: 'x', loan_adjustments: [], deleted_counts: {}, reconciled_at: 'y' })
+      );
+      const res = fakeRes();
+      await getItemRemoval(itemReq('item-1'), res, next);
+      expect(jsonBody(res)).toMatchObject({ removal: { status: 'cleaned', finished: true } });
+    });
+
+    it('404s when there is none', async () => {
+      mockGetItemRemoval.mockResolvedValue(null);
+      const res = fakeRes();
+      await getItemRemoval(itemReq('item-1'), res, next);
+      expect(res.status).toHaveBeenCalledWith(404);
+    });
+  });
+
+  describe('reconnect guards', () => {
+    it('a removing item cannot start Update Mode', async () => {
+      mockGetPlaidItemForUser.mockResolvedValue({ id: 'item-1', access_token: ACCESS_TOKEN, status: 'removing' });
+      const res = fakeRes();
+      await createReauthLinkToken(itemReq('item-1'), res, next);
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(jsonBody(res)).toMatchObject({ code: 'connection_being_removed' });
+      expect(mockCreateReauthLinkToken).not.toHaveBeenCalled();
+    });
+
+    it('a permission_revoked item CAN start Update Mode', async () => {
+      mockGetPlaidItemForUser.mockResolvedValue({ id: 'item-1', access_token: ACCESS_TOKEN, status: 'permission_revoked' });
+      mockCreateReauthLinkToken.mockResolvedValue('link-update-token');
+      const res = fakeRes();
+      await createReauthLinkToken(itemReq('item-1'), res, next);
+      expect(jsonBody(res)).toEqual({ link_token: 'link-update-token' });
+    });
+
+    it('a permission_revoked item Plaid refuses Update Mode for gets reconnect_unavailable (remove, then link again)', async () => {
+      mockGetPlaidItemForUser.mockResolvedValue({ id: 'item-1', access_token: ACCESS_TOKEN, status: 'permission_revoked' });
+      mockCreateReauthLinkToken.mockRejectedValue({ response: { status: 400, data: { error_code: 'ITEM_NOT_FOUND' } } });
+      const res = fakeRes();
+      await createReauthLinkToken(itemReq('item-1'), res, next);
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(jsonBody(res)).toMatchObject({ code: 'reconnect_unavailable', error: expect.stringContaining('link the bank again') });
+    });
+
+    it('completing Update Mode for a revoked item that is still refused: reconnect_unavailable, status untouched', async () => {
+      mockGetPlaidItemForUser.mockResolvedValue({ id: 'item-1', access_token: ACCESS_TOKEN, status: 'permission_revoked' });
+      mockGetAccounts.mockRejectedValue({ response: { status: 400, data: { error_code: 'ITEM_LOGIN_REQUIRED' } } });
+      const res = fakeRes();
+      await completeReauth(itemReq('item-1'), res, next);
+      expect(jsonBody(res)).toMatchObject({ code: 'reconnect_unavailable' });
+      expect(mockTransitionItemStatus).not.toHaveBeenCalled();
+    });
+
+    it('completing Update Mode for a revoked item that works again: permission_revoked -> active', async () => {
+      mockGetPlaidItemForUser.mockResolvedValue({ id: 'item-1', access_token: ACCESS_TOKEN, status: 'permission_revoked' });
+      mockGetAccounts.mockResolvedValue([]);
+      mockGetLinkedItemsForUser.mockResolvedValue([]);
+      const res = fakeRes();
+      await completeReauth(itemReq('item-1'), res, next);
+      expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('item-1', 'reauth_completed');
+    });
+
+    it('completing Update Mode for a removing item is refused', async () => {
+      mockGetPlaidItemForUser.mockResolvedValue({ id: 'item-1', access_token: ACCESS_TOKEN, status: 'removing' });
+      const res = fakeRes();
+      await completeReauth(itemReq('item-1'), res, next);
+      expect(jsonBody(res)).toMatchObject({ code: 'connection_being_removed' });
+      expect(mockGetAccounts).not.toHaveBeenCalled();
+      expect(mockTransitionItemStatus).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('an item removed (or revoked) while a sync/refresh loop is running is skipped, not a failure', () => {
+    const item = (id: string) => ({ id, user_id: 'user-a', access_token: `access-for-${id}`, transactions_cursor: null });
+
+    it('refresh: the vanished item is skipped; the others still refresh', async () => {
+      mockGetPlaidItemsForUser.mockResolvedValue([item('gone'), item('kept')]);
+      mockGetPlaidItemIdsMissingInstitution.mockResolvedValue(new Set());
+      mockGetAccounts.mockResolvedValue([]);
+      mockUpsertAccountsForItem.mockImplementation(async (id: string) => {
+        if (id === 'gone') throw new Error('insert or update on table "accounts" violates foreign key constraint');
+        return [];
+      });
+      mockGetPlaidItemStatusForUser.mockImplementation(async (id: string) => (id === 'gone' ? null : { id, status: 'active' }));
+      mockUpdateItemWebhook.mockResolvedValue(undefined);
+      mockGetLinkedItemsForUser.mockResolvedValue([]);
+      const res = fakeRes();
+      await refreshAccounts(authedReq(userA), res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(mockUpsertAccountsForItem).toHaveBeenCalledWith('kept', []);
+      expect(res.json).toHaveBeenCalled();
+    });
+
+    it('sync: an item that started removing mid-loop is skipped', async () => {
+      mockGetPlaidItemsForUser.mockResolvedValue([item('removing-now')]);
+      mockSyncItemTransactions.mockRejectedValue(
+        new Error('apply_synced_transaction_batch: one or more rows reference an account not owned by this user')
+      );
+      mockGetPlaidItemStatusForUser.mockResolvedValue({ id: 'removing-now', status: 'removing' });
+      const res = fakeRes();
+      await syncTransactions(authedReq(userA), res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(jsonBody(res)).toEqual({ added: 0, modified: 0, removed: 0 });
+    });
+
+    it('sync: a genuine failure on a still-syncable item still fails the request', async () => {
+      mockGetPlaidItemsForUser.mockResolvedValue([item('ok')]);
+      mockSyncItemTransactions.mockRejectedValue(new Error('boom'));
+      mockGetPlaidItemStatusForUser.mockResolvedValue({ id: 'ok', status: 'active' });
+      const res = fakeRes();
+      await syncTransactions(authedReq(userA), res, next);
+      expect(next).toHaveBeenCalled();
+    });
   });
 });

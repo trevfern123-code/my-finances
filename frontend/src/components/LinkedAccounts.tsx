@@ -1,11 +1,12 @@
 import { useState } from 'react';
 import { useUpdateGuard } from '../hooks/useAppUpdate';
-import type { LinkedAccount, LinkedItem } from '../lib/api';
+import type { InstitutionRemoval, LinkedAccount, LinkedItem } from '../lib/api';
 import { refreshAccountBalances, sandboxFireWebhook, sandboxResetLogin } from '../lib/api';
 import { accountDisplayName, sortAccountsByOrder } from '../lib/accountDisplay';
 import { computeReorder } from '../lib/reorder';
 import type { SessionOwnership } from '../lib/sessionOwnership';
-import { ReconnectButton } from './ReconnectButton';
+import { ConnectionControls, UnfinishedRemovals } from './ConnectionControls';
+import { describeFinishedRemoval } from './RemoveInstitutionPanel';
 import { EmojiPicker } from './EmojiPicker';
 import { ColorPicker } from './ColorPicker';
 
@@ -184,6 +185,8 @@ export function LinkedAccounts({
   captureOwnership,
   onUpdateCreditLimit,
   onUpdateCustomization,
+  unfinishedRemovals = [],
+  onConnectionsChanged,
 }: {
   items: LinkedItem[];
   isSandbox: boolean;
@@ -197,10 +200,20 @@ export function LinkedAccounts({
   captureOwnership: () => SessionOwnership;
   onUpdateCreditLimit: (accountId: string, creditLimit: number | null) => void;
   onUpdateCustomization: (accountId: string, fields: CustomizationFields) => void;
+  /** Linked Institution Management: removals not finished yet (some for institutions already gone). */
+  unfinishedRemovals?: InstitutionRemoval[];
+  /** A removal finished: refresh every dataset that could have changed. */
+  onConnectionsChanged?: () => void;
 }) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
+  const [removedNotice, setRemovedNotice] = useState<string | null>(null);
+
+  function handleRemoved(removal: InstitutionRemoval) {
+    setRemovedNotice(describeFinishedRemoval(removal));
+    onConnectionsChanged?.();
+  }
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -271,6 +284,12 @@ export function LinkedAccounts({
       </div>
       {error && <p className="error">{error}</p>}
       {hint && <p className="hint">{hint}</p>}
+      {removedNotice && (
+        <p className="hint connection-notice" role="status">
+          {removedNotice}
+        </p>
+      )}
+      <UnfinishedRemovals removals={unfinishedRemovals} items={items} captureOwnership={captureOwnership} onRemoved={handleRemoved} />
       {items.length === 0 ? (
         <p>No accounts linked yet.</p>
       ) : (
@@ -280,24 +299,15 @@ export function LinkedAccounts({
             return (
               <div key={item.id} className="institution-card">
                 <h3>{item.institution_name ?? 'Unknown institution'}</h3>
-                {item.status === 'login_required' && (
-                  <ReconnectButton
-                    itemId={item.id}
-                    institutionName={item.institution_name}
-                    createRefreshCommitter={createRefreshCommitter}
-                    captureOwnership={captureOwnership}
-                  />
-                )}
-                {item.status === 'credential_error' && (
-                  // Deliberately no reconnect button — the stored credential may be perfectly
-                  // valid to Plaid, this app simply failed to read it. A reconnect flow can't fix
-                  // that, and would misleadingly suggest the bank connection itself is the
-                  // problem (design doc §10).
-                  <p className="hint credential-error-hint">
-                    We&rsquo;re having trouble accessing this account&rsquo;s connection right now.
-                    This isn&rsquo;t something you need to fix — we&rsquo;ve been notified.
-                  </p>
-                )}
+                {/* Status, Reconnect (never for credential_error: the stored credential may be
+                    perfectly valid to Plaid, this app simply failed to read it — design doc §10),
+                    and Remove institution — the same controls as Settings -> Connections. */}
+                <ConnectionControls
+                  item={item}
+                  createRefreshCommitter={createRefreshCommitter}
+                  captureOwnership={captureOwnership}
+                  onRemoved={handleRemoved}
+                />
                 <ul>
                   {sorted.map((account, index) => (
                     <li

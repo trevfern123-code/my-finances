@@ -156,15 +156,90 @@ export interface LinkedAccount {
   exclude_from_cash_flow: boolean;
 }
 
+/** A connection's lifecycle status (Linked Institution Management; see lib/connectionStatus.ts for
+ *  what each means to the user). 'credential_error' means this app failed to decrypt/read the stored
+ *  Plaid credential — not a bank-reconnect situation like 'login_required' (see
+ *  PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md §9/§10). Never show a reconnect prompt for it. */
+export type ConnectionStatus =
+  | 'active'
+  | 'login_required'
+  | 'pending_expiration'
+  | 'credential_error'
+  | 'permission_revoked'
+  | 'removing';
+
 export interface LinkedItem {
   id: string;
   institution_id: string | null;
   institution_name: string | null;
-  /** 'credential_error' means this app failed to decrypt/read the stored Plaid credential — not
-   *  a bank-reconnect situation like 'login_required' (see PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md
-   *  §9/§10). Never show a reconnect prompt for it — reconnecting wouldn't fix anything. */
-  status: 'active' | 'login_required' | 'credential_error';
+  status: ConnectionStatus;
+  /** When this connection's transactions last synced successfully (older backends: absent). */
+  last_synced_at?: string | null;
+  /** When Plaid said access will expire (PENDING_EXPIRATION), if it said. */
+  consent_expires_at?: string | null;
+  /** The removal operation under way for this connection, if any. */
+  removal?: InstitutionRemoval | null;
   accounts: LinkedAccount[];
+}
+
+export interface LoanRestoration {
+  loan_id: string;
+  loan_name: string;
+  linked_transactions: number;
+  restored: number;
+  balance_before: number;
+  balance_after: number;
+}
+
+/** One institution-removal operation (server-persisted; survives reloads and the item itself). */
+export interface InstitutionRemoval {
+  item_id: string;
+  institution_name: string | null;
+  /** requested: not yet confirmed removed at Plaid; plaid_removed: removed there, local data not yet
+   *  deleted; cleaned: local data deleted (see `finished` for the follow-ups). */
+  status: 'requested' | 'plaid_removed' | 'cleaned';
+  finished: boolean;
+  attempts: number;
+  last_outcome: 'retryable' | 'needs_attention' | null;
+  last_error_code: string | null;
+  plaid_outcome: 'removed' | 'already_removed' | null;
+  loan_adjustments: LoanRestoration[] | null;
+  deleted_counts: Record<string, number> | null;
+  requested_at: string;
+  cleaned_at: string | null;
+}
+
+export interface InstitutionRemovalPreview {
+  item_id: string;
+  institution_name: string | null;
+  status: ConnectionStatus;
+  accounts: { id: string; name: string; mask: string | null; type: string | null; subtype: string | null }[];
+  counts: {
+    accounts: number;
+    transactions: number;
+    linked_transactions: number;
+    splits: number;
+    recurring_streams: number;
+    liabilities: number;
+  };
+  loan_restorations: {
+    loan_id: string;
+    loan_name: string;
+    linked_transactions: number;
+    restore_amount: number;
+    current_balance: number;
+    balance_after: number;
+  }[];
+  unrestorable_links: number;
+  /** Must be sent back when confirming: the server refuses if what would be removed has changed. */
+  digest: string;
+}
+
+export interface ConnectionsResponse {
+  items: LinkedItem[];
+  is_sandbox: boolean;
+  /** Removals not finished yet — including ones whose institution is already gone from `items`. */
+  unfinished_removals?: InstitutionRemoval[];
 }
 
 /** One line item of a split transaction. When a transaction has any splits, they — not its own
@@ -246,12 +321,46 @@ export function completeLinkAttempt(
   );
 }
 
-export function getLinkedItems(): Promise<{ items: LinkedItem[]; is_sandbox: boolean }> {
+export function getLinkedItems(): Promise<ConnectionsResponse> {
   return authedFetch('/api/plaid/items');
 }
 
-export function refreshAccountBalances(verifyOwnership: OwnershipCheck): Promise<{ items: LinkedItem[]; is_sandbox: boolean }> {
+export function refreshAccountBalances(verifyOwnership: OwnershipCheck): Promise<ConnectionsResponse> {
   return authedFetch('/api/plaid/accounts/refresh', { method: 'POST' }, false, verifyOwnership);
+}
+
+// ---- Linked Institution Management: destructive institution removal ------------------------------
+
+/** What removing the institution would delete and restore. Refusals are thrown errors with a `code`
+ *  (not_found; removal_in_progress when an operation already exists — resume it instead). */
+export function getInstitutionRemovalPreview(
+  itemId: string
+): Promise<{ preview: InstitutionRemovalPreview; blocked_reason: string | null; blocked_message: string | null }> {
+  return authedFetch(`/api/plaid/items/${itemId}/removal-preview`);
+}
+
+/**
+ * Starts the removal with the confirmed preview's digest, or resumes an existing one (`previewDigest`
+ * null). Resolves with the operation's state whether it finished (`removal.finished`) or stopped at a
+ * retryable point; refusals (preview_stale, connection_needs_attention,
+ * manual_loan_reconciliation_required, not_found) are thrown errors with that `code`. Never retried
+ * automatically — the user decides to retry.
+ */
+export function removeInstitution(
+  itemId: string,
+  previewDigest: string | null,
+  verifyOwnership: OwnershipCheck
+): Promise<{ removal: InstitutionRemoval; code?: string }> {
+  return authedFetch(
+    `/api/plaid/items/${itemId}/removal`,
+    { method: 'POST', body: JSON.stringify(previewDigest ? { preview_digest: previewDigest } : {}) },
+    false,
+    verifyOwnership
+  );
+}
+
+export function getInstitutionRemoval(itemId: string): Promise<{ removal: InstitutionRemoval }> {
+  return authedFetch(`/api/plaid/items/${itemId}/removal`);
 }
 
 export function updateAccountCreditLimit(

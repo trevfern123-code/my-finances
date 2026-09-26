@@ -13,6 +13,8 @@ import { isReportingRangeId, resolveReportingRange, type ResolvedRange } from '.
 import { PlaidCredentialError } from '../services/tokenEncryption';
 import { interpretHostedLinkSessions } from '../services/hostedLink';
 import { summarizeErrorSafely } from '../services/errorSanitizer';
+import { isSyncableItemStatus } from '../services/itemStatus';
+import { ItemRemovalIncompleteError, runItemRemoval, toRemovalView } from '../services/itemRemoval';
 import { env } from '../config/env';
 
 /** Date-Range Customization v1: `range_id` (one of the 5 reporting-range presets) takes
@@ -494,11 +496,36 @@ export async function completeLinkAttempt(req: Request, res: Response, next: Nex
   }
 }
 
+/**
+ * The user's connections, each with its removal operation (if one is under way), plus
+ * `unfinished_removals`: every removal not yet complete — including one whose item is already deleted
+ * but whose follow-ups still need to run, which would otherwise be invisible to the user.
+ */
+async function getConnectionsForUser(userId: string) {
+  const [items, removals] = await Promise.all([
+    dataService.getLinkedItemsForUser(userId),
+    dataService.listUnfinishedItemRemovals(userId),
+  ]);
+  const removalByItemId = new Map(removals.map((r) => [r.item_id, toRemovalView(r)]));
+  return {
+    items: (items ?? []).map((item) => ({ ...item, removal: removalByItemId.get(item.id) ?? null })),
+    unfinished_removals: removals.map(toRemovalView),
+  };
+}
+
+/** A per-item failure during a sync/refresh loop that is only an item disappearing or leaving the
+ *  syncable statuses mid-loop (a removal or revocation that started meanwhile) — skip it rather than
+ *  failing the whole request for the user's other items. */
+async function itemLeftSyncableState(itemId: string, userId: string): Promise<boolean> {
+  const current = await dataService.getPlaidItemStatusForUser(itemId, userId);
+  return !current || !isSyncableItemStatus(current.status);
+}
+
 export async function listLinkedItems(req: Request, res: Response, next: NextFunction) {
   try {
     const userId = req.user!.id;
-    const items = await dataService.getLinkedItemsForUser(userId);
-    res.json({ items, is_sandbox: env.plaidEnv === 'sandbox' });
+    const connections = await getConnectionsForUser(userId);
+    res.json({ ...connections, is_sandbox: env.plaidEnv === 'sandbox' });
   } catch (err) {
     next(err);
   }
@@ -518,7 +545,7 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
       try {
         const plaidAccounts = await plaidService.getAccounts(item.access_token);
         const updatedAccounts = await dataService.upsertAccountsForItem(item.id, plaidAccounts);
-        await dataService.setItemStatus(item.id, 'active');
+        await dataService.transitionItemStatus(item.id, 'synced');
 
         if (missingInstitution.has(item.id)) {
           // Best-effort, like the webhook backfill below.
@@ -547,11 +574,13 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
           // login_required for this; that would send the user through a reconnect flow that
           // can't fix anything and would misleadingly suggest their bank is the problem.
           console.error(`Plaid credential error refreshing item ${item.id}:`, err.name);
-          await dataService.setItemStatus(item.id, 'credential_error');
+          await dataService.transitionItemStatus(item.id, 'credential_error');
         } else if (plaidService.isReauthRequiredError(err)) {
           // An item needing re-auth shouldn't break refreshing everyone else's accounts —
           // flag it and let the frontend prompt the user to reconnect that one institution.
-          await dataService.setItemStatus(item.id, 'login_required');
+          await dataService.transitionItemStatus(item.id, 'login_required');
+        } else if (await itemLeftSyncableState(item.id, userId)) {
+          continue;
         } else {
           throw err;
         }
@@ -561,8 +590,8 @@ export async function refreshAccounts(req: Request, res: Response, next: NextFun
     // Once per refresh, not once per item — net worth is a total across all the user's items.
     await netWorthService.recordSnapshotForUser(userId);
 
-    const refreshed = await dataService.getLinkedItemsForUser(userId);
-    res.json({ items: refreshed, is_sandbox: env.plaidEnv === 'sandbox' });
+    const connections = await getConnectionsForUser(userId);
+    res.json({ ...connections, is_sandbox: env.plaidEnv === 'sandbox' });
   } catch (err) {
     next(err);
   }
@@ -683,9 +712,11 @@ export async function syncTransactions(req: Request, res: Response, next: NextFu
       } catch (err) {
         if (err instanceof PlaidCredentialError) {
           console.error(`Plaid credential error syncing item ${item.id}:`, err.name);
-          await dataService.setItemStatus(item.id, 'credential_error');
+          await dataService.transitionItemStatus(item.id, 'credential_error');
         } else if (plaidService.isReauthRequiredError(err)) {
-          await dataService.setItemStatus(item.id, 'login_required');
+          await dataService.transitionItemStatus(item.id, 'login_required');
+        } else if (await itemLeftSyncableState(item.id, userId)) {
+          continue;
         } else {
           throw err;
         }
@@ -708,13 +739,32 @@ export async function createReauthLinkToken(req: Request, res: Response, next: N
       res.status(404).json({ error: 'Item not found' });
       return;
     }
+    if (item.status === 'removing') {
+      res.status(409).json({ error: REMOVING_MESSAGE, code: 'connection_being_removed' });
+      return;
+    }
 
-    const linkToken = await plaidService.createReauthLinkToken(userId, item.access_token);
+    let linkToken: string;
+    try {
+      linkToken = await plaidService.createReauthLinkToken(userId, item.access_token);
+    } catch (err) {
+      // Revoked access that Plaid will not even open Update Mode for cannot be restored in place.
+      if (item.status === 'permission_revoked' && plaidService.isDefinitivePlaidRejection(err)) {
+        console.error(`Plaid refused Update Mode for revoked item ${item.id}:`, summarizeErrorSafely(err));
+        res.status(409).json({ error: RECONNECT_UNAVAILABLE_MESSAGE, code: 'reconnect_unavailable' });
+        return;
+      }
+      throw err;
+    }
     res.json({ link_token: linkToken });
   } catch (err) {
     next(err);
   }
 }
+
+const REMOVING_MESSAGE = 'This institution is being removed.';
+const RECONNECT_UNAVAILABLE_MESSAGE =
+  "This connection couldn't be restored. Remove the institution, then link the bank again.";
 
 export async function sandboxResetLogin(req: Request, res: Response, next: NextFunction) {
   try {
@@ -733,9 +783,9 @@ export async function sandboxResetLogin(req: Request, res: Response, next: NextF
     }
 
     await plaidService.sandboxResetLogin(item.access_token);
-    await dataService.setItemStatus(item.id, 'login_required');
+    await dataService.transitionItemStatus(item.id, 'login_required');
 
-    const items = await dataService.getLinkedItemsForUser(userId);
+    const { items } = await getConnectionsForUser(userId);
     res.json({ items });
   } catch (err) {
     next(err);
@@ -779,7 +829,7 @@ export async function completeReauth(req: Request, res: Response, next: NextFunc
         // (§7 Phase 4, where only Plaid's own item_id is known until the row resolves) this
         // status update doesn't need the row object at all.
         console.error(`Plaid credential error completing reauth for item ${itemId}:`, err.name);
-        await dataService.setItemStatus(itemId, 'credential_error');
+        await dataService.transitionItemStatus(itemId, 'credential_error');
         res.status(409).json({ error: 'This connection needs attention before it can be used again.' });
         return;
       }
@@ -789,12 +839,21 @@ export async function completeReauth(req: Request, res: Response, next: NextFunc
       res.status(404).json({ error: 'Item not found' });
       return;
     }
+    if (item.status === 'removing') {
+      res.status(409).json({ error: REMOVING_MESSAGE, code: 'connection_being_removed' });
+      return;
+    }
 
     // Update Mode doesn't issue a new access token — confirm the existing one actually
-    // works again before clearing the login_required flag.
+    // works again before clearing the login_required / pending_expiration / permission_revoked flag.
     try {
       await plaidService.getAccounts(item.access_token);
     } catch (err) {
+      if (item.status === 'permission_revoked' && plaidService.isDefinitivePlaidRejection(err)) {
+        // Update Mode finished but access is still refused: revoked consent that cannot be restored.
+        res.status(409).json({ error: RECONNECT_UNAVAILABLE_MESSAGE, code: 'reconnect_unavailable' });
+        return;
+      }
       if (plaidService.isReauthRequiredError(err)) {
         res.status(409).json({ error: 'Item still requires re-authentication' });
         return;
@@ -802,9 +861,109 @@ export async function completeReauth(req: Request, res: Response, next: NextFunc
       throw err;
     }
 
-    await dataService.setItemStatus(item.id, 'active');
-    const items = await dataService.getLinkedItemsForUser(userId);
+    // Conditional: never takes an item out of `removing` (a removal that began while Link was open).
+    await dataService.transitionItemStatus(item.id, 'reauth_completed');
+    const { items } = await getConnectionsForUser(userId);
     res.json({ items });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ---- Linked Institution Management V1: institution removal ------------------------------------------
+
+const REMOVAL_REFUSALS = {
+  not_found: { status: 404, error: 'Institution not found' },
+  preview_stale: {
+    status: 409,
+    error: 'This institution changed since you reviewed it. Review the removal again before confirming.',
+  },
+  connection_needs_attention: {
+    status: 409,
+    error: "This connection can't be removed right now because its stored credential can't be read. We've been notified.",
+  },
+  manual_loan_reconciliation_required: {
+    status: 409,
+    error: "This institution has a loan payment whose applied amount wasn't recorded, so its loan balance can't be restored exactly. Nothing was removed.",
+  },
+} as const;
+
+/** Why this item cannot be removed right now, if anything — shown with the preview, before confirming. */
+function removalBlockedReason(status: string, unrestorableLinks: number): keyof typeof REMOVAL_REFUSALS | null {
+  if (status === 'credential_error') return 'connection_needs_attention';
+  if (unrestorableLinks > 0) return 'manual_loan_reconciliation_required';
+  return null;
+}
+
+/** GET /items/:itemId/removal-preview — read-only: what removing the institution would delete and
+ *  restore, and the digest the removal request must echo. */
+export async function previewItemRemoval(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const { itemId } = req.params;
+
+    const existing = await dataService.getItemRemoval(userId, itemId);
+    if (existing) {
+      res.status(409).json({ error: 'This institution is already being removed.', code: 'removal_in_progress', removal: toRemovalView(existing) });
+      return;
+    }
+    const preview = await dataService.previewItemRemoval(userId, itemId);
+    if (!preview) {
+      res.status(404).json({ error: REMOVAL_REFUSALS.not_found.error, code: 'not_found' });
+      return;
+    }
+    const blocked = removalBlockedReason(preview.status, preview.unrestorable_links);
+    res.json({
+      preview,
+      blocked_reason: blocked,
+      blocked_message: blocked ? REMOVAL_REFUSALS[blocked].error : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /items/:itemId/removal — starts the removal (body: { preview_digest } from the confirmed
+ * preview) or resumes an existing one (the digest is then ignored). 200 when the removal is complete;
+ * 202 when it stopped at a retryable point (Plaid's answer unknown, or a later step failed) — the same
+ * request resumes it.
+ */
+export async function removeInstitution(req: Request, res: Response, next: NextFunction) {
+  const userId = req.user!.id;
+  const { itemId } = req.params;
+  const rawDigest = (req.body as { preview_digest?: unknown } | undefined)?.preview_digest;
+  const previewDigest = typeof rawDigest === 'string' && rawDigest.length <= 128 ? rawDigest : null;
+
+  try {
+    const result = await runItemRemoval(userId, itemId, previewDigest);
+    if (result.kind !== 'progressed') {
+      const refusal = REMOVAL_REFUSALS[result.kind];
+      res.status(refusal.status).json({ error: refusal.error, code: result.kind });
+      return;
+    }
+    res.status(result.removal.finished ? 200 : 202).json({ removal: result.removal });
+  } catch (err) {
+    if (err instanceof ItemRemovalIncompleteError) {
+      // Never log the raw cause: it may be a Plaid/Axios error carrying the outgoing request.
+      console.error(`Institution removal for item ${itemId} did not finish:`, summarizeErrorSafely(err.cause));
+      res.status(202).json({ removal: err.removal, code: 'removal_incomplete' });
+      return;
+    }
+    next(err);
+  }
+}
+
+/** GET /items/:itemId/removal — the removal operation's state (works after the item is deleted). */
+export async function getItemRemoval(req: Request, res: Response, next: NextFunction) {
+  try {
+    const userId = req.user!.id;
+    const removal = await dataService.getItemRemoval(userId, req.params.itemId);
+    if (!removal) {
+      res.status(404).json({ error: 'No removal for this institution', code: 'not_found' });
+      return;
+    }
+    res.json({ removal: toRemovalView(removal) });
   } catch (err) {
     next(err);
   }

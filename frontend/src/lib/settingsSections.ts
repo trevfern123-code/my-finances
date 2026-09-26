@@ -25,7 +25,7 @@ export const ALL_SECTIONS: SettingsSectionMeta[] = [
   { id: 'financial', label: 'Financial Preferences', available: true },
   { id: 'safe_to_spend', label: 'Safe to Spend', available: true },
   { id: 'categories', label: 'Categories', available: true },
-  { id: 'connections', label: 'Connections', available: false },
+  { id: 'connections', label: 'Connections', available: true },
 ];
 
 export function getAvailableSections(): SettingsSectionMeta[] {

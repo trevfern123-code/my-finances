@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
 import { roundToCents } from './money';
+import { STATUS_TRANSITIONS, SYNCABLE_ITEM_STATUSES, type ItemStatusTransition } from './itemStatus';
 import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION, type SemanticRole } from './transactionClassifier';
 import { buildLoanDeletionReclassifyPayload, type LinkedTransactionClassifierInputs } from './loanDeletionReclassify';
 import {
@@ -169,13 +170,17 @@ export async function insertPlaidItem(params: {
   return data as PlaidItemRow;
 }
 
+/** The user's items that manual sync and balance refresh act on: every status except
+ *  `permission_revoked` (syncing stops; data is kept) and `removing` (frozen until its removal
+ *  finishes). See itemStatus.ts. */
 export async function getPlaidItemsForUser(
   userId: string
 ): Promise<ResolvedPlaidItem<'id' | 'user_id' | 'transactions_cursor'>[]> {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
     .select(`id, user_id, ${ENCRYPTED_TOKEN_COLUMNS}, transactions_cursor`)
-    .eq('user_id', userId);
+    .eq('user_id', userId)
+    .in('status', [...SYNCABLE_ITEM_STATUSES]);
 
   if (error) throw new Error(`Failed to load Plaid items: ${error.message}`);
 
@@ -213,33 +218,97 @@ export async function updateItemCursor(itemRowId: string, cursor: string) {
   if (error) throw new Error(`Failed to update sync cursor: ${error.message}`);
 }
 
-export async function setItemStatus(
-  itemRowId: string,
-  status: 'active' | 'login_required' | 'credential_error'
-) {
-  const { error } = await supabaseAdmin.from('plaid_items').update({ status }).eq('id', itemRowId);
+/**
+ * Applies one named status transition (itemStatus.ts) as a single conditional UPDATE: the item moves
+ * only if its current status is one the transition may leave. Returns whether it moved. This is what
+ * stops a sync that was already running when a removal began from ending with `active` over
+ * `removing`, and an ordinary sync from clearing `permission_revoked`. A completed reconnect also
+ * clears any recorded consent expiry.
+ */
+export async function transitionItemStatus(itemRowId: string, transition: ItemStatusTransition): Promise<boolean> {
+  const { to, from } = STATUS_TRANSITIONS[transition];
+  const fields: Record<string, unknown> = { status: to };
+  if (transition === 'reauth_completed') fields.consent_expires_at = null;
+  const { data, error } = await supabaseAdmin
+    .from('plaid_items')
+    .update(fields)
+    .eq('id', itemRowId)
+    .in('status', [...from])
+    .select('id');
   if (error) throw new Error(`Failed to update item status: ${error.message}`);
+  return Array.isArray(data) && data.length > 0;
+}
+
+/** A sync of this item completed (its cursor advanced): records when, unless it is being removed. */
+export async function recordItemSyncedAt(itemRowId: string): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from('plaid_items')
+    .update({ last_synced_at: new Date().toISOString() })
+    .eq('id', itemRowId)
+    .neq('status', 'removing');
+  if (error) throw new Error(`Failed to record item sync: ${error.message}`);
+}
+
+/** PENDING_EXPIRATION / PENDING_DISCONNECT: records when access expires (null when Plaid gave no date)
+ *  and flags a healthy item. A removing item is left alone. */
+export async function recordItemPendingExpiration(itemRowId: string, consentExpiresAt: string | null): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from('plaid_items')
+    .update({ consent_expires_at: consentExpiresAt })
+    .eq('id', itemRowId)
+    .neq('status', 'removing');
+  if (error) throw new Error(`Failed to record item consent expiration: ${error.message}`);
+  await transitionItemStatus(itemRowId, 'pending_expiration');
 }
 
 /** Looks up an item by Plaid's own item_id, which is what webhook payloads identify items by. */
 export async function getPlaidItemByPlaidItemId(
   plaidItemId: string
-): Promise<ResolvedPlaidItem<'id' | 'user_id' | 'transactions_cursor'> | null> {
+): Promise<ResolvedPlaidItem<'id' | 'user_id' | 'transactions_cursor' | 'status'> | null> {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
-    .select(`id, user_id, ${ENCRYPTED_TOKEN_COLUMNS}, transactions_cursor`)
+    .select(`id, user_id, ${ENCRYPTED_TOKEN_COLUMNS}, transactions_cursor, status`)
     .eq('plaid_item_id', plaidItemId)
     .maybeSingle();
 
   if (error) throw new Error(`Failed to load Plaid item: ${error.message}`);
   if (!data) return null;
-  const row = data as EncryptedTokenRow & { id: string; user_id: string; transactions_cursor: string | null };
+  const row = data as EncryptedTokenRow & { id: string; user_id: string; transactions_cursor: string | null; status: string };
   return {
     id: row.id,
     user_id: row.user_id,
     access_token: resolveAccessToken(row.id, row),
     transactions_cursor: row.transactions_cursor,
+    status: row.status,
   };
+}
+
+/** Status and ownership of an item, without touching its credential (a webhook for a removing or
+ *  revoked item must be recognizable even if its token could not be decrypted). */
+export async function getPlaidItemStatusByPlaidItemId(
+  plaidItemId: string
+): Promise<{ id: string; user_id: string; status: string } | null> {
+  const { data, error } = await supabaseAdmin
+    .from('plaid_items')
+    .select('id, user_id, status')
+    .eq('plaid_item_id', plaidItemId)
+    .maybeSingle();
+  if (error) throw new Error(`Failed to load Plaid item: ${error.message}`);
+  return (data as { id: string; user_id: string; status: string } | null) ?? null;
+}
+
+export async function getPlaidItemStatusForUser(
+  itemId: string,
+  userId: string
+): Promise<{ id: string; status: string } | null> {
+  const { data, error } = await supabaseAdmin
+    .from('plaid_items')
+    .select('id, status')
+    .eq('id', itemId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (error) throw new Error(`Failed to load Plaid item: ${error.message}`);
+  return (data as { id: string; status: string } | null) ?? null;
 }
 
 export async function getPlaidItemForUser(
@@ -267,12 +336,152 @@ export async function getLinkedItemsForUser(userId: string) {
   const { data, error } = await supabaseAdmin
     .from('plaid_items')
     .select(
-      'id, institution_id, institution_name, status, accounts(id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal, nickname, color, icon, sort_order, hidden, exclude_from_net_worth, exclude_from_cash_flow)'
+      'id, institution_id, institution_name, status, last_synced_at, consent_expires_at, accounts(id, name, official_name, type, subtype, mask, current_balance, available_balance, iso_currency_code, credit_limit, savings_goal, nickname, color, icon, sort_order, hidden, exclude_from_net_worth, exclude_from_cash_flow)'
     )
     .eq('user_id', userId);
 
   if (error) throw new Error(`Failed to load linked items: ${error.message}`);
   return data;
+}
+
+// ---- Institution removal (Linked Institution Management V1) ----------------
+// The state machine lives in 20260926120000_linked_institution_management.sql; these are thin,
+// typed wrappers. services/itemRemoval.ts drives it.
+
+export type ItemRemovalStatus = 'requested' | 'plaid_removed' | 'cleaned';
+
+export interface LoanAdjustment {
+  loan_id: string;
+  loan_name: string;
+  linked_transactions: number;
+  restored: number;
+  balance_before: number;
+  balance_after: number;
+}
+
+export interface ItemRemovalRecord {
+  id: string;
+  user_id: string;
+  item_id: string;
+  plaid_item_id: string;
+  institution_name: string | null;
+  status_before: string;
+  status: ItemRemovalStatus;
+  preview_digest: string;
+  attempts: number;
+  last_attempt_at: string | null;
+  last_outcome: 'retryable' | 'needs_attention' | null;
+  last_error_code: string | null;
+  plaid_outcome: 'removed' | 'already_removed' | null;
+  loan_adjustments: LoanAdjustment[] | null;
+  deleted_counts: Record<string, number> | null;
+  requested_at: string;
+  plaid_removed_at: string | null;
+  cleaned_at: string | null;
+  reconciled_at: string | null;
+}
+
+export interface ItemRemovalPreview {
+  item_id: string;
+  institution_name: string | null;
+  status: string;
+  accounts: { id: string; name: string; mask: string | null; type: string | null; subtype: string | null }[];
+  counts: {
+    accounts: number;
+    transactions: number;
+    linked_transactions: number;
+    splits: number;
+    recurring_streams: number;
+    liabilities: number;
+  };
+  loan_restorations: {
+    loan_id: string;
+    loan_name: string;
+    linked_transactions: number;
+    restore_amount: number;
+    current_balance: number;
+    balance_after: number;
+  }[];
+  unrestorable_links: number;
+  digest: string;
+}
+
+export type BeginItemRemovalResult =
+  | { outcome: 'started' | 'existing'; removal: ItemRemovalRecord }
+  | { outcome: 'not_found' | 'connection_needs_attention' | 'preview_stale' | 'manual_loan_reconciliation_required' };
+
+/** Read-only: what removing the item would delete and restore, plus the digest the removal request
+ *  must echo. Null when the item does not exist for this user. */
+export async function previewItemRemoval(userId: string, itemId: string): Promise<ItemRemovalPreview | null> {
+  const { data, error } = await supabaseAdmin.rpc('preview_plaid_item_removal', { p_user_id: userId, p_item_id: itemId });
+  if (error) throw new Error(`Failed to preview institution removal: ${error.message}`);
+  return (data as ItemRemovalPreview | null) ?? null;
+}
+
+export async function beginItemRemoval(userId: string, itemId: string, previewDigest: string | null): Promise<BeginItemRemovalResult> {
+  const { data, error } = await supabaseAdmin.rpc('begin_plaid_item_removal', {
+    p_user_id: userId,
+    p_item_id: itemId,
+    p_preview_digest: previewDigest,
+  });
+  if (error) throw new Error(`Failed to start institution removal: ${error.message}`);
+  return data as BeginItemRemovalResult;
+}
+
+export async function recordItemRemovalAttempt(
+  userId: string,
+  itemId: string,
+  outcome: 'removed' | 'already_removed' | 'retryable' | 'needs_attention',
+  errorCode: string | null
+): Promise<ItemRemovalRecord> {
+  const { data, error } = await supabaseAdmin.rpc('record_plaid_item_removal_attempt', {
+    p_user_id: userId,
+    p_item_id: itemId,
+    p_outcome: outcome,
+    p_error_code: errorCode,
+  });
+  if (error) throw new Error(`Failed to record institution removal attempt: ${error.message}`);
+  return data as ItemRemovalRecord;
+}
+
+/** The atomic local cleanup (restores manual-loan balances, deletes the item). Refused by the database
+ *  unless Plaid removal is confirmed; a replay returns the recorded result. */
+export async function removeItemLocally(
+  userId: string,
+  itemId: string
+): Promise<{ replayed: boolean; loan_adjustments: LoanAdjustment[]; deleted_counts: Record<string, number> }> {
+  const { data, error } = await supabaseAdmin.rpc('remove_plaid_item_local', { p_user_id: userId, p_item_id: itemId });
+  if (error) throw new Error(`Failed to remove institution data: ${error.message}`);
+  return data as { replayed: boolean; loan_adjustments: LoanAdjustment[]; deleted_counts: Record<string, number> };
+}
+
+export async function markItemRemovalReconciled(userId: string, itemId: string): Promise<void> {
+  const { error } = await supabaseAdmin.rpc('mark_plaid_item_removal_reconciled', { p_user_id: userId, p_item_id: itemId });
+  if (error) throw new Error(`Failed to finish institution removal: ${error.message}`);
+}
+
+export async function getItemRemoval(userId: string, itemId: string): Promise<ItemRemovalRecord | null> {
+  const { data, error } = await supabaseAdmin
+    .from('plaid_item_removals')
+    .select('*')
+    .eq('item_id', itemId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (error) throw new Error(`Failed to load institution removal: ${error.message}`);
+  return (data as ItemRemovalRecord | null) ?? null;
+}
+
+/** Removals still in progress, or cleaned but awaiting their follow-ups — including ones whose item is
+ *  already gone, so the user can always finish them. */
+export async function listUnfinishedItemRemovals(userId: string): Promise<ItemRemovalRecord[]> {
+  const { data, error } = await supabaseAdmin
+    .from('plaid_item_removals')
+    .select('*')
+    .eq('user_id', userId)
+    .is('reconciled_at', null)
+    .order('requested_at', { ascending: true });
+  if (error) throw new Error(`Failed to load institution removals: ${error.message}`);
+  return (data as ItemRemovalRecord[] | null) ?? [];
 }
 
 // ---- Plaid Hosted Link attempts (Wave 1) ------------------------------------

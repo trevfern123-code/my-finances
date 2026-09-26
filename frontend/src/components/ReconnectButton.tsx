@@ -4,14 +4,26 @@ import { useUpdateGuard } from '../hooks/useAppUpdate';
 import { completeReauth, createReauthLinkToken, type LinkedItem } from '../lib/api';
 import type { SessionOwnership } from '../lib/sessionOwnership';
 
+/** Shown when Update Mode cannot restore revoked access (Linked Institution Management). The server
+ *  sends the same guidance itself when it refuses (code reconnect_unavailable). */
+export const REVOKED_UNRECOVERABLE_MESSAGE =
+  "Access couldn’t be restored. Remove the institution, then link the bank again.";
+
 export function ReconnectButton({
   itemId,
   institutionName,
   createRefreshCommitter,
   captureOwnership,
+  message,
+  revoked = false,
 }: {
   itemId: string;
   institutionName: string | null;
+  /** What the connection needs, shown beside the button (default: it needs reconnecting). */
+  message?: string;
+  /** The connection's access was revoked: if Update Mode ends in an error, the user is told to
+   *  remove the institution and link the bank again. */
+  revoked?: boolean;
   // See LinkedAccounts's own prop of the same name — called at the start of THIS component's
   // own async reconnect operation, not derived from a parent render snapshot.
   createRefreshCommitter: () => (items: LinkedItem[]) => void;
@@ -53,7 +65,7 @@ export function ReconnectButton({
   const onExit: PlaidLinkOnExit = (err) => {
     setBusy(false);
     setLinkToken(null);
-    if (err) setError(err.display_message || 'Reconnection did not finish. Please try again.');
+    if (err) setError(revoked ? REVOKED_UNRECOVERABLE_MESSAGE : err.display_message || 'Reconnection did not finish. Please try again.');
   };
 
   const { open, ready } = usePlaidLink({ token: linkToken ?? '', onSuccess, onExit });
@@ -84,7 +96,7 @@ export function ReconnectButton({
 
   return (
     <div className="reconnect-banner">
-      <span>{institutionName ?? 'This institution'} needs to be reconnected.</span>
+      <span>{message ?? `${institutionName ?? 'This institution'} needs to be reconnected.`}</span>
       <button onClick={handleClick} disabled={busy}>
         {busy ? 'Reconnecting...' : 'Reconnect'}
       </button>

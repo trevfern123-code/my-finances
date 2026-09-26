@@ -41,6 +41,7 @@ import {
   type AssetGroup,
   type BudgetCategory,
   type CategoryMapping,
+  type InstitutionRemoval,
   type LinkedItem,
   type Loan,
   type LoanPayment,
@@ -317,6 +318,9 @@ export default function App() {
   const { session, sessionId } = useAuthSession();
   const [activeTab, setActiveTab] = useState('overview');
   const [items, setItems] = useState<LinkedItem[]>([]);
+  // Linked Institution Management: removals not finished yet — including ones whose institution is
+  // already gone from `items` (the user must still be able to finish them). Set with `items`.
+  const [unfinishedRemovals, setUnfinishedRemovals] = useState<InstitutionRemoval[]>([]);
   const [isSandbox, setIsSandbox] = useState(false);
   const [transactions, setTransactions] = useState<TransactionItem[]>([]);
   const [budgetCategories, setBudgetCategories] = useState<BudgetCategory[]>([]);
@@ -754,6 +758,7 @@ export default function App() {
 
     if (itemsRes.status === 'fulfilled' && stillCurrent && itemsVersion === resourceVersionsRef.current.items) {
       setItems(itemsRes.value.items);
+      setUnfinishedRemovals(itemsRes.value.unfinished_removals ?? []);
       setIsSandbox(itemsRes.value.is_sandbox);
     }
     if (
@@ -1726,6 +1731,14 @@ export default function App() {
     applyReportingRange(reportingRangeRef.current);
   }
 
+  // Linked Institution Management: a finished removal deleted an institution's accounts,
+  // transactions, splits, recurring streams and liability records, restored manual-loan balances and
+  // recomputed today's net-worth snapshot — every dataset a new link can change can change here too,
+  // so it refreshes exactly as a new link does.
+  function handleConnectionsChanged() {
+    handlePlaidLinked();
+  }
+
   if (!session) {
     return (
       <>
@@ -2086,6 +2099,8 @@ export default function App() {
                         captureOwnership={captureOwnership}
                         onUpdateCreditLimit={handleUpdateCreditLimit}
                         onUpdateCustomization={handleUpdateAccountCustomization}
+                        unfinishedRemovals={unfinishedRemovals}
+                        onConnectionsChanged={handleConnectionsChanged}
                       />
                       <TransactionsFeed
                         transactions={transactions}
@@ -2111,6 +2126,13 @@ export default function App() {
                         budgetCategories: activeBudgetCategories,
                         onSave: handleSaveCategoryMapping,
                         onDelete: handleDeleteCategoryMapping,
+                      }}
+                      connections={{
+                        items,
+                        unfinishedRemovals,
+                        createRefreshCommitter: createAccountsRefreshCommitter,
+                        captureOwnership,
+                        onConnectionsChanged: handleConnectionsChanged,
                       }}
                     />
                   )}

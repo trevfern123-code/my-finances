@@ -787,27 +787,25 @@ needs them. Status as of the audited production baseline (`d2cf720`, 2026-09-24)
     no API or UI yet).
   - **Manual-loan balance-as-of semantics** (follow-up 1 above): design first, then implement.
 - **Required V1 functionality**
-  - **Linked institution management**: one backend capability, with entry points on the Accounts
-    page and in Settings → Connections (the section is already reserved in `settingsSections.ts`).
-    List institutions with status, account count and last sync; reconnect; and a **destructive
-    remove** (V1 has no "disconnect but keep history"). Removal needs explicit confirmation, Plaid
-    `/item/remove`, retry/idempotency, a deletion record, and one atomic local cleanup: restore
-    manual-loan balances by their recorded applied amounts, delete accounts, transactions, splits,
-    recurring streams and liability records, repair relational roles, recompute today's net-worth
-    snapshot. It also covers ownership and sync-race protections, and `USER_PERMISSION_REVOKED`.
-  - Reconnect stuck-state fix; user role correction; transaction pagination (the API caps a request
-    at 200 rows).
+  - **Linked institution management**: implemented on `feature/linked-institution-management`
+    (see "Linked institution management"), pending review and release.
+  - **Pending→posted transaction continuity** (next): persist Plaid's `pending_transaction_id` and
+    carry a pending row's manual-loan link, category, review state and splits to its posted row.
+    Not a prerequisite for institution removal (the applied-amount ledger makes removal exact
+    regardless of lineage), but required before Financial Semantics Phase B.
+  - User role correction; transaction pagination (the API caps a request at 200 rows). The
+    Reconnect stuck-state fix shipped with the frontend update manager.
 - **Release hardening**
-  - Service-worker update / frontend-backend version compatibility (see the release lessons above).
-    Phase 1, the backend API-level contract, is described in "Frontend/backend compatibility
-    contract"; phase 2 is the frontend update manager;
-    then retire the legacy routes kept for stale bundles.
+  - Service-worker update / frontend-backend version compatibility: both phases shipped (`a8265f9`,
+    `49436a2`; see "Frontend/backend compatibility contract"). Later: retire the legacy routes kept
+    for stale bundles.
   - Retain terminal `exchange_unknown` attempts for about 30 days (follow-up 2 above).
   - Plaid token encryption Phase 3: confirm no plaintext tokens remain, then remove the plaintext
     fallback and column.
   - Review whether public sign-up should be disabled or gated; default-privileges migration;
     remove the obsolete Railway "frontend" service (the root `railway.json` builds the backend for
-    any service built from this repository, so that service can only fail).
+    any service built from this repository, so that service can only fail; its auto-deploy was
+    disabled on 2026-09-25, but it still exists).
 - **V1 UX / polish**: Settings → Dashboard section, custom date ranges, accessibility pass on the
   later features.
 - **Post-V1**: mobile app; investments/portfolio tracking (Plaid Investments, holdings, cost basis;
@@ -852,6 +850,180 @@ create policy "Users can only see their own net_worth_snapshots"
 One row per `(user_id, date)`, upserted (`services/dataService.ts`'s `upsertNetWorthSnapshot`, `onConflict: 'user_id,date'`) whenever balances are actually refreshed from Plaid — initial link (`completeLinkAttempt`) and manual "Refresh balances" (`refreshAccounts`) — since that's the only time `accounts.current_balance` changes. There's no scheduled/cron snapshot yet, so a user who never clicks refresh won't accumulate history; that's a reasonable follow-up if daily granularity independent of user activity turns out to matter.
 
 The asset/liability split (`services/netWorth.ts`'s `aggregateAssetsAndLiabilities`) is the same logic `getSpendingSummary` already used — extracted into its own pure, tested module and reused by both, rather than duplicated.
+
+## Linked institution management
+
+V1 lets the user see every linked institution (Plaid item), reconnect it, and **destructively
+remove** it. Removal deletes everything imported from that institution. There is no
+"disconnect but keep history", no undo and no cancellation. Schema:
+`supabase/migrations/20260926120000_linked_institution_management.sql`. Backend:
+`services/itemStatus.ts`, `services/itemRemoval.ts`, `controllers/plaidController.ts`,
+`controllers/webhookController.ts`. Frontend: `lib/connectionStatus.ts`,
+`components/ConnectionControls.tsx`, `components/RemoveInstitutionPanel.tsx`,
+`components/ConnectionsSettings.tsx`.
+
+### Connection statuses (`plaid_items.status`, now a CHECK)
+
+| status | meaning | syncs | UI actions |
+|---|---|---|---|
+| `active` | normal | yes | Remove |
+| `login_required` | the bank needs the user to sign in again | attempted | Reconnect, Remove |
+| `pending_expiration` | `PENDING_EXPIRATION` / `PENDING_DISCONNECT`; `consent_expires_at` when Plaid gives a date | yes | Reconnect, Remove |
+| `credential_error` | this app cannot read its stored token (not a bank problem) | attempted | none (removal refused; see runbook) |
+| `permission_revoked` | `USER_PERMISSION_REVOKED`; all data kept | **no** | Reconnect (Update Mode), Remove |
+| `removing` | a removal operation owns the item | **no** | the operation's progress and Retry |
+
+Every status write is a named, conditional transition (`services/itemStatus.ts`,
+`dataService.transitionItemStatus`): one `UPDATE … where status in (…)`. So no writer can
+overwrite a status it doesn't own:
+- An ordinary successful sync or refresh (`synced`) only clears `login_required` or
+  `credential_error`. It can never clear `permission_revoked` or `pending_expiration`; only a
+  completed reconnect does.
+- Nothing ever leaves `removing`. The trigger `plaid_items_keep_removing` backs this up in the
+  database: an UPDATE that would change `removing` keeps it instead. This closes the race where a
+  sync already running when a removal began finished by writing `active`.
+
+`last_synced_at` is recorded only after a sync's cursor advances.
+
+**Reconnect for revoked access:** `permission_revoked` may use Plaid Update Mode. On success it
+returns to `active` and syncing resumes. If Plaid refuses Update Mode, or it finishes but access is
+still refused, the user is told to remove the institution and link the bank again
+(`reconnect_unavailable`). No duplicate Item is ever created automatically.
+
+### Webhooks
+
+`ITEM` webhooks change status only, and never delete anything:
+- `USER_PERMISSION_REVOKED` → `permission_revoked`;
+- `PENDING_EXPIRATION` → `pending_expiration` + `consent_expires_at`;
+- `PENDING_DISCONNECT` → `pending_expiration`;
+- `LOGIN_REPAIRED` → `active` (from `login_required`);
+- `ERROR`/`ITEM_LOGIN_REQUIRED` → `login_required`.
+
+They read the item's status without decrypting its token. `SYNC_UPDATES_AVAILABLE` is ignored for
+`permission_revoked` and `removing` items. Every webhook for a `removing` item is ignored.
+`NEW_ACCOUNTS_AVAILABLE` and `USER_ACCOUNT_REVOKED` are not handled in V1.
+
+### Removal lifecycle (`plaid_item_removals`, one row per item, kept after the item is gone)
+
+| state | entered when | retry does | token |
+|---|---|---|---|
+| `requested` | `begin_plaid_item_removal`: the user confirmed a preview whose digest still matches; the item becomes `removing` in the same transaction | call Plaid `/item/remove` again | kept |
+| `plaid_removed` | Plaid confirmed removal, or answered `ITEM_NOT_FOUND` | local cleanup only (Plaid is never called again) | kept (dead at Plaid) |
+| `cleaned` | `remove_plaid_item_local` committed | the follow-ups only, until `reconciled_at` is set | deleted with the item row |
+
+- **Plaid first.** Local data is deleted only from `plaid_removed`, and the cleanup function
+  refuses anything else. A timeout, network error, 5xx or rate limit is an **unknown** outcome: the
+  operation stays `requested` (`last_outcome = retryable`) and nothing local is touched. Retrying
+  simply calls Plaid again.
+- **Why `ITEM_NOT_FOUND` means removed.** It is what a retry sees after an earlier removal whose
+  success response was lost: the Item no longer exists at Plaid, so there is nothing left to remove
+  or bill. It is the only error treated as removed. A definitive refusal such as
+  `INVALID_ACCESS_TOKEN` stays `requested` with `last_outcome = needs_attention`: it says nothing
+  about whether the Item still exists. Verify this on Plaid Sandbox before a production rollout
+  (remove an Item, then call `/item/remove` again).
+- **One operation per item, never cancelled.** A second request, a double submit, or a request cut
+  short by a reload all converge on the same row. The user resumes it with Retry.
+- **Atomic local cleanup** (`remove_plaid_item_local`), under the per-user advisory lock every
+  balance- or sync-affecting writer takes:
+  1. restores each manual loan by exactly Σ `transactions.loan_balance_applied` over the item's
+     linked transactions at that moment (a pending and a posted row are both restored if both were
+     linked; lineage is irrelevant);
+  2. deletes the item: accounts, transactions, splits, recurring streams and liability records go
+     by cascade, and the encrypted token with the row;
+  3. records `loan_adjustments` and `deleted_counts`.
+
+  All three happen in one transaction. A linked row without a recorded amount makes both begin and
+  cleanup **refuse** (fail closed): nothing is removed at Plaid and nothing is deleted. A replay
+  returns the recorded result and restores nothing twice.
+- **Follow-ups** run after the cleanup commits (the classifier is TypeScript): the relational repair
+  sweep (surviving rows whose transfer/refund partner was deleted), a forward reconciliation of the
+  rows it reset, and **today's** net-worth snapshot. Historical snapshots are kept as recorded.
+  Until they finish, the operation is listed in `unfinished_removals`, and the same POST finishes
+  it, even though the item is gone.
+- **Preview digest.** The preview hashes the item's account ids and each linked transaction's
+  (id, loan, applied amount). The confirmation must carry it, so the user always confirms the
+  restorations that will be made. An ordinary new unlinked transaction doesn't change it.
+- **Refused:** `credential_error` items (409 `connection_needs_attention`). Without a readable
+  token the Item can't be removed at Plaid, and V1 never removes locally alone.
+
+### API (all under `/api/plaid`, authenticated, covered by the client API-level check)
+
+- `GET /items`: each item has `status`, `last_synced_at`, `consent_expires_at` and `removal` (its
+  operation, if any). The top-level `unfinished_removals` also includes removals whose item is
+  already gone.
+- `GET /items/:itemId/removal-preview`: accounts, counts, `loan_restorations`, `digest`,
+  `blocked_reason`/`blocked_message`. Returns 409 `removal_in_progress` if an operation exists.
+- `POST /items/:itemId/removal` with body `{ preview_digest }`: starts the removal, or resumes it
+  (no digest needed). Returns 200 when complete, and 202 when stopped at a retryable point
+  (including `removal_incomplete`). 409 means `preview_stale`, `connection_needs_attention` or
+  `manual_loan_reconciliation_required`; 404 means not found.
+- `GET /items/:itemId/removal`: the operation's state; works after the item is deleted.
+- Reconnect (`reauth-link-token`, `reauth-complete`) returns 409 `connection_being_removed` for a
+  `removing` item, and 409 `reconnect_unavailable` when revoked access can't be restored.
+
+The responses never include user ids, Plaid item ids, the preview digest or any token.
+
+### UI
+
+The Accounts page's institution cards and Settings → Connections render from the same status
+mapping. Remove opens an inline confirmation showing:
+- the accounts, transactions, splits, recurring payments and liability records to be deleted;
+- each manual loan's exact restoration;
+- that past budgets and reports lose these transactions;
+- that net-worth history keeps its past values.
+
+There is no typed confirmation and no re-authentication (personal V1). During the request the
+button is replaced by progress, and double clicks are ignored. The request holds the app-update
+`mutation` guard, so the page is never reloaded mid-removal. An unfinished removal is shown with
+what happened ("Nothing has been deleted…") and a Retry, including after a reload. A lost response
+is never retried automatically: the panel re-reads the recorded operation. When it finishes, every
+dataset is refreshed and the user is told what was added back to which loan.
+
+### Tests
+
+- `supabase/tests/access_control`: `a03` (ACL, MAINTAIN, immutable columns, backstop) and `a04`
+  (every state rule, exact restoration incl. clamped and pending+posted, other items and users
+  untouched, fail closed, replay).
+- Concurrency: `c07` (a link racing the cleanup is restored exactly), `c08` (a sync batch after
+  cleanup writes nothing), `c09` (a double cleanup restores once).
+- Backend: `itemStatus`, `itemRemoval`, `plaidErrors`, controller and webhook tests.
+- Frontend: `connectionStatus`, `institutionRemoval.test.tsx`, API tests.
+
+### Runbook
+
+- **A removal stuck in `requested` with `needs_attention`.** Read `last_error_code`
+  (`select item_id, attempts, last_error_code, last_attempt_at from plaid_item_removals where
+  status = 'requested';`). `CREDENTIAL_UNREADABLE` means the token became undecryptable after the
+  removal began; fix the key ring (Plaid token encryption), then Retry. Otherwise check the Item in
+  the Plaid Dashboard. If Plaid support confirms it is removed, the next Retry receives
+  `ITEM_NOT_FOUND` and completes. Never edit the row by hand to skip Plaid.
+- **A `credential_error` connection the user wants removed.** Removal is refused on purpose. Diagnose
+  the credential (Plaid token encryption: key id, ciphertext state) and restore it. Only then can
+  the connection be removed at Plaid.
+- **Cleanup refusing with `manual-loan reconciliation required`.** A linked transaction has no
+  recorded applied amount, which the schema should make impossible. Stop and investigate the row;
+  never delete it or null the link to get past the check.
+- **Unfinished follow-ups (`cleaned`, `reconciled_at` null).** The user's Retry (or `POST
+  /items/:id/removal`) reruns them; they are idempotent.
+
+### Releasing it
+
+1. Independent review; CI green (`build-and-test`, `migration-replay`, `database-harness`).
+2. Read-only preflight: `supabase/preflight/20260926120000_linked_institution_management_preflight.sql`
+   (PREFLIGHT 1–3). Stop on any unexpected value.
+3. `supabase db push --dry-run`, then `supabase db push`, from the linked checkout. The migration is
+   additive and compatible with the currently deployed backend, so the backend doesn't need to be
+   stopped. Then POSTFLIGHT 1.
+4. Merge. Railway deploys the backend and Vercel the frontend. The backend is compatible with the
+   previous frontend (new fields and statuses are additive). If the new frontend is live first, its
+   removal calls fail until Railway finishes.
+5. Smoke test, **Plaid Sandbox only**: link a disposable Sandbox institution, create a throwaway
+   manual loan whose match text links one of its payments, check the preview's restoration, remove
+   it, and compare `loan_adjustments` with PREFLIGHT 3 / the loan balance. Confirm the Item is gone
+   in the Plaid Dashboard, and that the postflight "after the smoke-test removal" query shows no
+   rows left. If the deployed Plaid environment is Production, stop before this step and decide
+   which real connection may be removed.
+6. Advance `PRODUCTION_HEAD` in `supabase/tests/replay/run.sh`.
 
 ## Frontend/backend compatibility contract
 

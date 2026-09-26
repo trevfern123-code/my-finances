@@ -8,6 +8,8 @@ vi.mock('./supabaseClient', () => ({
 import {
   CLIENT_UPDATE_REQUIRED,
   createManualLoan,
+  getInstitutionRemovalPreview,
+  removeInstitution,
   getLinkedItems,
   isManualLoanCreationResolvedError,
   updateNavLayout,
@@ -443,6 +445,53 @@ describe('authedFetch — client API level', () => {
     await Promise.resolve();
     expect(appUpdate.getSnapshot().guards).toEqual([]);
     resolveFetch(okResponse({ items: [], is_sandbox: false }));
+    await pending;
+  });
+});
+
+describe('institution removal requests (Linked Institution Management)', () => {
+  const verifyA = (session: { user: { id: string } }) => session.user.id === 'user-a';
+
+  beforeEach(() => {
+    mockGetSession.mockResolvedValue({ data: { session: SESSION_A } });
+  });
+
+  it('POSTs the confirmed digest and holds the app-update mutation guard for the whole request', async () => {
+    let resolveFetch!: (v: unknown) => void;
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise((r) => (resolveFetch = r)) as never);
+    const pending = removeInstitution('item-1', 'digest-1', verifyA);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(appUpdate.getSnapshot().guards).toEqual(['mutation']);
+    const [url, init] = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
+    expect(url).toMatch(/\/api\/plaid\/items\/item-1\/removal$/);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({ preview_digest: 'digest-1' });
+    resolveFetch(okResponse({ removal: { status: 'cleaned', finished: true } }));
+    await pending;
+    expect(appUpdate.getSnapshot().guards).toEqual([]);
+  });
+
+  it('a resume sends no digest', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(okResponse({ removal: {} }) as never);
+    await removeInstitution('item-1', null, verifyA);
+    expect(JSON.parse(String((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body))).toEqual({});
+  });
+
+  it('is refused before sending when this build is out of date (never removes on an incompatible client)', async () => {
+    appUpdate.markUpdateRequired();
+    await expect(removeInstitution('item-1', 'digest-1', verifyA)).rejects.toMatchObject({ code: 'client_update_required' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('the preview is a plain read (no mutation guard)', async () => {
+    let resolveFetch!: (v: unknown) => void;
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise((r) => (resolveFetch = r)) as never);
+    const pending = getInstitutionRemovalPreview('item-1');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(appUpdate.getSnapshot().guards).toEqual([]);
+    resolveFetch(okResponse({ preview: {}, blocked_reason: null, blocked_message: null }));
     await pending;
   });
 });

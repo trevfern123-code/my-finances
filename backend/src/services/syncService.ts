@@ -47,7 +47,10 @@ export async function syncItemTransactions(item: {
     removed,
     accountIdByPlaidId,
   });
-  await dataService.setItemStatus(item.id, 'active');
+  // Plaid accepted the credential, so a stale login_required/credential_error flag is cleared — but
+  // only through the conditional transition: a sync that was already running when the item was
+  // revoked or started removing must not write 'active' over that (itemStatus.ts).
+  await dataService.transitionItemStatus(item.id, 'synced');
 
   // Best-effort (wrapped internally by linkNewTransactionsToManualLoans) — auto-linking loan
   // payments shouldn't fail the sync that triggered it. Candidates are re-derived from Plaid's own
@@ -86,6 +89,7 @@ export async function syncItemTransactions(item: {
   }
 
   await dataService.updateItemCursor(item.id, cursor);
+  await dataService.recordItemSyncedAt(item.id);
 
   // Best-effort: recurring-stream detection is a separate Plaid call and a nice-to-have, not
   // core to syncing transactions — a failure here shouldn't fail the sync that triggered it. Runs

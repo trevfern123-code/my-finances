@@ -37,6 +37,12 @@ import {
   upsertReportingRange,
   insertPlaidItem,
   getPlaidItemsForUser,
+  transitionItemStatus,
+  recordItemSyncedAt,
+  recordItemPendingExpiration,
+  beginItemRemoval,
+  removeItemLocally,
+  listUnfinishedItemRemovals,
   getPlaidItemByPlaidItemId,
   getPlaidItemForUser,
   getTransactionsForReconciliation,
@@ -2852,5 +2858,72 @@ describe('Plaid Hosted Link attempts (Wave 1)', () => {
     expect(select.select).toHaveBeenCalledWith('id');
     expect(select.eq).toHaveBeenCalledWith('user_id', 'user-1');
     expect(select.is).toHaveBeenCalledWith('institution_id', null);
+  });
+});
+
+describe('Linked Institution Management — item status writes and removal wrappers', () => {
+  it('transitionItemStatus is ONE conditional update: only from the statuses the transition may leave', async () => {
+    const query = createQueryBuilder({ data: [{ id: 'item-1' }], error: null });
+    mockFrom.mockReturnValueOnce(query);
+    expect(await transitionItemStatus('item-1', 'synced')).toBe(true);
+    expect(query.update).toHaveBeenCalledWith({ status: 'active' });
+    expect(query.eq).toHaveBeenCalledWith('id', 'item-1');
+    expect(query.in).toHaveBeenCalledWith('status', ['login_required', 'credential_error']);
+  });
+
+  it('reports false when the item was not in a status the transition may leave (e.g. removing)', async () => {
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: [], error: null }));
+    expect(await transitionItemStatus('item-1', 'login_required')).toBe(false);
+  });
+
+  it('a completed reconnect also clears the recorded consent expiry', async () => {
+    const query = createQueryBuilder({ data: [{ id: 'item-1' }], error: null });
+    mockFrom.mockReturnValueOnce(query);
+    await transitionItemStatus('item-1', 'reauth_completed');
+    expect(query.update).toHaveBeenCalledWith({ status: 'active', consent_expires_at: null });
+    expect(query.in).toHaveBeenCalledWith('status', expect.arrayContaining(['permission_revoked', 'pending_expiration']));
+    expect(query.in).not.toHaveBeenCalledWith('status', expect.arrayContaining(['removing']));
+  });
+
+  it('getPlaidItemsForUser returns only syncable items (not revoked, not removing)', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+    await getPlaidItemsForUser('user-1');
+    expect(query.in).toHaveBeenCalledWith('status', ['active', 'login_required', 'pending_expiration', 'credential_error']);
+  });
+
+  it('recordItemSyncedAt and recordItemPendingExpiration never touch a removing item', async () => {
+    const synced = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(synced);
+    await recordItemSyncedAt('item-1');
+    expect(synced.neq).toHaveBeenCalledWith('status', 'removing');
+
+    const expiry = createQueryBuilder({ data: null, error: null });
+    const transition = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(expiry).mockReturnValueOnce(transition);
+    await recordItemPendingExpiration('item-1', '2026-10-02T12:00:00.000Z');
+    expect(expiry.update).toHaveBeenCalledWith({ consent_expires_at: '2026-10-02T12:00:00.000Z' });
+    expect(expiry.neq).toHaveBeenCalledWith('status', 'removing');
+    expect(transition.in).toHaveBeenCalledWith('status', ['active']);
+  });
+
+  it('beginItemRemoval passes user, item and digest to the RPC', async () => {
+    mockRpc.mockResolvedValueOnce({ data: { outcome: 'preview_stale' }, error: null });
+    expect(await beginItemRemoval('user-1', 'item-1', 'd')).toEqual({ outcome: 'preview_stale' });
+    expect(mockRpc).toHaveBeenCalledWith('begin_plaid_item_removal', { p_user_id: 'user-1', p_item_id: 'item-1', p_preview_digest: 'd' });
+  });
+
+  it('removeItemLocally surfaces a database refusal (e.g. fail closed) as an error', async () => {
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'manual-loan reconciliation required: remove_plaid_item_local: ...' } });
+    await expect(removeItemLocally('user-1', 'item-1')).rejects.toThrow('manual-loan reconciliation required');
+  });
+
+  it('listUnfinishedItemRemovals is scoped to the user and to unreconciled operations', async () => {
+    const query = createQueryBuilder({ data: [], error: null });
+    mockFrom.mockReturnValueOnce(query);
+    await listUnfinishedItemRemovals('user-1');
+    expect(mockFrom).toHaveBeenLastCalledWith('plaid_item_removals');
+    expect(query.eq).toHaveBeenCalledWith('user_id', 'user-1');
+    expect(query.is).toHaveBeenCalledWith('reconciled_at', null);
   });
 });

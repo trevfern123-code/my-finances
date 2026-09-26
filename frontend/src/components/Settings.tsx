@@ -15,6 +15,7 @@ import { FinancialPreferencesSettings } from './FinancialPreferencesSettings';
 import { SafeToSpendSettings } from './SafeToSpendSettings';
 import { NavigationSettings } from './NavigationSettings';
 import { CategoryMappings } from './CategoryMappings';
+import { ConnectionsSettings, type ConnectionsSettingsProps } from './ConnectionsSettings';
 
 const AVAILABLE_SECTIONS = getAvailableSections();
 
@@ -23,6 +24,7 @@ export function Settings({
   financialPreferences,
   navLayout,
   categoryMappings,
+  connections,
 }: {
   appearance: ReturnType<typeof useAppearance>;
   financialPreferences: ReturnType<typeof useFinancialPreferences>;
@@ -34,6 +36,8 @@ export function Settings({
     onSave: (plaidCategory: string, budgetCategoryId: string, backfill: boolean) => Promise<number>;
     onDelete: (mappingId: string) => void;
   };
+  /** Settings -> Connections (Linked Institution Management). */
+  connections?: ConnectionsSettingsProps;
 }) {
   // The mobile drill-down state lives alongside activeSection (lib/settingsSections.ts owns the
   // transition logic — see selectSection/goBackToList and their tests) — has no effect at desktop
@@ -123,6 +127,8 @@ export function Settings({
             onDelete={categoryMappings.onDelete}
           />
         )}
+
+        {activeSection === 'connections' && connections && <ConnectionsSettings {...connections} />}
       </div>
     </div>
   );
