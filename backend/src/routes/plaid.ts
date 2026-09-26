@@ -27,6 +27,10 @@ plaidRouter.patch('/transactions/:transactionId/category', plaidController.setTr
 plaidRouter.patch('/transactions/:transactionId/approve', plaidController.approveTransaction);
 plaidRouter.put('/transactions/:transactionId/splits', plaidController.setTransactionSplits);
 plaidRouter.delete('/transactions/:transactionId/splits', plaidController.clearTransactionSplits);
+// Linked Institution Management V1: destructive institution removal (preview, start/resume, status).
+plaidRouter.get('/items/:itemId/removal-preview', plaidController.previewItemRemoval);
+plaidRouter.post('/items/:itemId/removal', plaidController.removeInstitution);
+plaidRouter.get('/items/:itemId/removal', plaidController.getItemRemoval);
 plaidRouter.post('/items/:itemId/reauth-link-token', plaidController.createReauthLinkToken);
 plaidRouter.post('/items/:itemId/reauth-complete', plaidController.completeReauth);
 plaidRouter.post('/items/:itemId/sandbox-reset-login', plaidController.sandboxResetLogin);

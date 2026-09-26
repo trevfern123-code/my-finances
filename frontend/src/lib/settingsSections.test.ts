@@ -13,13 +13,12 @@ describe('getAvailableSections', () => {
   it('only returns sections marked available — Phase 3 placeholders are excluded', () => {
     const available = getAvailableSections();
     const ids = available.map((s) => s.id);
-    expect(ids).toEqual(['appearance', 'navigation', 'financial', 'safe_to_spend', 'categories']);
+    expect(ids).toEqual(['appearance', 'navigation', 'financial', 'safe_to_spend', 'categories', 'connections']);
   });
 
   it('excludes every registered-but-unbuilt Phase 3 section by name, explicitly', () => {
     const ids = getAvailableSections().map((s) => s.id);
     expect(ids).not.toContain('dashboard');
-    expect(ids).not.toContain('connections');
   });
 
   it('every section in the full registry is accounted for as either available or not', () => {
@@ -38,11 +37,11 @@ describe('isSectionAvailable', () => {
     expect(isSectionAvailable('financial')).toBe(true);
     expect(isSectionAvailable('safe_to_spend')).toBe(true);
     expect(isSectionAvailable('categories')).toBe(true);
+    expect(isSectionAvailable('connections')).toBe(true); // Linked Institution Management V1
   });
 
   it('is false for each Phase 3 placeholder', () => {
     expect(isSectionAvailable('dashboard')).toBe(false);
-    expect(isSectionAvailable('connections')).toBe(false);
   });
 });
 

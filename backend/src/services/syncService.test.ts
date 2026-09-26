@@ -11,13 +11,15 @@ vi.mock('./plaidService', () => ({
 const mockGetAccountIdMapForItem = vi.hoisted(() => vi.fn());
 const mockApplyTransactionChanges = vi.hoisted(() => vi.fn());
 const mockUpdateItemCursor = vi.hoisted(() => vi.fn());
-const mockSetItemStatus = vi.hoisted(() => vi.fn());
+const mockTransitionItemStatus = vi.hoisted(() => vi.fn());
+const mockRecordItemSyncedAt = vi.hoisted(() => vi.fn());
 const mockUpsertRecurringStreams = vi.hoisted(() => vi.fn());
 vi.mock('./dataService', () => ({
   getAccountIdMapForItem: mockGetAccountIdMapForItem,
   applyTransactionChanges: mockApplyTransactionChanges,
   updateItemCursor: mockUpdateItemCursor,
-  setItemStatus: mockSetItemStatus,
+  transitionItemStatus: mockTransitionItemStatus,
+  recordItemSyncedAt: mockRecordItemSyncedAt,
   upsertRecurringStreams: mockUpsertRecurringStreams,
 }));
 
@@ -75,9 +77,25 @@ describe('syncItemTransactions', () => {
     expect(mockUpdateItemCursor).toHaveBeenCalledWith('item-row-1', 'new-cursor');
   });
 
-  it('marks the item active on a successful sync', async () => {
+  it('clears a stale login_required through the conditional synced transition — never a blind write of active', async () => {
     await syncItemTransactions(item);
-    expect(mockSetItemStatus).toHaveBeenCalledWith('item-row-1', 'active');
+    expect(mockTransitionItemStatus).toHaveBeenCalledWith('item-row-1', 'synced');
+  });
+
+  it('records last_synced_at only once the cursor has advanced (a genuinely completed sync)', async () => {
+    const order: string[] = [];
+    mockUpdateItemCursor.mockImplementation(async () => void order.push('cursor'));
+    mockRecordItemSyncedAt.mockImplementation(async () => void order.push('synced_at'));
+    await syncItemTransactions(item);
+    expect(order).toEqual(['cursor', 'synced_at']);
+    expect(mockRecordItemSyncedAt).toHaveBeenCalledWith('item-row-1');
+  });
+
+  it('does not record last_synced_at when the sync fails before its cursor advances', async () => {
+    mockReconcileRelationalRoles.mockRejectedValueOnce(new Error('reconcile failed'));
+    await expect(syncItemTransactions(item)).rejects.toThrow('reconcile failed');
+    expect(mockUpdateItemCursor).not.toHaveBeenCalled();
+    expect(mockRecordItemSyncedAt).not.toHaveBeenCalled();
   });
 
   it('returns counts, not the raw arrays', async () => {
@@ -98,7 +116,7 @@ describe('syncItemTransactions', () => {
     mockSyncTransactions.mockRejectedValue(err);
 
     await expect(syncItemTransactions(item)).rejects.toThrow('ITEM_LOGIN_REQUIRED');
-    expect(mockSetItemStatus).not.toHaveBeenCalled();
+    expect(mockTransitionItemStatus).not.toHaveBeenCalled();
     expect(mockApplyTransactionChanges).not.toHaveBeenCalled();
   });
 
@@ -126,7 +144,7 @@ describe('syncItemTransactions', () => {
     const result = await syncItemTransactions(item);
 
     expect(result).toEqual({ added: 0, modified: 0, removed: 0 });
-    expect(mockSetItemStatus).toHaveBeenCalledWith('item-row-1', 'active');
+    expect(mockTransitionItemStatus).toHaveBeenCalledWith('item-row-1', 'synced');
   });
 
   it("passes Plaid's own added+modified transaction ids to linkNewTransactionsToManualLoans (Round 6 remediation, blocker 5) — not our own insertedTransactions dedup, which changes between sync attempts", async () => {

@@ -7,14 +7,18 @@ const mockVerifyPlaidWebhook = vi.hoisted(() => vi.fn());
 vi.mock('../services/webhookVerification', () => ({ verifyPlaidWebhook: mockVerifyPlaidWebhook }));
 
 const mockGetPlaidItemByPlaidItemId = vi.hoisted(() => vi.fn());
-const mockSetItemStatus = vi.hoisted(() => vi.fn());
+const mockTransitionItemStatus = vi.hoisted(() => vi.fn());
+const mockGetPlaidItemStatusByPlaidItemId = vi.hoisted(() => vi.fn());
+const mockRecordItemPendingExpiration = vi.hoisted(() => vi.fn());
 const mockMarkPlaidLinkAttemptReady = vi.hoisted(() => vi.fn());
 const mockClaimPlaidLinkAttempt = vi.hoisted(() => vi.fn());
 const mockFinishPlaidLinkAttempt = vi.hoisted(() => vi.fn());
 const mockInsertPlaidItem = vi.hoisted(() => vi.fn());
 vi.mock('../services/dataService', () => ({
   getPlaidItemByPlaidItemId: mockGetPlaidItemByPlaidItemId,
-  setItemStatus: mockSetItemStatus,
+  transitionItemStatus: mockTransitionItemStatus,
+  getPlaidItemStatusByPlaidItemId: mockGetPlaidItemStatusByPlaidItemId,
+  recordItemPendingExpiration: mockRecordItemPendingExpiration,
   markPlaidLinkAttemptReady: mockMarkPlaidLinkAttemptReady,
   claimPlaidLinkAttempt: mockClaimPlaidLinkAttempt,
   finishPlaidLinkAttempt: mockFinishPlaidLinkAttempt,
@@ -60,6 +64,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.spyOn(console, 'error').mockImplementation(() => {});
   mockVerifyPlaidWebhook.mockResolvedValue({});
+  // Linked Institution Management: every non-LINK webhook first reads the item's status (no token).
+  mockGetPlaidItemStatusByPlaidItemId.mockResolvedValue({ id: 'row-1', user_id: 'user-1', status: 'active' });
 });
 
 describe('handlePlaidWebhook — credential-error handling on the async path (§7 Phase 4, §9)', () => {
@@ -81,7 +87,7 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
     // No internal row id was available on this error, so there is genuinely nothing to mark —
     // confirms this stays an honest "logged, not silently treated as success" case rather than
     // guessing at a row id.
-    expect(mockSetItemStatus).not.toHaveBeenCalled();
+    expect(mockTransitionItemStatus).not.toHaveBeenCalled();
   });
 
   it('marks the correct item credential_error when the thrown error carries its itemRowId (Blocker 3)', async () => {
@@ -93,7 +99,7 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
     await handlePlaidWebhook(req, res);
     await flushMicrotasks();
 
-    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('internal-row-42', 'credential_error');
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('internal-row-42', 'credential_error');
   });
 
   it('one item\'s credential failure does not affect another item\'s status', async () => {
@@ -105,8 +111,8 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
     await handlePlaidWebhook(req, res);
     await flushMicrotasks();
 
-    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-affected', 'credential_error');
-    expect(mockSetItemStatus).not.toHaveBeenCalledWith('row-unrelated', expect.anything());
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-affected', 'credential_error');
+    expect(mockTransitionItemStatus).not.toHaveBeenCalledWith('row-unrelated', expect.anything());
   });
 
   it('rethrows (surfacing to the outer .catch, sanitized) a non-credential error resolving the item', async () => {
@@ -123,7 +129,7 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
       'SYNC_UPDATES_AVAILABLE',
       safeSummaryFor(err)
     );
-    expect(mockSetItemStatus).not.toHaveBeenCalled();
+    expect(mockTransitionItemStatus).not.toHaveBeenCalled();
   });
 
   it('processes a normal webhook exactly as before when nothing fails', async () => {
@@ -164,8 +170,8 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
     await handlePlaidWebhook(req, res);
     await flushMicrotasks();
 
-    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'login_required');
-    expect(mockSetItemStatus).not.toHaveBeenCalledWith('row-1', 'credential_error');
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'login_required');
+    expect(mockTransitionItemStatus).not.toHaveBeenCalledWith('row-1', 'credential_error');
   });
 
   it('does not swallow a PlaidCredentialError instance differently than any of its subclasses (instanceof, not name-matching)', async () => {
@@ -186,7 +192,7 @@ describe('handlePlaidWebhook — credential-error handling on the async path (§
       expect.stringContaining('Plaid credential error resolving webhook item plaid-item-1'),
       safeSummaryFor(err)
     );
-    expect(mockSetItemStatus).toHaveBeenCalledExactlyOnceWith('row-99', 'credential_error');
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-99', 'credential_error');
   });
 });
 
@@ -258,5 +264,86 @@ describe('handlePlaidWebhook — LINK SESSION_FINISHED (Wave 1 Hosted Link): rea
     await flushMicrotasks();
     expect(console.error).toHaveBeenCalled();
     expect(JSON.stringify((console.error as unknown as ReturnType<typeof vi.fn>).mock.calls)).not.toContain(LINK_TOKEN);
+  });
+});
+
+describe('handlePlaidWebhook — connection lifecycle (Linked Institution Management)', () => {
+  const syncUpdates = { webhook_type: 'TRANSACTIONS', webhook_code: 'SYNC_UPDATES_AVAILABLE', item_id: 'plaid-item-1' };
+  const itemWebhook = (code: string, extra: Record<string, unknown> = {}) => ({ webhook_type: 'ITEM', webhook_code: code, item_id: 'plaid-item-1', ...extra });
+
+  async function deliver(payload: Record<string, unknown>) {
+    const res = fakeRes();
+    await handlePlaidWebhook(fakeReq(payload), res);
+    await flushMicrotasks();
+    expect(res.status).toHaveBeenCalledWith(200);
+  }
+
+  it('USER_PERMISSION_REVOKED marks the item permission_revoked — and deletes nothing', async () => {
+    await deliver(itemWebhook('USER_PERMISSION_REVOKED'));
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'permission_revoked');
+    expect(mockSyncItemTransactions).not.toHaveBeenCalled();
+    expect(mockGetPlaidItemByPlaidItemId).not.toHaveBeenCalled(); // no token needed
+  });
+
+  it('PENDING_EXPIRATION records the expiry time and flags the item', async () => {
+    await deliver(itemWebhook('PENDING_EXPIRATION', { consent_expiration_time: '2026-10-02T12:00:00Z' }));
+    expect(mockRecordItemPendingExpiration).toHaveBeenCalledExactlyOnceWith('row-1', '2026-10-02T12:00:00.000Z');
+  });
+
+  it('PENDING_EXPIRATION without a usable time still flags the item', async () => {
+    await deliver(itemWebhook('PENDING_EXPIRATION', { consent_expiration_time: 'not-a-date' }));
+    expect(mockRecordItemPendingExpiration).not.toHaveBeenCalled();
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'pending_expiration');
+  });
+
+  it('PENDING_DISCONNECT flags the item for reconnection', async () => {
+    await deliver(itemWebhook('PENDING_DISCONNECT', { reason: 'INSTITUTION_MIGRATION' }));
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'pending_expiration');
+  });
+
+  it('LOGIN_REPAIRED clears login_required', async () => {
+    await deliver(itemWebhook('LOGIN_REPAIRED'));
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'login_repaired');
+  });
+
+  it('unhandled ITEM codes (e.g. NEW_ACCOUNTS_AVAILABLE) change nothing', async () => {
+    await deliver(itemWebhook('NEW_ACCOUNTS_AVAILABLE'));
+    expect(mockTransitionItemStatus).not.toHaveBeenCalled();
+    expect(mockSyncItemTransactions).not.toHaveBeenCalled();
+  });
+
+  it('a status webhook works even when the item\'s credential cannot be decrypted (the token is never read)', async () => {
+    mockGetPlaidItemByPlaidItemId.mockRejectedValue(new UnknownKeyIdError('row-1'));
+    await deliver(itemWebhook('USER_PERMISSION_REVOKED'));
+    expect(mockTransitionItemStatus).toHaveBeenCalledExactlyOnceWith('row-1', 'permission_revoked');
+  });
+
+  it.each([
+    ['a sync', syncUpdates],
+    ['ITEM_LOGIN_REQUIRED', itemWebhook('ERROR', { error: { error_code: 'ITEM_LOGIN_REQUIRED' } })],
+    ['USER_PERMISSION_REVOKED', itemWebhook('USER_PERMISSION_REVOKED')],
+    ['PENDING_EXPIRATION', itemWebhook('PENDING_EXPIRATION', { consent_expiration_time: '2026-10-02T12:00:00Z' })],
+  ])('a removing item ignores %s entirely', async (_label, payload) => {
+    mockGetPlaidItemStatusByPlaidItemId.mockResolvedValue({ id: 'row-1', user_id: 'user-1', status: 'removing' });
+    await deliver(payload);
+    expect(mockSyncItemTransactions).not.toHaveBeenCalled();
+    expect(mockTransitionItemStatus).not.toHaveBeenCalled();
+    expect(mockRecordItemPendingExpiration).not.toHaveBeenCalled();
+    expect(mockGetPlaidItemByPlaidItemId).not.toHaveBeenCalled();
+  });
+
+  it('a permission_revoked item does not sync (its data is kept, untouched)', async () => {
+    mockGetPlaidItemStatusByPlaidItemId.mockResolvedValue({ id: 'row-1', user_id: 'user-1', status: 'permission_revoked' });
+    await deliver(syncUpdates);
+    expect(mockGetPlaidItemByPlaidItemId).not.toHaveBeenCalled();
+    expect(mockSyncItemTransactions).not.toHaveBeenCalled();
+  });
+
+  it('an unknown (or already removed) item is ignored', async () => {
+    mockGetPlaidItemStatusByPlaidItemId.mockResolvedValue(null);
+    await deliver(syncUpdates);
+    await deliver(itemWebhook('USER_PERMISSION_REVOKED'));
+    expect(mockSyncItemTransactions).not.toHaveBeenCalled();
+    expect(mockTransitionItemStatus).not.toHaveBeenCalled();
   });
 });

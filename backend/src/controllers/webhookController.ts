@@ -4,6 +4,7 @@ import * as syncService from '../services/syncService';
 import { verifyPlaidWebhook } from '../services/webhookVerification';
 import { PlaidCredentialError } from '../services/tokenEncryption';
 import { summarizeErrorSafely } from '../services/errorSanitizer';
+import { isSyncableItemStatus } from '../services/itemStatus';
 
 interface PlaidWebhookPayload {
   webhook_type: string;
@@ -13,6 +14,8 @@ interface PlaidWebhookPayload {
   // LINK / SESSION_FINISHED only.
   link_token?: unknown;
   status?: unknown;
+  // ITEM / PENDING_EXPIRATION only.
+  consent_expiration_time?: unknown;
 }
 
 export async function handlePlaidWebhook(req: Request, res: Response) {
@@ -57,6 +60,22 @@ async function processWebhook(payload: PlaidWebhookPayload) {
     return;
   }
 
+  // Linked Institution Management: the item's lifecycle status decides what (if anything) this webhook
+  // may do, and is read WITHOUT decrypting its credential — a status webhook needs no token.
+  const current = await dataService.getPlaidItemStatusByPlaidItemId(payload.item_id);
+  if (!current) return; // Unknown or since-removed item — nothing to do.
+  // A removal operation owns this item: nothing may sync it or change its status (itemStatus.ts).
+  if (current.status === 'removing') return;
+
+  if (payload.webhook_type === 'ITEM') {
+    await processItemLifecycleWebhook(current.id, payload);
+    return;
+  }
+
+  if (!(payload.webhook_type === 'TRANSACTIONS' && payload.webhook_code === 'SYNC_UPDATES_AVAILABLE')) return;
+  // Revoked access stops syncing; the data stays until the user reconnects or removes the institution.
+  if (!isSyncableItemStatus(current.status)) return;
+
   let item;
   try {
     item = await dataService.getPlaidItemByPlaidItemId(payload.item_id);
@@ -73,22 +92,57 @@ async function processWebhook(payload: PlaidWebhookPayload) {
         summarizeErrorSafely(err)
       );
       if (err.itemRowId) {
-        await dataService.setItemStatus(err.itemRowId, 'credential_error');
+        await dataService.transitionItemStatus(err.itemRowId, 'credential_error');
       }
       return;
     }
     throw err;
   }
-  if (!item) return; // Unknown or since-removed item — nothing to do.
+  if (!item) return; // Removed between the two reads — nothing to do.
+  await syncService.syncItemTransactions(item);
+}
 
-  if (payload.webhook_type === 'TRANSACTIONS' && payload.webhook_code === 'SYNC_UPDATES_AVAILABLE') {
-    await syncService.syncItemTransactions(item);
-    return;
-  }
-
-  if (payload.webhook_type === 'ITEM' && payload.webhook_code === 'ERROR') {
-    if (payload.error?.error_code === 'ITEM_LOGIN_REQUIRED') {
-      await dataService.setItemStatus(item.id, 'login_required');
+/**
+ * ITEM webhooks that change a connection's lifecycle status. Each is a conditional transition
+ * (itemStatus.ts), so none of them can override a status it does not own. None of them ever deletes
+ * anything: a revoked connection keeps all its data until the user reconnects or removes it.
+ */
+async function processItemLifecycleWebhook(itemRowId: string, payload: PlaidWebhookPayload) {
+  switch (payload.webhook_code) {
+    case 'ERROR':
+      if (payload.error?.error_code === 'ITEM_LOGIN_REQUIRED') {
+        await dataService.transitionItemStatus(itemRowId, 'login_required');
+      }
+      return;
+    case 'USER_PERMISSION_REVOKED':
+      // Syncing stops; Update Mode (Reconnect) may restore access, and removal stays available.
+      await dataService.transitionItemStatus(itemRowId, 'permission_revoked');
+      return;
+    case 'PENDING_EXPIRATION': {
+      const expiresAt = parseWebhookTimestamp(payload.consent_expiration_time);
+      if (expiresAt) {
+        await dataService.recordItemPendingExpiration(itemRowId, expiresAt);
+      } else {
+        await dataService.transitionItemStatus(itemRowId, 'pending_expiration');
+      }
+      return;
     }
+    case 'PENDING_DISCONNECT':
+      // Plaid gives no date; any expiry recorded earlier is kept.
+      await dataService.transitionItemStatus(itemRowId, 'pending_expiration');
+      return;
+    case 'LOGIN_REPAIRED':
+      await dataService.transitionItemStatus(itemRowId, 'login_repaired');
+      return;
+    default:
+      // NEW_ACCOUNTS_AVAILABLE, USER_ACCOUNT_REVOKED, WEBHOOK_UPDATE_ACKNOWLEDGED, ...: not handled in V1.
+      return;
   }
+}
+
+/** An ISO 8601 timestamp from a webhook payload, or null if absent or not a real time. */
+function parseWebhookTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string' || value === '') return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }

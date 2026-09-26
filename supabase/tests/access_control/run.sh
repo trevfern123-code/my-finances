@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Access-control harness for the Wave 1 remediation migrations. Nothing here touches any real
+# Access-control harness for the Wave 1 remediation migrations and Linked Institution Management
+# (20260926120000: removal state machine, exact loan restoration, races). Nothing here touches any real
 # database: every run uses a throwaway container of Supabase's own PostgreSQL 17 image (the real
 # anon/authenticated/service_role roles, auth schema, auth.uid() and platform default privileges).
 #
