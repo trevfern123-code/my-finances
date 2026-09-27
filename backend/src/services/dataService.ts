@@ -2031,10 +2031,16 @@ export async function updateLinkedPaymentPrincipal(
   loanId: string,
   newPrincipalPortion: number
 ): Promise<void> {
+  // Scoped through the ownership chain (accounts → plaid_items), not by id alone: supabaseAdmin
+  // bypasses RLS, so an id-only read would let another user's row reach the "not linked to this
+  // loan" branch and be distinguishable from an unknown id. A foreign row and an unknown id must be
+  // the same thing here — TransactionNotFoundError — so the controller's user-scoped carry-over
+  // lookup, and ultimately the same 404, is all either can produce.
   const { data: txn, error: fetchError } = await supabaseAdmin
     .from('transactions')
-    .select('manual_loan_id, amount')
+    .select('manual_loan_id, amount, accounts!inner(plaid_items!inner(user_id))')
     .eq('id', transactionId)
+    .eq('accounts.plaid_items.user_id', userId)
     .maybeSingle();
 
   if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
@@ -2078,17 +2084,23 @@ export async function updateLinkedPaymentPrincipal(
  *  a completed, not a failed, unlink. Only a genuine mismatch (linked to a DIFFERENT loan than
  *  the one named in the request, or the transaction not existing at all) is a real error. */
 export async function unlinkPaymentFromLoan(userId: string, transactionId: string, loanId: string): Promise<boolean> {
+  // Scoped through the ownership chain, not by id alone (see updateLinkedPaymentPrincipal): without
+  // it, another user's ALREADY-UNLINKED row would take the idempotent `false` path below and the
+  // request would continue as if it had succeeded.
   const { data: txn, error: fetchError } = await supabaseAdmin
     .from('transactions')
-    .select('manual_loan_id, amount, category, personal_finance_category_detailed, personal_finance_category_confidence')
+    .select(
+      'manual_loan_id, amount, category, personal_finance_category_detailed, personal_finance_category_confidence, accounts!inner(plaid_items!inner(user_id))'
+    )
     .eq('id', transactionId)
+    .eq('accounts.plaid_items.user_id', userId)
     .maybeSingle();
 
   if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
   // Pending → posted continuity: a pending row Plaid has since posted is gone; the controller
   // resolves what happened through the user-scoped carry-over rather than reporting a failure.
   if (!txn) throw new TransactionNotFoundError('Payment not found');
-  if (txn.manual_loan_id === null) return false; // already unlinked — idempotent no-op, no RPC call needed
+  if (txn.manual_loan_id === null) return false; // already unlinked (and OWNED) — idempotent no-op, no RPC call needed
   if (txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
 
   // manual_loan_link no longer governs this row's role once unlinked — reclassify via the normal

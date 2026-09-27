@@ -3097,3 +3097,74 @@ describe('linked-payment edits when the pending row has posted (pending → post
     await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toThrow('Failed to unlink payment: connection reset');
   });
 });
+
+// Codex final review of 3534697: the pre-reads must be scoped through the ownership chain. With
+// supabaseAdmin (RLS bypassed), an id-only read would make another user's row distinguishable from
+// an unknown id (a "not linked to this loan" error, or the idempotent already-unlinked path).
+describe('linked-payment pre-reads are ownership-scoped (foreign row ≡ unknown id)', () => {
+  beforeEach(() => mockRpc.mockReset());
+
+  it('updateLinkedPaymentPrincipal filters the read through accounts → plaid_items for the signed-in user', async () => {
+    const query = createQueryBuilder({ data: { manual_loan_id: 'loan-1', amount: 200 }, error: null });
+    mockFrom.mockReturnValueOnce(query);
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
+
+    await updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100);
+
+    expect(query.select.mock.calls[0][0]).toContain('accounts!inner(plaid_items!inner(user_id))');
+    expect(query.eq).toHaveBeenCalledWith('id', 'txn-1');
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+  });
+
+  it("updateLinkedPaymentPrincipal: another user's linked row is indistinguishable from a missing id — the scoped read returns nothing, so TransactionNotFoundError, not \"not linked to this loan\"", async () => {
+    // The ownership-scoped query yields no row for a foreign id, exactly as for an unknown id.
+    const query = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-of-user-2', 'loan-1', 100)).rejects.toBeInstanceOf(TransactionNotFoundError);
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('unlinkPaymentFromLoan filters the read through the ownership chain too', async () => {
+    const query = createQueryBuilder({
+      data: { manual_loan_id: 'loan-1', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+    mockRpc.mockResolvedValueOnce({ data: true, error: null });
+
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).resolves.toBe(true);
+    expect(query.select.mock.calls[0][0]).toContain('accounts!inner(plaid_items!inner(user_id))');
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+  });
+
+  it("unlinkPaymentFromLoan: another user's already-unlinked row cannot take the idempotent-success path — the scoped read returns nothing, so TransactionNotFoundError and no RPC", async () => {
+    const query = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-of-user-2-unlinked', 'loan-1')).rejects.toBeInstanceOf(TransactionNotFoundError);
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it("an OWNED already-unlinked row still takes the idempotent path (the scope changes nothing for the user's own rows)", async () => {
+    mockFrom.mockReturnValueOnce(
+      createQueryBuilder({
+        data: { manual_loan_id: null, amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+        error: null,
+      })
+    );
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).resolves.toBe(false);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('the owned pending → posted race is unchanged: the read finds the row, the RPC then reports it gone', async () => {
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: { manual_loan_id: 'loan-1', amount: 200 }, error: null }));
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'update_linked_payment_principal: transaction not found or not owned by user' },
+    });
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100)).rejects.toBeInstanceOf(TransactionNotFoundError);
+  });
+});

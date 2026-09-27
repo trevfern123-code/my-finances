@@ -284,3 +284,43 @@ describe('linked-payment edits racing a posting (pending → posted continuity)'
     expect(res.status).not.toHaveBeenCalled();
   });
 });
+
+// Codex final review of 3534697: a foreign transaction id and a random id must produce the same 404
+// from the payment controllers — the service reports both as TransactionNotFoundError, and the
+// user-scoped carry-over lookup finds nothing for either.
+describe('linked-payment controllers: foreign and random ids are the same 404', () => {
+  const next = vi.fn() as unknown as NextFunction;
+  const reqFor = (transactionId: string, body: unknown = {}) =>
+    ({ user: { id: 'user-1' }, params: { id: 'loan-1', transactionId }, body } as unknown as Request);
+
+  beforeEach(() => {
+    mockGetManualLoan.mockResolvedValue({ id: 'loan-1', user_id: 'user-1', current_balance: 900 });
+    mockFindTransactionCarryover.mockResolvedValue(null);
+    mockUpdateLinkedPaymentPrincipal.mockRejectedValue(new TransactionNotFoundError('Payment not found'));
+    mockUnlinkPaymentFromLoan.mockRejectedValue(new TransactionNotFoundError('Payment not found'));
+  });
+
+  it.each([
+    ['a random id', 'no-such-transaction'],
+    ["another user's transaction", 'txn-owned-by-user-2'],
+  ])('principal edit with %s → 404, identical body', async (_label, transactionId) => {
+    const res = fakeRes();
+    await updateLinkedPayment(reqFor(transactionId, { principal_portion: 10 }), res, next);
+    expect(mockFindTransactionCarryover).toHaveBeenCalledWith('user-1', transactionId);
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect((res.json as ReturnType<typeof vi.fn>).mock.calls[0][0]).toEqual({ error: 'Transaction not found' });
+    expect(mockGetTransactionItemForUser).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a random id', 'no-such-transaction'],
+    ["another user's transaction", 'txn-owned-by-user-2'],
+  ])('unlink with %s → 404, identical body, no reconciliation', async (_label, transactionId) => {
+    const res = fakeRes();
+    await unlinkPayment(reqFor(transactionId), res, next);
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect((res.json as ReturnType<typeof vi.fn>).mock.calls[0][0]).toEqual({ error: 'Transaction not found' });
+    expect(mockGetManualLoan).toHaveBeenCalledTimes(1);
+  });
+});
