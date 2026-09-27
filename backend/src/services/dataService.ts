@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
-import { roundToCents } from './money';
 import { STATUS_TRANSITIONS, SYNCABLE_ITEM_STATUSES, type ItemStatusTransition } from './itemStatus';
 import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION, type SemanticRole } from './transactionClassifier';
 import { buildLoanDeletionReclassifyPayload, type LinkedTransactionClassifierInputs } from './loanDeletionReclassify';
@@ -1014,6 +1013,9 @@ function mapPlaidTransaction(transaction: PlaidTransaction, accountId: string) {
     personal_finance_category_confidence: transaction.personal_finance_category?.confidence_level ?? null,
     plaid_category: transaction.category ? transaction.category.join(' > ') : null,
     pending: transaction.pending,
+    // Pending → posted continuity: the posted row names the pending row it replaces. Persisted so
+    // apply_synced_transaction_batch_v2 can carry the pending row's user state across (design §5).
+    pending_transaction_id: transaction.pending_transaction_id ?? null,
   };
 }
 
@@ -1160,6 +1162,8 @@ export async function applyTransactionChanges(params: {
 
   let insertedRows: InsertedTransaction[] = [];
   const touchedTransactionIds: string[] = [];
+  let batchInserts: object[] = [];
+  let batchUpdates: object[] = [];
 
   if (upsertCandidates.length > 0) {
     const plaidIds = upsertCandidates.map((t) => t.plaid_transaction_id);
@@ -1204,6 +1208,9 @@ export async function applyTransactionChanges(params: {
           personalFinanceCategoryConfidence: t.personal_finance_category_confidence,
           manualLoanId: null,
         });
+        // The mapping's answer is a default the posting step may override with the pending row's
+        // carried category (apply_synced_transaction_batch_v2 labels it budget_category_source =
+        // 'mapping' when it stands, so a later mapping backfill can tell it from a user's choice).
         return {
           ...t,
           needs_review: true,
@@ -1273,36 +1280,79 @@ export async function applyTransactionChanges(params: {
       });
       touchedTransactionIds.push(id);
     }
-
-    if (rowsToInsert.length > 0 || rowsToUpdate.length > 0) {
-      const { data: batchResult, error: batchError } = await supabaseAdmin.rpc('apply_synced_transaction_batch', {
-        p_user_id: params.userId,
-        p_inserts: rowsToInsert,
-        p_updates: rowsToUpdate,
-      });
-      if (batchError) throw new Error(`Failed to apply synced transaction batch: ${batchError.message}`);
-      insertedRows = (batchResult ?? []) as InsertedTransaction[];
-      touchedTransactionIds.push(...insertedRows.map((r) => r.id));
-    }
+    batchInserts = rowsToInsert;
+    batchUpdates = rowsToUpdate;
   }
 
-  if (params.removed.length > 0) {
-    const removedIds = params.removed.map((t) => t.transaction_id);
-    // Round 6 remediation (blocker 4's Plaid-removal gap): a removed transaction that was linked
-    // to a manual loan (e.g. a pending row Plaid replaces with its posted counterpart) must have
-    // its principal restored to the loan's balance as part of the SAME atomic operation as the
-    // delete — a plain DELETE here would silently overstate how much principal had been paid
-    // down, permanently. See delete_transactions_and_restore_loan_balances in the Phase A
-    // migration; it is a no-op balance-wise for any removed row that wasn't loan-linked.
-    const { error } = await supabaseAdmin.rpc('delete_transactions_and_restore_loan_balances', {
+  // Pending → posted continuity (design §5): removals, inserts and updates are ONE atomic write.
+  // apply_synced_transaction_batch_v2 writes a carry-over for every removed PENDING row, restores
+  // and deletes every removed row (through the existing delete_transactions_and_restore_loan_balances
+  // — a linked pending row's principal goes back to the loan in the same transaction as the delete,
+  // never a plain DELETE), inserts/updates through the existing validated batch RPC, and then
+  // re-applies the pending row's category, approval, splits, loan link and role override to the
+  // posted row that names it. Before this, inserts/updates and removals were two RPC calls — two
+  // transactions — so a pending→posted pair could commit half-way.
+  const removedIds = params.removed.map((t) => t.transaction_id);
+  if (batchInserts.length > 0 || batchUpdates.length > 0 || removedIds.length > 0) {
+    const { data: batchResult, error: batchError } = await supabaseAdmin.rpc('apply_synced_transaction_batch_v2', {
       p_user_id: params.userId,
-      p_plaid_transaction_ids: removedIds,
+      p_inserts: batchInserts,
+      p_updates: batchUpdates,
+      p_removed_plaid_ids: removedIds,
     });
-
-    if (error) throw new Error(`Failed to delete removed transactions: ${error.message}`);
+    if (batchError) throw new Error(`Failed to apply synced transaction batch: ${batchError.message}`);
+    const result = (batchResult ?? {}) as { inserted?: InsertedTransaction[] };
+    insertedRows = result.inserted ?? [];
+    touchedTransactionIds.push(...insertedRows.map((r) => r.id));
   }
 
   return { insertedTransactions: insertedRows, touchedTransactionIds };
+}
+
+/** Thrown by the pending-row mutation wrappers when the RPC reports the row is gone — the controller
+ *  then asks `findTransactionCarryover` what happened to it (design §8). */
+export class TransactionNotFoundError extends Error {}
+
+/** Every mutation RPC reports "not found / not owned" with this prefix; anything else is a real error. */
+function throwMutationError(context: string, message: string): never {
+  if (message.includes('transaction_not_found:')) throw new TransactionNotFoundError(`${context}: transaction not found`);
+  throw new Error(`${context}: ${message}`);
+}
+
+/** What became of a pending row the user is trying to edit after Plaid removed it: `superseded` (it
+ *  posted; `postedTransactionId` is the row that replaced it), `pending_removed` (withdrawn, not yet
+ *  posted — its state is held in the carry-over), or null (nothing known). Always scoped to the
+ *  signed-in user, so one user can never learn that another user's row id existed. */
+export async function findTransactionCarryover(
+  userId: string,
+  pendingTransactionRowId: string
+): Promise<{ status: 'superseded'; postedTransactionId: string } | { status: 'pending_removed' } | null> {
+  const { data, error } = await supabaseAdmin
+    .from('transaction_carryovers')
+    .select('consumed_at, consumed_by_transaction_id, expires_at')
+    .eq('user_id', userId)
+    .eq('pending_transaction_row_id', pendingTransactionRowId)
+    .maybeSingle();
+  if (error) throw new Error(`Failed to look up transaction carry-over: ${error.message}`);
+  if (!data) return null;
+  const row = data as { consumed_at: string | null; consumed_by_transaction_id: string | null; expires_at: string };
+  if (row.consumed_by_transaction_id) return { status: 'superseded', postedTransactionId: row.consumed_by_transaction_id };
+  if (Date.parse(row.expires_at) > Date.now()) return { status: 'pending_removed' };
+  return null;
+}
+
+/** Best-effort housekeeping after a sync (design §7): drops carry-overs that expired unconsumed (the
+ *  pending transaction never posted) and consumed ones older than 30 days. Nothing financial depends
+ *  on a carry-over after it is consumed or expired. */
+export async function sweepTransactionCarryovers(userId: string): Promise<void> {
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const nowIso = new Date().toISOString();
+  const { error } = await supabaseAdmin
+    .from('transaction_carryovers')
+    .delete()
+    .eq('user_id', userId)
+    .or(`and(consumed_at.is.null,expires_at.lt.${nowIso}),and(consumed_at.not.is.null,consumed_at.lt.${cutoff})`);
+  if (error) throw new Error(`Failed to sweep transaction carry-overs: ${error.message}`);
 }
 
 /** `start`/`end` are both inclusive (YYYY-MM-DD) — matches TransactionsFeed's existing client-side
@@ -1321,7 +1371,7 @@ export async function getRecentTransactionsForUser(
   let query = supabaseAdmin
     .from('transactions')
     .select(
-      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, accounts!inner(name, nickname, plaid_items!inner(user_id, institution_name)), splits:transaction_splits(id, budget_category_id, amount, note)'
+      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, pending_transaction_id, posted_from_pending_amount, review_note, accounts!inner(name, nickname, plaid_items!inner(user_id, institution_name)), splits:transaction_splits(id, budget_category_id, amount, note)'
     )
     .eq('accounts.plaid_items.user_id', userId);
   if (start) query = query.gte('date', start);
@@ -1330,6 +1380,22 @@ export async function getRecentTransactionsForUser(
   const { data, error } = await query.order('date', { ascending: false }).limit(limit);
 
   if (error) throw new Error(`Failed to load transactions: ${error.message}`);
+  return data;
+}
+
+/** One transaction in the feed's shape (the same columns getRecentTransactionsForUser selects), or
+ *  null when it does not exist for this user — used to hand a client the posted row that superseded
+ *  the pending row it tried to edit (continuity design §8). */
+export async function getTransactionItemForUser(userId: string, transactionId: string) {
+  const { data, error } = await supabaseAdmin
+    .from('transactions')
+    .select(
+      'id, amount, iso_currency_code, date, name, merchant_name, category, plaid_category, pending, budget_category_id, needs_review, pending_transaction_id, posted_from_pending_amount, review_note, accounts!inner(name, nickname, plaid_items!inner(user_id, institution_name)), splits:transaction_splits(id, budget_category_id, amount, note)'
+    )
+    .eq('accounts.plaid_items.user_id', userId)
+    .eq('id', transactionId)
+    .maybeSingle();
+  if (error) throw new Error(`Failed to load transaction: ${error.message}`);
   return data;
 }
 
@@ -1395,30 +1461,32 @@ export async function getTransactionOwnerId(transactionId: string): Promise<stri
   return accounts.plaid_items.user_id;
 }
 
+/** Sets or clears (null) a transaction's budget category through `set_transaction_budget_category`
+ *  (continuity design §6): under the per-user advisory lock, so it serialises with a posting of the
+ *  same pending row and is either carried across or answered as superseded; records
+ *  `budget_category_source = 'user'` — also for null, a deliberate clear the mapping backfill and the
+ *  posting step must never undo. Throws TransactionNotFoundError when the row is gone. */
 export async function setTransactionCategory(
+  userId: string,
   transactionId: string,
   budgetCategoryId: string | null
 ): Promise<TransactionRow> {
-  const { data, error } = await supabaseAdmin
-    .from('transactions')
-    .update({ budget_category_id: budgetCategoryId })
-    .eq('id', transactionId)
-    .select()
-    .single();
-
-  if (error) throw new Error(`Failed to set transaction category: ${error.message}`);
+  const { data, error } = await supabaseAdmin.rpc('set_transaction_budget_category', {
+    p_user_id: userId,
+    p_transaction_id: transactionId,
+    p_budget_category_id: budgetCategoryId,
+  });
+  if (error) throwMutationError('Failed to set transaction category', error.message);
   return data as TransactionRow;
 }
 
-export async function approveTransaction(transactionId: string): Promise<TransactionRow> {
-  const { data, error } = await supabaseAdmin
-    .from('transactions')
-    .update({ needs_review: false })
-    .eq('id', transactionId)
-    .select()
-    .single();
-
-  if (error) throw new Error(`Failed to approve transaction: ${error.message}`);
+/** Approves a transaction through `approve_transaction` (same lock; also clears `review_note`). */
+export async function approveTransaction(userId: string, transactionId: string): Promise<TransactionRow> {
+  const { data, error } = await supabaseAdmin.rpc('approve_transaction', {
+    p_user_id: userId,
+    p_transaction_id: transactionId,
+  });
+  if (error) throwMutationError('Failed to approve transaction', error.message);
   return data as TransactionRow;
 }
 
@@ -2412,82 +2480,57 @@ export async function backfillCategoryMapping(
   plaidCategory: string,
   budgetCategoryId: string
 ): Promise<number> {
-  const { data: matches, error: fetchError } = await supabaseAdmin
-    .from('transactions')
-    .select('id, accounts!inner(plaid_items!inner(user_id))')
-    .eq('accounts.plaid_items.user_id', userId)
-    .eq('category', plaidCategory)
-    .is('budget_category_id', null);
-
-  if (fetchError) throw new Error(`Failed to find transactions to backfill: ${fetchError.message}`);
-  const ids = (matches as unknown as { id: string }[]).map((m) => m.id);
-  if (ids.length === 0) return 0;
-
-  const { error: updateError } = await supabaseAdmin
-    .from('transactions')
-    .update({ budget_category_id: budgetCategoryId })
-    .in('id', ids);
-
-  if (updateError) throw new Error(`Failed to backfill transactions: ${updateError.message}`);
-  return ids.length;
+  // Continuity design §6.1: one locked RPC. It skips every row the user deliberately cleared
+  // (budget_category_source = 'user'), labels what it fills, and also fills matching carry-overs of
+  // pending rows Plaid removed but has not yet posted — the old select-then-UPDATE here could
+  // refill a deliberate clear and raced with posting.
+  const { data, error } = await supabaseAdmin.rpc('backfill_category_mapping', {
+    p_user_id: userId,
+    p_plaid_category: plaidCategory,
+    p_budget_category_id: budgetCategoryId,
+  });
+  if (error) throw new Error(`Failed to backfill transactions: ${error.message}`);
+  return (data as number | null) ?? 0;
 }
 
 // ---- Transaction splits ---------------------------------------------------------
 
-/** Replaces a transaction's splits wholesale (delete-then-insert — there's no natural way to
- *  diff a list of line items against what's already there). Throws if the transaction doesn't
- *  belong to the user, or if the new splits don't sum to the transaction's own amount — a split
- *  reallocates the existing amount across categories, it doesn't change it. */
+/** Thrown when the splits RPC rejects the draft itself (unbalanced sum, a category that isn't the
+ *  user's, a non-finite amount) — a 400 for the client, unlike a missing transaction. */
+export class InvalidSplitsError extends Error {}
+
+/** Replaces a transaction's splits wholesale through `replace_transaction_splits` (continuity design
+ *  §6): one transaction under the per-user lock — the previous delete-then-insert could leave a row
+ *  with no splits if the insert failed after the delete. The RPC verifies ownership, that every
+ *  category is the user's, and that the splits sum to the transaction's own amount to the cent (a
+ *  split reallocates the existing amount across categories, it doesn't change it). */
 export async function setTransactionSplits(
   transactionId: string,
   userId: string,
   splits: { budgetCategoryId: string; amount: number; note: string | null }[]
 ): Promise<TransactionSplitRow[]> {
-  const { data: txn, error: fetchError } = await supabaseAdmin
-    .from('transactions')
-    .select('amount, accounts!inner(plaid_items!inner(user_id))')
-    .eq('id', transactionId)
-    .maybeSingle();
-
-  if (fetchError) throw new Error(`Failed to load transaction: ${fetchError.message}`);
-  if (!txn) throw new Error('Transaction not found');
-
-  const owner = (txn.accounts as unknown as { plaid_items: { user_id: string } }).plaid_items.user_id;
-  if (owner !== userId) throw new Error('Transaction not found');
-
-  const total = roundToCents(splits.reduce((sum, s) => sum + s.amount, 0));
-  if (total !== roundToCents(txn.amount as number)) {
-    throw new Error(`Splits must add up to the transaction's amount (${(txn.amount as number).toFixed(2)})`);
+  const { data, error } = await supabaseAdmin.rpc('replace_transaction_splits', {
+    p_user_id: userId,
+    p_transaction_id: transactionId,
+    p_splits: splits.map((s) => ({ budget_category_id: s.budgetCategoryId, amount: s.amount, note: s.note })),
+  });
+  if (error) {
+    if (error.message.includes('splits_unbalanced:') || error.message.includes('splits_invalid:')) {
+      throw new InvalidSplitsError(error.message.replace(/^.*?(splits_unbalanced|splits_invalid): replace_transaction_splits: /, ''));
+    }
+    throwMutationError('Failed to save transaction splits', error.message);
   }
-
-  const { error: deleteError } = await supabaseAdmin
-    .from('transaction_splits')
-    .delete()
-    .eq('transaction_id', transactionId);
-  if (deleteError) throw new Error(`Failed to clear existing splits: ${deleteError.message}`);
-
-  const { data, error: insertError } = await supabaseAdmin
-    .from('transaction_splits')
-    .insert(
-      splits.map((s) => ({
-        transaction_id: transactionId,
-        budget_category_id: s.budgetCategoryId,
-        amount: s.amount,
-        note: s.note,
-      }))
-    )
-    .select();
-
-  if (insertError) throw new Error(`Failed to save transaction splits: ${insertError.message}`);
-  return data as TransactionSplitRow[];
+  return (data ?? []) as TransactionSplitRow[];
 }
 
+/** Clears a transaction's splits — the same RPC with an empty array, so it takes the same lock. */
 export async function clearTransactionSplits(transactionId: string, userId: string): Promise<void> {
-  const ownerId = await getTransactionOwnerId(transactionId);
-  if (!ownerId || ownerId !== userId) throw new Error('Transaction not found');
-
-  const { error } = await supabaseAdmin.from('transaction_splits').delete().eq('transaction_id', transactionId);
-  if (error) throw new Error(`Failed to clear transaction splits: ${error.message}`);
+  const { error } = await supabaseAdmin.rpc('replace_transaction_splits', {
+    p_user_id: userId,
+    p_transaction_id: transactionId,
+    p_splits: [],
+  });
+  if (error) throwMutationError('Failed to clear transaction splits', error.message);
 }
 
 // ---- User preferences ---------------------------------------------------------

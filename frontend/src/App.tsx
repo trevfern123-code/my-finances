@@ -1204,9 +1204,42 @@ export default function App() {
       if (committed) refreshBudgetCategories();
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
-        setActionError(err instanceof Error ? err.message : 'Failed to update category');
+        if (!handleTransactionGone(err, transactionId, expectedSessionId)) {
+          setActionError(err instanceof Error ? err.message : 'Failed to update category');
+        }
       }
     }
+  }
+
+  /**
+   * Pending → posted continuity: an edit that reaches the server after Plaid replaced the pending row
+   * is refused with what happened. `transaction_superseded` carries the posted row — the feed swaps it
+   * in for the dead pending row and tells the user to redo the change there (the earlier changes made
+   * while it was pending were carried across by the server). `transaction_pending_removed` means the
+   * bank withdrew the pending transaction; the row is dropped from the feed. Returns true when handled.
+   */
+  function handleTransactionGone(err: unknown, transactionId: string, expectedSessionId: string | null): boolean {
+    const code = (err as { code?: string } | null)?.code;
+    if (code === 'transaction_superseded') {
+      const posted = (err as { superseded_by?: TransactionItem }).superseded_by;
+      commitMutationForResource('transactions', expectedSessionId, () => {
+        setTransactions((prev) =>
+          posted
+            ? prev.map((t) => (t.id === transactionId ? posted : t))
+            : prev.filter((t) => t.id !== transactionId)
+        );
+      });
+      setActionError(err instanceof Error ? err.message : 'This pending transaction has posted.');
+      return true;
+    }
+    if (code === 'transaction_pending_removed') {
+      commitMutationForResource('transactions', expectedSessionId, () => {
+        setTransactions((prev) => prev.filter((t) => t.id !== transactionId));
+      });
+      setActionError(err instanceof Error ? err.message : 'Your bank withdrew this pending transaction.');
+      return true;
+    }
+    return false;
   }
 
   async function handleApproveTransaction(transactionId: string) {
@@ -1217,12 +1250,14 @@ export default function App() {
       await approveTransaction(transactionId, ownership.verify);
       commitMutationForResource('transactions', expectedSessionId, () => {
         setTransactions((prev) =>
-          prev.map((t) => (t.id === transactionId ? { ...t, needs_review: false } : t))
+          prev.map((t) => (t.id === transactionId ? { ...t, needs_review: false, review_note: null } : t))
         );
       });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
-        setActionError(err instanceof Error ? err.message : 'Failed to approve transaction');
+        if (!handleTransactionGone(err, transactionId, expectedSessionId)) {
+          setActionError(err instanceof Error ? err.message : 'Failed to approve transaction');
+        }
       }
     }
   }

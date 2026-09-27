@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response, NextFunction } from 'express';
 import {
+  approveTransaction,
+  clearTransactionSplits,
   completeLinkAttempt,
   completeReauth,
   createLinkToken,
@@ -12,6 +14,8 @@ import {
   previewItemRemoval,
   refreshAccounts,
   removeInstitution,
+  setTransactionCategory,
+  setTransactionSplits,
   syncTransactions,
 } from './plaidController';
 import { ItemRemovalIncompleteError } from '../services/itemRemoval';
@@ -42,8 +46,24 @@ const dataServiceErrors = vi.hoisted(() => ({
     }
   },
   PlaidLinkStoreOutcomeUnknownError: class PlaidLinkStoreOutcomeUnknownError extends Error {},
+  TransactionNotFoundError: class TransactionNotFoundError extends Error {},
+  InvalidSplitsError: class InvalidSplitsError extends Error {},
 }));
+const mockSetTransactionCategory = vi.hoisted(() => vi.fn());
+const mockApproveTransaction = vi.hoisted(() => vi.fn());
+const mockSetTransactionSplits = vi.hoisted(() => vi.fn());
+const mockClearTransactionSplits = vi.hoisted(() => vi.fn());
+const mockBudgetCategoryBelongsToUser = vi.hoisted(() => vi.fn());
+const mockFindTransactionCarryover = vi.hoisted(() => vi.fn());
+const mockGetTransactionItemForUser = vi.hoisted(() => vi.fn());
 vi.mock('../services/dataService', () => ({
+  setTransactionCategory: mockSetTransactionCategory,
+  approveTransaction: mockApproveTransaction,
+  setTransactionSplits: mockSetTransactionSplits,
+  clearTransactionSplits: mockClearTransactionSplits,
+  budgetCategoryBelongsToUser: mockBudgetCategoryBelongsToUser,
+  findTransactionCarryover: mockFindTransactionCarryover,
+  getTransactionItemForUser: mockGetTransactionItemForUser,
   createPlaidLinkAttempt: mockCreatePlaidLinkAttempt,
   readPlaidLinkAttempt: mockReadPlaidLinkAttempt,
   claimPlaidLinkAttempt: mockClaimPlaidLinkAttempt,
@@ -1176,5 +1196,79 @@ describe('Linked Institution Management — connections, removal and reconnect g
       await syncTransactions(authedReq(userA), res, next);
       expect(next).toHaveBeenCalled();
     });
+  });
+});
+
+// Pending → posted continuity (design §8): a mutation whose transaction is gone is resolved through
+// the user-scoped carry-over lookup — superseded (with the posted row), withdrawn, or a plain 404.
+describe('transaction mutations racing a posting (pending → posted continuity)', () => {
+  const txnReq = (transactionId: string, body?: unknown) => authedReq(userA, { params: { transactionId }, body });
+  const gone = () => new dataServiceErrors.TransactionNotFoundError('gone');
+
+  beforeEach(() => {
+    mockBudgetCategoryBelongsToUser.mockResolvedValue(true);
+    mockFindTransactionCarryover.mockResolvedValue(null);
+  });
+
+  it('category: passes the signed-in user to the locked RPC and returns the row', async () => {
+    mockSetTransactionCategory.mockResolvedValue({ id: 'txn-1', budget_category_id: 'cat-1', budget_category_source: 'user' });
+    const res = fakeRes();
+    await setTransactionCategory(txnReq('txn-1', { budget_category_id: 'cat-1' }), res, next);
+    expect(mockSetTransactionCategory).toHaveBeenCalledWith('user-a', 'txn-1', 'cat-1');
+    expect(jsonBody(res)).toEqual({ transaction: expect.objectContaining({ budget_category_source: 'user' }) });
+  });
+
+  it('category: a row Plaid has since posted → 409 transaction_superseded with the posted row, looked up for THIS user', async () => {
+    mockSetTransactionCategory.mockRejectedValue(gone());
+    mockFindTransactionCarryover.mockResolvedValue({ status: 'superseded', postedTransactionId: 'txn-posted' });
+    mockGetTransactionItemForUser.mockResolvedValue({ id: 'txn-posted', amount: 60.1, pending_transaction_id: 'plaid-p' });
+    const res = fakeRes();
+    await setTransactionCategory(txnReq('txn-pending', { budget_category_id: null }), res, next);
+    expect(mockFindTransactionCarryover).toHaveBeenCalledWith('user-a', 'txn-pending');
+    expect(mockGetTransactionItemForUser).toHaveBeenCalledWith('user-a', 'txn-posted');
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(jsonBody(res)).toEqual({
+      error: expect.stringContaining('has posted'),
+      code: 'transaction_superseded',
+      superseded_by: expect.objectContaining({ id: 'txn-posted' }),
+    });
+  });
+
+  it('approve: a pending row the bank withdrew (not yet posted) → 409 transaction_pending_removed, nothing written', async () => {
+    mockApproveTransaction.mockRejectedValue(gone());
+    mockFindTransactionCarryover.mockResolvedValue({ status: 'pending_removed' });
+    const res = fakeRes();
+    await approveTransaction(txnReq('txn-pending'), res, next);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(jsonBody(res)).toEqual({ error: expect.stringContaining('withdrew'), code: 'transaction_pending_removed' });
+    expect(mockGetTransactionItemForUser).not.toHaveBeenCalled();
+  });
+
+  it("splits and clear: another user's row (no carry-over for this user) is a plain 404", async () => {
+    mockSetTransactionSplits.mockRejectedValue(gone());
+    mockClearTransactionSplits.mockRejectedValue(gone());
+    const res1 = fakeRes();
+    await setTransactionSplits(txnReq('txn-b', { splits: [{ budget_category_id: 'cat-1', amount: 5 }] }), res1, next);
+    expect(res1.status).toHaveBeenCalledWith(404);
+    const res2 = fakeRes();
+    await clearTransactionSplits(txnReq('txn-b'), res2, next);
+    expect(res2.status).toHaveBeenCalledWith(404);
+    expect(mockFindTransactionCarryover).toHaveBeenCalledWith('user-a', 'txn-b');
+  });
+
+  it("splits: the RPC's balance refusal is a 400 with code splits_invalid", async () => {
+    mockSetTransactionSplits.mockRejectedValue(new dataServiceErrors.InvalidSplitsError("splits must add up to the transaction's amount (50.00)"));
+    const res = fakeRes();
+    await setTransactionSplits(txnReq('txn-1', { splits: [{ budget_category_id: 'cat-1', amount: 30 }] }), res, next);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(jsonBody(res)).toEqual({ error: "splits must add up to the transaction's amount (50.00)", code: 'splits_invalid' });
+  });
+
+  it('any other failure still goes to the error handler', async () => {
+    mockApproveTransaction.mockRejectedValue(new Error('connection reset'));
+    const res = fakeRes();
+    await approveTransaction(txnReq('txn-1'), res, next);
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ message: 'connection reset' }));
+    expect(res.status).not.toHaveBeenCalled();
   });
 });
