@@ -789,10 +789,11 @@ needs them. Status as of the audited production baseline (`d2cf720`, 2026-09-24)
 - **Required V1 functionality**
   - **Linked institution management**: implemented on `feature/linked-institution-management`
     (see "Linked institution management"), pending review and release.
-  - **Pending→posted transaction continuity** (next): persist Plaid's `pending_transaction_id` and
-    carry a pending row's manual-loan link, category, review state and splits to its posted row.
-    Not a prerequisite for institution removal (the applied-amount ledger makes removal exact
-    regardless of lineage), but required before Financial Semantics Phase B.
+  - **Pending→posted transaction continuity**: implemented on `feature/pending-posted-continuity`
+    (see "Pending → posted transaction continuity"), pending review and release. Persists Plaid's
+    `pending_transaction_id` and carries a pending row's manual-loan link, category (including a
+    deliberate clear), review state and splits to its posted row in one atomic sync write. Required
+    before Financial Semantics Phase B.
   - User role correction; transaction pagination (the API caps a request at 200 rows). The
     Reconnect stuck-state fix shipped with the frontend update manager.
 - **Release hardening**
@@ -1134,8 +1135,12 @@ instead of delete-then-insert) and the mapping backfill (`backfill_category_mapp
 user-cleared rows, labels its fills `'mapping'` and also fills unconsumed carry-overs) are RPCs that
 take the per-user lock first. So an edit either lands before the posting and is carried, or finds
 the row gone: the controller then answers `409 transaction_superseded` (with the posted row) or
-`409 transaction_pending_removed`, looked up **for the signed-in user only**; the frontend swaps the
-posted row in or drops the withdrawn one.
+`409 transaction_pending_removed`, looked up **for the signed-in user only**
+(`controllers/transactionGone.ts`, shared by category, approval, splits and the manual-loan payment
+edits — principal and unlink — whose pre-read/RPC pair can also lose the race). The frontend routes
+every such refusal through one reducer (`lib/transactionContinuity.ts`): the posted row is swapped in
+as an ID-deduplicating upsert (a copy already loaded by a refresh never appears twice), a withdrawn
+row is dropped, and the split editor keyed to the dead row unmounts with it.
 
 **Rollback-window safeguard.** Every new-backend category writer stamps `budget_category_set_seq`
 from a sequence (guaranteed to differ on every write, even within one transaction). The
@@ -1151,7 +1156,9 @@ arrival order, amount change, sign flip, deleted loan, replay, expiry, ledger ex
 approve), `c10` (a category edit racing the posting waits, then is reported superseded), `c11` (the
 backfill waits on the posting, then fills the posted row). Backend: `dataService` (one v2 call, RPC
 wrappers, `TransactionNotFoundError`, user-scoped carry-over lookup), controller superseded /
-pending-removed responses. Frontend: `transactionsFeedContinuity.test.tsx`.
+pending-removed responses for category, approve, splits, and the manual-loan principal edit and
+unlink. Frontend: `transactionsFeedContinuity.test.tsx` (display copy) and
+`lib/transactionContinuity.test.ts` (the superseded / withdrawn reducer, incl. deduplication).
 
 **Runbook.** A posted row flagged with a `review_note`: read the note, check the amounts/splits/link,
 approve (clears the note). `select * from transaction_carryovers where consumed_at is null` lists

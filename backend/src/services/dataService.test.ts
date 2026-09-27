@@ -3052,3 +3052,48 @@ describe('Linked Institution Management — item status writes and removal wrapp
     expect(query.is).toHaveBeenCalledWith('reconciled_at', null);
   });
 });
+
+describe('linked-payment edits when the pending row has posted (pending → posted continuity)', () => {
+  beforeEach(() => mockRpc.mockReset());
+
+  it('updateLinkedPaymentPrincipal: a row missing at the pre-read is TransactionNotFoundError; a different loan is a plain error', async () => {
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: null, error: null }));
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100)).rejects.toBeInstanceOf(TransactionNotFoundError);
+    expect(mockRpc).not.toHaveBeenCalled();
+
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: { manual_loan_id: 'loan-2', amount: 200 }, error: null }));
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100)).rejects.toThrow('Payment is not linked to this loan');
+  });
+
+  it('updateLinkedPaymentPrincipal: the RPC losing the race (row deleted between read and lock) is TransactionNotFoundError', async () => {
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: { manual_loan_id: 'loan-1', amount: 200 }, error: null }));
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'update_linked_payment_principal: transaction not found or not owned by user' },
+    });
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100)).rejects.toBeInstanceOf(TransactionNotFoundError);
+  });
+
+  it('unlinkPaymentFromLoan: missing at the pre-read, or gone by the time the RPC locks, is TransactionNotFoundError; other RPC errors stay plain', async () => {
+    const linkedRow = {
+      manual_loan_id: 'loan-1',
+      amount: 200,
+      category: null,
+      personal_finance_category_detailed: null,
+      personal_finance_category_confidence: null,
+    };
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: null, error: null }));
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toBeInstanceOf(TransactionNotFoundError);
+
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: linkedRow, error: null }));
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'unlink_transaction_from_manual_loan: transaction not found or not owned by user' },
+    });
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toBeInstanceOf(TransactionNotFoundError);
+
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: linkedRow, error: null }));
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'connection reset' } });
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toThrow('Failed to unlink payment: connection reset');
+  });
+});

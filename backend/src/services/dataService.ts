@@ -2038,7 +2038,11 @@ export async function updateLinkedPaymentPrincipal(
     .maybeSingle();
 
   if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
-  if (!txn || txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
+  // Pending → posted continuity: the row can vanish between this read and the RPC (or before it) when
+  // Plaid posts the pending transaction. That is not a generic failure — the controller resolves it
+  // through the user-scoped carry-over (superseded / withdrawn), so signal it as TransactionNotFoundError.
+  if (!txn) throw new TransactionNotFoundError('Payment not found');
+  if (txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
 
   // WRITE-boundary validation (Round 2 remediation §7) — same rule as linkTransactionToLoan; the
   // RPC re-validates this bound again itself (defense in depth).
@@ -2050,7 +2054,14 @@ export async function updateLinkedPaymentPrincipal(
     p_loan_id: loanId,
     p_new_principal_portion: normalizedPrincipal,
   });
-  if (error) throw new Error(`Failed to update payment: ${error.message}`);
+  if (error) {
+    // The RPC re-reads under the per-user lock; a row the posting deleted (or another user's row)
+    // surfaces here as its own "not found or not owned" error.
+    if (error.message.includes('transaction not found or not owned by user')) {
+      throw new TransactionNotFoundError('Payment not found');
+    }
+    throw new Error(`Failed to update payment: ${error.message}`);
+  }
 }
 
 /** Reverses a payment link — restores the loan's balance by the portion that had been applied
@@ -2074,7 +2085,9 @@ export async function unlinkPaymentFromLoan(userId: string, transactionId: strin
     .maybeSingle();
 
   if (fetchError) throw new Error(`Failed to load payment: ${fetchError.message}`);
-  if (!txn) throw new Error('Payment not found');
+  // Pending → posted continuity: a pending row Plaid has since posted is gone; the controller
+  // resolves what happened through the user-scoped carry-over rather than reporting a failure.
+  if (!txn) throw new TransactionNotFoundError('Payment not found');
   if (txn.manual_loan_id === null) return false; // already unlinked — idempotent no-op, no RPC call needed
   if (txn.manual_loan_id !== loanId) throw new Error('Payment is not linked to this loan');
 
@@ -2100,7 +2113,12 @@ export async function unlinkPaymentFromLoan(userId: string, transactionId: strin
     p_role_confidence: classification.roleConfidence,
     p_classifier_version: classification.classifierVersion,
   });
-  if (error) throw new Error(`Failed to unlink payment: ${error.message}`);
+  if (error) {
+    if (error.message.includes('transaction not found or not owned by user')) {
+      throw new TransactionNotFoundError('Payment not found');
+    }
+    throw new Error(`Failed to unlink payment: ${error.message}`);
+  }
   return data as boolean;
 }
 

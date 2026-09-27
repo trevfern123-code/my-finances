@@ -59,6 +59,7 @@ import {
 import { currentGenerationValue } from './lib/authGeneration';
 import { groupCardsIntoRows, type CardId } from './lib/dashboardLayout';
 import { decodeSessionId } from './lib/jwt';
+import { resolveTransactionGone } from './lib/transactionContinuity';
 import { createSessionOwnership } from './lib/sessionOwnership';
 import { getVisibleOrderedTabIds } from './lib/navLayout';
 import { NavigationWriteCoordinator } from './lib/navigationWriteCoordinator';
@@ -1219,27 +1220,15 @@ export default function App() {
    * bank withdrew the pending transaction; the row is dropped from the feed. Returns true when handled.
    */
   function handleTransactionGone(err: unknown, transactionId: string, expectedSessionId: string | null): boolean {
-    const code = (err as { code?: string } | null)?.code;
-    if (code === 'transaction_superseded') {
-      const posted = (err as { superseded_by?: TransactionItem }).superseded_by;
-      commitMutationForResource('transactions', expectedSessionId, () => {
-        setTransactions((prev) =>
-          posted
-            ? prev.map((t) => (t.id === transactionId ? posted : t))
-            : prev.filter((t) => t.id !== transactionId)
-        );
-      });
-      setActionError(err instanceof Error ? err.message : 'This pending transaction has posted.');
-      return true;
-    }
-    if (code === 'transaction_pending_removed') {
-      commitMutationForResource('transactions', expectedSessionId, () => {
-        setTransactions((prev) => prev.filter((t) => t.id !== transactionId));
-      });
-      setActionError(err instanceof Error ? err.message : 'Your bank withdrew this pending transaction.');
-      return true;
-    }
-    return false;
+    // The list change itself is the pure reducer in lib/transactionContinuity.ts (ID-deduplicating
+    // upsert of the posted row, or removal of the withdrawn one); this only commits it to state.
+    const probe = resolveTransactionGone([], transactionId, err);
+    if (!probe) return false;
+    commitMutationForResource('transactions', expectedSessionId, () => {
+      setTransactions((prev) => resolveTransactionGone(prev, transactionId, err)?.transactions ?? prev);
+    });
+    setActionError(probe.message);
+    return true;
   }
 
   async function handleApproveTransaction(transactionId: string) {
@@ -1267,13 +1256,25 @@ export default function App() {
   // session check inside commitMutationForResource still applies — a stale lifecycle's own error
   // handling is SplitEditor's business, but its successful response must not mutate a NEWER
   // lifecycle's transactions.
+  // Pending → posted continuity: a split save/clear that loses the race to the posting is not an
+  // editor-level error. The row it targeted is gone, so the feed must change — the posted row swapped
+  // in (or the withdrawn row dropped) — and the editor, which is keyed to the dead row's id, unmounts
+  // with it. Resolving (not rethrowing) here is what lets SplitEditor end its saving state; the
+  // page-level message explains what happened. Any other error still throws to SplitEditor's inline
+  // message as before.
   async function handleSaveTransactionSplits(
     transactionId: string,
     splits: { budget_category_id: string; amount: number }[]
   ) {
     const expectedSessionId = sessionIdRef.current;
     const ownership = captureOwnership();
-    const res = await saveTransactionSplits(transactionId, splits, ownership.verify);
+    let res;
+    try {
+      res = await saveTransactionSplits(transactionId, splits, ownership.verify);
+    } catch (err) {
+      if (isStillCurrentSession(expectedSessionId) && handleTransactionGone(err, transactionId, expectedSessionId)) return;
+      throw err;
+    }
     const committed = commitMutationForResource('transactions', expectedSessionId, () => {
       setTransactions((prev) => prev.map((t) => (t.id === transactionId ? { ...t, splits: res.splits } : t)));
     });
@@ -1283,7 +1284,12 @@ export default function App() {
   async function handleClearTransactionSplits(transactionId: string) {
     const expectedSessionId = sessionIdRef.current;
     const ownership = captureOwnership();
-    await clearTransactionSplits(transactionId, ownership.verify);
+    try {
+      await clearTransactionSplits(transactionId, ownership.verify);
+    } catch (err) {
+      if (isStillCurrentSession(expectedSessionId) && handleTransactionGone(err, transactionId, expectedSessionId)) return;
+      throw err;
+    }
     const committed = commitMutationForResource('transactions', expectedSessionId, () => {
       setTransactions((prev) => prev.map((t) => (t.id === transactionId ? { ...t, splits: [] } : t)));
     });

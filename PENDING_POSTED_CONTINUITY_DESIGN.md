@@ -1,13 +1,16 @@
 # Pending → posted transaction continuity — Design for review
 
-**Status:** design only, revision 5. No code, schema or production data is changed by this document.
+**Status:** revision 5, approved by Codex; **implemented** on `feature/pending-posted-continuity`
+(commit `a34c005` plus the Codex remediation commit that follows it). This is the design of record for
+that implementation; where the code differs it is noted inline (the sequence-based protocol marker
+`budget_category_set_seq`, §4/§6.2). Not yet merged, and the migration is not yet applied to production.
 **Decided (Trevor):** C1–C6 as recommended (§11).
 
 **Revision 5 — changes from Codex's fourth review (one blocker):**
 1. §6.2: a **backstop trigger** for the backend-rollback window. An old backend's lock-free mapping
    backfill could fill a category the user deliberately cleared through the new backend while leaving
    `budget_category_source = 'user'`, so the returning new backend would read the fill as the user's
-   choice. New-backend writers now stamp `budget_category_set_at`; a `BEFORE UPDATE` trigger keeps a
+   choice. New-backend writers now stamp `budget_category_set_seq`; a `BEFORE UPDATE` trigger keeps a
    `'user'`-cleared row at NULL when a writer changes the value without touching the stamp — the same
    silent-pin pattern as `plaid_items_keep_removing`. Regression tests K20/K20b.
 2. §10 K19 now states its assumption (pending and posted Plaid categories match); §9/§12 count **five
@@ -170,7 +173,7 @@ create table public.transaction_carryovers (
   pending_plaid_category        text null,      -- the pending row's Plaid `category`: lets backfill_category_mapping fill an unconsumed carry-over of that category exactly as it fills a live row (§6.1)
   budget_category_id            uuid null references public.budget_categories(id) on delete set null,
   budget_category_source        text null,
-  budget_category_set_at        timestamptz null,
+  budget_category_set_seq       bigint null,
   needs_review                  boolean not null,
   user_role_override            text null,
   user_role_override_at         timestamptz null,
@@ -264,7 +267,7 @@ second step. Per page, in this order:
       §6.1); an existing mapping does not apply itself to it. Otherwise the user categorises it by
       hand. Pending and posted Plaid categories rarely differ, so this is uncommon; decision **C6**
       (§11, decided) records the alternative and why it is not recommended.
-    - `budget_category_set_at` is copied along with the value and label (§6.2).
+    - `budget_category_set_seq` is copied along with the value and label (§6.2).
     - **Old-backend edits during rollout and rollback** (§9 windows 2 and 4): an old backend's direct
       `UPDATE` sets or clears the value and leaves the label stale. Because posting copies exactly, a
       value it set is preserved and a value it cleared stays cleared — the stale label changes
@@ -396,7 +399,7 @@ protection has to live in the database, where it applies to every backend versio
   if old.budget_category_source = 'user'
      and old.budget_category_id is null
      and new.budget_category_id is not null
-     and new.budget_category_set_at is not distinct from old.budget_category_set_at then
+     and new.budget_category_set_seq is not distinct from old.budget_category_set_seq then
     new.budget_category_id := null;   -- a writer that does not know the protocol is filling a deliberate clear: keep the clear
   end if;
   return new;
@@ -454,9 +457,12 @@ With §6, every mutation and the posting serialise on the per-user lock:
   `pending_transaction_row_id = <the id the client sent>`** — never by id alone, so a user can never
   learn that another user's row id existed or was superseded:
   - consumed → `409 transaction_superseded` with `superseded_by: <posted TransactionItem>` (its
-    ownership is implied by the user-scoped lookup); the UI re-renders the posted row and, for a role
-    override, re-issues against it with a fresh CAS value — automatically when the amount is
-    unchanged, after a confirm when it changed;
+    ownership is implied by the user-scoped lookup); the UI swaps the posted row into the dead pending
+    row's place (an ID-deduplicating upsert — if a refresh already loaded the posted row, the pending
+    row is dropped and the loaded copy refreshed), shows the server's message, and the user redoes
+    the change on the posted row. (Automatic re-issue of a role override against the posted row is
+    Phase B's concern, not implemented here.) This applies to every transaction mutation: category,
+    approval, split save/clear, and the manual-loan payment edits (principal, unlink);
   - unconsumed (removed, not yet posted) → `409 transaction_pending_removed`, "Your bank withdrew
     this pending transaction. If it posts, your earlier changes will carry over." Nothing is written
     (C5);
@@ -480,8 +486,8 @@ against what:
 | 1. Before the migration | old | old | today |
 | 2. Migration applied, old backend still running | old | new | old backend calls the old RPCs: inserts/updates then a separate delete; no carry-overs are written; a pending row removed in this window loses its corrections exactly as today (degradation, not corruption). Its category/approve/splits/backfill writes are today's lock-free ones and leave `budget_category_source` null or stale; posting later copies whatever value they left (§5 I3), so nothing they set or cleared is changed — only a clear they made stays fillable by a later backfill, as today. New columns are otherwise null; the new table is empty. |
 | 3. New backend deployed | new | new | new backend calls `_v2` and the mutation RPCs; continuity active. |
-| 4. Rollback of the backend | old | new | back to window 2 behaviour. Unconsumed carry-overs simply expire; consumed ones are inert audit rows; `review_note`/`posted_from_pending_amount`/`budget_category_source`/`budget_category_set_at` are ignored by the old code. The old category `UPDATE` leaves the label stale — harmless, because posting copies the value exactly whatever the label says (§5 I3). The old lock-free backfill tries to fill every NULL row, including clears labelled `'user'`: the **trigger (§6.2) keeps those at NULL**, so no mapping fill can masquerade as a user choice when the new backend returns; NULL rows labelled null/`'mapping'` are filled as today. Limitation: a new-backend clear cannot be re-categorised through the old UI in this window (§6.2). |
-| 5. Schema rollback (only if abandoning the feature) | old | old | drop the table, the index, the trigger and its function, the **five RPCs** (`apply_synced_transaction_batch_v2`, `set_transaction_budget_category`, `approve_transaction`, `replace_transaction_splits`, `backfill_category_mapping`) and the **five continuity-only columns** (`pending_transaction_id`, `posted_from_pending_amount`, `review_note`, `budget_category_source`, `budget_category_set_at`); the old RPCs were never touched, so nothing has to be restored. **`user_role_override_at` is never dropped**: it is Phase B's user-history column, created here only for migration ordering; once any row holds a value, dropping it would destroy when the user made a correction. It is nullable and harmless to every backend version. Data in the dropped columns is not financial. |
+| 4. Rollback of the backend | old | new | back to window 2 behaviour. Unconsumed carry-overs simply expire; consumed ones are inert audit rows; `review_note`/`posted_from_pending_amount`/`budget_category_source`/`budget_category_set_seq` are ignored by the old code. The old category `UPDATE` leaves the label stale — harmless, because posting copies the value exactly whatever the label says (§5 I3). The old lock-free backfill tries to fill every NULL row, including clears labelled `'user'`: the **trigger (§6.2) keeps those at NULL**, so no mapping fill can masquerade as a user choice when the new backend returns; NULL rows labelled null/`'mapping'` are filled as today. Limitation: a new-backend clear cannot be re-categorised through the old UI in this window (§6.2). |
+| 5. Schema rollback (only if abandoning the feature) | old | old | drop the table, the index, the trigger and its function, the **five RPCs** (`apply_synced_transaction_batch_v2`, `set_transaction_budget_category`, `approve_transaction`, `replace_transaction_splits`, `backfill_category_mapping`) and the **five continuity-only columns** (`pending_transaction_id`, `posted_from_pending_amount`, `review_note`, `budget_category_source`, `budget_category_set_seq`); the old RPCs were never touched, so nothing has to be restored. **`user_role_override_at` is never dropped**: it is Phase B's user-history column, created here only for migration ordering; once any row holds a value, dropping it would destroy when the user made a correction. It is nullable and harmless to every backend version. Data in the dropped columns is not financial. |
 
 The new backend must never run against the old schema (it would fail on the missing RPC at the first
 sync), so the migration is applied first, as for LIM. The dry run must list exactly one file. A later
@@ -517,7 +523,7 @@ the same page twice:
 | **K12c posted amount and balance both bind** | L 250; P 400 linked 350 (applied 250, L = 0) | — | removed P (→ 250); added Q **300** | principal' = `least(350, 300) = 300` (C3), applied `least(300, 250) = 250`, L = 0; two notes (principal reduced to $300; only $250 applied); `posted_from_pending_amount = 400` |
 | **K17 category copied exactly, never re-mapped** | (a) pre-column row: Dining chosen by hand, `source` null, mapping(pending) = Groceries; (b) old-backend window: `UPDATE` set Household, label stale `'mapping'`; (c) row whose Groceries **equals** mapping(pending) (label `'mapping'`), posted Plaid category maps to **Dining**; (d) pre-column **cleared** row: NULL / null; (e) old-backend **clear** in the window: NULL / stale `'mapping'`; (f) never-categorised pending row: NULL / null, posted Plaid category maps to Dining; (g) new-backend clear: NULL / `'user'` | | Q | (a) Dining / null; (b) Household / `'mapping'` (stale label kept, value kept); (c) **Groceries** / `'mapping'` — not re-derived to Dining, the user may have chosen Groceries; (d) **NULL** / null — not re-mapped; (e) **NULL** / `'mapping'` — not re-mapped; (f) **NULL** / null — the accepted cost (C6): the row stays in the review queue and K18's backfill fills it later; (g) NULL / `'user'`. In every case value and label are byte-identical to the pending row's |
 | **K18 mapping backfill skips user clears** | rows with Plaid category FOOD_AND_DRINK: R1 NULL / `'user'` (cleared via the new RPC), R2 NULL / null (pre-column), R3 NULL / `'mapping'` (old-backend clear), R4 Dining / `'user'`; unconsumed carry-overs: V1 NULL / `'user'`, V2 NULL / null, both `pending_plaid_category = FOOD_AND_DRINK` | user creates mapping FOOD_AND_DRINK → Groceries | `backfill_category_mapping` | R1 **unchanged** (NULL / `'user'`); R2 → Groceries / `'mapping'`; R3 → Groceries / `'mapping'` (the documented degradation for old-backend clears); R4 unchanged; V1 **unchanged**; V2 → Groceries / `'mapping'`; return value 2; not executable by client roles; another user's mapping id raises; **control against `main`:** today's `backfillCategoryMapping` fills R1 too |
-| **K19 backfill vs posting, serialised** | pending P (NULL / null, Plaid category FOOD_AND_DRINK); **the posted row Q carries the same Plaid category** — the "same result in either order" claim assumes this, since the backfill matches on the row's own `category` | | holder: `_v2` page posting P→Q; contender: `backfill_category_mapping(FOOD_AND_DRINK → Groceries)` | backfill first: the carry-over is filled, Q posts with Groceries / `'mapping'`; posting first: Q posts NULL / null, then the backfill fills Q → Groceries / `'mapping'`; both orders end identically, both stamp `budget_category_set_at`. Variant with P cleared via the new RPC (NULL / `'user'`): both orders end NULL / `'user'`. Variant where Q's Plaid category **differs** (GENERAL_MERCHANDISE): backfill first → carry-over filled → Q Groceries; posting first → Q NULL and the backfill does not match it → the orders differ, which is expected and documented here, not a defect |
+| **K19 backfill vs posting, serialised** | pending P (NULL / null, Plaid category FOOD_AND_DRINK); **the posted row Q carries the same Plaid category** — the "same result in either order" claim assumes this, since the backfill matches on the row's own `category` | | holder: `_v2` page posting P→Q; contender: `backfill_category_mapping(FOOD_AND_DRINK → Groceries)` | backfill first: the carry-over is filled, Q posts with Groceries / `'mapping'`; posting first: Q posts NULL / null, then the backfill fills Q → Groceries / `'mapping'`; both orders end identically, both stamp `budget_category_set_seq`. Variant with P cleared via the new RPC (NULL / `'user'`): both orders end NULL / `'user'`. Variant where Q's Plaid category **differs** (GENERAL_MERCHANDISE): backfill first → carry-over filled → Q Groceries; posting first → Q NULL and the backfill does not match it → the orders differ, which is expected and documented here, not a defect |
 | **K20 old backfill cannot fill a new-backend clear** | R1 cleared via `set_transaction_budget_category` → NULL / `'user'` / stamped t1; R2 NULL / null; R3 NULL / `'mapping'` (old-backend clear) — all FOOD_AND_DRINK | | simulate the **old** backend's backfill: `update public.transactions set budget_category_id = <Groceries> where id in (R1, R2, R3)` as service_role, no stamp change | R1 stays **NULL / `'user'` / t1** (pinned by the trigger); R2 → Groceries (label still null); R3 → Groceries (label still `'mapping'`); the statement succeeds (no RAISE); then the new backend's `set_transaction_budget_category(R1, Dining)` → Dining / `'user'` / t2 (the stamp moved, so the trigger lets it through); **control against `main`** (no trigger): R1 is filled and reads as a user choice |
 | **K20b the accepted limitation** | R1 as in K20 | | simulate the **old** category endpoint on R1: `update … set budget_category_id = <Dining> where id = R1` | pinned: R1 stays NULL / `'user'` (documented §6.2); the same statement on a row labelled null succeeds — the pin is specific to `'user'`-labelled NULLs |
 | **K13 category deleted while splits held** | 60.00 splits Groceries 40 / Household 20 | | removed P; `deleteBudgetCategory(Household)`; added Q 60.00 | splits dropped (not partially re-created), needs_review, note "A category used by this transaction's splits was deleted; splits removed"; Q's own `budget_category_id` (Groceries) kept |
@@ -533,10 +539,19 @@ and role, including that the lookup passes the signed-in user id; `mapPlaidTrans
 `categoryMappingController` calls `backfill_category_mapping` (no `select … is null` + `update` pair
 remains anywhere in `dataService`); the sweep deletes only expired unconsumed and old consumed records.
 
-### 10.3 Frontend tests
-"Posted · was pending $52.10" and `review_note` render; approve clears the note; the superseded flow
-re-targets automatically when the amount is unchanged and confirms when it changed; `role="alert"`
-for the pending-removed refusal; clearing a category then reloading shows it still cleared.
+### 10.3 Frontend tests (as implemented)
+- `components/transactionsFeedContinuity.test.tsx`: "Posted · was pending $52.10" and `review_note`
+  render for an unreviewed posted row; nothing is said when the amount did not change; a note is
+  hidden once the row is approved.
+- `lib/transactionContinuity.test.ts` (the pure reducer every mutation handler — category, approve,
+  split save, split clear — routes a refused edit through): `transaction_superseded` swaps the posted
+  row into the pending row's slot; when the posted row is already loaded the pending row is dropped
+  and the loaded copy refreshed, never two copies; a superseded response without a body drops the
+  pending row; `transaction_pending_removed` drops the withdrawn row; any other error is not a
+  continuity outcome. The split editor is keyed to the dead row's id, so it unmounts when the row is
+  swapped or dropped (`App.tsx` resolves instead of rethrowing in that case).
+- Not covered by an automated frontend test (manual smoke test at release): approving a posted row
+  clears its note end to end; a cleared category surviving a reload.
 
 ### 10.4 Control against `main`
 K1 on today's code: Q has `needs_review = true`, no category, no override — the "fails before" proof.

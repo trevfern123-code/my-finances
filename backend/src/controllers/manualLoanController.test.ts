@@ -18,6 +18,11 @@ const { ManualLoanNotFoundError, ManualLoanCreationError, ManualLoanCreationKeyR
   };
 });
 
+const mockUpdateLinkedPaymentPrincipal = vi.hoisted(() => vi.fn());
+const mockUnlinkPaymentFromLoan = vi.hoisted(() => vi.fn());
+const mockFindTransactionCarryover = vi.hoisted(() => vi.fn());
+const mockGetTransactionItemForUser = vi.hoisted(() => vi.fn());
+const { TransactionNotFoundError } = vi.hoisted(() => ({ TransactionNotFoundError: class TransactionNotFoundError extends Error {} }));
 vi.mock('../services/dataService', () => ({
   deleteManualLoan: mockDeleteManualLoan,
   markManualLoanDeletionReconciled: mockMarkReconciled,
@@ -25,6 +30,11 @@ vi.mock('../services/dataService', () => ({
   getManualLoan: mockGetManualLoan,
   listPaymentsForLoan: mockListPaymentsForLoan,
   getLinkedPaymentsForLoan: mockGetLinkedPaymentsForLoan,
+  updateLinkedPaymentPrincipal: mockUpdateLinkedPaymentPrincipal,
+  unlinkPaymentFromLoan: mockUnlinkPaymentFromLoan,
+  findTransactionCarryover: mockFindTransactionCarryover,
+  getTransactionItemForUser: mockGetTransactionItemForUser,
+  TransactionNotFoundError,
   ManualLoanNotFoundError,
   ManualLoanCreationError,
   ManualLoanCreationKeyResolvedError,
@@ -43,7 +53,7 @@ vi.mock('../services/loans', () => ({
   computePayoffProgressPct: vi.fn(),
 }));
 
-import { createManualLoanIdempotent, deleteManualLoan } from './manualLoanController';
+import { createManualLoanIdempotent, deleteManualLoan, unlinkPayment, updateLinkedPayment } from './manualLoanController';
 
 function fakeReq(): Request {
   return { user: { id: 'user-1' }, params: { id: 'loan-1' }, body: {} } as unknown as Request;
@@ -199,5 +209,78 @@ describe('createManualLoan controller — resolved idempotency keys (Round 12 re
 
     expect(next).toHaveBeenCalledWith(expect.objectContaining({ message: 'Failed to create manual loan: boom' }));
     expect(res.status).not.toHaveBeenCalledWith(409);
+  });
+});
+
+// Pending → posted continuity (design §8): a linked-payment edit that loses the race to the posting
+// of its pending row is answered with what happened, through the user-scoped carry-over lookup.
+describe('linked-payment edits racing a posting (pending → posted continuity)', () => {
+  const paymentReq = (body: unknown = {}) =>
+    ({ user: { id: 'user-1' }, params: { id: 'loan-1', transactionId: 'txn-pending' }, body } as unknown as Request);
+  const next = vi.fn() as unknown as NextFunction;
+  const body = (res: Response) => (res.json as ReturnType<typeof vi.fn>).mock.calls[0][0];
+
+  beforeEach(() => {
+    mockGetManualLoan.mockResolvedValue({ id: 'loan-1', user_id: 'user-1', current_balance: 900 });
+    mockFindTransactionCarryover.mockResolvedValue(null);
+  });
+
+  it('principal edit: the pending payment has posted → 409 transaction_superseded with the posted row (this user only)', async () => {
+    mockUpdateLinkedPaymentPrincipal.mockRejectedValue(new TransactionNotFoundError('Payment not found'));
+    mockFindTransactionCarryover.mockResolvedValue({ status: 'superseded', postedTransactionId: 'txn-posted' });
+    mockGetTransactionItemForUser.mockResolvedValue({ id: 'txn-posted', amount: 400, pending_transaction_id: 'plaid-p' });
+    const res = fakeRes();
+    await updateLinkedPayment(paymentReq({ principal_portion: 300 }), res, next);
+    expect(mockFindTransactionCarryover).toHaveBeenCalledWith('user-1', 'txn-pending');
+    expect(mockGetTransactionItemForUser).toHaveBeenCalledWith('user-1', 'txn-posted');
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(body(res)).toEqual({
+      error: expect.stringContaining('has posted'),
+      code: 'transaction_superseded',
+      superseded_by: expect.objectContaining({ id: 'txn-posted' }),
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('principal edit: the pending payment was withdrawn → 409 transaction_pending_removed', async () => {
+    mockUpdateLinkedPaymentPrincipal.mockRejectedValue(new TransactionNotFoundError('Payment not found'));
+    mockFindTransactionCarryover.mockResolvedValue({ status: 'pending_removed' });
+    const res = fakeRes();
+    await updateLinkedPayment(paymentReq({ principal_portion: 300 }), res, next);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(body(res)).toEqual({ error: expect.stringContaining('withdrew'), code: 'transaction_pending_removed' });
+  });
+
+  it('unlink: superseded → 409 with the posted row; the loan is not re-read and no repair runs', async () => {
+    mockUnlinkPaymentFromLoan.mockRejectedValue(new TransactionNotFoundError('Payment not found'));
+    mockFindTransactionCarryover.mockResolvedValue({ status: 'superseded', postedTransactionId: 'txn-posted' });
+    mockGetTransactionItemForUser.mockResolvedValue({ id: 'txn-posted' });
+    const res = fakeRes();
+    await unlinkPayment(paymentReq(), res, next);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(body(res)).toMatchObject({ code: 'transaction_superseded' });
+    expect(mockGetManualLoan).toHaveBeenCalledTimes(1);
+  });
+
+  it('unlink: withdrawn → 409 transaction_pending_removed; an unknown or foreign row → 404', async () => {
+    mockUnlinkPaymentFromLoan.mockRejectedValue(new TransactionNotFoundError('Payment not found'));
+    mockFindTransactionCarryover.mockResolvedValueOnce({ status: 'pending_removed' });
+    const res1 = fakeRes();
+    await unlinkPayment(paymentReq(), res1, next);
+    expect(res1.status).toHaveBeenCalledWith(409);
+    expect(body(res1)).toMatchObject({ code: 'transaction_pending_removed' });
+
+    mockFindTransactionCarryover.mockResolvedValueOnce(null);
+    const res2 = fakeRes();
+    await unlinkPayment(paymentReq(), res2, next);
+    expect(res2.status).toHaveBeenCalledWith(404);
+  });
+
+  it('any other failure still goes to the error handler', async () => {
+    mockUpdateLinkedPaymentPrincipal.mockRejectedValue(new Error('Payment is not linked to this loan'));
+    const res = fakeRes();
+    await updateLinkedPayment(paymentReq({ principal_portion: 1 }), res, next);
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ message: 'Payment is not linked to this loan' }));
+    expect(res.status).not.toHaveBeenCalled();
   });
 });

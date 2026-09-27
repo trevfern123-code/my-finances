@@ -16,6 +16,7 @@ import { summarizeErrorSafely } from '../services/errorSanitizer';
 import { isSyncableItemStatus } from '../services/itemStatus';
 import { ItemRemovalIncompleteError, runItemRemoval, toRemovalView } from '../services/itemRemoval';
 import { env } from '../config/env';
+import { respondTransactionGone } from './transactionGone';
 
 /** Date-Range Customization v1: `range_id` (one of the 5 reporting-range presets) takes
  *  precedence when present and valid; falls back to the legacy `months` count (default 6,
@@ -993,35 +994,6 @@ export async function listTransactions(req: Request, res: Response, next: NextFu
   } catch (err) {
     next(err);
   }
-}
-
-/**
- * Pending → posted continuity (design §8): a mutation whose transaction is gone is not simply a 404.
- * If Plaid replaced the pending row with a posted one, the client is told which row now holds its
- * state (409 `transaction_superseded`) so it can re-target; if Plaid withdrew the pending row and it
- * has not (yet) posted, the earlier changes are held in the carry-over and the edit is refused with an
- * explanation (409 `transaction_pending_removed`). The lookup is scoped to the signed-in user. Nothing
- * about another user's rows is ever revealed: their ids fall through to the same 404 as an unknown id.
- */
-async function respondTransactionGone(res: Response, userId: string, transactionId: string): Promise<void> {
-  const carryover = await dataService.findTransactionCarryover(userId, transactionId);
-  if (carryover?.status === 'superseded') {
-    const posted = await dataService.getTransactionItemForUser(userId, carryover.postedTransactionId);
-    res.status(409).json({
-      error: 'This pending transaction has posted. Apply the change to the posted transaction instead.',
-      code: 'transaction_superseded',
-      superseded_by: posted,
-    });
-    return;
-  }
-  if (carryover?.status === 'pending_removed') {
-    res.status(409).json({
-      error: 'Your bank withdrew this pending transaction. If it posts, your earlier changes will carry over.',
-      code: 'transaction_pending_removed',
-    });
-    return;
-  }
-  res.status(404).json({ error: 'Transaction not found' });
 }
 
 export async function setTransactionCategory(req: Request, res: Response, next: NextFunction) {
