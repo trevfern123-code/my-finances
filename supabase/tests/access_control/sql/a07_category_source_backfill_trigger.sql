@@ -44,6 +44,14 @@ select th.assert(not has_table_privilege('authenticated', 'public.transaction_ca
              and not has_table_privilege('anon', 'public.transaction_carryovers', 'select')
              and has_table_privilege('service_role', 'public.transaction_carryovers', 'delete'),
   'ACL: transaction_carryovers is service_role only');
+select th.assert((select count(*) from pg_indexes where schemaname = 'public'
+                    and indexname in ('transactions_pending_transaction_id_idx',
+                                      'transaction_carryovers_user_expiry_idx',
+                                      'transaction_carryovers_account_idx',
+                                      'transaction_carryovers_budget_category_idx',
+                                      'transaction_carryovers_manual_loan_idx',
+                                      'transaction_carryovers_consumed_transaction_idx')) = 6,
+  'schema: all six continuity indexes exist, including every carry-over FK delete path');
 set role authenticated;
 select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-0000000000aa","role":"authenticated"}', true);
 select th.expect_error($q$ select public.set_transaction_budget_category('00000000-0000-0000-0000-0000000000aa', gen_random_uuid(), null) $q$, '%permission denied%');

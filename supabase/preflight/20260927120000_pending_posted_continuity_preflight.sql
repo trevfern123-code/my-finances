@@ -14,6 +14,13 @@ select
             and column_name in ('pending_transaction_id', 'posted_from_pending_amount', 'review_note',
                                 'budget_category_source', 'budget_category_set_seq', 'user_role_override_at')) as transactions_columns,
   to_regclass('public.transactions_budget_category_seq') is not null                         as sequence,
+  exists (select 1 from pg_indexes where schemaname = 'public'
+          and indexname in ('transactions_pending_transaction_id_idx',
+                            'transaction_carryovers_user_expiry_idx',
+                            'transaction_carryovers_account_idx',
+                            'transaction_carryovers_budget_category_idx',
+                            'transaction_carryovers_manual_loan_idx',
+                            'transaction_carryovers_consumed_transaction_idx'))              as indexes,
   exists (select 1 from pg_trigger where tgrelid = 'public.transactions'::regclass
           and tgname = 'transactions_keep_user_cleared_category')                            as trigger,
   (to_regprocedure('public.transactions_keep_user_cleared_category()') is not null
@@ -52,7 +59,7 @@ where t.pending;
 select category, count(*) from public.transactions where budget_category_id is null group by category order by 2 desc;
 
 -- POSTFLIGHT 1 (after `supabase db push`). Expected: ledger_head = 20260927120000, columns = 6,
--- functions = 5, trigger_fn_locked = true, trigger = true, carryovers = 0, client_table_access = false,
+-- functions = 5, indexes = 6, trigger_fn_locked = true, trigger = true, carryovers = 0, client_table_access = false,
 -- service_role_table_privileges = {DELETE,INSERT,SELECT,UPDATE}, rls_enabled = true, policies = 0,
 -- sequence_client_access = false, and the two md5 values identical to PREFLIGHT 1.
 select
@@ -71,6 +78,13 @@ select
       and not has_function_privilege('public', p.oid, 'execute')
       and not has_function_privilege('anon', p.oid, 'execute')
       and not has_function_privilege('authenticated', p.oid, 'execute'))                   as functions,
+  (select count(*) from pg_indexes where schemaname = 'public'
+    and indexname in ('transactions_pending_transaction_id_idx',
+                      'transaction_carryovers_user_expiry_idx',
+                      'transaction_carryovers_account_idx',
+                      'transaction_carryovers_budget_category_idx',
+                      'transaction_carryovers_manual_loan_idx',
+                      'transaction_carryovers_consumed_transaction_idx'))                  as indexes,
   (select not has_function_privilege('service_role', p.oid, 'execute')
       and not has_function_privilege('authenticated', p.oid, 'execute')
       and not has_function_privilege('anon', p.oid, 'execute')

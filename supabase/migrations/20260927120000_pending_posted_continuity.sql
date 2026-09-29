@@ -24,7 +24,7 @@
 --   * creates transactions.user_role_override_at now, so Phase B's migration adds no column and the
 --     carry-over can copy it (design §3 P6).
 --
--- Additive only: six nullable columns, one sequence, one index, one table, one trigger, five RPCs.
+-- Additive only: six nullable columns, one sequence, six indexes, one table, one trigger, five RPCs.
 -- No existing function, constraint or row is changed. Every function: SECURITY INVOKER, search_path
 -- pinned empty, the per-user advisory lock every balance/sync writer takes, executable by
 -- service_role only (the trigger function by no role). Postconditions at the end abort the whole
@@ -159,6 +159,12 @@ create table public.transaction_carryovers (
 
 create index transaction_carryovers_user_expiry_idx on public.transaction_carryovers (user_id, expires_at);
 create index transaction_carryovers_account_idx on public.transaction_carryovers (account_id);
+-- PostgreSQL does not index the referencing side of a foreign key automatically. Cover every
+-- remaining FK whose parent delete cascades or sets NULL so deleting a category, loan or consumed
+-- transaction never scans the whole carry-over table.
+create index transaction_carryovers_budget_category_idx on public.transaction_carryovers (budget_category_id);
+create index transaction_carryovers_manual_loan_idx on public.transaction_carryovers (manual_loan_id);
+create index transaction_carryovers_consumed_transaction_idx on public.transaction_carryovers (consumed_by_transaction_id);
 
 alter table public.transaction_carryovers enable row level security;
 revoke all on table public.transaction_carryovers from public, anon, authenticated, service_role;
