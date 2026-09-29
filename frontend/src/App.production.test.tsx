@@ -12,7 +12,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
-import type { UserPreferences } from './lib/api';
+import type { TransactionItem, UserPreferences } from './lib/api';
 import { installFakeWebLocks, removeWebLocks } from './testUtils/fakeWebLocks';
 
 const mockGetSession = vi.hoisted(() => vi.fn());
@@ -3810,5 +3810,113 @@ describe('Wave 1 Hosted Link recovery outcomes, as the user sees them', () => {
     expect(shown).not.toMatch(/was not added|wasn't added|not linked|start linking|try again/i);
     expect(shown).toMatch(/don't try linking this bank again yet/i);
     expect(shown).toMatch(/contact support/i);
+  });
+});
+
+describe('Continuity release closeout: approve a changed-amount posted row, then reload', () => {
+  const note = 'Amount changed from 52.10 to 60.10; splits removed';
+  let stored: TransactionItem;
+  let reads: number;
+  let writes: number;
+  let failApproval: boolean;
+  let approvalGate: ReturnType<typeof deferred<void>>;
+
+  beforeEach(async () => {
+    // Exercise the actual App handler, API request/ownership code and feed. Only auth and the
+    // network boundary are fake. Each GET is a fresh server snapshot, not a reference to React's
+    // state. The separate PostgreSQL K2-approval assertions prove the real RPC's persistence.
+    stored = {
+      ...fakeTransactionNeedingReview('posted-closeout', 'Continuity restaurant', true).transactions[0],
+      amount: 60.1,
+      pending_transaction_id: 'pending-closeout',
+      posted_from_pending_amount: 52.1,
+      review_note: note,
+    };
+    reads = 0;
+    writes = 0;
+    failApproval = false;
+    approvalGate = deferred<void>();
+    const actual = await vi.importActual<typeof import('./lib/api')>('./lib/api');
+    mockGetTransactions.mockImplementation(actual.getTransactions);
+    mockApproveTransaction.mockImplementation(actual.approveTransaction);
+    mockGetUserPreferences.mockResolvedValue(fakePreferences());
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init: RequestInit = {}) => {
+      const path = String(input).slice(String(input).indexOf('/api/'));
+      const method = init.method ?? 'GET';
+      expect(new Headers(init.headers).get('Authorization')).toBe(`Bearer ${currentFakeSession!.access_token}`);
+      if (method === 'GET' && path.startsWith('/api/plaid/transactions?')) {
+        reads += 1;
+        return new Response(JSON.stringify({ transactions: [stored] }), { status: 200 });
+      }
+      if (method === 'PATCH' && path === '/api/plaid/transactions/posted-closeout/approve') {
+        writes += 1;
+        await approvalGate.promise;
+        if (failApproval) {
+          return new Response(JSON.stringify({ error: 'Approval unavailable' }), { status: 503 });
+        }
+        stored = { ...stored, needs_review: false, review_note: null };
+        return new Response(JSON.stringify({ transaction: stored }), { status: 200 });
+      }
+      throw new Error(`Unexpected closeout test request: ${method} ${path}`);
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    mockApproveTransaction.mockReset();
+    mockGetTransactions.mockReset();
+  });
+
+  async function bootToTransactions() {
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-closeout', 'sid-closeout')));
+    await waitForReady();
+    fireEvent.click(screen.getByRole('tab', { name: 'Accounts' }));
+    await waitFor(() => expect(screen.getByText('Continuity restaurant')).toBeTruthy());
+  }
+
+  it('clears the warning only after success and keeps it cleared after a fresh App mount and GET', async () => {
+    await bootToTransactions();
+    expect(screen.getByText(note)).toBeTruthy();
+    expect(screen.getByText(/Posted · was pending \$52\.10/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    await waitFor(() => expect(writes).toBe(1));
+    expect(screen.getByText(note)).toBeTruthy(); // never clear before the server succeeds
+    expect(stored.needs_review).toBe(true);
+
+    await act(async () => { approvalGate.resolve(); await approvalGate.promise; });
+    await waitFor(() => expect(screen.queryByText(note)).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
+    expect(stored).toMatchObject({ needs_review: false, review_note: null, amount: 60.1, posted_from_pending_amount: 52.1 });
+
+    const readsBeforeReload = reads;
+    cleanup(); // discard every App state value; the next mount must fetch again
+    await bootToTransactions();
+    expect(reads).toBeGreaterThan(readsBeforeReload);
+    expect(screen.queryByText(note)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
+    // The informational original amount remains; only the actionable warning is dismissed.
+    expect(screen.getByText(/Posted · was pending \$52\.10/)).toBeTruthy();
+    expect(writes).toBe(1); // reload does not re-approve
+  });
+
+  it('retains the warning and review state after a refused approval, including reload', async () => {
+    failApproval = true;
+    await bootToTransactions();
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    await waitFor(() => expect(writes).toBe(1));
+    await act(async () => { approvalGate.resolve(); await approvalGate.promise; });
+    await waitFor(() => expect(screen.getByText('Approval unavailable')).toBeTruthy());
+    expect(screen.getByText(note)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
+    expect(stored).toMatchObject({ needs_review: true, review_note: note });
+
+    const readsBeforeReload = reads;
+    cleanup();
+    await bootToTransactions();
+    expect(reads).toBeGreaterThan(readsBeforeReload);
+    expect(screen.getByText(note)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
+    expect(writes).toBe(1); // failure is not silently retried
   });
 });
