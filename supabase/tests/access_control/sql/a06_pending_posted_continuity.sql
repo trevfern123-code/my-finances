@@ -277,3 +277,19 @@ select th.assert(pg_temp.applied_total() = (select sum(loan_balance_applied) fro
 select th.assert(pg_temp.loan('00000000-0000-0000-0000-0000000006b1') = 10000 - (select coalesce(sum(loan_balance_applied), 0) from public.transactions where manual_loan_id = '00000000-0000-0000-0000-0000000006b1'),
   'ledger: SoFi balance = 10000 - Σ applied over its live rows');
 select th.assert(pg_temp.loan('00000000-0000-0000-0000-0000000006b2') = 5000, 'ledger: Car fully restored');
+
+-- Release closeout: approve the actual K2 changed-amount row, then read persisted state. Keep this
+-- after K8, which intentionally checks the original unapproved note survives a replay.
+select th.expect_error($q$ select public.approve_transaction(
+  '00000000-0000-0000-0000-0000000000bb', pg_temp.id_of('q2')) $q$, '%transaction_not_found%');
+select th.assert((pg_temp.txn('q2')).needs_review and (pg_temp.txn('q2')).review_note is not null,
+  'K2 approval: another user cannot dismiss the warning');
+select public.approve_transaction('00000000-0000-0000-0000-0000000000aa', pg_temp.id_of('q2'));
+select th.assert(not (pg_temp.txn('q2')).needs_review and (pg_temp.txn('q2')).review_note is null,
+  'K2 approval: a fresh database read sees approval and the cleared warning');
+select th.assert((pg_temp.txn('q2')).amount = 60.10 and (pg_temp.txn('q2')).posted_from_pending_amount = 52.10
+  and (pg_temp.txn('q2')).budget_category_id = '00000000-0000-0000-0000-0000000006c1',
+  'K2 approval: amount history and category are not changed by approval');
+select public.approve_transaction('00000000-0000-0000-0000-0000000000aa', pg_temp.id_of('q2'));
+select th.assert(not (pg_temp.txn('q2')).needs_review and (pg_temp.txn('q2')).review_note is null,
+  'K2 approval: repeating approval remains harmless');

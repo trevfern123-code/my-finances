@@ -1,9 +1,12 @@
-# Pending → posted transaction continuity — Design for review
+# Pending → posted transaction continuity — Design of record
 
 **Status:** revision 5, approved by Codex; **implemented** on `feature/pending-posted-continuity`
 (commit `a34c005` plus the Codex remediation commit that follows it). This is the design of record for
 that implementation; where the code differs it is noted inline (the sequence-based protocol marker
-`budget_category_set_seq`, §4/§6.2). Not yet merged, and the migration is not yet applied to production.
+`budget_category_set_seq`, §4/§6.2). **Released:** PR #6 merged as `a1b4120` on 2026-09-29 UTC;
+migration `20260927120000` applied and postflight verified before backend/frontend deployment.
+Live Sandbox K1/K14 checks passed; their temporary connection was removed with Trevor's approval.
+See [release closeout](PENDING_POSTED_CONTINUITY_RELEASE.md) for evidence and test boundaries.
 **Decided (Trevor):** C1–C6 as recommended (§11).
 
 **Revision 5 — changes from Codex's fourth review (one blocker):**
@@ -550,8 +553,15 @@ remains anywhere in `dataService`); the sweep deletes only expired unconsumed an
   pending row; `transaction_pending_removed` drops the withdrawn row; any other error is not a
   continuity outcome. The split editor is keyed to the dead row's id, so it unmounts when the row is
   swapped or dropped (`App.tsx` resolves instead of rethrowing in that case).
-- Not covered by an automated frontend test (manual smoke test at release): approving a posted row
-  clears its note end to end; a cleared category surviving a reload.
+- `App.production.test.tsx`, "Continuity release closeout": the real App handler, feed and API client
+  approve a changed-amount posted row through a stateful fake network boundary, then unmount/remount
+  and fetch a fresh snapshot. The warning clears only after success and stays cleared after reload;
+  a refused approval keeps the warning and review state, including after reload. The informational
+  "was pending" amount remains in both cases. Real PostgreSQL persistence and owner checks are
+  separately asserted on K2's row in `a06_pending_posted_continuity.sql`.
+- Trevor chose this repeatable automated route for the final warning-clearing check instead of
+  another live Sandbox connection. It is not a claim of a live changed-amount webhook test. The
+  intentional category-clear/reload case was verified in the deployed app during K14.
 
 ### 10.4 Control against `main`
 K1 on today's code: Q has `needs_review = true`, no category, no override — the "fails before" proof.
