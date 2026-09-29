@@ -789,10 +789,11 @@ needs them. Status as of the audited production baseline (`d2cf720`, 2026-09-24)
 - **Required V1 functionality**
   - **Linked institution management**: implemented on `feature/linked-institution-management`
     (see "Linked institution management"), pending review and release.
-  - **Pending→posted transaction continuity** (next): persist Plaid's `pending_transaction_id` and
-    carry a pending row's manual-loan link, category, review state and splits to its posted row.
-    Not a prerequisite for institution removal (the applied-amount ledger makes removal exact
-    regardless of lineage), but required before Financial Semantics Phase B.
+  - **Pending→posted transaction continuity**: implemented on `feature/pending-posted-continuity`
+    (see "Pending → posted transaction continuity"), pending review and release. Persists Plaid's
+    `pending_transaction_id` and carries a pending row's manual-loan link, category (including a
+    deliberate clear), review state and splits to its posted row in one atomic sync write. Required
+    before Financial Semantics Phase B.
   - User role correction; transaction pagination (the API caps a request at 200 rows). The
     Reconnect stuck-state fix shipped with the frontend update manager.
 - **Release hardening**
@@ -1088,6 +1089,87 @@ dataset is refreshed and the user is told what was added back to which loan.
    rows left. If the deployed Plaid environment is Production, stop before this step and decide
    which real connection may be removed.
 6. Advance `PRODUCTION_HEAD` in `supabase/tests/replay/run.sh`.
+
+## Pending → posted transaction continuity
+
+Design: `PENDING_POSTED_CONTINUITY_DESIGN.md` (approved rev 5). Schema:
+`supabase/migrations/20260927120000_pending_posted_continuity.sql`. Preflight/postflight:
+`supabase/preflight/20260927120000_pending_posted_continuity_preflight.sql`.
+
+Plaid reports most transactions twice: a **pending** row, then a **posted** row with a new id and a
+`pending_transaction_id` pointing at the pending one, while the pending row is reported removed.
+Before this, the two were unrelated: the pending row was deleted and the posted row inserted fresh,
+so a budget category, a deliberate clear, an approval, splits, a manual-loan link (and, once Phase B
+lands, a role correction) made on the pending row were lost days later.
+
+**One atomic sync write.** `apply_synced_transaction_batch_v2(inserts, updates, removed_plaid_ids)`
+handles a sync page's removals, inserts and updates in one transaction under the per-user advisory
+lock (before: the batch RPC, then a *separate* delete RPC). For a removed **pending** row it writes a
+`transaction_carryovers` record (its category + source, approval, override + timestamp, splits as
+JSON, loan link + principal, loan name/id snapshots, Plaid category) before restoring its
+`loan_balance_applied` and deleting it through the existing `delete_transactions_and_restore_loan_balances`.
+An inserted row whose `pending_transaction_id` names a live pending row brings that row through the
+same path in the same page, so **every arrival order** (same page, posted first, removal first — even
+in a later sync) converges on one carry path. The old RPCs are untouched: an old backend keeps working
+during deployment and rollback (design §9).
+
+**What carries** (design §7; C1–C6 decided):
+- `budget_category_id` **and** `budget_category_source` are copied **exactly, including NULL** —
+  posting never consults the category mapping, so a cleared category stays cleared and a chosen
+  category that happens to equal the mapping is never "re-derived".
+- Approval is kept when the amount is unchanged and **re-flagged** (with a `review_note` carrying both
+  amounts) when it changed.
+- Splits are re-created only when the amount is unchanged and every category still exists;
+  otherwise dropped whole with a note — never scaled, never partial.
+- The loan link is re-applied through `link_transaction_to_manual_loan` with
+  `least(principal, posted amount)`; the link function clamps what it applies to the remaining
+  balance and records that as `loan_balance_applied`, so Σ restored = Σ applied holds at every commit
+  (LIM removal and loan deletion keep restoring exactly what was applied). A reduced principal or a
+  binding clamp re-flags the row with a note; a deleted loan is named from the snapshot.
+- A sign flip drops the override and **skips** the loan link, with notes.
+
+**Pending-row mutations under the same lock.** Category (`set_transaction_budget_category`, which
+records `budget_category_source = 'user'` — also for a deliberate NULL), approval
+(`approve_transaction`, clears `review_note`), splits (`replace_transaction_splits`, one transaction
+instead of delete-then-insert) and the mapping backfill (`backfill_category_mapping`, which skips
+user-cleared rows, labels its fills `'mapping'` and also fills unconsumed carry-overs) are RPCs that
+take the per-user lock first. So an edit either lands before the posting and is carried, or finds
+the row gone: the controller then answers `409 transaction_superseded` (with the posted row) or
+`409 transaction_pending_removed`, looked up **for the signed-in user only**
+(`controllers/transactionGone.ts`, shared by category, approval, splits and the manual-loan payment
+edits — principal and unlink — whose pre-read/RPC pair can also lose the race). The frontend routes
+every such refusal through one reducer (`lib/transactionContinuity.ts`): the posted row is swapped in
+as an ID-deduplicating upsert (a copy already loaded by a refresh never appears twice), a withdrawn
+row is dropped, and the split editor keyed to the dead row unmounts with it.
+
+**Rollback-window safeguard.** Every new-backend category writer stamps `budget_category_set_seq`
+from a sequence (guaranteed to differ on every write, even within one transaction). The
+`BEFORE UPDATE` trigger `transactions_keep_user_cleared_category` keeps a `'user'`-labelled NULL at
+NULL when a writer changes the value without moving the stamp — an old backend's lock-free backfill
+or category endpoint during a rollback — so a mapping fill can never masquerade as the user's choice
+when the new backend returns. Accepted limitation, rollback window only: the old UI cannot
+re-categorise a row cleared through the new backend.
+
+**Tests.** `supabase/tests/access_control`: `a06` (K1–K14, K17 and the K12 clamp family: every
+arrival order, amount change, sign flip, deleted loan, replay, expiry, ledger exactness), `a07`
+(ACL, the sequence marker inside one transaction, K18 backfill, K20/K20b trigger, atomic splits,
+approve), `c10` (a category edit racing the posting waits, then is reported superseded), `c11` (the
+backfill waits on the posting, then fills the posted row). Backend: `dataService` (one v2 call, RPC
+wrappers, `TransactionNotFoundError`, user-scoped carry-over lookup), controller superseded /
+pending-removed responses for category, approve, splits, and the manual-loan principal edit and
+unlink. Frontend: `transactionsFeedContinuity.test.tsx` (display copy) and
+`lib/transactionContinuity.test.ts` (the superseded / withdrawn reducer, incl. deduplication).
+
+**Runbook.** A posted row flagged with a `review_note`: read the note, check the amounts/splits/link,
+approve (clears the note). `select * from transaction_carryovers where consumed_at is null` lists
+pending rows Plaid withdrew that have not posted; they expire 30 days after removal and are swept
+after a sync. The `budget_category_source` column is the only signal of who set a category; never
+edit it by hand.
+
+**Releasing it.** PREFLIGHT 0–3 (read-only), `supabase db push --dry-run` (exactly one file), push,
+POSTFLIGHT 1 (the two md5 values of the old RPCs must be unchanged), merge/deploy, Sandbox smoke test
+(a pending transaction categorised, cleared, re-categorised and approved, then posted), advance
+`PRODUCTION_HEAD`.
 
 ## Frontend/backend compatibility contract
 

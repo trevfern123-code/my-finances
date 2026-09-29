@@ -25,6 +25,12 @@ import {
   getCategorySpendRows,
   setTransactionSplits,
   clearTransactionSplits,
+  setTransactionCategory,
+  approveTransaction,
+  backfillCategoryMapping,
+  findTransactionCarryover,
+  InvalidSplitsError,
+  TransactionNotFoundError,
   deleteCategoryMappingsForBudgetCategory,
   getBudgetCategoryForUser,
   updateAccountCustomization,
@@ -659,7 +665,7 @@ describe('applyTransactionChanges', () => {
     const mappingsQuery = createQueryBuilder({ data: [], error: null });
     mockFrom.mockReturnValueOnce(existingQuery).mockReturnValueOnce(mappingsQuery);
     const insertedRow = { id: 'txn-row-new', name: 'Coffee Shop', merchant_name: 'Coffee Shop', amount: 12.5 };
-    mockRpc.mockResolvedValueOnce({ data: [insertedRow], error: null });
+    mockRpc.mockResolvedValueOnce({ data: { inserted: [insertedRow], carried: [], carried_count: 0, removed: 0 }, error: null });
 
     const result = await applyTransactionChanges({
       userId: 'user-1',
@@ -669,8 +675,9 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
+    // Pending → posted continuity: ONE atomic RPC carries inserts, updates and removals together.
     expect(mockRpc).toHaveBeenCalledWith(
-      'apply_synced_transaction_batch',
+      'apply_synced_transaction_batch_v2',
       expect.objectContaining({
         p_user_id: 'user-1',
         p_inserts: expect.arrayContaining([
@@ -681,6 +688,8 @@ describe('applyTransactionChanges', () => {
             personal_finance_category_detailed: 'COFFEE',
             personal_finance_category_confidence: 'HIGH',
             plaid_category: 'Food and Drink > Coffee',
+            // The posted row names the pending row it replaces (null for a first-time row).
+            pending_transaction_id: null,
             // Row-level classification (Financial Semantics Foundation Phase A) runs at insert
             // time — an ordinary FOOD_AND_DRINK purchase falls all the way to the sign-based
             // fallback.
@@ -691,6 +700,7 @@ describe('applyTransactionChanges', () => {
           }),
         ]),
         p_updates: [],
+        p_removed_plaid_ids: [],
       })
     );
     expect(result).toEqual({
@@ -1123,13 +1133,13 @@ describe('applyTransactionChanges', () => {
         })
       ).resolves.toBeDefined();
 
-      expect(mockRpc).toHaveBeenCalledWith('apply_synced_transaction_batch', expect.anything());
+      expect(mockRpc).toHaveBeenCalledWith('apply_synced_transaction_batch_v2', expect.anything());
     });
   });
 
-  it('deletes removed transactions via the atomic delete-and-restore-balances RPC (Round 6 remediation, blocker 4)', async () => {
+  it('sends removed transactions to the SAME atomic RPC as inserts/updates (pending → posted continuity)', async () => {
     mockRpc.mockReset();
-    mockRpc.mockResolvedValueOnce({ data: null, error: null });
+    mockRpc.mockResolvedValueOnce({ data: { inserted: [], carried: [], carried_count: 0, removed: 1 }, error: null });
 
     await applyTransactionChanges({
       userId: 'user-1',
@@ -1139,19 +1149,26 @@ describe('applyTransactionChanges', () => {
       accountIdByPlaidId,
     });
 
-    expect(mockRpc).toHaveBeenCalledWith('delete_transactions_and_restore_loan_balances', {
+    // Before continuity this was a separate delete_transactions_and_restore_loan_balances call — a
+    // second transaction, so a pending→posted pair could commit half-way. The v2 RPC restores any
+    // linked pending row's principal and writes its carry-over in the same transaction as the delete.
+    expect(mockRpc).toHaveBeenCalledTimes(1);
+    expect(mockRpc).toHaveBeenCalledWith('apply_synced_transaction_batch_v2', {
       p_user_id: 'user-1',
-      p_plaid_transaction_ids: ['txn-removed'],
+      p_inserts: [],
+      p_updates: [],
+      p_removed_plaid_ids: ['txn-removed'],
     });
+    expect(mockRpc).not.toHaveBeenCalledWith('delete_transactions_and_restore_loan_balances', expect.anything());
   });
 
-  it('propagates a failure from the removal RPC', async () => {
+  it('propagates a failure from the atomic batch RPC (removals included) and leaves the cursor to the caller', async () => {
     mockRpc.mockReset();
     mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'boom' } });
 
     await expect(
       applyTransactionChanges({ userId: 'user-1', added: [], modified: [], removed: [fakeRemoved], accountIdByPlaidId })
-    ).rejects.toThrow('Failed to delete removed transactions');
+    ).rejects.toThrow('Failed to apply synced transaction batch: boom');
   });
 
   it('does nothing when there are no changes at all', async () => {
@@ -1209,85 +1226,182 @@ describe('getCategorySpendRows', () => {
   });
 });
 
+// Pending → posted continuity (design §6): every pending-row mutation is one locked RPC. The
+// application no longer reads the row first, checks ownership, or deletes-then-inserts splits — the
+// RPC does all of that under the per-user advisory lock, so an edit racing this row's posting is
+// either carried across or reported as gone (TransactionNotFoundError → the controller resolves it).
 describe('setTransactionSplits', () => {
-  it('replaces existing splits when the new splits sum to the transaction amount', async () => {
-    const fetchQuery = createQueryBuilder({
-      data: { amount: 50, accounts: { plaid_items: { user_id: 'user-1' } } },
-      error: null,
-    });
-    const deleteQuery = createQueryBuilder({ data: null, error: null });
+  beforeEach(() => mockRpc.mockReset());
+
+  it('replaces the splits through the atomic replace_transaction_splits RPC and returns what it inserted', async () => {
     const insertedSplits = [
       { id: 'split-1', transaction_id: 'txn-1', budget_category_id: 'cat-dining', amount: 30, note: null },
       { id: 'split-2', transaction_id: 'txn-1', budget_category_id: 'cat-groceries', amount: 20, note: null },
     ];
-    const insertQuery = createQueryBuilder({ data: insertedSplits, error: null });
-    mockFrom.mockReturnValueOnce(fetchQuery).mockReturnValueOnce(deleteQuery).mockReturnValueOnce(insertQuery);
+    mockRpc.mockResolvedValueOnce({ data: insertedSplits, error: null });
 
     const result = await setTransactionSplits('txn-1', 'user-1', [
       { budgetCategoryId: 'cat-dining', amount: 30, note: null },
       { budgetCategoryId: 'cat-groceries', amount: 20, note: null },
     ]);
 
-    expect(deleteQuery.delete).toHaveBeenCalled();
-    expect(deleteQuery.eq).toHaveBeenCalledWith('transaction_id', 'txn-1');
-    expect(insertQuery.insert.mock.calls[0][0]).toEqual([
-      { transaction_id: 'txn-1', budget_category_id: 'cat-dining', amount: 30, note: null },
-      { transaction_id: 'txn-1', budget_category_id: 'cat-groceries', amount: 20, note: null },
-    ]);
+    expect(mockRpc).toHaveBeenCalledWith('replace_transaction_splits', {
+      p_user_id: 'user-1',
+      p_transaction_id: 'txn-1',
+      p_splits: [
+        { budget_category_id: 'cat-dining', amount: 30, note: null },
+        { budget_category_id: 'cat-groceries', amount: 20, note: null },
+      ],
+    });
+    // No direct table access: the delete and the insert happen inside the RPC's one transaction.
+    expect(mockFrom).not.toHaveBeenCalled();
     expect(result).toEqual(insertedSplits);
   });
 
-  it("rejects splits that don't sum to the transaction's amount", async () => {
-    const fetchQuery = createQueryBuilder({
-      data: { amount: 50, accounts: { plaid_items: { user_id: 'user-1' } } },
-      error: null,
+  it("surfaces the RPC's balance refusal as InvalidSplitsError with the human message", async () => {
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: "splits_unbalanced: replace_transaction_splits: splits must add up to the transaction's amount (50.00)" },
     });
-    mockFrom.mockReturnValueOnce(fetchQuery);
 
     await expect(
       setTransactionSplits('txn-1', 'user-1', [{ budgetCategoryId: 'cat-dining', amount: 30, note: null }])
-    ).rejects.toThrow(/must add up to the transaction's amount \(50\.00\)/);
-
-    // Rejected before ever touching the splits table.
-    expect(mockFrom).toHaveBeenCalledTimes(1);
+    ).rejects.toMatchObject({ constructor: InvalidSplitsError, message: "splits must add up to the transaction's amount (50.00)" });
   });
 
-  it("rejects when the transaction doesn't belong to the requesting user", async () => {
-    const fetchQuery = createQueryBuilder({
-      data: { amount: 50, accounts: { plaid_items: { user_id: 'someone-else' } } },
-      error: null,
+  it('maps the RPC\'s transaction_not_found (not found or another user\'s) to TransactionNotFoundError', async () => {
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'transaction_not_found: replace_transaction_splits: transaction txn-1 not found or not owned by user' },
     });
-    mockFrom.mockReturnValueOnce(fetchQuery);
 
     await expect(
       setTransactionSplits('txn-1', 'user-1', [{ budgetCategoryId: 'cat-dining', amount: 50, note: null }])
-    ).rejects.toThrow('Transaction not found');
+    ).rejects.toBeInstanceOf(TransactionNotFoundError);
   });
 });
 
 describe('clearTransactionSplits', () => {
-  it('deletes all splits for the transaction once ownership is confirmed', async () => {
-    const ownerQuery = createQueryBuilder({
-      data: { id: 'txn-1', accounts: { plaid_items: { user_id: 'user-1' } } },
-      error: null,
-    });
-    const deleteQuery = createQueryBuilder({ data: null, error: null });
-    mockFrom.mockReturnValueOnce(ownerQuery).mockReturnValueOnce(deleteQuery);
+  beforeEach(() => mockRpc.mockReset());
+
+  it('clears through the same RPC with an empty array (same lock, same ownership check)', async () => {
+    mockRpc.mockResolvedValueOnce({ data: [], error: null });
 
     await clearTransactionSplits('txn-1', 'user-1');
 
-    expect(deleteQuery.delete).toHaveBeenCalled();
-    expect(deleteQuery.eq).toHaveBeenCalledWith('transaction_id', 'txn-1');
+    expect(mockRpc).toHaveBeenCalledWith('replace_transaction_splits', {
+      p_user_id: 'user-1',
+      p_transaction_id: 'txn-1',
+      p_splits: [],
+    });
+    expect(mockFrom).not.toHaveBeenCalled();
   });
 
-  it("rejects when the transaction doesn't belong to the requesting user", async () => {
-    const ownerQuery = createQueryBuilder({
-      data: { id: 'txn-1', accounts: { plaid_items: { user_id: 'someone-else' } } },
+  it('maps transaction_not_found to TransactionNotFoundError', async () => {
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'transaction_not_found: replace_transaction_splits: transaction txn-1 not found or not owned by user' },
+    });
+
+    await expect(clearTransactionSplits('txn-1', 'user-1')).rejects.toBeInstanceOf(TransactionNotFoundError);
+  });
+});
+
+describe('setTransactionCategory / approveTransaction (locked RPCs, pending → posted continuity)', () => {
+  beforeEach(() => mockRpc.mockReset());
+
+  it('sets a category through set_transaction_budget_category, passing the signed-in user', async () => {
+    const row = { id: 'txn-1', budget_category_id: 'cat-dining', budget_category_source: 'user' };
+    mockRpc.mockResolvedValueOnce({ data: row, error: null });
+
+    await expect(setTransactionCategory('user-1', 'txn-1', 'cat-dining')).resolves.toEqual(row);
+    expect(mockRpc).toHaveBeenCalledWith('set_transaction_budget_category', {
+      p_user_id: 'user-1',
+      p_transaction_id: 'txn-1',
+      p_budget_category_id: 'cat-dining',
+    });
+  });
+
+  it('a deliberate clear is sent as NULL (the RPC records budget_category_source = user for it too)', async () => {
+    mockRpc.mockResolvedValueOnce({ data: { id: 'txn-1', budget_category_id: null, budget_category_source: 'user' }, error: null });
+
+    await setTransactionCategory('user-1', 'txn-1', null);
+    expect(mockRpc).toHaveBeenCalledWith('set_transaction_budget_category', expect.objectContaining({ p_budget_category_id: null }));
+  });
+
+  it('approves through approve_transaction', async () => {
+    mockRpc.mockResolvedValueOnce({ data: { id: 'txn-1', needs_review: false, review_note: null }, error: null });
+
+    await approveTransaction('user-1', 'txn-1');
+    expect(mockRpc).toHaveBeenCalledWith('approve_transaction', { p_user_id: 'user-1', p_transaction_id: 'txn-1' });
+  });
+
+  it('maps transaction_not_found to TransactionNotFoundError and anything else to a plain error', async () => {
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'transaction_not_found: approve_transaction: transaction txn-1 not found or not owned by user' },
+    });
+    await expect(approveTransaction('user-1', 'txn-1')).rejects.toBeInstanceOf(TransactionNotFoundError);
+
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'connection reset' } });
+    await expect(setTransactionCategory('user-1', 'txn-1', null)).rejects.toThrow('Failed to set transaction category: connection reset');
+  });
+});
+
+describe('backfillCategoryMapping (locked RPC, pending → posted continuity §6.1)', () => {
+  beforeEach(() => mockRpc.mockReset());
+
+  it('delegates to backfill_category_mapping — no select-then-UPDATE remains in the application', async () => {
+    mockRpc.mockResolvedValueOnce({ data: 3, error: null });
+
+    await expect(backfillCategoryMapping('user-1', 'FOOD_AND_DRINK', 'cat-groceries')).resolves.toBe(3);
+    expect(mockRpc).toHaveBeenCalledWith('backfill_category_mapping', {
+      p_user_id: 'user-1',
+      p_plaid_category: 'FOOD_AND_DRINK',
+      p_budget_category_id: 'cat-groceries',
+    });
+    expect(mockFrom).not.toHaveBeenCalled();
+  });
+
+  it('returns 0 when the RPC reports nothing filled, and propagates its errors', async () => {
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
+    await expect(backfillCategoryMapping('user-1', 'FOOD_AND_DRINK', 'cat-groceries')).resolves.toBe(0);
+
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'budget_category_not_found: …' } });
+    await expect(backfillCategoryMapping('user-1', 'FOOD_AND_DRINK', 'cat-x')).rejects.toThrow('Failed to backfill transactions');
+  });
+});
+
+describe('findTransactionCarryover (continuity §8 — always scoped to the signed-in user)', () => {
+  it('reports a consumed carry-over as superseded by its posted row', async () => {
+    const query = createQueryBuilder({
+      data: { consumed_at: '2026-09-26T10:00:00Z', consumed_by_transaction_id: 'txn-posted', expires_at: '2026-10-26T10:00:00Z' },
       error: null,
     });
-    mockFrom.mockReturnValueOnce(ownerQuery);
+    mockFrom.mockReturnValueOnce(query);
 
-    await expect(clearTransactionSplits('txn-1', 'user-1')).rejects.toThrow('Transaction not found');
+    await expect(findTransactionCarryover('user-1', 'txn-pending')).resolves.toEqual({
+      status: 'superseded',
+      postedTransactionId: 'txn-posted',
+    });
+    expect(query.eq).toHaveBeenCalledWith('user_id', 'user-1');
+    expect(query.eq).toHaveBeenCalledWith('pending_transaction_row_id', 'txn-pending');
+  });
+
+  it('reports an unconsumed, unexpired carry-over as pending_removed, and nothing otherwise', async () => {
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    mockFrom.mockReturnValueOnce(
+      createQueryBuilder({ data: { consumed_at: null, consumed_by_transaction_id: null, expires_at: future }, error: null })
+    );
+    await expect(findTransactionCarryover('user-1', 'txn-pending')).resolves.toEqual({ status: 'pending_removed' });
+
+    mockFrom.mockReturnValueOnce(
+      createQueryBuilder({ data: { consumed_at: null, consumed_by_transaction_id: null, expires_at: '2020-01-01T00:00:00Z' }, error: null })
+    );
+    await expect(findTransactionCarryover('user-1', 'txn-pending')).resolves.toBeNull();
+
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: null, error: null }));
+    await expect(findTransactionCarryover('user-1', 'someone-elses-row')).resolves.toBeNull();
   });
 });
 
@@ -2936,5 +3050,121 @@ describe('Linked Institution Management — item status writes and removal wrapp
     expect(mockFrom).toHaveBeenLastCalledWith('plaid_item_removals');
     expect(query.eq).toHaveBeenCalledWith('user_id', 'user-1');
     expect(query.is).toHaveBeenCalledWith('reconciled_at', null);
+  });
+});
+
+describe('linked-payment edits when the pending row has posted (pending → posted continuity)', () => {
+  beforeEach(() => mockRpc.mockReset());
+
+  it('updateLinkedPaymentPrincipal: a row missing at the pre-read is TransactionNotFoundError; a different loan is a plain error', async () => {
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: null, error: null }));
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100)).rejects.toBeInstanceOf(TransactionNotFoundError);
+    expect(mockRpc).not.toHaveBeenCalled();
+
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: { manual_loan_id: 'loan-2', amount: 200 }, error: null }));
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100)).rejects.toThrow('Payment is not linked to this loan');
+  });
+
+  it('updateLinkedPaymentPrincipal: the RPC losing the race (row deleted between read and lock) is TransactionNotFoundError', async () => {
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: { manual_loan_id: 'loan-1', amount: 200 }, error: null }));
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'update_linked_payment_principal: transaction not found or not owned by user' },
+    });
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100)).rejects.toBeInstanceOf(TransactionNotFoundError);
+  });
+
+  it('unlinkPaymentFromLoan: missing at the pre-read, or gone by the time the RPC locks, is TransactionNotFoundError; other RPC errors stay plain', async () => {
+    const linkedRow = {
+      manual_loan_id: 'loan-1',
+      amount: 200,
+      category: null,
+      personal_finance_category_detailed: null,
+      personal_finance_category_confidence: null,
+    };
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: null, error: null }));
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toBeInstanceOf(TransactionNotFoundError);
+
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: linkedRow, error: null }));
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'unlink_transaction_from_manual_loan: transaction not found or not owned by user' },
+    });
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toBeInstanceOf(TransactionNotFoundError);
+
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: linkedRow, error: null }));
+    mockRpc.mockResolvedValueOnce({ data: null, error: { message: 'connection reset' } });
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).rejects.toThrow('Failed to unlink payment: connection reset');
+  });
+});
+
+// Codex final review of 3534697: the pre-reads must be scoped through the ownership chain. With
+// supabaseAdmin (RLS bypassed), an id-only read would make another user's row distinguishable from
+// an unknown id (a "not linked to this loan" error, or the idempotent already-unlinked path).
+describe('linked-payment pre-reads are ownership-scoped (foreign row ≡ unknown id)', () => {
+  beforeEach(() => mockRpc.mockReset());
+
+  it('updateLinkedPaymentPrincipal filters the read through accounts → plaid_items for the signed-in user', async () => {
+    const query = createQueryBuilder({ data: { manual_loan_id: 'loan-1', amount: 200 }, error: null });
+    mockFrom.mockReturnValueOnce(query);
+    mockRpc.mockResolvedValueOnce({ data: null, error: null });
+
+    await updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100);
+
+    expect(query.select.mock.calls[0][0]).toContain('accounts!inner(plaid_items!inner(user_id))');
+    expect(query.eq).toHaveBeenCalledWith('id', 'txn-1');
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+  });
+
+  it("updateLinkedPaymentPrincipal: another user's linked row is indistinguishable from a missing id — the scoped read returns nothing, so TransactionNotFoundError, not \"not linked to this loan\"", async () => {
+    // The ownership-scoped query yields no row for a foreign id, exactly as for an unknown id.
+    const query = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-of-user-2', 'loan-1', 100)).rejects.toBeInstanceOf(TransactionNotFoundError);
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('unlinkPaymentFromLoan filters the read through the ownership chain too', async () => {
+    const query = createQueryBuilder({
+      data: { manual_loan_id: 'loan-1', amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+      error: null,
+    });
+    mockFrom.mockReturnValueOnce(query);
+    mockRpc.mockResolvedValueOnce({ data: true, error: null });
+
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).resolves.toBe(true);
+    expect(query.select.mock.calls[0][0]).toContain('accounts!inner(plaid_items!inner(user_id))');
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+  });
+
+  it("unlinkPaymentFromLoan: another user's already-unlinked row cannot take the idempotent-success path — the scoped read returns nothing, so TransactionNotFoundError and no RPC", async () => {
+    const query = createQueryBuilder({ data: null, error: null });
+    mockFrom.mockReturnValueOnce(query);
+
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-of-user-2-unlinked', 'loan-1')).rejects.toBeInstanceOf(TransactionNotFoundError);
+    expect(query.eq).toHaveBeenCalledWith('accounts.plaid_items.user_id', 'user-1');
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it("an OWNED already-unlinked row still takes the idempotent path (the scope changes nothing for the user's own rows)", async () => {
+    mockFrom.mockReturnValueOnce(
+      createQueryBuilder({
+        data: { manual_loan_id: null, amount: 200, category: null, personal_finance_category_detailed: null, personal_finance_category_confidence: null },
+        error: null,
+      })
+    );
+    await expect(unlinkPaymentFromLoan('user-1', 'txn-1', 'loan-1')).resolves.toBe(false);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('the owned pending → posted race is unchanged: the read finds the row, the RPC then reports it gone', async () => {
+    mockFrom.mockReturnValueOnce(createQueryBuilder({ data: { manual_loan_id: 'loan-1', amount: 200 }, error: null }));
+    mockRpc.mockResolvedValueOnce({
+      data: null,
+      error: { message: 'update_linked_payment_principal: transaction not found or not owned by user' },
+    });
+    await expect(updateLinkedPaymentPrincipal('user-1', 'txn-1', 'loan-1', 100)).rejects.toBeInstanceOf(TransactionNotFoundError);
   });
 });

@@ -118,8 +118,14 @@ async function authedFetch(
       }
 
       // A machine-readable `code`, when the server sends one, lets a caller act on a specific outcome
-      // without parsing the human-readable message (see isManualLoanCreationResolvedError).
-      throw Object.assign(new Error(message), typeof body.code === 'string' ? { code: body.code } : {});
+      // without parsing the human-readable message (see isManualLoanCreationResolvedError). A
+      // `transaction_superseded` refusal also carries the posted row that replaced the pending one
+      // the caller tried to edit, so the feed can re-target (pending → posted continuity).
+      throw Object.assign(
+        new Error(message),
+        typeof body.code === 'string' ? { code: body.code } : {},
+        body.superseded_by ? { superseded_by: body.superseded_by as TransactionItem } : {}
+      );
     }
 
     if (response.status === 204) return undefined;
@@ -268,6 +274,12 @@ export interface TransactionItem {
   budget_category_id: string | null;
   /** True until the user approves the transaction — never reset by a later Plaid update. */
   needs_review: boolean;
+  /** Pending → posted continuity: Plaid's id of the pending transaction this posted row replaced. */
+  pending_transaction_id?: string | null;
+  /** The pending amount when it differed from the posted amount; null otherwise. */
+  posted_from_pending_amount?: number | null;
+  /** Why the row was (re)flagged for review when it posted — cleared on approve. */
+  review_note?: string | null;
   splits: TransactionSplit[];
   accounts: { name: string; nickname: string | null; plaid_items: { institution_name: string | null } };
 }

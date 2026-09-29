@@ -16,6 +16,7 @@ import { summarizeErrorSafely } from '../services/errorSanitizer';
 import { isSyncableItemStatus } from '../services/itemStatus';
 import { ItemRemovalIncompleteError, runItemRemoval, toRemovalView } from '../services/itemRemoval';
 import { env } from '../config/env';
+import { respondTransactionGone } from './transactionGone';
 
 /** Date-Range Customization v1: `range_id` (one of the 5 reporting-range presets) takes
  *  precedence when present and valid; falls back to the legacy `months` count (default 6,
@@ -1001,12 +1002,6 @@ export async function setTransactionCategory(req: Request, res: Response, next: 
     const { transactionId } = req.params;
     const { budget_category_id: budgetCategoryId } = req.body as { budget_category_id: string | null };
 
-    const ownerId = await dataService.getTransactionOwnerId(transactionId);
-    if (!ownerId || ownerId !== userId) {
-      res.status(404).json({ error: 'Transaction not found' });
-      return;
-    }
-
     if (budgetCategoryId !== null) {
       const belongsToUser = await dataService.budgetCategoryBelongsToUser(budgetCategoryId, userId);
       if (!belongsToUser) {
@@ -1015,7 +1010,18 @@ export async function setTransactionCategory(req: Request, res: Response, next: 
       }
     }
 
-    const transaction = await dataService.setTransactionCategory(transactionId, budgetCategoryId);
+    // Ownership is verified inside the locked RPC (not by a separate read first), so an edit
+    // racing this row's posting is either carried across or reported as superseded.
+    let transaction;
+    try {
+      transaction = await dataService.setTransactionCategory(userId, transactionId, budgetCategoryId);
+    } catch (err) {
+      if (err instanceof dataService.TransactionNotFoundError) {
+        await respondTransactionGone(res, userId, transactionId);
+        return;
+      }
+      throw err;
+    }
     res.json({ transaction });
   } catch (err) {
     next(err);
@@ -1027,13 +1033,16 @@ export async function approveTransaction(req: Request, res: Response, next: Next
     const userId = req.user!.id;
     const { transactionId } = req.params;
 
-    const ownerId = await dataService.getTransactionOwnerId(transactionId);
-    if (!ownerId || ownerId !== userId) {
-      res.status(404).json({ error: 'Transaction not found' });
-      return;
+    let transaction;
+    try {
+      transaction = await dataService.approveTransaction(userId, transactionId);
+    } catch (err) {
+      if (err instanceof dataService.TransactionNotFoundError) {
+        await respondTransactionGone(res, userId, transactionId);
+        return;
+      }
+      throw err;
     }
-
-    const transaction = await dataService.approveTransaction(transactionId);
     res.json({ transaction });
   } catch (err) {
     next(err);
@@ -1047,12 +1056,6 @@ export async function setTransactionSplits(req: Request, res: Response, next: Ne
     const { splits } = req.body as {
       splits?: { budget_category_id?: string; amount?: number; note?: string | null }[];
     };
-
-    const ownerId = await dataService.getTransactionOwnerId(transactionId);
-    if (!ownerId || ownerId !== userId) {
-      res.status(404).json({ error: 'Transaction not found' });
-      return;
-    }
 
     if (!Array.isArray(splits) || splits.length === 0) {
       res.status(400).json({ error: 'At least one split is required' });
@@ -1071,15 +1074,30 @@ export async function setTransactionSplits(req: Request, res: Response, next: Ne
       }
     }
 
-    const saved = await dataService.setTransactionSplits(
-      transactionId,
-      userId,
-      splits.map((s) => ({
-        budgetCategoryId: s.budget_category_id!,
-        amount: s.amount!,
-        note: s.note ?? null,
-      }))
-    );
+    // Ownership, the cent-exact balance and the categories are all re-verified inside the locked
+    // RPC, which replaces the splits in one transaction (continuity design §6).
+    let saved;
+    try {
+      saved = await dataService.setTransactionSplits(
+        transactionId,
+        userId,
+        splits.map((s) => ({
+          budgetCategoryId: s.budget_category_id!,
+          amount: s.amount!,
+          note: s.note ?? null,
+        }))
+      );
+    } catch (err) {
+      if (err instanceof dataService.TransactionNotFoundError) {
+        await respondTransactionGone(res, userId, transactionId);
+        return;
+      }
+      if (err instanceof dataService.InvalidSplitsError) {
+        res.status(400).json({ error: err.message, code: 'splits_invalid' });
+        return;
+      }
+      throw err;
+    }
     res.status(201).json({ splits: saved });
   } catch (err) {
     next(err);
@@ -1091,13 +1109,15 @@ export async function clearTransactionSplits(req: Request, res: Response, next: 
     const userId = req.user!.id;
     const { transactionId } = req.params;
 
-    const ownerId = await dataService.getTransactionOwnerId(transactionId);
-    if (!ownerId || ownerId !== userId) {
-      res.status(404).json({ error: 'Transaction not found' });
-      return;
+    try {
+      await dataService.clearTransactionSplits(transactionId, userId);
+    } catch (err) {
+      if (err instanceof dataService.TransactionNotFoundError) {
+        await respondTransactionGone(res, userId, transactionId);
+        return;
+      }
+      throw err;
     }
-
-    await dataService.clearTransactionSplits(transactionId, userId);
     res.status(204).send();
   } catch (err) {
     next(err);

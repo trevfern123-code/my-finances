@@ -195,7 +195,20 @@ export function TransactionsFeed({
                         </span>
                         <span className="hint">
                           {formatDate(t.date)} · {t.accounts ? accountDisplayName(t.accounts) : '—'}
+                          {t.posted_from_pending_amount != null && (
+                            <>
+                              {' · '}
+                              <span className="posted-from-pending">
+                                Posted · was pending {formatAmount(t.posted_from_pending_amount, t.iso_currency_code).replace(/^[-+]/, '')}
+                              </span>
+                            </>
+                          )}
                         </span>
+                        {t.needs_review && t.review_note && (
+                          // Why continuity re-flagged this row when it posted (amount change, dropped
+                          // splits, reduced principal, deleted loan) — cleared by Approve.
+                          <span className="hint review-note">{t.review_note}</span>
+                        )}
                       </div>
                       <span className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
                         {formatAmount(t.amount, t.iso_currency_code)}

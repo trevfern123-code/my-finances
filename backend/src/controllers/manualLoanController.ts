@@ -8,6 +8,7 @@ import {
   repairExistingRelationalRoles,
 } from '../services/roleReconciliation';
 import type { ManualLoanRow } from '../types';
+import { respondTransactionGone } from './transactionGone';
 
 type LifetimeTotals = { principalPaid: number; interestPaid: number };
 
@@ -291,7 +292,17 @@ export async function updateLinkedPayment(req: Request, res: Response, next: Nex
       return;
     }
 
-    await dataService.updateLinkedPaymentPrincipal(userId, req.params.transactionId, loan.id, principalPortion);
+    try {
+      await dataService.updateLinkedPaymentPrincipal(userId, req.params.transactionId, loan.id, principalPortion);
+    } catch (err) {
+      // Pending → posted continuity: the pending payment may have posted (or been withdrawn) since
+      // the Loans tab loaded it — answer with what happened, never a generic failure.
+      if (err instanceof dataService.TransactionNotFoundError) {
+        await respondTransactionGone(res, userId, req.params.transactionId);
+        return;
+      }
+      throw err;
+    }
     const updatedLoan = (await dataService.getManualLoan(loan.id, userId))!;
     res.json({ loan: await enrichLoan(updatedLoan) });
   } catch (err) {
@@ -308,7 +319,15 @@ export async function unlinkPayment(req: Request, res: Response, next: NextFunct
       return;
     }
 
-    await dataService.unlinkPaymentFromLoan(userId, req.params.transactionId, loan.id);
+    try {
+      await dataService.unlinkPaymentFromLoan(userId, req.params.transactionId, loan.id);
+    } catch (err) {
+      if (err instanceof dataService.TransactionNotFoundError) {
+        await respondTransactionGone(res, userId, req.params.transactionId);
+        return;
+      }
+      throw err;
+    }
     // The unlinked transaction is no longer a manual_loan_link row — it may now be, or may have
     // previously invalidated, a transfer/refund relationship (Round 3 remediation §2/§3).
     // Bounded, reuses the same fixed windows as ordinary reconciliation — never a global scan.

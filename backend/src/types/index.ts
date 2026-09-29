@@ -111,6 +111,22 @@ export interface TransactionRow {
   classifier_version: number;
   /** User correction, if any — never written by sync/backfill/reconciliation. */
   user_role_override: string | null;
+  /** When the user last set or cleared `user_role_override` (Phase B writes it; created by the
+   *  continuity migration so the carry-over can copy it). */
+  user_role_override_at: string | null;
+  /** Pending → posted continuity: Plaid's id of the pending transaction this posted row replaced. */
+  pending_transaction_id: string | null;
+  /** The pending amount when it differed from the posted amount; null otherwise. */
+  posted_from_pending_amount: number | null;
+  /** Why continuity (re)set needs_review — amount change, dropped splits, reduced principal, deleted
+   *  loan. Cleared on approve. */
+  review_note: string | null;
+  /** Who set budget_category_id: 'mapping' (sync/backfill) or 'user' (the category RPC, including a
+   *  deliberate NULL). Null = unknown (rows that predate the column). */
+  budget_category_source: string | null;
+  /** Protocol marker (a sequence value) moved by every new-backend category write; see the
+   *  transactions_keep_user_cleared_category trigger. */
+  budget_category_set_seq: number | null;
   /** Generated (`coalesce(user_role_override, auto_role)`) — see semanticEffects.ts for why this
    *  alone is insufficient for a manual-loan-linked transaction without an override. */
   effective_role: string | null;

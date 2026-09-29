@@ -91,6 +91,15 @@ export async function syncItemTransactions(item: {
   await dataService.updateItemCursor(item.id, cursor);
   await dataService.recordItemSyncedAt(item.id);
 
+  // Pending → posted continuity housekeeping (design §7): carry-overs that expired unconsumed (the
+  // pending transaction never posted) and consumed ones past their audit window. Best-effort — the
+  // sync's own correctness never depends on it.
+  try {
+    await dataService.sweepTransactionCarryovers(item.user_id);
+  } catch (err) {
+    console.error(`Failed to sweep transaction carry-overs for item ${item.id}:`, summarizeErrorSafely(err));
+  }
+
   // Best-effort: recurring-stream detection is a separate Plaid call and a nice-to-have, not
   // core to syncing transactions — a failure here shouldn't fail the sync that triggered it. Runs
   // after the cursor advance since it has no bearing on transaction-semantics correctness.
