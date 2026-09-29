@@ -1,6 +1,14 @@
 # Financial Semantics Phase B — Design for review
 
-**Status:** design only, revision 6. No code, schema or production data is changed by this document.
+**Status:** revision 6, approved at design level (Codex). **Implementation slice 1 in progress** on
+`feature/phase-b-aggregation-slice1` — see §14. No migration, endpoint, production data or live
+calculation has been changed by Phase B.
+
+**Reconciled 2026-09-29 with the completed continuity release** (`PENDING_POSTED_CONTINUITY_RELEASE.md`):
+pending→posted continuity shipped in PR #6 (merge `a1b4120`), migration `20260927120000` is applied in
+production, and PR #7 (`ea5c90f`) closed the release out. References below that described continuity as
+future work now say so; no Phase B product decision was changed. Genuinely open questions found while
+implementing are in §13.
 
 **Revision 6:** §9.1 refund-tie fixture corrected — the competing original 8f is dated **09-18** (7 days
 before the 09-25 refund, the same distance as 8a), not 09-11 (14 days), so the case actually produces
@@ -141,7 +149,8 @@ Also relevant: `exclude_from_cash_flow` (account flag) is applied in C1–C6 and
 
 ### 1.3 Two prerequisites the roadmap already names
 
-1. **Pending → posted continuity is not implemented** and ships first (D1, decided). Its design is
+1. **Pending → posted continuity is released** (D1, decided and done: PR #6 merged as `a1b4120`,
+   migration `20260927120000` applied in production, closeout PR #7 `ea5c90f`). Its design is
    `PENDING_POSTED_CONTINUITY_DESIGN.md`; the properties Phase B relies on are its §3 (P1–P5):
    corrections including `user_role_override` survive posting in every arrival order, the loan ledger
    stays exact, and a mutation racing a posting gets `409 transaction_superseded` and re-targets.
@@ -580,8 +589,8 @@ recurring-streams response carries `bill_status: 'bill' | 'internal' | 'merged'`
 - **Refunds/income:** override to `income` or `refund` follows §4.1 (a negative `expense` override
   reduces spending; a positive `income` override reduces income). No sign restriction is enforced —
   the user is correcting Plaid — but the UI warns when the sign is unusual for the chosen role.
-- **Pending rows:** an override on a pending row is lost when Plaid posts it **unless** continuity
-  (§1.3) ships first. (§12 D1.)
+- **Pending rows:** an override on a pending row survives posting — continuity (§1.3) is released and
+  carries `user_role_override` and `user_role_override_at` to the posted row. (§12 D1.)
 - **Audit:** add `user_role_override_at timestamptz` (nullable) so the UI can say "You changed this on
   Sep 26" and preflights can count corrections; set/cleared together with the override. Optional
   but cheap (§12 D9).
@@ -835,7 +844,7 @@ Phase B fixes it as part of the aggregation rework:
 
 ### 8.1 Preflight (read-only, `supabase/preflight/2026xxxx_phase_b_preflight.sql`)
 
-1. Ledger head = `20260926120000`; Phase B version not recorded; Phase B objects absent (function,
+1. Ledger head = `20260927120000` (continuity, applied); Phase B version not recorded; Phase B objects absent (function,
    column, index).
 2. `count(*) where auto_role is null` — rows Phase A never classified. **Known today: 219 of the
    221 rows in the last 12 months.** Expected 0 **after** the backfill in §8.2; any other value
@@ -881,7 +890,7 @@ Phase B fixes it as part of the aggregation rework:
 ### 8.3 Rollout order (each step its own approval, as for LIM)
 
 1. Design approved (this document) → Codex review → implement on
-   `feature/financial-semantics-phase-b` (continuity first if D1 says so, on its own branch).
+   Phase B branches (continuity, D1, is already released; slice 1 is §14).
 2. Backfill dry run on production (read-only) → review → `--apply` (write, approved).
 3. Preflight 1–10 on production; keep the before/after snapshot.
 4. `supabase db push --dry-run` (exactly one file) → `db push` → postflight (function privileges,
@@ -1137,7 +1146,7 @@ returned; #13's NULL role in the same fixture is still handled by R0 in a fixtur
   mismatch on the *second* row leaves the first untouched (checked after the RAISE); same-account /
   unequal-amount / same-sign / already-overridden each raise; not executable by client roles; another
   user's row raises.
-- `c10_override_vs_sync`: holder runs `apply_synced_transaction_batch` modifying the row; contender
+- `c10_override_vs_sync`: holder runs `apply_synced_transaction_batch_v2` (the sync RPC since continuity) modifying the row; contender
   sets an override — serialised by the per-user advisory lock; the final row has both the new Plaid
   fields and the override.
 - `c11_override_vs_link`: override to `expense` racing `link_transaction_to_manual_loan` on the same
@@ -1228,8 +1237,8 @@ against bc87477.
 ## 11. Work breakdown (for estimation, not commitment)
 
 0. (Optional, D15) Aggregate fetch paging fix on its own small PR ahead of everything else.
-1. Continuity (D1 = first): `PENDING_POSTED_CONTINUITY_DESIGN.md` — migration (`transaction_carryovers`,
-   three columns), the atomic carry-over inside the sync RPC, superseded handling, tests.
+1. ~~Continuity (D1 = first)~~ — **done**: released in PR #6 / closed out in PR #7
+   (`PENDING_POSTED_CONTINUITY_RELEASE.md`).
 2. Backend: `fetchAllPages`; `semanticAggregation.ts` (totals + effect rows + card-payment and
    transfer partner detection) with tests; fetch functions select role columns and pad; controllers
    (frozen fields + new fields); stream merging; `PATCH /role` (both forms, ack) + effects endpoint;
@@ -1339,10 +1348,67 @@ the Phase A backfill.
 
 ## Appendix A — Pending → posted continuity
 
-Superseded in revision 3 by the separate document `PENDING_POSTED_CONTINUITY_DESIGN.md`, which ships
-before Phase B (D1). Phase B relies on its §3 contract (P1–P5): every correction on a pending row —
+Superseded in revision 3 by the separate document `PENDING_POSTED_CONTINUITY_DESIGN.md`, which shipped
+before Phase B (D1; released — `PENDING_POSTED_CONTINUITY_RELEASE.md`). Phase B relies on its §3 contract (P1–P5): every correction on a pending row —
 including `user_role_override` and its timestamp — survives posting in every arrival order (same page,
 posted before removal, removal before posting via the `transaction_carryovers` record), the loan
 ledger stays exact when the posted amount differs, page replay is idempotent, and a mutation racing a
 posting receives `409 transaction_superseded` with the posted row so the client re-targets. Its open
 decisions (C1–C5) are listed there.
+
+---
+
+## 13. Open questions found during implementation (slice 1)
+
+Recorded, not decided. None changes an approved product decision; each is a place where the design's
+text is silent or self-inconsistent and a choice affects a figure.
+
+- **Q1 — §9.1 "externally funded" variant, "Marking 4b as a transfer gives Income 2.10 and Cash flow
+  −397.90".** This sentence predates the tracked-set principle (revision 3). Under §4.1/§4.2 an
+  unpaired `internal_transfer` leg is an *external transfer* counted in cash flow with its sign, which
+  gives Cash flow **102.10** (2.10 − 400 + 500) — the same rule that keeps #9's single-row override at
+  1 827.10. The two statements cannot both hold. The module implements §4.1/§4.2; the test for this
+  variant is an `it.todo` until the design says which is intended. *Affects financial correctness.*
+- **Q2 — Does a transfer leg need its partner to carry the `internal_transfer` role too?** §4.2 says
+  "the same rule reconciliation used to pair it", and reconciliation pairs only eligible transfer
+  rows, so the module requires both legs to be `internal_transfer`. Consequence: if the user marks
+  only one side as a transfer and the other side stays `income`, the marked side is an external
+  transfer and the other side is income — cash flow is right, but Income includes the $500 until the
+  other side is marked too (the two-row form, §4.9, exists for this). Confirm.
+- **Q3 — Splits that do not sum to their parent.** Split writes have been cent-exact since
+  `roundToCents` replaced a 1-cent tolerance (README "Financial precision"), but older rows could be a
+  cent off. The module allocates splits exactly as stored (today's behaviour) and reports each such
+  parent in `splitMismatches`, so Budget total can then differ from Spending by that residual.
+  Alternatives: assign the residual to *unassigned*, or treat it as an integrity failure. Needs a
+  decision before Budget adopts the module; a preflight count of mismatched parents would size it.
+- **Q4 — A negative `credit_card_payment` leg on a non-credit account** (e.g. an overpayment returned
+  to checking). §4.3 classifies card-side legs by sign ("externally funded inflow (−, no payer leg)"),
+  so the module treats it as externally funded (0 in cash flow). But that money arrived in a tracked
+  depository account, so a cash view arguably should count it. Pinned by a test; confirm or change.
+- **Q5 — Pagination stop condition.** §7.4 says the helper "stops on a short page". If the server's
+  row cap is lower than the requested page size, every page is short and that rule would silently
+  truncate — the defect I7 exists to prevent. `fetchAllPages` therefore stops only on an **empty** page
+  (one extra request). Not a product decision; recorded as a deliberate deviation for review.
+- **Q6 — `unclassifiedAmount` sign.** Reported as the Plaid-signed sum of unclassified rows. The design
+  names the field but not its sign; the UI copy will decide which it needs.
+
+## 14. Implementation status
+
+**Slice 1 (implemented, disconnected from live behaviour):**
+- `backend/src/services/semanticAggregation.ts` — the pure module of §3: `aggregateCashFlow`,
+  `aggregateCashFlowByMonth`, `aggregateBudgetSpend`, `aggregateMonthlyBreakdown`, `resolveRows`; every
+  dollar through `getSemanticEffects()`; reciprocal transfer (±3 d) and per-payment card (±5 d)
+  pairing over a padded input; R0 and R9; effect rows for drill-down reconciliation. Integer-cent
+  arithmetic.
+- `backend/src/services/fetchAllPages.ts` — the keyset helper of §7.4 plus `(date, id)` and
+  `(transaction_id, id)` PostgREST filter builders.
+- `backend/src/testUtils/phaseBFixture.ts` — the §9.1 fixture; `semanticAggregation.test.ts` and
+  `fetchAllPages.test.ts`.
+- Nothing imports these modules outside their tests: no endpoint, response field, calculation,
+  migration or loan bookkeeping changed.
+
+**Planned (not implemented):** routing the aggregate fetches through `fetchAllPages` with role
+columns and ±`PAIRING_PAD_DAYS` padding; the new response fields (§5, §6.1) behind API level 2; the
+effects endpoint; recurring-stream merging (§4.8); the Phase B migration (`set_transaction_role_override`,
+replaced `replace_transaction_splits`, index); `PATCH /role`; feed pagination; frontend; preflight,
+the Phase A backfill (release gate) and release.
