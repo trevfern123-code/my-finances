@@ -1,4 +1,4 @@
--- DRAFT (rev 2) — NOT YET RUN AGAINST PRODUCTION. Read-only audit of card-payment matching for
+-- DRAFT (rev 3) — NOT YET RUN AGAINST PRODUCTION. Read-only audit of card-payment matching for
 -- FINANCIAL_SEMANTICS_PHASE_B_DESIGN.md §13 R3 and CARD_PAYMENT_PAIRING_DESIGN.md §9.
 --
 -- Two statements, each a single SELECT: no write, no DDL, no function with side effects. Safe to run
@@ -18,7 +18,10 @@
 --     excluded accounts (still used as pairing evidence).
 --
 -- POSSIBLE and UNKNOWN are EXPOSURE, not confirmed error: `unresolved_exposure` is the most the
--- slice-1 figure could be wrong by for those legs, not the amount it is wrong by.
+-- slice-1 figure could be wrong by for those legs, not the amount it is wrong by. CONFIRMED buckets
+-- can still differ from slice 1 — the approved rules (design §10) see more evidence, e.g. an excluded
+-- card closer than the included one (T5). That KNOWN difference is `confirmed_difference`, reported
+-- separately and never added to exposure.
 --
 -- Classification is respected as the app applies it:
 --   * a user override (user_role_override) always wins — a row overridden to another role is out of
@@ -35,7 +38,7 @@
 -- Sides follow semanticAggregation.ts exactly: an account whose type is 'credit' is the credit side;
 -- every other account — including a NULL type — is the cash side.
 --
--- Three effects are reported separately, never summed together:
+-- Five columns are reported separately, never summed together:
 --   live_effect          what the LIVE app adds to cash flow for these legs today: it is sign-based
 --                        and role-blind, so every leg on an included account counts −amount (Plaid
 --                        convention, + = outflow) and legs on excluded accounts count 0;
@@ -43,6 +46,12 @@
 --                        classification above (projected for 'projected' rows): −amount for a
 --                        cash-side leg it leaves unpaired (payment −, return +), 0 otherwise;
 --                        NULL for out-of-scope rows;
+--   proposed_effect      CONFIRMED buckets only: what the approved rules add (cash side: 0 when the
+--                        partner is on an included card, −amount for a payment / +amount for a
+--                        return when the partner is excluded or the user has no included card;
+--                        credit side: 0). NULL where the destination is not established;
+--   confirmed_difference proposed_effect − slice1_effect, CONFIRMED buckets only: how much slice 1 is
+--                        KNOWN to differ from the approved rules. NULL otherwise;
 --   unresolved_exposure  Σ|amount| of cash-side legs whose destination is not established (POSSIBLE,
 --                        UNKNOWN); 0 for CONFIRMED and for every credit-side leg (never moves cash
 --                        flow under D5); NULL out of scope.
@@ -225,6 +234,13 @@ select env_class,
        case when bucket like 'out_of_scope%' then null
             else (sum(case when not credit_side and not s1_paired then -cents else 0 end)
                   / 100.0)::numeric(14, 2) end                                        as slice1_effect,
+       case when bucket like 'confirmed%'
+            then (sum(case when not credit_side and bucket <> 'confirmed_tracked_pair_5d'
+                           then -cents else 0 end) / 100.0)::numeric(14, 2) end            as proposed_effect,
+       case when bucket like 'confirmed%'
+            then (sum(case when not credit_side and bucket <> 'confirmed_tracked_pair_5d' then -cents else 0 end
+                      - case when not credit_side and not s1_paired then -cents else 0 end)
+                  / 100.0)::numeric(14, 2) end                                        as confirmed_difference,
        case when bucket like 'out_of_scope%' then null
             else (sum(case when not credit_side and (bucket like 'possible%' or bucket like 'unknown%')
                            then abs(cents) else 0 end) / 100.0)::numeric(14, 2) end   as unresolved_exposure

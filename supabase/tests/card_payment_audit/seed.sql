@@ -89,6 +89,14 @@ insert into seed (n, acct, days_ago, amount, detailed, confidence, category, ove
   -- R5 an excluded cash account funds the included card → confirmed_funded_from_excluded_account_5d (0).
   (41, 'b', 22, 650, 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT', 'HIGH', 'LOAN_PAYMENTS', null, false, false, false),
   (42, 'x', 21, -650, 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT', 'HIGH', 'LOAN_PAYMENTS', null, false, false, false);
+  -- R7 (rev 3) an excluded card leg closer than the included one: checking +100 "Sep 1", included card
+  -- −100 "Sep 3", excluded card −100 "Sep 2". Stored roles, so this is its own 'current' row.
+  -- Slice 1 (included only) pairs checking with the included card → slice1_effect 0. The approved rule
+  -- pairs it with the excluded card → proposed_effect −100, confirmed_difference −100, exposure 0.
+insert into seed (n, acct, days_ago, amount, detailed, confidence, category, override, stored, pending, from_start) values
+  (43, 'c', 50, 100, 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT', 'HIGH', 'LOAN_PAYMENTS', null, true, false, false),
+  (44, 'x', 48, -100, 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT', 'HIGH', 'LOAN_PAYMENTS', null, true, false, false),
+  (45, 'e', 49, -100, 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT', 'HIGH', 'LOAN_PAYMENTS', null, true, false, false);
   -- R6 (no new rows): #14/#15, a payment to an excluded card, is confirmed_untracked_partner_excluded_5d
   -- with exposure 0 — slice 1 already counts it correctly, so it is not exposure.
 

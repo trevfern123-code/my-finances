@@ -1,18 +1,38 @@
-# Card-Payment Pairing — resolving Phase B §13 R3 (design proposal, rev 2)
+# Card-Payment Pairing — resolving Phase B §13 R3 (design proposal, rev 3)
 
 Status: **proposal for review — nothing implemented.** There is no migration, endpoint or
 live-calculation change. The document completes option (a) of `FINANCIAL_SEMANTICS_PHASE_B_DESIGN.md`
-§13 R3 while preserving D5. Every product decision is **pending Trevor** (§10). Acceptance tests are
-in §11. The read-only audit draft is `supabase/preflight/phase_b_card_payment_matching_audit.sql`
+§13 R3 while preserving D5. **Trevor approved the first-version product choices on 2026-09-29**
+(§10). Two items are deferred and not part of this release: recurring destination rules (T8) and
+the payment-and-return shortcut. Acceptance tests are in §11. The read-only audit draft is `supabase/preflight/phase_b_card_payment_matching_audit.sql`
 (§9). It has **not** been run against production, and has been validated only against synthetic rows
 in a throwaway local container.
+
+**Changes in rev 3** (Trevor's decisions; Codex review of 14e7bc7):
+
+1. **Decisions recorded** (§10): T1–T7 and T9 approved as recommended; T8 deferred. The
+   `same_destination` payment-and-return shortcut is **removed** from this release. Users confirm
+   individual transactions, and there is no cross-month cancellation.
+2. **Inconsistent reads return "Updating", never figures** (§3.7). Suppose, after the retries, the
+   transaction rows and the card states still do not come from one version. Then the aggregate
+   returns a retryable `updating` result with no totals and no ranges.
+3. **The evaluator's lock order and version publication** are specified (§3.7).
+   - It locks in a fixed order: the per-user advisory lock, then the user's version row.
+   - It publishes exactly the version it read under that lock, which is the version of the inputs it
+     evaluated. It never re-reads the version afterwards.
+   - It writes only derived tables, which have no foreign keys to data rows, so it cannot deadlock
+     with a lock-free writer.
+4. **Confirmed differences are reported separately from unresolved exposure** (§9). The audit gains
+   `proposed_effect` and `confirmed_difference`. A new regression, R7, is added to both the audit and
+   the pure-module tests: checking +100 Sep 1, included card −100 Sep 3, excluded card −100 Sep 2.
+   Slice 1 gives 0. The approved matching rule gives −100, with zero unresolved exposure.
 
 **Changes in rev 2** (Codex review of 5a6e831):
 
 1. **No automatic "proof of absence".** Ten days plus a successful sync was a heuristic. A
    counterpart may exist but be misclassified, farther away than 60 days, or differ by more than $5.
    A payment with no confirmed destination stays unresolved until the user confirms it (§3.4).
-   Rejecting a candidate never implies "unlinked card". T4 is pending.
+   Rejecting a candidate never implies "unlinked card". (T4 is now decided — §10.)
 2. **Atomic invalidation** (§3.7). Every input change bumps a per-user version in the writer's own
    transaction. Derived states are readable as resolved only when they were computed at exactly
    that version, so a failed or late evaluation can never expose a stale resolved total.
@@ -102,20 +122,18 @@ assumes an answer (§6).
 | `tracked` | `user_pair` | 0 (fee remainder §4.3) | User-confirmed pair with a leg on an included card |
 | `untracked` | `partner_excluded` | payment −, return + | Tier 1 or user pair with a leg on an **excluded** card |
 | `untracked` | `no_included_card` | payment −, return + | The user has no included credit account at all, so no leg can be tracked |
-| `untracked` | `user_confirmed_unlinked` | payment −, return + | The user said "this went to a card I haven't linked" (or a T8 rule the user created) |
+| `untracked` | `user_confirmed_unlinked` | payment −, return + | The user said "this went to a card I haven't linked" — for this transaction |
 | `untracked` | `removed_card` | payment −, return + | Its pair's card was removed through LIM; converted in the removal transaction (§4.7, T9) |
-| `unit` | `same_destination` | the unit nets to 0 | The user linked a cash-side payment and its return (§4.2) |
 | `unresolved` | `no_candidate` | one of the two | No candidate within the suggestion limits. The text varies with the leg's age and sync status |
 | `unresolved` | `possible_match` | one of the two | An exact-amount candidate the automatic rule cannot use |
 | `unresolved` | `amount_differs` | one of the two | A near-amount candidate |
 | `unresolved` | `ambiguous` | one of the two | An exact candidate within 5 days, but a tie or not reciprocal |
 | `unresolved` | `matched_leg_not_posted` | one of the two | A user decision whose other leg is still waiting to post (§3.6) |
 | `unresolved` | `decision_invalidated` | one of the two | A user decision whose leg changed amount or role (§3.6) |
-| `unresolved` | `evaluation_pending` | one of the two | The states are older than the inputs (§3.7) |
 
 Rules that apply throughout:
 - **Precedence**, when several apply to one leg:
-  1. an active **user** decision (pair, same destination, confirmed unlinked);
+  1. an active **user** decision (a pair, or a confirmed unlinked destination);
   2. then a **tier 1** pair;
   3. then `destination_removed_card` (system-written by a removal, §4.7);
   4. then `no_included_card`;
@@ -124,7 +142,10 @@ Rules that apply throughout:
   If a tier 1 pair or suggestion contradicts an active user decision, the user decision stands and
   the contradiction is shown as a suggestion ("Sapphire is now linked and shows a matching credit —
   match?"). Automation never overrides the user.
-- **No state means unresolved.** A missing state is never read as untracked.
+- **Stale states are never legs' states.** If the states are older than the inputs, no leg state
+  is returned at all: the whole card-dependent result is `updating` (§3.7).
+- **No state means unresolved.** With fresh states every card leg has one, so a missing state is an
+  integrity failure, reported as such. It is never read as untracked.
 - **Credit-side legs** are labelled only: `paired`, `funded_from_excluded`, or unresolved with the
   same reasons. Their cash-flow effect is always 0 (D5).
 
@@ -158,8 +179,8 @@ by the user, or invalidated (not deleted) by an amount or role change (§3.6).
 A leg becomes `untracked` only through evidence or the user:
 - **Evidence:** a pair whose partner is outside the included cards, or the fact that the user has no
   included credit account.
-- **The user:** an explicit confirmation of the destination (or a rule the user created, T8), or a
-  LIM removal that converts an existing pair (T9).
+- **The user:** an explicit confirmation of the destination for that transaction. A LIM removal
+  converts an existing pair (T9).
 
 Nothing else makes a leg untracked. In particular, none of the following does:
 - the passage of time;
@@ -171,14 +192,11 @@ Each of those is consistent with a counterpart that exists but was misclassified
 `LOAN_PAYMENTS` fallback to `debt_payment`), lies beyond H, or differs by more than $5.
 
 **The consequence is deliberate.** A user who has at least one included card and pays a card that
-isn't linked must confirm each such payment once, unless they create a rule (T8). A payment and its
-return can be confirmed together (`same_destination`).
+isn't linked must confirm each such payment once. A return is confirmed on its own, like any other
+transaction. Recurring rules (T8) and the payment-and-return shortcut are deferred.
 
-**T4 — pending.**
-- **Recommended:** no automatic absence, as above.
-- **The alternative** (rev 1's "S days + fresh sync") would label a guess as a fact. It should be
-  adopted only if Trevor explicitly accepts that it can be wrong, and it would need its own visible
-  label ("assumed unlinked").
+**T4 — decided (Trevor, 2026-09-29):** there is no automatic "unlinked" assumption based on elapsed
+time or sync status.
 
 ### 3.5 What is stored
 
@@ -190,8 +208,7 @@ All new tables:
 **`card_payment_decisions`** — what the user decided. It has **no foreign key to `transactions`.**
 - Columns:
   - `id`, `user_id`;
-  - `kind`: `pair` | `not_this_pair` | `same_destination` | `destination_unlinked` |
-    `destination_removed_card`;
+  - `kind`: `pair` | `not_this_pair` | `destination_unlinked` | `destination_removed_card`;
   - leg A: `a_account_id`, `a_plaid_transaction_id`, `a_cents`;
   - leg B (null for single-leg kinds): the same three columns;
   - `difference_cents` (pairs only; `|a_cents| − |b_cents|`, signed by which side is larger);
@@ -205,9 +222,12 @@ All new tables:
 - **Purge:** only when every referenced lineage has been `gone` (§3.6) for more than 30 days — the
   continuity retention, C2 — or by the user's own undo.
 
-**Derived tables** (recomputable at any time from inputs + decisions):
-- **`card_payment_auto_pairs`** — tier 1 results. It references transactions `on delete cascade`,
-  which is fine for derived data.
+**Derived tables** (recomputable at any time from inputs + decisions). They are written only by the
+evaluator and carry **no foreign key** to `transactions` or `accounts` (only `user_id`). An FK
+would make the evaluator take key-share locks on data rows, and could deadlock it with a lock-free
+writer (§3.7). A stale reference is harmless: it is never readable, because the delete that made it
+stale also bumped the version.
+- **`card_payment_auto_pairs`** — tier 1 results.
 - **`card_payment_leg_states`** — one row per card leg: `transaction_id`, `user_id`, `side`,
   `state`, `reason`, `partner_transaction_id`, `decision_id`, `candidate_ids`, `effect_cents`,
   `computed_at_version`.
@@ -234,12 +254,13 @@ the **current row**:
 A decision is **active** only when all of these hold:
 - every leg has a current row;
 - each current row's cents equal the recorded cents;
-- for a `pair` or `same_destination`, both rows are card legs of the kinds the decision needs.
+- for a `pair`, both rows are card legs on opposite sides.
 
 Otherwise it is **inactive**, with a reason, and is kept:
 - `matched_leg_not_posted` — a leg is `waiting_to_post`;
-- `decision_invalidated` — cents or role changed. The posted row gets a `review_note`, for example
-  "Card-payment match cleared: amount changed from 100.00 to 98.00" (the continuity C1 rule);
+- `decision_invalidated` — cents or role changed. The leg's state carries the message, for example
+  "Card-payment match cleared: amount changed from 100.00 to 98.00" (the spirit of the continuity C1
+  rule). The evaluator writes no transaction row, so it does not set `review_note` (§3.7 lock order);
 - `partner_gone` — the other leg is `gone`.
 
 An inactive decision leaves its legs unresolved. A `not_this_pair` decision only suppresses a
@@ -275,8 +296,49 @@ time.
 
 **Evaluation.** `evaluate_card_payments(user)` recomputes **all** of the user's card legs. That is
 card legs only: a few per month, so a full recompute is cheap and removes any dependency-closure bug.
-It then stamps the states and sets `evaluated_version := input_version` as read inside its own
-transaction.
+
+**Lock order.** Every participant takes locks in this order, and the evaluator never waits on L3:
+- **L1 — the per-user advisory lock** (`pg_advisory_xact_lock`), taken by every RPC and by the
+  evaluator. It is re-entrant within the RPC that already holds it.
+- **L2 — the user's `card_payment_eval_versions` row.** The evaluator takes it with `FOR UPDATE`;
+  input triggers take it with their `UPDATE`.
+- **L3 — data rows** (transactions, accounts, …).
+
+A lock-free writer (a direct update, or an old backend's direct statement) takes L3 and then, in its
+AFTER trigger, L2. The evaluator holds L1 and L2 but **takes no L3 lock**. It writes no transaction
+or account row, and its derived tables have no FKs to them, so no wait cycle can form.
+
+**Deadlocks outside the evaluator.** A multi-statement RPC holds L2 from its first input write
+(the trigger bump) until commit. Suppose it then writes a data row that a **lock-free** writer
+holds, while that writer waits on L2 for its own bump. That is a cycle.
+- **Detection:** PostgreSQL detects it and aborts one transaction, which rolls back completely,
+  bump included. No state can become falsely fresh, and the sync batch or direct write is retried.
+- **Exposure:** it is limited to lock-free writers. In this release every new-backend input writer
+  takes L1 first, including the account-inclusion change, which becomes an RPC. The only lock-free
+  writers are an old backend's direct account update during a rollback window, and manual SQL.
+- **Scope of the account trigger:** it fires only when `type`, `exclude_from_cash_flow` or
+  `item_id` actually changes, so nickname or colour edits never take L2.
+
+**Steps** — publishing exactly the evaluated version:
+1. **Require READ COMMITTED.** If `transaction_isolation` is anything else, raise. The subtransaction
+   fails, the user stays stale, and that is safe. Under REPEATABLE READ the snapshot could predate the
+   version it reads.
+2. **Take L1.**
+3. **Take L2 and read the version:** `select input_version into v … for update`, creating the row
+   first if it is missing.
+4. **Read the inputs**, in statements that run after step 3. Each takes a fresh snapshot, so it sees:
+   - every input change committed before L2 was granted. A change and its bump commit together, so
+     every bump counted in `v` has its change visible;
+   - the transaction's own earlier writes.
+
+   A change not yet committed has not bumped `v`. Its bump is waiting on L2 and lands after this
+   commit, making the user stale.
+5. **Compute and replace** the derived rows, stamped `computed_at_version = v`.
+6. **Publish:** `evaluated_version := v` — the version read in step 3, **never a re-read**. If this
+   same transaction writes another input after step 3, `input_version` is already greater than
+   `v`, and the user stays stale. That is the safe direction.
+7. **Commit** publishes the states and `evaluated_version` together.
+
 - **Where it runs:** at the end of every new RPC that changes an input — the sync batch, the role
   override, the decision RPCs, the account-inclusion update and the LIM removal. It runs in a
   subtransaction (`begin … exception when others then …`).
@@ -286,29 +348,41 @@ transaction.
   readable as resolved.**
 - **Standalone** (a retry after commit, or after a trigger-only change from an old or direct writer),
   it runs in its own transaction under the lock.
-- **A bump after evaluation** in the same transaction, or from a lock-free writer, simply leaves the
-  user stale. That is the safe direction: a lock-free writer's bump waits on the versions row until
-  the evaluating transaction commits, then makes the user stale.
-
 **Reading.** `get_card_payment_states(user, from, to)` is one statement, so it sees one snapshot. It
-returns `input_version`, `evaluated_version` and the legs.
-- **If the two versions differ**, it returns every card leg as `unresolved / evaluation_pending`,
-  never the stored states.
-- **The aggregation brackets its paged transaction fetch** (`fetchAllPages`) with that version and a
-  final `input_version` read. On a mismatch it retries up to twice, then computes with every card leg
-  `evaluation_pending`.
-- **Rows and states from different versions are never combined.**
+returns `input_version`, `evaluated_version` and — only when they are equal — the legs' states.
+When they differ it returns `fresh = false` and **no** states.
 
-**Invariant:** a resolved card-leg state is only ever read together with the exact committed inputs
-it was computed from.
+**The aggregation's read protocol:**
+1. **S** ← `get_card_payment_states`.
+2. Page the transactions (`fetchAllPages`; each page is its own snapshot).
+3. **V2** ← `select input_version`.
+4. **Compute** only if S is fresh **and** `S.input_version = V2`. Every input change bumps the
+   version, so equality means no input committed between S and the last page. The pages and the
+   states then describe exactly version `V2`.
+5. **Otherwise retry**, at most twice more, with a short backoff.
+6. **If it is still inconsistent**, return a **retryable `updating` result**: `{ status: 'updating',
+   retryAfterMs, reason: 'inputs_changing' | 'matching_pending' | 'matching_failed' }`.
+   - It has **no totals and no ranges**: no `cashFlow`, `cashFlowRange`, savings rate or breakdown
+     figures.
+   - It covers the whole aggregate response, because every figure in it came from the same
+     inconsistent pages.
+   - `matching_failed` means `last_error_code` is set. The backend keeps retrying the evaluation
+     and logs the code; the response stays retryable.
+
+**Invariant:** no figure — single number or range — is ever computed from rows and states of
+different versions, or from states older than the inputs.
+
+In normal operation the writer's own RPC evaluates before commit, so readers see fresh states.
+`updating` appears only while inputs are changing under a read, after a trigger-only write (an old
+or direct writer), or while an evaluation is failing.
 
 ### 3.8 Implementation language
 
 The evaluator is written in SQL (plpgsql), so it can run inside the writers' transactions. The
 pure TypeScript module stays as the **oracle**. A property test on generated histories requires the
 SQL and TypeScript results to be identical. This is an engineering choice, open to review, not a
-product decision. The alternative — TypeScript after commit only — is correct under §3.7, but would
-show `evaluation_pending` for a moment after every sync.
+product decision. The alternative — TypeScript after commit only — is correct under §3.7, but every
+read between a sync's commit and its evaluation would return `updating`.
 
 ## 4. How each case is handled (examples)
 
@@ -333,10 +407,12 @@ If the leg posts by Sep 6, tier 1 pairs it automatically and the range collapses
   (Sep 16) are a return-of-pair suggestion → range [X, X + 100]. Confirming gives X.
 - **Payment and return, destination not linked:** C +100 Sep 1 and C −100 Sep 12, with the user
   having included card X.
-  - Each leg alone is unresolved: bounds [X − 100, X + 100], deliberately conservative.
-  - One confirmation, "Sep 12 is the return of the Sep 1 payment" (`same_destination`), makes them a
-    unit: −100 + 100 = 0 whatever the destination, so the result is exactly X.
-  - Alternatively, confirming "unlinked card" on both gives −100 and +100, also X.
+  - Each leg is unresolved until the user confirms it: [X − 100, X] for the payment and [X, X + 100]
+    for the return, in their own months.
+  - The user confirms each transaction individually ("It went to a card I haven't linked" / "It came
+    back from a card I haven't linked") → −100 in its month and +100 in its month.
+  - When both fall in one month, it nets to X. Across months, each month shows its own confirmed
+    figure. There is **no cross-month cancellation**; the payment-and-return shortcut is deferred.
 - **Return on an excluded card:** E +100 and C −100 within 5 days pair in tier 1 → `partner_excluded`
   → +100, immediately.
 
@@ -380,13 +456,23 @@ Notation:
 C +250 to a card Z that was never linked:
 - **The user has no included credit account:** `no_included_card` → −250 immediately. That is proof:
   no included card exists. Linking a card later re-evaluates.
-- **The user has included card X:** unresolved until they confirm "a card I haven't linked", create a
-  rule (T8), or pick a match. There is no automatic conversion (T4).
+- **The user has included card X:** unresolved until they confirm "a card I haven't linked" for that
+  transaction, or pick a match. There is no automatic conversion (T4), and recurring rules are
+  deferred (T8).
 
 ### 4.6 Excluded accounts
 - **Payment to an excluded card.** C +500 and E −500 pair in tier 1 → `partner_excluded` → −500
   immediately. Slice 1 already counts −500 here, so this is **correct today** and not exposure (§9).
   Including E later makes it `tracked` (0).
+- **An excluded card closer than the included card** (regression R7). C +100 Sep 1, X −100 Sep 3 and
+  E −100 Sep 2:
+  - Tier 1 over the approved pool (T5) pairs C with E: E is closer, and each is the other's best
+    match. So C is `partner_excluded` → **−100**, a confirmed result with no unresolved exposure.
+  - X's leg stays unresolved on the credit side (0).
+  - Slice 1, which never sees E, pairs C with X → 0.
+  - This is a **confirmed difference** between slice 1 and the approved rules, not exposure. The
+    audit reports it in `confirmed_difference` (§9). The pure-module tests pin it with a
+    characterization test (0) and an `it.fails` test for the approved figure (−100).
 - **Excluded cash account funding an included card.** F +300 and X −300 pair. F is ignored, and X is
   labelled "funded from an excluded account" (0).
 
@@ -419,11 +505,10 @@ user pair decided on Pc–Pk.
 | … then Tk posts, cents equal | Both current, the decision is active → Tc `tracked` / `user_pair` |
 | Tk posts first, then Tc | Identical final result, by symmetry |
 | Tc arrives **before** Pc's removal (reversed arrival) | Tc is current and Pc superseded (not in the pool, no state). Pc's later removal changes nothing |
-| Tc's amount ≠ Pc's recorded amount | The decision is inactive (`decision_invalidated`), `review_note` is set on Tc, Tc is unresolved. The user may confirm again (a new decision) |
+| Tc's amount ≠ Pc's recorded amount | The decision is inactive (`decision_invalidated`); Tc's state shows the reason; Tc is unresolved. The user may confirm again (a new decision) |
 | Pc is cancelled and never posts | Pc stays `waiting_to_post` until its carry-over expires, then `gone`. The decision is inactive; it is purged 30 days after every lineage is gone |
-| **A decision with no partner** (`destination_unlinked` on Pc) | The same lineage rule: carried to Tc if the cents are equal, otherwise invalidated with a review note |
+| **A decision with no partner** (`destination_unlinked` on Pc) | The same lineage rule: carried to Tc if the cents are equal, otherwise invalidated (reason shown on the state) |
 | `not_this_pair` on Pc–Xk | Applies to Tc–Xk once Tc posts, whatever the amounts (it only suppresses a suggestion) |
-| `same_destination` on Pc (payment) – C return | Carried to Tc if the cents are equal |
 
 - **Tier 1 pairs involving pending rows** are derived. They are recomputed at each evaluation, so
   posting simply re-derives them.
@@ -445,13 +530,13 @@ user pair decided on Pc–Pk.
 - **Inputs:** card legs arrive with their state (from `get_card_payment_states`), `effect_cents` and
   labels. The module no longer pairs card legs, so the ±5-day card window and the card half of
   `PAIRING_PAD_DAYS` leave it. Transfers are unchanged.
-- **Outputs:**
+- **Outputs:** `status: 'ok' | 'updating'`. `updating` carries no figures (§3.7). With `ok`:
   - `cashFlowRange { low, high }` and `savingsRateRange`;
   - `cashFlow` (a single number only when nothing is unresolved);
   - `cardPaymentsUnresolved { count, paymentsAmount, returnsAmount, byReason }`.
 - **Invariants:**
   - low ≤ high;
-  - high − low = Σ|cash-side unresolved amount|, where a `same_destination` unit counts 0;
+  - high − low = Σ|cash-side unresolved amount|;
   - when nothing is unresolved, low = high = the D5 figure.
 - **Tests:** the two `it.fails` tests in `semanticAggregation.test.ts` become passing tests through
   stored user decisions.
@@ -470,31 +555,29 @@ user pair decided on Pc–Pk.
 | ambiguous | "Two payments could match Sapphire's $400.00 credit on Sep 2 — which one?" | Pick one · Neither |
 | matched_leg_not_posted | "Matched to Sapphire's pending credit — waiting for it to post." | Undo match |
 | decision_invalidated | "Your match was cleared because the amount changed from $100.00 to $98.00." | Match again · Choose another |
-| evaluation_pending | "Updating card-payment matches…" (if it persists: "Card-payment matching couldn't update.") | — |
 
 The sync status adds a line when relevant: "Sapphire hasn't synced since Sep 3 — reconnect." Other
 places:
-- **Returns** additionally offer "This is the return of …" (`same_destination`).
 - **Overview / Cash Flow** get a "Card payments to review (N)" list across periods.
 - **Unaffected:** Budget and Spending (card payments are never spending), Net worth and Liquid cash
   (balance-based).
 
-### 6.2 Headline figures — **T1, pending Trevor**
-Any period with an unresolved cash-side leg has two possible D5 values. The options:
+### 6.2 Headline figures — **T1 decided: ranges**
+Any period with an unresolved cash-side leg has two possible D5 values. It shows them as a range:
+"Cash flow $1,100 – $1,200 · 1 card payment isn't matched yet — Review".
+- The savings rate is shown the same way.
+- Charts show the conservative bound with a hatched segment to the other bound. No month-over-month
+  change is shown unless both months are resolved.
+- With nothing unresolved it shows a single number.
+- **An `updating` result** (§3.7) shows "Updating…" in place of every card-dependent figure. There is
+  no range and no number, and the client retries after `retryAfterMs`. If the reason is
+  `matching_failed` and it persists, the text becomes "Card-payment matching couldn't update — we'll
+  keep trying."
 
-- **(A) Range — recommended.** "Cash flow $1,100 – $1,200 · 1 card payment isn't matched yet —
-  Review".
-  - The savings rate is shown the same way.
-  - Charts show the conservative bound with a hatched segment to the other bound, and no
-    month-over-month change unless both months are resolved.
-  - `evaluation_pending` shows "Updating…" instead of a range covering every card leg.
-- **(B) Withhold:** "—" until resolved. This is strict, and the current month would often be blank.
-- **(C) One provisional number with a warning.** It can display an incorrect total, so **it is not
-  accepted by default.** It is an option only if Trevor explicitly accepts it and chooses the
-  assumption.
+A provisional single number with a warning is **not** used.
 
-The API carries everything any option needs: `cashFlow: number | null`, `cashFlowRange`,
-`savingsRateRange` and `cardPaymentsUnresolved`. Legacy fields stay frozen per D11.
+The API: `status`, `cashFlow: number | null`, `cashFlowRange`, `savingsRateRange` and
+`cardPaymentsUnresolved`; with `updating`, none of the figures. Legacy fields stay frozen per D11.
 
 ## 7. D5 preservation check
 
@@ -503,7 +586,7 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
 | Payment to an included card | 0 | `tracked`, 0 — also when far apart, once confirmed |
 | Payment to an unlinked card | −amount | −amount once **established**: no included card, or the user confirmed; unresolved before |
 | Payment to an excluded card | −amount | `partner_excluded`, −amount (proven by the pair) |
-| Its return (untracked) | +amount | the same, +amount; with `same_destination` the unit nets to 0 |
+| Its return (untracked) | +amount | the same, +amount, once confirmed for that transaction |
 | Card leg funded from outside or an excluded account | 0 | credit side, always 0 |
 | Fee remainder | (not covered by D5) | §4.3: D5's boundary rule applied to the excess (T6) |
 | Destination not established | — | both D5 values reported; the headline per T1 |
@@ -514,7 +597,7 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
    - the four tables of §3.5;
    - input triggers (§3.7) and `card_payment_bump`;
    - `evaluate_card_payments` and `get_card_payment_states`;
-   - decision RPCs: `link_card_payment`, `mark_card_payment_destination`, `link_same_destination`,
+   - decision RPCs: `link_card_payment`, `mark_card_payment_destination`,
      `dismiss_card_payment_candidate`, `undo_card_payment_decision`, each with a CAS on
      `computed_at_version`;
    - the sync batch RPC and LIM removal RPC extended (or a v3, if coexistence with an old backend
@@ -527,12 +610,12 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
 5. **Rollback:** drop the new objects. Only a disconnected build falls back to slice 1, which is why
    R3 gates live integration.
 
-## 9. The read-only audit (draft rev 2, not run)
+## 9. The read-only audit (draft rev 3, not run)
 
 - **File:** `supabase/preflight/phase_b_card_payment_matching_audit.sql`, with two single-SELECT
   statements.
 - **Validation:** `supabase/tests/card_payment_audit/run.sh` runs it in a read-only session against
-  42 synthetic rows in a throwaway container of Supabase's PostgreSQL 17 image, and compares with
+  45 synthetic rows in a throwaway container of Supabase's PostgreSQL 17 image, and compares with
   `expected.out`.
 
 **What rev 2 changes:**
@@ -544,6 +627,28 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
 | Projected classification mixed with current behaviour | `classification` = current (override or stored role) vs projected (classifier rules for NULL-role rows). `live_effect` = today's live app (sign-based, role-blind), separate from `slice1_effect` | every row |
 | "Possible" treated as error, including excluded-card payments | `unresolved_exposure` = the most the slice-1 figure could be wrong by, counted only for cash-side legs whose destination is not established. Excluded-card pairs are `confirmed_untracked_partner_excluded_5d` with exposure 0 | **R6** #14/#15 (exposure 0). **R4** #38–40: an excluded leg ties with the included one — `slice1_effect` 0 but exposure 555. **R5** #41/#42: funded from an excluded account |
 
+**What rev 3 changes** (Codex review of 14e7bc7) — confirmed differences are reported separately
+from exposure. Per bucket, one row reports:
+
+| Column | For CONFIRMED buckets | For POSSIBLE / UNKNOWN buckets |
+|---|---|---|
+| `slice1_effect` | what slice 1 adds | what slice 1 adds |
+| `proposed_effect` | what the approved rules add: 0 tracked, −amount/+amount untracked, 0 credit side | NULL — not established |
+| `confirmed_difference` | `proposed_effect − slice1_effect`: slice 1 is **known** to differ by this | NULL |
+| `unresolved_exposure` | 0 | Σ|amount| of cash-side legs: the most slice 1 **could** differ by |
+
+The two are never summed together.
+
+**Regression R7** (#43–#45, stored roles, so it is its own `current` row). C +100, X −100 two days
+later, and E −100 one day later. The expected row is `cash_side / payment / current /
+confirmed_untracked_partner_excluded_5d`, with:
+- `slice1_effect` 0.00;
+- `proposed_effect` −100.00;
+- `confirmed_difference` −100.00;
+- `unresolved_exposure` 0.00.
+
+X's leg is `possible_tie_or_not_reciprocal_5d` on the credit side, with exposure 0.
+
 **Other properties:**
 - **Classification:** user overrides are respected first, then stored roles, then the classifier's
   row-level rules (the only source of `credit_card_payment`).
@@ -551,21 +656,26 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
   column is read.
 - **Sandbox:** classified by institution id and name, plus an optional test-user list. Everything else
   is `not_identified`, not "real". If production ran on Sandbox throughout, every row is Sandbox data.
-- **Use:** the results inform T2 and the UI's priorities. They do not change the definition.
+- **Use:** the results size the review workload and the confirmed changes. They do not change the
+  definition.
 
-## 10. Decisions — all pending Trevor
+## 10. Decisions — approved by Trevor, 2026-09-29 (first version)
 
-| # | Decision | Recommendation | Status |
-|---|---|---|---|
-| T1 | Headline figures while unresolved: (A) range, (B) withhold, (C) provisional number + warning | (A). (C) only with explicit acceptance, since it can show an incorrect total | **pending** |
-| T2 | Suggestion limits: H and the near-amount tolerance (the manual picker is unlimited either way) | 60 days, $5.00 | **pending** |
-| T3 | Return-of-pair: suggest, or apply automatically | Suggest | **pending** |
-| T4 | Automatic absence: none, or the heuristic (S days + fresh sync, labelled "assumed") | **None**. The rev 1 recommendation is withdrawn | **pending** |
-| T5 | Use excluded accounts' legs as pairing evidence | Yes | **pending** |
-| T6 | Fee remainder rules (§4.3) | As specified | **pending** |
-| T7 | Tier 1 pairs in closed months may dissolve (visibly) on new ambiguity | Yes | **pending** |
-| T8 | User-created destination rules ("payments from Checking named … go to a card I haven't linked"), future legs only, visible and revocable | Offer them. Each application is a user confirmation | **pending** |
-| T9 | LIM removal converts pairs with the removed card into `destination_removed_card` | Yes | **pending** |
+| # | Decision |
+|---|---|
+| T1 | **Ranges** while payments remain unresolved (§6.2). No provisional single number |
+| T2 | **60 days / $5.00** suggestion limits; suggestions are never applied automatically |
+| T3 | **Unusual returns require confirmation** — return-of-pair is a suggestion |
+| T4 | **No automatic "unlinked"** assumption based on elapsed time or sync status |
+| T5 | **Excluded accounts may provide matching evidence** (effect still per the tracked set). This changes some slice-1 results — see R7 |
+| T6 | **Fee-remainder rules** of §4.3, with explicit confirmation of the difference |
+| T7 | **Historical totals may change with new evidence, visibly** |
+| T8 | **Deferred:** recurring destination rules are not in this release |
+| T9 | **Preserve known destinations** during institution removal (`destination_removed_card`), with the warning |
+
+**Also deferred:** the `same_destination` payment-and-return shortcut. Users confirm individual
+transactions, and this release has no cross-month cancellation behaviour. No other convenience
+features are in scope.
 
 ## 11. Acceptance tests
 
@@ -577,8 +687,11 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
    - after "unlinked": −100.
 2. **Codex return:** range [0, +100]; after the return-pair decision, 0. The `it.fails` test becomes
    `it`.
-3. **Payment and return with unconfirmed destination:** bounds [−100, +100]. After
-   `same_destination`: exactly 0. After two "unlinked" confirmations: 0.
+3. **Payment and return with unconfirmed destination**, each confirmed individually:
+   - in one month: bounds [−100, +100] → after both confirmations 0;
+   - across months: each month's own bounds, then −100 and +100 in their own months.
+
+   No state links the two legs.
 4. **Fee matrix (§4.3), every row:**
    - payment and return;
    - cash larger and card larger;
@@ -590,12 +703,16 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
 6. **Excluded card pair:** −500 with no range. **No included card:** −250 with no range.
 7. **Generated-history invariants:**
    - low ≤ high;
-   - high − low = Σ|unresolved cash-side| (units count 0);
+   - high − low = Σ|unresolved cash-side|;
    - resolved ⇒ low = high = D5;
    - credit-side legs never move a bound;
    - `no_candidate` never contributes to `untracked`.
-8. **Missing or `evaluation_pending` state:** unresolved, never untracked.
+8. **Stale or inconsistent input:** the module returns `status: 'updating'` with no figure — no
+   `cashFlow`, no range and no savings rate — never a figure computed from it. A missing leg state
+   with fresh states is an integrity error, never untracked.
 9. **Transfers:** unchanged on the §9.1 fixture.
+9a. **R7** (excluded card closer than the included card): slice 1 gives 0 (characterization). The
+    approved rule gives −100 (`it.fails` until implemented), with zero unresolved exposure.
 
 **Evaluator, triggers and RPCs (real-PostgreSQL harness, throwaway container):**
 10. **Oracle:** the SQL evaluator equals the TypeScript oracle on generated histories (clustered
@@ -616,21 +733,42 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
     Updates of non-input columns (e.g. `budget_category_id`, `review_note`) do not bump.
 14. **Stale reads:**
     - after a trigger-only change (simulated old-backend or direct update),
-      `get_card_payment_states` returns every card leg `evaluation_pending`, never the previous
-      resolved states;
-    - after a standalone evaluation, fresh states.
-15. **Evaluation failure** (fault injected): the sync batch still commits, `evaluated_version` is
-    behind, readers see `evaluation_pending`, and a retry resolves.
-16. **Reader bracket:** a sync committing between the aggregation's version read and its last page
-    forces a retry, and after two mismatches every card leg is `evaluation_pending`. Rows and states
-    from different versions are never combined.
+      `get_card_payment_states` returns `fresh = false` and no states, and the aggregate returns
+      `updating` (`matching_pending`) with no figures;
+    - after a standalone evaluation, fresh states and figures.
+15. **Evaluation failure** (fault injected): the sync batch still commits, and `evaluated_version`
+    stays behind. The aggregate returns `updating` (`matching_failed`) with no figures, and a retry
+    resolves.
+16. **Reader bracket:**
+    - a sync committing between S and the last page forces a retry;
+    - when every attempt sees a change (the harness commits a change during each attempt), the result
+      is `updating` (`inputs_changing`) with **no totals and no ranges**;
+    - a single interleaved change followed by a quiet retry returns correct figures for the new
+      version.
+16a. **Evaluator lock order and publication:**
+    - the evaluator takes L1 then L2;
+    - a lock-free update committed before L2 is granted is both counted in `v` and visible to the
+      evaluation;
+    - one still uncommitted when L2 is granted is neither, and leaves the user stale after commit;
+    - an input written in the same transaction after step 3 leaves `input_version > evaluated_version`;
+    - `evaluated_version` always equals the `v` read under L2;
+    - evaluation under REPEATABLE READ raises inside the subtransaction and leaves the user stale.
+16b. **The evaluator never deadlocks:** a lock-free transaction delete or update (holding L3,
+    waiting on L2) runs concurrently with the evaluator 50 times. The evaluator never waits on L3,
+    both complete, and no deadlock is reported. The derived tables have no FK to data rows.
+16c. **An RPC vs a lock-free writer on the same row** (the documented cycle). Either both complete,
+    or PostgreSQL aborts one with `deadlock_detected` and it rolls back completely. Afterwards,
+    `evaluated_version = input_version` holds only if the surviving transaction evaluated after the
+    last committed bump; otherwise the user is stale. A falsely fresh state never appears.
+16d. **The account trigger's scope:** updating `nickname` / `color` / `sort_order` does not bump.
+    Updating `exclude_from_cash_flow` to its current value does not bump either.
 17. **Lineage** — every row of the §4.8 table:
     - both pending legs removed before either posts, in one batch and in separate batches;
     - Tc first, and Tk first;
     - posted before the removal of the pending row;
-    - amount changed (invalidated, `review_note`, decision kept);
+    - amount changed (invalidated, reason on the state, decision kept);
     - cancelled pending (`waiting_to_post` → `gone` → purge after 30 days);
-    - single-leg decisions (`destination_unlinked`, `same_destination`, `not_this_pair`).
+    - single-leg decisions (`destination_unlinked`) and `not_this_pair`.
 
     Final links are identical across all orders. No decision row is deleted by a transaction delete.
 18. **LIM removal (T9):**
@@ -662,7 +800,9 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
     - a LIM removal vs a link on a leg of that card.
 22. **Grants:** no `anon` / `authenticated` privilege on the new tables. RPCs are service-role only,
     SECURITY INVOKER, with an empty `search_path`. The trigger functions are executable by no role.
-23. **Audit:** `supabase/tests/card_payment_audit/run.sh` passes (R1–R6 included).
+23. **Audit:** `supabase/tests/card_payment_audit/run.sh` passes (R1–R7 included).
+    `confirmed_difference` and `unresolved_exposure` are never both non-NULL and non-zero on one
+    bucket row.
 
 **Frontend (vitest + testing-library):**
 24. Every reason of §6.1 renders its text and actions. Each action sends the leg's
@@ -670,5 +810,5 @@ The API carries everything any option needs: `cashFlow: number | null`, `cashFlo
 25. **T1 per the chosen option:**
     - range text, the review link and a hatched chart segment;
     - no month-over-month change when either month is unresolved;
-    - "Updating…" for `evaluation_pending`.
+    - "Updating…" and a retry for an `updating` result, with no range or number rendered.
 26. **Review list:** counts match `cardPaymentsUnresolved` across periods.

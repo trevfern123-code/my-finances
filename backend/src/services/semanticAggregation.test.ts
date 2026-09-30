@@ -822,3 +822,36 @@ describe('§13 R3 — tracked legs outside the ±5-day card window change cash f
     expect(run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('ret', '2026-09-16', ACCOUNT.C, -100)]).cashFlow).toBe(0);
   });
 });
+
+// ---- R7: an excluded card leg closer than the included one (CARD_PAYMENT_PAIRING_DESIGN.md §4.6) --
+//
+// Trevor approved T5 (2026-09-29): legs on excluded accounts are matching evidence. Slice 1 never sees
+// them, so it pairs checking with the included card. Under the approved rule the excluded card's leg is
+// the closer reciprocal match, so the payment went outside the tracked set: a CONFIRMED difference of
+// −100 with zero unresolved exposure, not a range. The characterization test pins slice 1; the
+// `it.fails` test states the approved figure and flips when the stored-pairing slice lands.
+
+describe('R7 — an excluded card closer than the included card: a confirmed difference from slice 1', () => {
+  const accounts: AggregationAccount[] = [
+    { id: ACCOUNT.C, type: 'depository', excludeFromCashFlow: false },
+    { id: ACCOUNT.X, type: 'credit', excludeFromCashFlow: false },
+    { id: ACCOUNT.E, type: 'credit', excludeFromCashFlow: true },
+  ];
+  const rows = [
+    leg('pay', '2026-09-01', ACCOUNT.C, 100, 'credit_card_payment'),
+    leg('included-card', '2026-09-03', ACCOUNT.X, -100, 'credit_card_payment'),
+    leg('excluded-card', '2026-09-02', ACCOUNT.E, -100, 'credit_card_payment'),
+  ];
+  const run = () => aggregateCashFlow({ accounts, transactions: rows, period: SEPTEMBER });
+
+  it('characterization: slice 1 ignores the excluded card and pairs checking with the included card → 0', () => {
+    const t = run();
+    expect(t.creditCardPaymentsTracked).toBe(100);
+    expect(t.creditCardPaymentsUntracked).toBe(0);
+    expect(t.cashFlow).toBe(0);
+  });
+
+  it.fails('approved rule (T5): the closer excluded-card leg is the partner → −100, confirmed (no range)', () => {
+    expect(run().cashFlow).toBe(-100);
+  });
+});

@@ -1474,7 +1474,7 @@ decisions (C1–C5) are listed there.
       §4.9.
 
     This keeps D5. The rev 2 proposal refines what happens until the user acts: the leg is
-    *unresolved*, and the figure is shown per decision T1 (a range is recommended) rather than as a
+    *unresolved*, and the figure is shown per decision T1 (ranges, approved) rather than as a
     wrong single number. Cost: a migration (columns + RPC), reconciliation changes, and a pairing
     backfill that joins the Phase A backfill release gate.
   - **(b) Match a return to its original payment, in the pure module.** A cash-side return pairs with
@@ -1511,7 +1511,7 @@ decisions (C1–C5) are listed there.
      with no user action and no schema change. Either way the automatic ±5-day window is not widened
      silently.
 
-  **Proposal for review (2026-09-29, rev 2 after Codex's review of 5a6e831):**
+  **Proposal for review (2026-09-29, rev 3 — Trevor's decisions recorded; Codex's reviews of 5a6e831 and 14e7bc7):**
   `CARD_PAYMENT_PAIRING_DESIGN.md` completes option (a) while preserving D5. Under D5 only cash-side
   legs move cash flow, so each gets one of three states: tracked, untracked or **unresolved**.
   Unresolved is never guessed. A leg becomes untracked only through evidence (a pair with an excluded
@@ -1519,15 +1519,34 @@ decisions (C1–C5) are listed there.
   time, a sync or a rejected suggestion never counts as proof.
 
   User decisions are keyed by transaction lineage, so they survive pending → posted in any order.
-  Derived states are invalidated atomically in the writer's transaction and are never read as
-  resolved when stale.
+  Derived states are invalidated atomically in the writer's transaction. If the transaction rows
+  and the card states do not come from one version, the aggregate returns a retryable `updating`
+  result with no figures. The evaluator locks the per-user advisory lock, then its version row, and
+  publishes exactly the version it read under that lock.
 
   The document covers late legs, returns, fees, ambiguity, unlinked/excluded accounts,
   pending→posted and removal. It also sets out what users see while a payment is unresolved
-  (decision T1: range, withhold, or a provisional number that is not accepted by default), decisions
-  T1–T7 and acceptance tests. The audit draft (not run) is
-  `supabase/preflight/phase_b_card_payment_matching_audit.sql`, validated only against synthetic
-  rows by `supabase/tests/card_payment_audit/run.sh`. R3 stays open until Trevor decides.
+  (ranges, T1), and the acceptance tests.
+
+  **Trevor approved the first-version choices on 2026-09-29:**
+  - T1: ranges;
+  - T2: 60-day / $5 suggestions, never applied automatically;
+  - T3: unusual returns need confirmation;
+  - T4: no automatic "unlinked";
+  - T5: excluded accounts are evidence;
+  - T6: fee-remainder rules with explicit confirmation;
+  - T7: history may change visibly;
+  - T9: known destinations are kept on removal, with the warning.
+
+  **Deferred:** T8 (recurring destination rules) and the payment-and-return shortcut.
+
+  T5 changes some slice-1 results: regression R7, a confirmed difference of −100 with zero exposure.
+  The audit draft (not run) is `supabase/preflight/phase_b_card_payment_matching_audit.sql`. It
+  reports confirmed differences apart from unresolved exposure, and is validated only against
+  synthetic rows by `supabase/tests/card_payment_audit/run.sh`.
+
+  R3 stays a release gate for live integration until the stored-pairing slice is implemented and
+  reviewed.
 
 ## 14. Implementation status
 

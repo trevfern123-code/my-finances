@@ -35,5 +35,11 @@ ACTUAL="$(docker exec -i "$CONTAINER" psql -X -q -A -v ON_ERROR_STOP=1 -U postgr
   -c "set default_transaction_read_only = on" -f - < "$ROOT/supabase/preflight/phase_b_card_payment_matching_audit.sql")" \
   || { echo "FAILED: the audit did not run"; exit 1; }
 
+# Named regression rows (design §9), checked before the full comparison so a failure says which case.
+check() { printf '%s
+' "$ACTUAL" | grep -qxF "$2" || { echo "FAIL  $1: expected row missing: $2"; exit 1; }; }
+check "R1 NULL account type is the cash side"   "sandbox_institution_id|cash_side|payment|projected|predicted|confirmed_tracked_pair_5d|4|1|1|2210.00|-2210.00|0.00|0.00|0.00|0.00"
+check "R7 excluded card closer: confirmed difference, zero exposure"   "sandbox_institution_id|cash_side|payment|current|stored|confirmed_untracked_partner_excluded_5d|1|1|0|100.00|-100.00|0.00|-100.00|-100.00|0.00"
+check "R6 payment to an excluded card is not exposure"   "sandbox_institution_id|cash_side|payment|projected|predicted|confirmed_untracked_partner_excluded_5d|1|1|0|500.00|-500.00|-500.00|-500.00|0.00|0.00"
 if [ "${UPDATE:-0}" = 1 ]; then printf '%s\n' "$ACTUAL" > "$HERE/expected.out"; echo "expected.out rewritten"; exit 0; fi
 if diff --strip-trailing-cr <(printf '%s\n' "$ACTUAL") "$HERE/expected.out"; then echo "PASS  card-payment audit buckets"; else echo "FAIL  (diff above)"; exit 1; fi
