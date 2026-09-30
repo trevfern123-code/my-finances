@@ -130,6 +130,7 @@ assumes an answer (§6).
 | `unresolved` | `ambiguous` | one of the two | An exact candidate within 5 days, but a tie or not reciprocal |
 | `unresolved` | `matched_leg_not_posted` | one of the two | A user decision whose other leg is still waiting to post (§3.6) |
 | `unresolved` | `decision_invalidated` | one of the two | A user decision whose leg changed amount or role (§3.6) |
+| `unresolved` | `ambiguous_replacement` | one of the two | More than one posted row on the same account names this leg's pending id (§3.6, approved rule of 2026-09-30). Applies ahead of every precedence step below |
 
 Rules that apply throughout:
 - **Precedence**, when several apply to one leg:
@@ -246,7 +247,8 @@ the **current row**:
    `pending_transaction_id = P`, it is the current row, even while the pending row P still exists.
    That can happen when the posted row arrives before the removal. The pending row is then
    *superseded*: it is excluded from the pool and gets no state. If more than one row claims P, the
-   decision is inactive (`lineage_ambiguous`), which is defensive — Plaid should never do this.
+   decision is inactive (`lineage_ambiguous`), and the rows are held by the conflicting-replacement
+   rule below.
 2. **Otherwise, the row P itself exists** (pending or posted): that row is current.
 3. **Otherwise the lineage has no current row.** It is `waiting_to_post` if an unexpired, unconsumed
    carry-over for P exists, and `gone` if not.
@@ -268,6 +270,33 @@ suggestion, so it applies whenever both legs have current rows, whatever the amo
 
 This makes every arrival order resolve to the same result (§4.8), because the decision never
 depended on which row object existed when it was made.
+
+**Conflicting replacements — approved rule (Trevor, 2026-09-30).** Sometimes more than one posted
+transaction on the same user/account names the same pending payment as its
+`pending_transaction_id`. The matching of every such row then stays **unresolved** while the conflict
+remains.
+- **Scope:** the guard applies at the **lineage level**, whatever decision exists — a user pair, a
+  destination confirmation, a system `destination_removed_card` decision, or none. No decision says
+  which replacement is correct, and neither does its absence. A decision naming one of the rows by
+  its own posted id is equally inactive (`lineage_ambiguous`).
+- **What the rows get:**
+  - leg reason `ambiguous_replacement` (detail `lineage_ambiguous`), with the approved per-period
+    bounds {0, −amount};
+  - no candidates;
+  - no automatic match;
+  - they are never another leg's partner or candidate.
+
+  Rows on an excluded account keep the excluded-account treatment: not counted, and unmatched.
+- **Never automatic:** conflicting bank transactions are never deleted, merged, or chosen between.
+- **Recovery:** once a later snapshot has a single replacement, re-evaluation applies the normal rules
+  with no manual action. Tier 1 matching, and any decision naming the lineage, apply again.
+- **Different accounts:** rows on different accounts, or of different users, naming the same pending
+  id are not a conflict (the lineage key includes the account).
+
+**Future requirement (not built):** a conflict that **persists** needs a clear review path. The user
+must be shown what the conflict is and how it can be resolved, without being asked to guess which
+bank transaction is the real replacement. This design does not define that workflow; it must be
+designed before the feature relies on user action here.
 
 ### 3.7 Atomic invalidation and read consistency
 
@@ -677,6 +706,12 @@ X's leg is `possible_tie_or_not_reciprocal_5d` on the credit side, with exposure
 transactions, and this release has no cross-month cancellation behaviour. No other convenience
 features are in scope.
 
+**Approved 2026-09-30 (Trevor): conflicting replacements stay unresolved** (§3.6). When several posted
+rows on the same user/account claim to replace the same pending payment, none is chosen and no
+resolved matching effect is published, whatever decision exists or none. This includes
+`destination_removed_card`, so the earlier open question Q12 is closed. A persistent conflict needs a
+future review path that does not make the user guess; it is not built.
+
 ## 11. Acceptance tests
 
 **Pure module (vitest), from stored states:**
@@ -771,6 +806,18 @@ features are in scope.
     - single-leg decisions (`destination_unlinked`) and `not_this_pair`.
 
     Final links are identical across all orders. No decision row is deleted by a transaction delete.
+17a. **Conflicting replacements (approved rule, 2026-09-30):** several posted rows on one account naming
+    the same pending id stay `ambiguous_replacement`, unmatched, and never another leg's
+    partner or candidate. This holds:
+    - with a user pair, with a destination confirmation, with `destination_removed_card`, and with
+      no decision;
+    - with reordered inputs;
+    - with the approved per-period bounds;
+    - with excluded-account rows not counted.
+
+    Rows on different accounts or of different users are not a conflict. A corrected snapshot with one
+    replacement evaluates normally, with no manual action. *(Pure-evaluator coverage exists; the
+    database evaluator must pass the same cases.)*
 18. **LIM removal (T9):**
     - the pairs are converted before the deletes, in the same transaction;
     - cash legs become `removed_card`;
