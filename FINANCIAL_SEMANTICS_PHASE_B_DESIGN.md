@@ -1510,6 +1510,20 @@ decisions (C1–C5) are listed there.
      with no user action and no schema change. Either way the automatic ±5-day window is not widened
      silently.
 
+  **Proposal for review (2026-09-29):** `CARD_PAYMENT_PAIRING_DESIGN.md` completes option (a) while
+  preserving D5. Under D5 only cash-side legs move cash flow, so each gets one of three states:
+  tracked, untracked or **unresolved**. Unresolved is never guessed. Evidence comes from:
+  - automatic ±5-day pairs, stored over full history;
+  - suggestions the user confirms;
+  - a proof of absence tied to sync recency.
+
+  The document covers late legs, returns, fees, ambiguity, unlinked/excluded accounts,
+  pending→posted and removal. It also sets out what users see while a payment is unresolved
+  (decision T1: range, withhold, or a provisional number that is not accepted by default), decisions
+  T1–T7 and acceptance tests. The audit draft (not run) is
+  `supabase/preflight/phase_b_card_payment_matching_audit.sql`, validated only against synthetic
+  rows by `supabase/tests/card_payment_audit/run.sh`. R3 stays open until Trevor decides.
+
 ## 14. Implementation status
 
 **Slice 1 (implemented, disconnected from live behaviour):**
@@ -1527,7 +1541,8 @@ decisions (C1–C5) are listed there.
   migration or loan bookkeeping changed.
 - **Known limitation (open, §13 R3):** card-payment legs on included accounts that do not pair (more
   than 5 days apart, or amounts differ) shift cash flow by the full amount. Characterization and
-  `it.fails` tests pin it. It blocks live integration of card-payment figures.
+  `it.fails` tests pin it. It blocks live integration of card-payment figures. Proposed
+  resolution: `CARD_PAYMENT_PAIRING_DESIGN.md` (not implemented).
 
 **Planned (not implemented):** routing the aggregate fetches through `fetchAllPages` with role
 columns and ±`PAIRING_PAD_DAYS` padding; the new response fields (§5, §6.1) behind API level 2; the

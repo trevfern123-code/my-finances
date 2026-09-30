@@ -1,0 +1,26 @@
+env_class|side|direction|role_basis|bucket|legs|users|pending_legs|amount|current_rule_cash_flow_effect
+not_identified|cash_side|payment|predicted|unknown_no_included_card|1|1|0|50.00|-50.00
+sandbox_institution_id|cash_side|payment|override|confirmed_paired_within_5d|1|1|0|1100.00|0.00
+sandbox_institution_id|cash_side|payment|predicted|confirmed_paired_within_5d|3|1|1|1500.00|0.00
+sandbox_institution_id|cash_side|payment|predicted|out_of_scope_classified_other_role|2|1|0|2200.00|
+sandbox_institution_id|cash_side|payment|override|out_of_scope_user_override_other_role|1|1|0|1000.00|
+sandbox_institution_id|cash_side|payment|predicted|possible_amount_differs_within_5d|1|1|0|150.00|-150.00
+sandbox_institution_id|cash_side|payment|predicted|possible_exact_amount_6_to_60d|1|1|0|300.00|-300.00
+sandbox_institution_id|cash_side|payment|predicted|possible_partner_on_excluded_card|1|1|0|500.00|-500.00
+sandbox_institution_id|cash_side|payment|predicted|possible_tie_or_not_reciprocal_5d|2|1|0|800.00|-800.00
+sandbox_institution_id|cash_side|payment|predicted|unknown_no_candidate|1|1|0|600.00|-600.00
+sandbox_institution_id|cash_side|payment|predicted|unknown_recent_no_candidate|1|1|0|700.00|-700.00
+sandbox_institution_id|cash_side|return|predicted|possible_exact_amount_6_to_60d|1|1|0|200.00|200.00
+sandbox_institution_id|credit_side|payment|predicted|confirmed_paired_within_5d|3|1|0|1500.00|0.00
+sandbox_institution_id|credit_side|payment|stored|confirmed_paired_within_5d|1|1|0|1100.00|0.00
+sandbox_institution_id|credit_side|payment|predicted|out_of_scope_excluded_account|1|1|0|500.00|
+sandbox_institution_id|credit_side|payment|predicted|possible_amount_differs_within_5d|1|1|0|148.00|0.00
+sandbox_institution_id|credit_side|payment|predicted|possible_exact_amount_6_to_60d|1|1|0|300.00|0.00
+sandbox_institution_id|credit_side|payment|predicted|possible_tie_or_not_reciprocal_5d|1|1|0|400.00|0.00
+sandbox_institution_id|credit_side|payment|predicted|unknown_no_candidate|1|1|0|800.00|0.00
+sandbox_institution_id|credit_side|return|predicted|possible_exact_amount_6_to_60d|1|1|0|200.00|0.00
+(20 rows)
+env_class|items|items_not_active|items_not_synced_2d|users|credit_accounts|credit_accounts_excluded|other_accounts|other_accounts_excluded
+not_identified|1|0|1|1|0|0|1|0
+sandbox_institution_id|1|0|1|1|2|1|1|0
+(2 rows)
