@@ -746,3 +746,79 @@ describe('returned card payments: cash arriving in checking vs a payment into a 
     expect(t.cashFlow).toBe(1827.1);
   });
 });
+
+// ---- Design §13 R3: both legs tracked but outside the matching window (Codex review of 4e31fb3) ----
+//
+// Both legs of a payment (or of a return) are in the tracked set but farther apart than the ±5-day
+// card window, so they do not pair. That is NOT only a labelling difference: the unpaired cash-side
+// leg is counted as cash crossing the tracked-set boundary while its unpaired credit-side leg is
+// non-cash, so cash flow is off by the full amount, permanently. The characterization tests pin
+// today's numbers; the `it.fails` tests state the correct figure and are EXPECTED to fail until the
+// resolution proposed in design §13 R3 is decided and built (vitest passes them while they fail and
+// flags them the moment they start passing). This is a known limitation, not an accepted one.
+
+describe('§13 R3 — tracked legs outside the ±5-day card window change cash flow, not just labels', () => {
+  const accounts: AggregationAccount[] = [
+    { id: ACCOUNT.C, type: 'depository', excludeFromCashFlow: false },
+    { id: ACCOUNT.X, type: 'credit', excludeFromCashFlow: false },
+  ];
+  const ccp = (id: string, date: string, accountId: string, amount: number) => leg(id, date, accountId, amount, 'credit_card_payment');
+  const run = (rows: AggregationTransaction[]) => aggregateCashFlow({ accounts, transactions: rows, period: SEPTEMBER });
+  // Codex's reproduction: checking +100 Sep 1 and card −100 Sep 2 (a pair); card reversal +100 Sep 10;
+  // checking return −100 on `returnDate`.
+  const paymentAndReturn = (returnDate: string) => [
+    ccp('pay', '2026-09-01', ACCOUNT.C, 100),
+    ccp('card', '2026-09-02', ACCOUNT.X, -100),
+    ccp('rev', '2026-09-10', ACCOUNT.X, 100),
+    ccp('ret', returnDate, ACCOUNT.C, -100),
+  ];
+
+  it('characterization: the checking return 5 days after the card reversal pairs with it → cash flow 0', () => {
+    const t = run(paymentAndReturn('2026-09-15'));
+    expect(t.creditCardPaymentsTracked).toBe(100);
+    expect(t.creditCardPaymentsReturnedTracked).toBe(100);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(0);
+    expect(t.creditCardPaymentsReversedExternally).toBe(0);
+    expect(t.cashFlow).toBe(0);
+  });
+
+  it("characterization: one day later (6 days) the return legs do not pair → cash flow +100 (today's behaviour)", () => {
+    const t = run(paymentAndReturn('2026-09-16'));
+    expect(t.creditCardPaymentsTracked).toBe(100); // the payment still pairs: 0 cash
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(100); // the checking return is counted as cash in: +100
+    expect(t.creditCardPaymentsReversedExternally).toBe(100); // the card reversal is counted as non-cash: 0
+    expect(t.cashFlow).toBe(100);
+  });
+
+  it.fails('correct figure: a payment and its return between two TRACKED accounts net to 0 however far apart the legs are', () => {
+    // Checking −100 then +100, card −100 then +100: no cash crossed the tracked-set boundary.
+    expect(run(paymentAndReturn('2026-09-16')).cashFlow).toBe(0);
+  });
+
+  it("characterization: §4.3's late-card-leg residual is the same mechanism — payment Sep 1, card leg Sep 7 → −100, Sep 6 → 0", () => {
+    const late = run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('card', '2026-09-07', ACCOUNT.X, -100)]);
+    expect(late.creditCardPaymentsUntracked).toBe(100);
+    expect(late.creditCardPaymentsExternallyFunded).toBe(100);
+    expect(late.cashFlow).toBe(-100);
+    const onTime = run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('card', '2026-09-06', ACCOUNT.X, -100)]);
+    expect(onTime.creditCardPaymentsTracked).toBe(100);
+    expect(onTime.cashFlow).toBe(0);
+  });
+
+  it.fails('correct figure: a payment whose card leg posts 6 days later is still internal to the tracked set', () => {
+    // The late leg having "arrived" does not self-correct anything: both legs are present, unpaired.
+    expect(run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('card', '2026-09-07', ACCOUNT.X, -100)]).cashFlow).toBe(0);
+  });
+
+  it('not a fetched-context artefact: every leg is inside the period, and the documented pad gives the same result', () => {
+    const rows = paymentAndReturn('2026-09-16');
+    const padded = aggregateCashFlow({ accounts, transactions: fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS), period: SEPTEMBER });
+    expect(padded).toEqual(run(rows));
+    expect(padded.cashFlow).toBe(100);
+  });
+
+  it('the untracked-card cases the rule exists for are unaffected: payment −100, and payment + return net 0', () => {
+    expect(run([ccp('pay', '2026-09-01', ACCOUNT.C, 100)]).cashFlow).toBe(-100);
+    expect(run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('ret', '2026-09-16', ACCOUNT.C, -100)]).cashFlow).toBe(0);
+  });
+});

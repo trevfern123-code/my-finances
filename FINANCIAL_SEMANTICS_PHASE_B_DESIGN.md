@@ -389,10 +389,15 @@ unlink it." — never a plausible-looking number. R0 applies **only** to `effect
   Sep 1 payment whose card leg on Aug 28 is equally close to an Aug 24 payment). Nothing is
   persisted; the same rows always pair the same way.
   Persisting card-payment pairs (a `role_source` value, like `account_pair_match`) is Phase C.
-- Residual risk, accepted for Phase B: a payment to a *linked* card whose legs fail to pair (amount
-  differs by a fee, or the card leg is more than 5 days late) is counted as an untracked outflow
-  while its purchases are also spending — a temporary double count that self-corrects when the leg
-  arrives, and is visible in the "untracked" line. (§12 D5.)
+- **Residual risk — reopened as §13 R3, not accepted** (Codex review of 4e31fb3). A payment to a
+  *linked, included* card whose legs fail to pair — the amounts differ (a fee), or the legs are more
+  than 5 days apart — is counted as an untracked outflow (subtracted) while its card leg is externally
+  funded (0), and the purchases it settled are also Spending. Earlier text called this a temporary
+  double count that self-corrects when the leg arrives. That holds only while the card leg is not yet
+  synced and later posts within ±5 days. Once both legs are present but unpaired, nothing corrects it:
+  cash flow is permanently off by the payment amount. A returned payment has the mirror-image error
+  (+amount). D5 was agreed with the self-correcting description; the numbers, mechanism and proposed
+  resolution are in §13 R3, and live integration of card-payment figures waits for that decision.
 - Budget categories that today hold card payments (a "Credit card" category) will fall to ~$0
   spent. §8 preflight lists them; the UI shows "Card payments and transfers no longer count as
   spending" on the Budget tab once. No automatic archiving. (§12 D12.)
@@ -1240,7 +1245,7 @@ against bc87477.
 | Headline numbers change on release and look like a bug | §8.1-10 snapshot; explainers with excluded totals; one-time Budget notice; release note with the before/after table |
 | Today's range totals are already truncated at 1 000 rows | §7.4 internal paging; §8.1-11 measures the live exposure; D15 offers to ship the fix first |
 | Card payment to an unlinked card hides real spending | it is never dropped from cash flow: untracked outflow line (§4.3); override to `expense`; Phase C persisted pairing |
-| Card-payment pairing misses (fee-adjusted amount, >5-day lag) | temporary double count is visible in the untracked line and self-corrects; pad + reciprocal rule tested (§9.1) |
+| Card-payment pairing misses (fee-adjusted amount, legs > 5 days apart) | **open — blocks live integration (§13 R3).** Not self-correcting: while both legs are present and unpaired, cash flow is off by the full amount. Characterization and `it.fails` tests pin it; resolution proposed in §13 R3; the window is not widened |
 | A `LOAN_PAYMENTS` stream is dropped from bills although nothing else shows the payment; or a $900 card payment is reserved as $35 | merge, never drop (§4.8): one item per card/loan at the expected amount; uncovered streams stay bills; every merge carries its reason |
 | A payment to an excluded card or a transfer to an excluded/unlinked account vanishes from cash flow | tracked-set principle (§4.1): partners must be included accounts; such legs count as untracked card outflows / external transfers |
 | Overriding a linked loan payment misread as unlinking / silently changes the savings rate / acknowledged against stale amounts | acknowledgement carries the shown amounts and is verified under the lock; explicit `debt_payment` is recognised as a change |
@@ -1412,18 +1417,98 @@ decisions (C1–C5) are listed there.
   unclassified rows, always reported alongside `unclassifiedCount` (a $45 purchase and a $20 deposit →
   count 2, amount 25).
 
-**Still open (product choices, no figure depends on them yet):**
+**Still open — presentation choices (no figure depends on them):**
 
 - **R1 — How returns are shown.** The module reports untracked returns on their own line. The UI could
   instead show one netted "card payments to untracked cards" line (outflows − returns). Either is
   consistent with the cash-flow total; it is a presentation choice for the frontend slice.
 - **R2 — Whether "reversed externally" is shown at all.** It moves no tracked cash; it may be useful only
   as an explanation next to a card's balance. Presentation choice.
-- **R3 — A return far from its payment.** A return is matched only to a credit-side leg within ±5 days,
-  never to the original payment. If a payment to a *linked* card is returned more than 5 days after the
-  card shows the reversal, both legs are unpaired: the return is added as cash (correct) and the card's
-  +leg is "reversed externally" (0) — cash flow stays right, only the labels differ. Accepted residual,
-  in the spirit of §4.3's existing fee/late-leg residual.
+
+**Open — changes figures, blocks live integration:**
+
+- **R3 — Card-payment legs that are both tracked but do not pair change cash flow** (Codex review of
+  4e31fb3; corrected 2026-09-29; **open, not accepted**). The earlier text here said a far-away return
+  leaves cash flow right and only changes labels. That is wrong. Codex's reproduction (checking C,
+  included credit card X, every row `credit_card_payment`, period September):
+
+  | Rows | Cash flow today | Correct |
+  |---|---|---|
+  | C +100 Sep 1, X −100 Sep 2, X +100 Sep 10, C −100 **Sep 15** | 0 | 0 |
+  | the same with C −100 on **Sep 16** | **+100** | 0 |
+  | C +100 Sep 1, X −100 **Sep 6** | 0 | 0 |
+  | C +100 Sep 1, X −100 **Sep 7** | **−100** | 0 |
+
+  **Mechanism.** Whether a cash-side card leg moves tracked cash is decided only by finding a
+  credit-side partner within ±5 days (§4.3). An unpaired cash-side leg is treated as crossing the
+  tracked-set boundary: a payment is an untracked outflow (subtracted), a return an untracked return
+  (added). An unpaired credit-side leg is treated as non-cash: externally funded or reversed
+  externally (0), per D5. When both legs are on included accounts but more than 5 days apart, or
+  differ by a fee, the two halves of one movement are counted asymmetrically. Cash flow is then off by
+  the full amount (−amount for a payment, +amount for a return), and the savings rate by
+  amount ÷ income. The error is:
+  - **permanent** — both legs are already present, so no later row corrects it;
+  - **not a fetched-context effect** — every leg is inside the period, and the documented pad gives
+    the same result (tested);
+  - **a cliff** — one day decides between 0 and ±100.
+
+  §4.3's late-leg and fee residual is the same mechanism, and was wrongly described as self-correcting.
+
+  **Regression coverage** (`semanticAggregation.test.ts`, "§13 R3"):
+  - characterization tests pin the four rows above;
+  - two `it.fails` tests assert the correct 0 for the Sep 16 return and the Sep 7 card leg. They pass
+    while the limitation exists and fail as soon as a fix corrects it, when they become plain `it`;
+  - the untracked-card cases the rule exists for are asserted unchanged.
+
+  The matching window was deliberately not widened.
+
+  **Options (none implemented):**
+  - **(a) Persisted, user-correctable card-payment pairing — recommended.** Pull the Phase C persisted
+    pair (§4.3; e.g. `role_source = 'account_pair_match'` plus a pair id) forward, for card payments
+    only:
+    - automatic pairing runs at reconciliation time over the user's full history, not over a fetch
+      pad, with today's ±5-day, exact-cents reciprocal rule; aggregation reads the stored pairs;
+    - an unpaired leg with a unique, unpaired, exact-opposite leg on the other side (included card ↔
+      included cash account, e.g. within 60 days) is surfaced as a **suggested match**. It is never
+      applied automatically: the user links or dismisses it through the atomic two-row correction of
+      §4.9.
+
+    This keeps D5. Until the user acts the figure is still off, but it is flagged, explained and one
+    action from correct. Cost: a migration (columns + RPC), reconciliation changes, and a pairing
+    backfill that joins the Phase A backfill release gate.
+  - **(b) Match a return to its original payment, in the pure module.** A cash-side return pairs with
+    the earlier unreturned payment on the same account and inherits its status. This fixes Codex's case
+    only, not the late card leg or fees, and needs its own window and a larger pad (twice that window).
+    Not recommended on its own.
+  - **(c) Count unpaired credit-side legs too — reverses part of D5.** An unpaired credit-side leg on an
+    included card counts by its effect on the tracked set: an externally funded payment is added and an
+    externally reversed payment subtracted, just as external transfers are counted. Totals then never
+    depend on pairing: pairing only chooses labels, and a fee difference nets to the fee. The cost is
+    that a card paid from an unlinked account adds that payment to cash flow (card purchases −500,
+    external payment +500 → 0). D5 deliberately avoided that, because it hides that the user's own
+    unlinked account paid the bill. This is a product decision for Trevor.
+  - **(d) Keep today's rule with a visible diagnostic.** Show "possible unmatched card payment" on
+    affected legs, sized by the measurement below. This ships a known numerical error, so only with
+    Trevor's explicit acceptance of the measured size.
+
+  **Recommended handling before live integration:**
+  1. R3 is a **release gate** for any endpoint that returns card-payment-dependent figures (cash flow,
+     savings rate, Monthly Breakdown). Slice 1 stays disconnected meanwhile.
+  2. Trevor runs a **read-only measurement** against production; Claude prepares the query when asked.
+     It covers the last 12 months of card-payment legs on included accounts. Because `auto_role` is
+     mostly NULL until the Phase A backfill, it identifies them by Plaid category
+     `LOAN_PAYMENTS_CREDIT_CARD_PAYMENT`. It buckets them as:
+     - paired within ±5 days;
+     - exact opposite counterpart 6–60 days away;
+     - amount differs by ≤ $5 within 5 days;
+     - no counterpart.
+
+     It also counts credit-side legs with no cash-side counterpart: the population that (c) would
+     change.
+  3. **Decide between (a) and (c)** with those numbers. (a) is recommended unless the measurement shows
+     externally funded payments are rare and near misses common. In that case (c) gives correct totals
+     with no user action and no schema change. Either way the automatic ±5-day window is not widened
+     silently.
 
 ## 14. Implementation status
 
@@ -1440,6 +1525,9 @@ decisions (C1–C5) are listed there.
   `fetchAllPages.test.ts`.
 - Nothing imports these modules outside their tests: no endpoint, response field, calculation,
   migration or loan bookkeeping changed.
+- **Known limitation (open, §13 R3):** card-payment legs on included accounts that do not pair (more
+  than 5 days apart, or amounts differ) shift cash flow by the full amount. Characterization and
+  `it.fails` tests pin it. It blocks live integration of card-payment figures.
 
 **Planned (not implemented):** routing the aggregate fetches through `fetchAllPages` with role
 columns and ±`PAIRING_PAD_DAYS` padding; the new response fields (§5, §6.1) behind API level 2; the
