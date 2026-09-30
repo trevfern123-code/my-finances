@@ -143,6 +143,12 @@ Rules that apply throughout:
   If a tier 1 pair or suggestion contradicts an active user decision, the user decision stands and
   the contradiction is shown as a suggestion ("Sapphire is now linked and shows a matching credit —
   match?"). Automation never overrides the user.
+  - *Approved 2026-09-30:* this includes qualifying evidence on an **excluded** card against a
+    payment the user marked as going to an unlinked card, even though confirming that destination
+    would leave the cash-flow effect unchanged.
+  - The confirmation and its effect stay unchanged until the user acts.
+  - The candidate keeps its evidence kind and `contradictsDecision`.
+  - *(Cosmetic, not a financial rule: future wording may say "Possible match on an excluded card".)*
 - **Stale states are never legs' states.** If the states are older than the inputs, no leg state
   is returned at all: the whole card-dependent result is `updating` (§3.7).
 - **No state means unresolved.** With fresh states every card leg has one, so a missing state is an
@@ -164,6 +170,11 @@ suggestion is an unpaired opposite-side leg in the pool of one of these shapes:
 - near amount within 5 days, differing by 1 cent to $5.00 *(T2)*;
 - *return-of-pair*: a cash-side return and a credit-side reversal of equal cents on the same two
   accounts as an earlier tracked pair, dated after it *(T3)*.
+  - *Approved 2026-09-30:* the refund and the card reversal may be **up to 60 days apart**. The
+    original payment may be older, with no limit.
+  - It is a suggestion requiring confirmation. Manual matching is unrestricted by distance.
+  - Within 5 days, the existing automatic tier 1 rule still pairs a return. No automatic window is
+    widened.
 
 **The manual picker has no limits.** The user may also choose any unpaired opposite-side card leg of
 their own, at any distance and any amount. A difference is shown and must be accepted explicitly
@@ -265,8 +276,46 @@ Otherwise it is **inactive**, with a reason, and is kept:
   rule). The evaluator writes no transaction row, so it does not set `review_note` (§3.7 lock order);
 - `partner_gone` — the other leg is `gone`.
 
-An inactive decision leaves its legs unresolved. A `not_this_pair` decision only suppresses a
+An inactive decision normally leaves its counted card-payment legs unresolved, subject to the narrow
+known-effect exception below. A `not_this_pair` decision only suppresses a
 suggestion, so it applies whenever both legs have current rows, whatever the amounts.
+
+**Changed user confirmations stay reserved — approved (Trevor, 2026-09-30).** The bank may change an
+amount in a previously confirmed match. The affected entries then stay **reserved** while that
+confirmation is inactive: they are never reused automatically to match a different payment, and never
+offered as another payment's candidate. The account owner will review them through a guided in-app
+interface. That is a user workflow, not routine developer review, and it is not built yet.
+
+**Narrow known-effect exception — approved (Trevor, 2026-09-30).** A known cash-flow effect and an
+invalidated confirmation are separate facts. The exception applies only when **all** of these hold:
+- the confirmation is a user-confirmed unlinked destination (`destination_unlinked`);
+- the only reason it is inactive is a **same-direction** amount correction (a payment stays a
+  payment, a return stays a return);
+- the leg is on an included cash account;
+- the user has **no included credit account**.
+
+Then the corrected effect is published, because it is established independently: no included card
+could hold the money. The leg becomes `untracked` / `no_included_card` at the corrected amount (for
+example $100 → $98 gives −$98). At the same time:
+- the old confirmation stays **inactive** and visibly marked as needing review (`amount_changed` on
+  the leg and the decision);
+- the leg stays reserved against automatic reassignment.
+
+The exception does **not** extend to:
+- conflicting replacements or ambiguous lineage;
+- changed roles;
+- missing counterparts (waiting or gone);
+- conflicting decisions;
+- ownership failures;
+- pair decisions;
+- a direction change;
+- any user who has an included credit account.
+
+In all of those cases the narrow exception does not apply; the ordinary evaluation rules determine
+the result. A row whose role changed away from `credit_card_payment` leaves this evaluator, and a
+foreign-owned decision is rejected rather than attached to the user's payment. That payment may still
+have a known effect from independent evidence, such as no included credit account. Counted card-payment
+legs held by an inactive user decision otherwise remain unresolved; excluded-account legs are not counted.
 
 This makes every arrival order resolve to the same result (§4.8), because the decision never
 depended on which row object existed when it was made.
@@ -518,6 +567,16 @@ C +250 to a card Z that was never linked:
 - **Relinking** creates new accounts and Plaid ids. A `destination_removed_card` decision ranks below
   a tier 1 pair (§3.2 precedence). When the relinked card's history re-imports the matching legs, the
   cash legs become `tracked` again automatically, and the decision stays as dormant history.
+- **An invalidated removed-card record is re-evaluated — approved (Trevor, 2026-09-30).** A
+  system-generated `destination_removed_card` record can become invalid because the amount changes.
+  The leg is then evaluated with current bank information under the existing rules:
+  - a clear qualifying match (tier 1) applies automatically;
+  - otherwise it stays unresolved, unless current independent evidence establishes the effect (for
+    example, no included card).
+
+  The invalidated record is never used as proof. It never overrides a protected user confirmation,
+  and never bypasses the conflicting-replacement guard. Unlike a user confirmation, it does not
+  reserve the leg.
 - **A card item that is not syncing** changes wording only: "Reconnect Sapphire to finish matching 2
   payments". It is never evidence.
 
@@ -712,6 +771,22 @@ resolved matching effect is published, whatever decision exists or none. This in
 `destination_removed_card`, so the earlier open question Q12 is closed. A persistent conflict needs a
 future review path that does not make the user guess; it is not built.
 
+**Approved 2026-09-30 (Trevor), second set:**
+1. **Changed user confirmations stay reserved** (§3.6). An inactive, amount-changed confirmation keeps
+   its entries out of automatic matching. The account owner reviews them through a future guided
+   interface, which is not built.
+2. **The narrow known-effect exception** (§3.6). A same-direction amount correction of a
+   user-confirmed unlinked destination, with no included credit account, publishes the corrected
+   effect. The confirmation stays inactive (needs review) and the entry stays reserved. The exception
+   extends to nothing else.
+3. **Invalidated removed-card records are re-evaluated** under the existing rules (§4.7).
+4. **Return suggestions** allow up to 60 days between refund and reversal; the original payment may be
+   older (§3.3). They need confirmation; manual matching is unrestricted, and no automatic window is
+   widened.
+5. **Possible matches on excluded cards are shown** against an "unlinked" confirmation (§3.2), with
+   the confirmation and its effect unchanged until the user acts. The "Possible match on an excluded
+   card" wording is a cosmetic choice for the UI, not part of the rule.
+
 ## 11. Acceptance tests
 
 **Pure module (vitest), from stored states:**
@@ -818,6 +893,21 @@ future review path that does not make the user guess; it is not built.
     Rows on different accounts or of different users are not a conflict. A corrected snapshot with one
     replacement evaluates normally, with no manual action. *(Pure-evaluator coverage exists; the
     database evaluator must pass the same cases.)*
+17b. **Second set of approvals (2026-09-30):**
+    - a changed confirmation stays reserved: no leg of it is reused or offered as a candidate;
+    - the $100 → $98 exception: −98 published, the decision inactive `amount_changed` on the leg and
+      the decision, the leg reserved; the same for a return (−100 → −98 gives +98);
+    - negative cases: an included card, a direction change, conflicting replacements, conflicting
+      decisions, a changed role, a pair decision, an ownership failure. None of them publishes an
+      effect through the exception;
+    - the removed-card re-evaluation: a tier 1 match applies; no match with an included card stays
+      unresolved; no included card gives `no_included_card`; a user confirmation and the conflict
+      guard both win;
+    - return suggestions at 60 days (yes) and 61 days (no), with an older original; the automatic
+      5-day window unchanged; manual matching unrestricted;
+    - excluded-card evidence listed against "unlinked", exact late and tier-1-shaped.
+
+    *(Pure-evaluator coverage exists; the database evaluator must pass the same cases.)*
 18. **LIM removal (T9):**
     - the pairs are converted before the deletes, in the same transaction;
     - cash legs become `removed_card`;

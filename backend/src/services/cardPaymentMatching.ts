@@ -181,7 +181,10 @@ export interface CardLegResult {
   accountIncluded: boolean;
   state: CardLegState;
   reason: CardLegReason;
-  /** For `decision_invalidated` / `matched_leg_not_posted`: why the decision is inactive. */
+  /** Why the decision named on this leg is inactive: set for `decision_invalidated`,
+   *  `matched_leg_not_posted` and `ambiguous_replacement`, and — the one approved exception — on an
+   *  `untracked` / `no_included_card` leg whose confirmed amount the bank corrected (`amount_changed`,
+   *  needing review; the effect is known independently). */
   detail: InactiveDetail | null;
   partnerTransactionId: string | null;
   decisionId: string | null;
@@ -637,10 +640,26 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
         applyPair(draft, partner, 'user_pair');
       }
     } else if (claim !== undefined) {
-      // A leg claimed by an inactive user decision stays unresolved (§3.6).
+      // A leg claimed by an inactive user decision stays reserved: never matched automatically (§3.6;
+      // approved for amount changes, 2026-09-30). The decision stays attached, visibly needing review.
       draft.decisionId = claim.decision.id;
       draft.detail = claim.inactive;
-      draft.reason = claim.inactive === 'waiting_to_post' ? 'matched_leg_not_posted' : 'decision_invalidated';
+      if (
+        // The one approved exception (2026-09-30): a user-confirmed unlinked destination whose amount
+        // the bank corrected in the same direction, when no included card exists. The effect is
+        // known independently of the (inactive) confirmation — no included card can hold it — so it
+        // is published; the confirmation stays inactive and the leg stays reserved. Nothing else
+        // qualifies: not conflicting decisions, changed roles, pairs, or an included card.
+        claim.inactive === 'amount_changed' &&
+        claim.decision.kind === 'destination_unlinked' &&
+        leg.side === 'cash' &&
+        !includedCreditExists &&
+        Math.sign(leg.txn.amountCents) === Math.sign(claim.decision.a.cents)
+      ) {
+        setResolved(draft, 'untracked', 'no_included_card', -leg.txn.amountCents);
+      } else {
+        draft.reason = claim.inactive === 'waiting_to_post' ? 'matched_leg_not_posted' : 'decision_invalidated';
+      }
     } else if (tier1Partner !== undefined) {
       // 2. Tier 1.
       draft.partner = tier1Partner;

@@ -35,14 +35,43 @@ resolved matching effect is published while the conflict remains.
   make the user guess which bank transaction is the real one. It is recorded in the design (§3.6,
   §10).
 
+**Correction pass 3 (2026-09-30) — Trevor's second set of approvals.** This pass started from the
+reviewed checkpoint `0647c1e`, which Trevor had committed. The tree was clean, with no unexpected
+work. Five choices were approved and recorded in the design (§3.2, §3.3, §3.6, §4.7, §10, §11 test 17b).
+
+**The only financial behaviour that changed is #2.** The others already matched the approvals; for
+those this pass records the approval and adds explicit coverage.
+
+| # | Approved choice | Engine behaviour |
+|---|---|---|
+| 1 | **Changed user confirmations stay reserved.** An amount change in a confirmed match leaves the entries out of automatic matching and out of candidate lists while the confirmation is inactive. The account owner will review them through a future guided in-app interface — a user workflow, not developer review, and not built | Unchanged (was provisional Q2). New explicit test |
+| 2 | **Narrow known-effect exception.** A user-confirmed unlinked destination, a same-direction amount correction, and no included credit account: the corrected effect is published ($100 → $98 gives −$98). The confirmation stays **inactive** and visibly needs review, and the leg stays **reserved** | **Changed.** The leg becomes `untracked` / `no_included_card`, keeping `decisionId` and `detail: 'amount_changed'`; the decision stays inactive. Before, it was unresolved [−98, 0] |
+| 3 | **An invalidated removed-card record is re-evaluated** with current bank data under the existing rules. A clear tier 1 match applies; otherwise it stays unresolved unless independent evidence establishes the effect. The invalid record is never proof, never overrides a user confirmation, and never bypasses the conflict guard | Unchanged (was provisional Q5). New explicit tests |
+| 4 | **Return suggestions: refund and reversal up to 60 days apart**, and the original may be older. Confirmation is required, manual matching is unrestricted, and no automatic window is widened | Unchanged (was provisional Q4). New boundary tests at 60 and 61 days, 5 and 6 days, and manual matching |
+| 5 | **Possible matches on excluded cards are shown** against "unlinked", with the confirmation and effect unchanged. The evidence kind and `contradictsDecision` are kept | Unchanged (was provisional Q11). New explicit test |
+
+**Cosmetic choices** are kept separate from the financial rules: the future "Possible match on an
+excluded card" wording, and the guided-review interface. Neither is built.
+
+**Tests first.** 19 tests were added before the engine change. Exactly the two positive #2 tests failed
+(payment and return). All the others passed against the unchanged engine, confirming #1 and #3–#5
+already held.
+
 ## 1. Starting point and working tree
 
 - **Repository:** `C:\Users\Trevor\dev\my-finances-phase-b`, branch `feature/phase-b-aggregation-slice1`.
 - **Start:** `460e6a3`, clean working tree. No earlier engine work existed, so nothing was restarted or
   overwritten.
-- **Current:** still at `460e6a3`. The only tracked modification is documentation:
-  `CARD_PAYMENT_PAIRING_DESIGN.md`, which records the approved conflicting-replacement rule
-  (correction pass 2). There are also four new untracked files:
+- **Current (correction pass 3):** HEAD is `0647c1e`, Trevor's commit of the work below. This pass's
+  changes are **uncommitted**:
+  - `backend/src/services/cardPaymentMatching.ts` (modified): the #2 exception, and one doc comment;
+  - `backend/src/services/cardPaymentMatching.adversarial.test.ts` (modified): 19 tests, invariant I11,
+    a generator branch and a coverage guard;
+  - `CARD_PAYMENT_PAIRING_DESIGN.md` (modified): the approvals;
+  - `PHASE_B_MATCHING_ENGINE_HANDOFF.md` (modified): this section.
+
+  `cardPaymentMatching.test.ts` is unchanged.
+- **History before `0647c1e`:** the tree was at `460e6a3`, with these files untracked:
   - `backend/src/services/cardPaymentMatching.ts` — the engine;
   - `backend/src/services/cardPaymentMatching.test.ts` — Stage 1 unit tests;
   - `backend/src/services/cardPaymentMatching.adversarial.test.ts` — Stage 2 adversarial and
@@ -80,7 +109,9 @@ resolved matching effect is published while the conflict remains.
   - legs on excluded accounts are `not_counted`, 0.
 - **Precedence** [§3.2, §3.6]:
   1. an active user decision;
-  2. otherwise, a leg held by an inactive user decision stays unresolved;
+  2. otherwise, a counted leg held by an inactive user decision stays unresolved, except for the
+     approved same-direction, unlinked-destination amount correction with no included credit account
+     (correction pass 3 above); the confirmation stays inactive and the leg stays reserved;
   3. otherwise tier 1;
   4. otherwise a removed-card decision;
   5. otherwise no included card;
@@ -145,10 +176,10 @@ All commands ran in `backend/`, with CI's placeholder environment (`FRONTEND_URL
 | Check | Result |
 |---|---|
 | `npm run typecheck` | passed |
-| `npx vitest run` (full backend suite) | **38 files; 1247 passed, 3 expected fail, 10 todo (1260)** — correction pass 2 (pass 1: 1239 passed) |
-| `npx vitest run src/services/cardPaymentMatching` | 2 files; 108 passed, 10 todo — correction pass 2 (pass 1: 100; overnight: 92) |
+| `npx vitest run` (full backend suite) | **38 files; 1266 passed, 3 expected fail, 10 todo (1279)** — correction pass 3 (pass 2: 1247; pass 1: 1239) |
+| `npx vitest run src/services/cardPaymentMatching` | 2 files; 127 passed, 10 todo — correction pass 3 (pass 2: 108; pass 1: 100; overnight: 92) |
 | `npm run build` | passed. It emits `dist/services/cardPaymentMatching.js`, like slice 1's `semanticAggregation.js`, but nothing imports it |
-| `git diff --check` (tracked files) | clean — there are no tracked changes |
+| `git diff --check` (tracked files) | passed — no whitespace errors in the four-file correction delta |
 | whitespace check of the three new source files (`git diff --no-index --check`) | clean |
 | importer search (`backend/src`, `frontend/src`) | no file outside the engine's own two test files references `cardPaymentMatching` |
 
@@ -178,6 +209,16 @@ Correction pass 2 checked the lineage-level guard the same way:
 | no hold state for conflicting rows | 10 |
 | a decision naming a conflicting row by its posted id treated as unambiguous | 2 |
 | held rows listing candidates | 3 |
+
+Correction pass 3 checked the #2 exception by loosening each condition:
+
+| Condition loosened | Failing tests |
+|---|---|
+| included-card condition ignored | 3 |
+| same-direction condition ignored | 1 |
+| extended to pair decisions | 1 |
+| extended to any invalidation reason | 2 |
+| exception drops the needs-review marker | 3 |
 
 **Expected failures (unchanged, not weakened):** the three `it.fails` tests in
 `semanticAggregation.test.ts` still fail as designed:
@@ -213,7 +254,10 @@ application requirements this work does not cover (§6 below).
 
 | 6 | **Q12 / approved rule:** replacements of an ambiguous lineage were held only when a *user* decision named them. With a `destination_removed_card` decision, or no decision, one replacement could still auto-pair | The rule Trevor approved on 2026-09-30. The failing tests were written first (10 failed) | A lineage-level guard: every row of a conflicting group is `ambiguous_replacement` — outside the tier 1 pool, with no candidates, and never another leg's candidate. A decision naming a conflicting row by its posted id is also ambiguous | `Q12 closed — a removed-card decision…`, `no saved decision: both replacements held…`, `a user decision naming one replacement by its own posted id is held too…`, `the held rows keep the approved period-specific bounds…`, `excluded-account treatment is preserved…`, `isolation: one replacement per ACCOUNT is not a conflict…`, `a corrected snapshot with one replacement evaluates normally…`, `ordinary relinking with a single replacement still matches automatically…` — the first two with reordered inputs; generated invariant **I10** |
 
-No approved rule was changed to make a test pass.
+| 7 | *(approved behaviour change, not a bug)* #2 known-effect exception: a confirmed unlinked payment corrected $100 → $98 with no included card showed an unresolved range [−98, 0] instead of the known −98 | Trevor's approval, 2026-09-30. The failing tests were written first (2 failed) | One branch in the inactive-decision case, gated on all five conditions | `2. confirmed $100 unlinked payment corrected to $98…`, `2. the same exception for a confirmed return…`, and seven negative tests (`2 (negative). …`: included card, direction change, conflicting replacements, conflicting decisions, changed role, pair decision, ownership failure); generated invariant **I11** |
+
+No approved rule was changed to make a test pass. No existing test expectation changed in correction
+pass 3.
 
 **Test expectation changes in correction pass 2** (flagged for review):
 - The two pass-1 user-decision cases now expect reason `ambiguous_replacement` on the conflicting rows
@@ -245,7 +289,7 @@ No approved rule was changed to make a test pass.
   - dismissals breaking ties;
   - return-of-pair negatives;
   - mixed users.
-- **Invariants I1–I10 over 300 generated two-user histories** (seeds 1000–1299, `mulberry32`):
+- **Invariants I1–I11 over 300 generated two-user histories** (seeds 1000–1299, `mulberry32`):
   - exactly the expected legs;
   - only included cash legs move cash flow;
   - exact bounds;
@@ -258,6 +302,10 @@ No approved rule was changed to make a test pass.
   - *(correction pass 2)* **I10** — every row of a conflicting replacement group (computed from the input
     alone) is held: unresolved `ambiguous_replacement` (or `not_counted` on an excluded account), never
     a partner, never a candidate, with no candidates of its own. No other row carries that reason;
+  - *(correction pass 3)* **I11** — a leg that publishes an effect while carrying an inactive decision
+    is exactly the approved exception (destination_unlinked, same direction, amount changed, no
+    included card, reserved). The generator has a branch that produces it, and the coverage guard
+    requires it;
   - *(correction pass)* **I9** — `contradictsDecision` is true exactly for candidates of legs with an
     active user decision.
 - **Also over the generated histories:**
@@ -275,17 +323,17 @@ Codex decides it.
 
 | # | Question | Minimal example | Implemented |
 |---|---|---|---|
-| Q1 | Does a leg held by an **inactive** decision stay unresolved even when a proof applies (`no_included_card`)? | No included card. The user marks pending Pc (+100) "unlinked"; Tc posts at +98 | Unresolved [−98, 0], following §3.6 ("an inactive decision leaves its legs unresolved") |
-| Q2 | Are legs held by a user decision (active **or inactive**) removed from automatic pairing and from others' candidates? | User pair C1–X; X's amount changes to −98 (inactive); C2 +98 is 1 day from X | X stays held: C2 is `no_candidate`, not paired with X. **Still provisional** for the ordinary inactive reasons (amount/role changed, partner gone, waiting). Conflicting replacements are now governed by the approved lineage-level rule instead, which does not depend on a decision |
+| Q1 | Does a leg held by an **inactive** decision stay unresolved even when a proof applies (`no_included_card`)? | No included card. The user marks pending Pc (+100) "unlinked"; Tc posts at +98 | **Decided in part (approved #2, 2026-09-30):** this exact example now publishes −98, with the decision inactive and the leg reserved. The exception does not extend to changed roles, missing counterparts, conflicting decisions, conflicting or ambiguous lineage, ownership failures or an included card; ordinary rules apply instead. A changed non-card role leaves this evaluator; a foreign-owned decision is rejected, without blocking independent proof for the user's payment. Counted legs held by inactive user decisions otherwise stay unresolved. **Still provisional:** the remaining pair-shape reasons (`not_cash_side`, `sides_not_opposite`, `direction_mismatch`, `difference_not_accepted`) stay unresolved |
+| Q2 | Are legs held by a user decision (active **or inactive**) removed from automatic pairing and from others' candidates? | User pair C1–X; X's amount changes to −98 (inactive); C2 +98 is 1 day from X | X stays held: C2 is `no_candidate`, not paired with X. **Approved for amount changes** (#1, 2026-09-30). **Still provisional** for the other inactive reasons (role changed, partner gone, waiting, pair-shape reasons, conflicting decisions); the same reservation is applied to them. Conflicting replacements are governed by the approved lineage-level rule |
 | Q3 | Two live (non-superseded) user decisions on one leg — the database should prevent this | `pair(C,X)` and `destination_unlinked(C)` | Both inactive `conflicting_decisions`; the lowest decision id is reported on the leg |
-| Q4 | Distance limit for return-of-pair | Pair Sep 1/2, reversal Sep 10, return Nov 20 (71 days) | The 60-day suggestion limit applies between the return and the reversal. There is no limit on the time since the original pair, which must have the same absolute amount |
-| Q5 | An **inactive** `destination_removed_card` decision | Removed-card decision on C +100; C now +98 | Ignored: it doesn't apply or hold the leg, which is evaluated normally |
+| ~~Q4~~ | **Closed — approved #4, 2026-09-30.** Distance limit for return-of-pair | Pair Sep 1/2, reversal Sep 10, return Nov 20 (71 days) | Up to 60 days between refund and reversal; the original may be older. **Still provisional:** that the original pair must have the same absolute amount, and must be *tracked* (both legs on included accounts) |
+| ~~Q5~~ | **Closed — approved #3, 2026-09-30.** An **inactive** (amount-changed) `destination_removed_card` decision | Removed-card decision on C +100; C now +98 | Re-evaluated under the existing rules. It is never proof, never reserves the leg, never overrides a user confirmation, and never bypasses the conflict guard |
 | Q6 | A destination decision on a **credit-side** leg | `destination_unlinked` naming a card leg | Inactive `not_cash_side`; for `destination_unlinked` it still holds the leg (Q2) |
 | Q7 | `partner_gone` is an inactivity reason in §3.6 but not a leg reason in §3.2 | Pc–Pk pair; Pk's carry-over expires | Leg reason `decision_invalidated`, detail `partner_gone` |
 | Q8 | A posted row naming a pending id **on a different account** | — | Not a replacement: the design's lineage key includes the account |
 | Q9 | When the "recent" wording switches (§6.1 says "usually 1–3 days") | — | `RECENT_LABEL_DAYS = 10`, label only |
 | Q10 | Zero-amount card rows | — | Not card legs, so they get no state (as slice 1) |
-| Q11 | Does a candidate on an **excluded** card contradict "a card I haven't linked"? The effect would be the same (untracked), but the destination differs | C +100 marked unlinked; E −100 six days later | Listed as a contradiction, like any other suggestion-rule candidate |
+| ~~Q11~~ | **Closed — approved #5, 2026-09-30.** Does a candidate on an **excluded** card contradict "a card I haven't linked"? | C +100 marked unlinked; E −100 six days later | Listed, with its evidence kind and `contradictsDecision: true`; the effect is unchanged. The wording "Possible match on an excluded card" is cosmetic and not built |
 | ~~Q12~~ | **Closed — approved by Trevor, 2026-09-30.** Replacements of an ambiguous lineage are held under a `destination_removed_card` decision too, and also with no decision at all | Removed-card decision on pending Pc; two posted rows name Pc; an included card leg is 1 day from one of them | Both replacements `ambiguous_replacement`; the card leg is not auto-paired. This is no longer provisional |
 
 **Limitations of this module:**
@@ -344,9 +392,10 @@ workflow, sync retry, repair interface or automatic cleanup.
 
 ## 7. Live app unchanged
 
-- The only tracked file modified is `CARD_PAYMENT_PAIRING_DESIGN.md` (documentation: the approved
-  rule, closing Q12, the future review-path requirement and acceptance test 17a). No application code
-  was changed.
+- **Application code:** no route, service used by the app, script or frontend file was changed. The
+  modified tracked files are the isolated engine, its adversarial tests and two documents (§1).
+- **Commits:** Claude made no commits. `0647c1e` is Trevor's commit, and correction pass 3 is
+  uncommitted.
 - No route, service used by the app, script or frontend file imports the engine.
 - There were no migrations, schema changes, database access (local or production), dependency or
   environment changes, commits, pushes, pull requests, merges or deployments.

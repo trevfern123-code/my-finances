@@ -537,6 +537,183 @@ describe('APPROVED RULE (Trevor, 2026-09-30): conflicting replacements stay unre
   });
 });
 
+describe('APPROVED (Trevor, 2026-09-30, batch 2): changed confirmations, removed-card reevaluation, returns, excluded evidence', () => {
+  const SEP = { start: '2026-09-01', end: '2026-10-01' };
+  // No included credit account: only an excluded card and cash accounts.
+  const noIncludedCard = [C, C2, E, F];
+
+  // ---- 1. A changed user confirmation keeps its entries reserved -----------------------------------
+  it('1. a confirmed pair whose card amount changed stays reserved: neither leg is reused for another payment', () => {
+    // User paired c (+100) with x (−100, 20 days later). The bank corrects x to −98. A second payment
+    // c2 +98 one day before x would be a tier 1 match for x if x were free.
+    const ev = run(
+      [tx('c', 'C', '2026-09-01', 10000), tx('x', 'X', '2026-09-21', -9800), tx('c2', 'C2', '2026-09-20', 9800)],
+      { decisions: [mkDecision('d', 'pair', ref('C', 'p-c', 10000), ref('X', 'p-x', -10000))] }
+    );
+    expect(ev.decisions[0]).toMatchObject({ status: 'inactive', detail: 'amount_changed' });
+    expect(byId(ev).get('x')).toMatchObject({ state: 'unresolved', reason: 'decision_invalidated', detail: 'amount_changed', partnerTransactionId: null });
+    expect(byId(ev).get('c')).toMatchObject({ state: 'unresolved', reason: 'decision_invalidated', partnerTransactionId: null });
+    expect(byId(ev).get('c2')).toMatchObject({ state: 'unresolved', partnerTransactionId: null });
+    expect(byId(ev).get('c2')!.candidates.map((c) => c.transactionId)).not.toContain('x');
+  });
+
+  // ---- 2. The narrow known-effect exception ($100 → $98, no included card) -------------------------
+  const unlinked100 = mkDecision('u', 'destination_unlinked', ref('C', 'p-c', 10000));
+
+  it('2. confirmed $100 unlinked payment corrected to $98, no included card → effect −98; confirmation inactive, needs review; reserved', () => {
+    // An excluded card leg of −98 one day later would be a tier 1 partner if the payment were free.
+    const ev = run([tx('c', 'C', '2026-09-01', 9800), tx('e', 'E', '2026-09-02', -9800)], { accounts: noIncludedCard, decisions: [unlinked100] });
+    const c = byId(ev).get('c')!;
+    expect(c).toMatchObject({
+      state: 'untracked',
+      reason: 'no_included_card',
+      effectCents: -9800,
+      lowCents: -9800,
+      highCents: -9800,
+      // the invalidated confirmation stays attached and visibly needs review — a separate fact
+      decisionId: 'u',
+      detail: 'amount_changed',
+      // reserved: not matched automatically
+      partnerTransactionId: null,
+    });
+    expect(ev.decisions).toEqual([{ decisionId: 'u', kind: 'destination_unlinked', status: 'inactive', detail: 'amount_changed' }]);
+    expect(byId(ev).get('e')).toMatchObject({ state: 'not_counted', partnerTransactionId: null });
+    expect(summarizeCardPaymentPeriod(ev, SEP)).toMatchObject({ lowCents: -9800, highCents: -9800, resolved: true });
+  });
+
+  it('2. the same exception for a confirmed return corrected in the same direction (−100 → −98) → +98', () => {
+    const d = mkDecision('u', 'destination_unlinked', ref('C', 'p-c', -10000));
+    const c = byId(run([tx('c', 'C', '2026-09-01', -9800)], { accounts: noIncludedCard, decisions: [d] })).get('c')!;
+    expect(c).toMatchObject({ state: 'untracked', reason: 'no_included_card', effectCents: 9800, detail: 'amount_changed', decisionId: 'u' });
+  });
+
+  it('2 (negative). an included credit account prevents the exception → still unresolved [−98, 0]', () => {
+    const c = byId(run([tx('c', 'C', '2026-09-01', 9800)], { decisions: [unlinked100] })).get('c')!;
+    expect(c).toMatchObject({ state: 'unresolved', reason: 'decision_invalidated', detail: 'amount_changed', lowCents: -9800, highCents: 0 });
+  });
+
+  it('2 (negative). a direction change (+100 → −98) is not a same-direction correction → unresolved', () => {
+    const c = byId(run([tx('c', 'C', '2026-09-01', -9800)], { accounts: noIncludedCard, decisions: [unlinked100] })).get('c')!;
+    expect(c).toMatchObject({ state: 'unresolved', reason: 'decision_invalidated', detail: 'amount_changed', lowCents: 0, highCents: 9800 });
+  });
+
+  it('2 (negative). conflicting replacements are never an exception, even with no included card', () => {
+    const d = mkDecision('u', 'destination_unlinked', ref('C', 'pc', 10000));
+    const ev = run(
+      [tx('T1', 'C', '2026-09-01', 9800, { plaid: 't1', pendingOf: 'pc' }), tx('T2', 'C', '2026-09-05', 9800, { plaid: 't2', pendingOf: 'pc' })],
+      { accounts: noIncludedCard, decisions: [d] }
+    );
+    for (const id of ['T1', 'T2']) expect(byId(ev).get(id)).toMatchObject({ state: 'unresolved', reason: 'ambiguous_replacement', effectCents: null });
+  });
+
+  it('2 (negative). conflicting decisions are never an exception', () => {
+    const ev = run([tx('c', 'C', '2026-09-01', 9800)], {
+      accounts: noIncludedCard,
+      decisions: [unlinked100, mkDecision('u2', 'destination_unlinked', ref('C', 'p-c', 9800))],
+    });
+    expect(byId(ev).get('c')).toMatchObject({ state: 'unresolved', detail: 'conflicting_decisions', effectCents: null });
+  });
+
+  it('2 (negative). a changed role is never an exception: the row is no longer a card leg, no effect is published', () => {
+    const ev = run([tx('c', 'C', '2026-09-01', 9800, { role: 'expense' })], { accounts: noIncludedCard, decisions: [unlinked100] });
+    expect(ev.legs).toEqual([]);
+    expect(ev.decisions[0]).toMatchObject({ status: 'inactive', detail: 'amount_changed' });
+  });
+
+  it('2 (negative). a confirmed pair whose amount changed (missing counterpart shape) is not extended → unresolved', () => {
+    const ev = run([tx('c', 'C', '2026-09-01', 9800), tx('e', 'E', '2026-09-20', -10000)], {
+      accounts: noIncludedCard,
+      decisions: [mkDecision('d', 'pair', ref('C', 'p-c', 10000), ref('E', 'p-e', -10000))],
+    });
+    expect(byId(ev).get('c')).toMatchObject({ state: 'unresolved', reason: 'decision_invalidated', detail: 'amount_changed', effectCents: null });
+  });
+
+  it('2 (negative). an ownership failure is not the exception: the rejected decision attaches nothing to the leg', () => {
+    const foreign = { ...unlinked100, userId: V };
+    const c = byId(run([tx('c', 'C', '2026-09-01', 9800)], { accounts: noIncludedCard, decisions: [foreign] })).get('c')!;
+    // The ordinary no-included-card proof applies (unchanged behaviour); no decision is named, nothing needs review.
+    expect(c).toMatchObject({ state: 'untracked', reason: 'no_included_card', decisionId: null, detail: null });
+  });
+
+  it('2. when the bank restores the recorded amount, the confirmation is active again (no manual clearing)', () => {
+    const c = byId(run([tx('c', 'C', '2026-09-01', 10000)], { accounts: noIncludedCard, decisions: [unlinked100] })).get('c')!;
+    expect(c).toMatchObject({ state: 'untracked', reason: 'user_confirmed_unlinked', detail: null, decisionId: 'u' });
+  });
+
+  // ---- 3. An invalidated removed-card record is reevaluated under the ordinary rules ---------------
+  const removed100 = mkDecision('r', 'destination_removed_card', ref('C', 'p-c', 10000));
+
+  it('3. removed-card record invalidated by an amount change + a clear tier 1 match → matched automatically', () => {
+    const ev = run([tx('c', 'C', '2026-09-01', 9800), tx('x', 'X', '2026-09-02', -9800)], { decisions: [removed100] });
+    expect(ev.decisions[0]).toMatchObject({ status: 'inactive', detail: 'amount_changed' });
+    expect(byId(ev).get('c')).toMatchObject({ state: 'tracked', reason: 'auto_pair', partnerTransactionId: 'x' });
+  });
+
+  it('3. …with no qualifying match and an included card → unresolved; the invalid record is not proof', () => {
+    const c = byId(run([tx('c', 'C', '2026-09-01', 9800)], { decisions: [removed100] })).get('c')!;
+    expect(c).toMatchObject({ state: 'unresolved', reason: 'no_candidate', lowCents: -9800, highCents: 0 });
+    expect(c.reason).not.toBe('removed_card');
+  });
+
+  it('3. …with independent current evidence (no included card) → untracked by that evidence, not by the record', () => {
+    const c = byId(run([tx('c', 'C', '2026-09-01', 9800)], { accounts: noIncludedCard, decisions: [removed100] })).get('c')!;
+    expect(c).toMatchObject({ state: 'untracked', reason: 'no_included_card', effectCents: -9800 });
+  });
+
+  it('3. …never overrides a protected user confirmation, and never bypasses the conflicting-replacement guard', () => {
+    const withUser = run([tx('c', 'C', '2026-09-01', 9800), tx('x', 'X', '2026-09-02', -9800)], {
+      decisions: [removed100, mkDecision('u', 'destination_unlinked', ref('C', 'p-c', 9800))],
+    });
+    expect(byId(withUser).get('c')).toMatchObject({ state: 'untracked', reason: 'user_confirmed_unlinked', decisionId: 'u' });
+    const conflicted = run(
+      [tx('T1', 'C', '2026-09-01', 9800, { plaid: 't1', pendingOf: 'pc' }), tx('T2', 'C', '2026-09-03', 9800, { plaid: 't2', pendingOf: 'pc' }), tx('x', 'X', '2026-09-02', -9800)],
+      { decisions: [mkDecision('r', 'destination_removed_card', ref('C', 'pc', 10000))] }
+    );
+    for (const id of ['T1', 'T2']) expect(byId(conflicted).get(id)).toMatchObject({ reason: 'ambiguous_replacement', partnerTransactionId: null });
+  });
+
+  // ---- 4. Return suggestions: refund and reversal up to 60 days apart; the original may be older ----
+  const returnCase = (reversalDate: string, returnDate: string) =>
+    run([
+      tx('p', 'C', '2026-06-01', 10000),
+      tx('k', 'X', '2026-06-02', -10000),
+      tx('rev', 'X', reversalDate, 10000),
+      tx('ret', 'C', returnDate, -10000),
+    ]);
+
+  it('4. refund 60 days after the reversal → return-of-pair suggestion (original payment 100+ days older)', () => {
+    const ret = byId(returnCase('2026-09-10', '2026-11-09')).get('ret')!;
+    expect(ret).toMatchObject({ state: 'unresolved', reason: 'possible_match' });
+    expect(ret.candidates).toEqual([{ transactionId: 'rev', kind: 'return_of_pair', distanceDays: 60, differenceCents: 0, contradictsDecision: false }]);
+  });
+
+  it('4. refund 61 days after the reversal → no suggestion (manual matching stays unrestricted)', () => {
+    const ev = returnCase('2026-09-10', '2026-11-10');
+    expect(byId(ev).get('ret')).toMatchObject({ state: 'unresolved', reason: 'no_candidate', candidates: [] });
+    const manual = run(
+      [tx('p', 'C', '2026-06-01', 10000), tx('k', 'X', '2026-06-02', -10000), tx('rev', 'X', '2026-09-10', 10000), tx('ret', 'C', '2026-11-10', -10000)],
+      { decisions: [mkDecision('m', 'pair', ref('C', 'p-ret', -10000), ref('X', 'p-rev', 10000))] }
+    );
+    expect(byId(manual).get('ret')).toMatchObject({ state: 'tracked', reason: 'user_pair', partnerTransactionId: 'rev' });
+  });
+
+  it('4. the automatic window is unchanged: within 5 days a return pairs automatically, at 6 it is only suggested', () => {
+    expect(byId(returnCase('2026-09-10', '2026-09-15')).get('ret')).toMatchObject({ state: 'tracked', reason: 'auto_pair' });
+    expect(byId(returnCase('2026-09-10', '2026-09-16')).get('ret')).toMatchObject({ state: 'unresolved', reason: 'possible_match' });
+  });
+
+  // ---- 5. Possible matches on excluded cards are shown against "unlinked" --------------------------
+  it('5. an excluded-card leg contradicting "unlinked" is listed (exact late and tier-1-shaped); effect unchanged', () => {
+    const d = mkDecision('u', 'destination_unlinked', ref('C', 'p-c', 10000));
+    const late = byId(run([tx('c', 'C', '2026-09-01', 10000), tx('e', 'E', '2026-09-08', -10000)], { decisions: [d] })).get('c')!;
+    expect(late).toMatchObject({ state: 'untracked', reason: 'user_confirmed_unlinked', effectCents: -10000 });
+    expect(late.candidates).toEqual([{ transactionId: 'e', kind: 'exact_amount', distanceDays: 7, differenceCents: 0, contradictsDecision: true }]);
+    const near = byId(run([tx('c', 'C', '2026-09-01', 10000), tx('e', 'E', '2026-09-02', -10000)], { decisions: [d] })).get('c')!;
+    expect(near).toMatchObject({ state: 'untracked', reason: 'user_confirmed_unlinked', effectCents: -10000 });
+    expect(near.candidates).toEqual([{ transactionId: 'e', kind: 'tier1_competitor', distanceDays: 1, differenceCents: 0, contradictsDecision: true }]);
+  });
+});
+
 describe('scenarios: decisions take precedence over suggestions and automation (§3.2)', () => {
   it('a user pair 40 days apart stands; the tier-1-shaped leg is a contradiction, and is not paired with the claimed leg', () => {
     const ev = run(
@@ -675,6 +852,15 @@ function generateUser(r: () => number, userId: string, prefix: string, withDecis
       } else {
         decisions.push({ ...mkDecision(id, kind, refOf(a, r() < 0.9 ? a.amountCents : a.amountCents + 1), null, null, userId), decidedSeq: k, supersededBy: r() < 0.1 ? 'undone' : null });
       }
+    }
+  }
+  // Approved exception (2026-09-30): sometimes a user with no included card confirmed a cash payment as
+  // "unlinked" at an amount the bank has since corrected in the same direction.
+  if (withDecisions && !hasIncludedCard && r() < 0.6) {
+    const cashLegs = transactions.filter((t) => cash.some((c) => c.id === t.accountId) && Math.abs(t.amountCents) > 100);
+    if (cashLegs.length > 0) {
+      const t = pick(cashLegs);
+      decisions.push({ ...mkDecision(`${prefix}dx`, 'destination_unlinked', ref(t.accountId, t.plaidTransactionId, t.amountCents + Math.sign(t.amountCents) * 200), null, null, userId), decidedSeq: 99 });
     }
   }
   return { accounts, transactions, carryovers, decisions };
@@ -825,6 +1011,19 @@ function checkInvariants(input: CardPaymentMatchingInput, ev: CardPaymentEvaluat
     if (leg.partnerTransactionId !== null) expect(conflicting.has(leg.partnerTransactionId)).toBe(false);
     for (const c of leg.candidates) expect(conflicting.has(c.transactionId)).toBe(false);
   }
+  // I11 (approved exception, 2026-09-30): a leg that publishes an effect while carrying an inactive
+  // decision is exactly the narrow exception — a same-direction amount correction of a user-confirmed
+  // unlinked destination, no included card — and stays reserved. Nothing else combines the two.
+  for (const leg of ev.legs) {
+    if (leg.detail === null || leg.state === 'unresolved' || leg.state === 'not_counted') continue;
+    expect(leg).toMatchObject({ state: 'untracked', reason: 'no_included_card', detail: 'amount_changed', partnerTransactionId: null });
+    expect(includedCardExists).toBe(false);
+    const d = input.decisions.find((x) => x.id === leg.decisionId)!;
+    expect(d.kind).toBe('destination_unlinked');
+    expect(Math.sign(leg.amountCents)).toBe(Math.sign(d.a.cents));
+    expect(leg.amountCents).not.toBe(d.a.cents);
+    expect(decisions.get(d.id)).toMatchObject({ status: 'inactive', detail: 'amount_changed' });
+  }
   // I9 (Codex review): a candidate contradicts a decision exactly when its leg has an active user
   // decision; everywhere else candidates are ordinary suggestions.
   for (const leg of ev.legs) {
@@ -861,7 +1060,7 @@ function checkInvariants(input: CardPaymentMatchingInput, ev: CardPaymentEvaluat
 }
 
 describe('invariants over 300 generated two-user histories (seeds 1000–1299)', () => {
-  it('every evaluation satisfies the approved rules (I1–I10)', () => {
+  it('every evaluation satisfies the approved rules (I1–I11)', () => {
     for (const seed of SEEDS) {
       const { input } = generate(seed);
       for (const userId of [U, V]) {
@@ -964,6 +1163,7 @@ describe('invariants over 300 generated two-user histories (seeds 1000–1299)',
         seen.add(`${leg.state}/${leg.reason}`);
         if (leg.detail === 'lineage_ambiguous') seen.add(`${leg.state}/${leg.reason}/lineage_ambiguous`);
         if (leg.candidates.some((c) => c.contradictsDecision)) seen.add('contradiction');
+        if (leg.state === 'untracked' && leg.detail === 'amount_changed') seen.add('known-effect exception');
       }
     }
     for (const needed of [
@@ -981,6 +1181,7 @@ describe('invariants over 300 generated two-user histories (seeds 1000–1299)',
       'not_counted/excluded_account',
       'unresolved/ambiguous_replacement/lineage_ambiguous',
       'contradiction',
+      'known-effect exception',
     ]) {
       expect(seen, needed).toContain(needed);
     }
