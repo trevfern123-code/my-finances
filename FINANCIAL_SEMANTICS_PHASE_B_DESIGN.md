@@ -1473,8 +1473,9 @@ decisions (C1–C5) are listed there.
       applied automatically: the user links or dismisses it through the atomic two-row correction of
       §4.9.
 
-    This keeps D5. Until the user acts the figure is still off, but it is flagged, explained and one
-    action from correct. Cost: a migration (columns + RPC), reconciliation changes, and a pairing
+    This keeps D5. The rev 2 proposal refines what happens until the user acts: the leg is
+    *unresolved*, and the figure is shown per decision T1 (a range is recommended) rather than as a
+    wrong single number. Cost: a migration (columns + RPC), reconciliation changes, and a pairing
     backfill that joins the Phase A backfill release gate.
   - **(b) Match a return to its original payment, in the pure module.** A cash-side return pairs with
     the earlier unreturned payment on the same account and inherits its status. This fixes Codex's case
@@ -1510,12 +1511,16 @@ decisions (C1–C5) are listed there.
      with no user action and no schema change. Either way the automatic ±5-day window is not widened
      silently.
 
-  **Proposal for review (2026-09-29):** `CARD_PAYMENT_PAIRING_DESIGN.md` completes option (a) while
-  preserving D5. Under D5 only cash-side legs move cash flow, so each gets one of three states:
-  tracked, untracked or **unresolved**. Unresolved is never guessed. Evidence comes from:
-  - automatic ±5-day pairs, stored over full history;
-  - suggestions the user confirms;
-  - a proof of absence tied to sync recency.
+  **Proposal for review (2026-09-29, rev 2 after Codex's review of 5a6e831):**
+  `CARD_PAYMENT_PAIRING_DESIGN.md` completes option (a) while preserving D5. Under D5 only cash-side
+  legs move cash flow, so each gets one of three states: tracked, untracked or **unresolved**.
+  Unresolved is never guessed. A leg becomes untracked only through evidence (a pair with an excluded
+  card, or no included card at all) or the user's confirmation. There is **no automatic absence**:
+  time, a sync or a rejected suggestion never counts as proof.
+
+  User decisions are keyed by transaction lineage, so they survive pending → posted in any order.
+  Derived states are invalidated atomically in the writer's transaction and are never read as
+  resolved when stale.
 
   The document covers late legs, returns, fees, ambiguity, unlinked/excluded accounts,
   pending→posted and removal. It also sets out what users see while a payment is unresolved
