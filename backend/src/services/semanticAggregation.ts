@@ -18,18 +18,31 @@
  *  - §4.2 transfers: an `internal_transfer` leg is internal (contributes 0) when it pairs with a
  *    reciprocal opposite leg on another INCLUDED account within ±3 days; otherwise it is an external
  *    transfer, counted in cash flow with its sign, never as spending or income.
- *  - §4.3 card payments, paired PER PAYMENT: a payer leg (+) is tracked (0) when it pairs with a
- *    reciprocal card leg (−) on an included `credit` account within ±5 days; an unpaired payer leg is
- *    an untracked card outflow (subtracted in cash flow); an unpaired card leg is an externally
- *    funded inflow (0 — no tracked cash moved).
+ *  - §4.3 card payments, paired PER PAYMENT between a CASH-side leg (on a non-credit account — the
+ *    money) and a CREDIT-side leg (on an included `credit` account — the liability), reciprocally,
+ *    within ±5 days, opposite cents. Only cash-side legs can move tracked cash:
+ *      cash + (payment out)   paired → tracked (0) · unpaired → untracked card outflow (subtracted)
+ *      cash − (payment returned/reversed into checking)
+ *                             paired with a credit + leg → tracked return (0)
+ *                             unpaired → untracked returned payment (ADDED: cash arrived)
+ *      credit − (card received a payment), unpaired → externally funded (0: no tracked cash moved)
+ *      credit + (payment reversed on the card), unpaired → reversed externally (0)
+ *    So a payment and its later return net to zero whether or not the card is tracked.
  *  - §4.5 refunds reduce spending in their own month and category; §4.6 splits inherit the parent's
  *    single role and are ignored for loan-decomposed parents; §5 C5 manual-loan interest appears in
  *    the Monthly Breakdown under the synthetic `LOAN_INTEREST` category.
  *
  * Rows on accounts excluded from cash flow are dropped before anything else: they are neither
- * aggregated nor partner candidates (design §4.1). Callers pass rows for the reporting period PLUS a
- * padding of `PAIRING_PAD_DAYS` on each side; padding rows are only ever pairing candidates, so a
- * card leg that posts after the period still tracks the in-period payment (design §4.3, §9.1).
+ * aggregated nor partner candidates (design §4.1).
+ *
+ * FETCHED-CONTEXT CONTRACT. Callers pass every row in `pairingContextRange(period)` — the period
+ * padded by `PAIRING_PAD_DAYS` on each side. Rows outside the period are only ever pairing evidence.
+ * The pad is TWICE the widest matching window, because reciprocal matching is two hops deep: an
+ * in-period leg's candidates lie within one window of it, and deciding whether a candidate's OWN
+ * best match is that leg (or a tie with a competitor) needs the candidate's candidates, up to a
+ * second window further out. With this pad the in-period result is identical to the result over
+ * complete surrounding history; with only one window of padding, an out-of-range competitor that
+ * makes a match ambiguous is missed and the leg is wrongly paired (design §4.2/§4.3, §9.1).
  *
  * All arithmetic is in integer cents; every figure is converted back to dollars once, at the end.
  */
@@ -105,21 +118,32 @@ export interface CashFlowTotals {
   transfersInternal: number;
   /** Unpaired transfer legs, signed as cash (out negative, in positive); counted in cash flow. */
   transfersExternal: number;
-  /** Paired card payments, by the payer leg's magnitude (net zero in cash flow). */
+  /** Paired card payments, by the cash leg's magnitude (net zero in cash flow). */
   creditCardPaymentsTracked: number;
-  /** Unpaired payer legs (card not linked or excluded): subtracted in cash flow. */
+  /** Unpaired cash-side payments out (card not linked or excluded): subtracted in cash flow. */
   creditCardPaymentsUntracked: number;
-  /** Unpaired card-side legs (paid from outside the tracked set): informational, not cash. */
+  /** Paired returns: a cash-side −leg matched with the card's +leg (net zero in cash flow). */
+  creditCardPaymentsReturnedTracked: number;
+  /** Unpaired cash-side −legs — a payment returned into an included account from a card that is not
+   *  tracked: ADDED in cash flow (the cash arrived). The counterpart of `creditCardPaymentsUntracked`,
+   *  so a payment and its return net to zero. */
+  creditCardPaymentsReturnedUntracked: number;
+  /** Unpaired credit-side −legs (the card was paid from outside the tracked set): informational. */
   creditCardPaymentsExternallyFunded: number;
+  /** Unpaired credit-side +legs (a payment reversed on the card, its cash side outside the tracked
+   *  set): informational. */
+  creditCardPaymentsReversedExternally: number;
   /** Σ refund effects, signed (refunds negative, reversals positive). Already inside `spending`. */
   refunds: number;
-  /** Income − Spending − Debt payments − Untracked card outflows + External transfers. */
+  /** Income − Spending − Debt payments − Untracked card outflows + Untracked card returns
+   *  + External transfers. */
   cashFlow: number;
   /** (Cash flow + Known principal) / Income, or 0 when Income ≤ 0 (design §4.1 R-definitions). */
   savingsRate: number;
   /** Rows with a NULL effective role, counted by their sign fallback (R0). */
   unclassifiedCount: number;
-  /** Σ of those rows' amounts, Plaid-signed. */
+  /** The SIGNED NET of those rows' amounts, Plaid convention (+ out, − in): an unclassified $45
+   *  purchase and an unclassified $20 deposit give 25. Read together with `unclassifiedCount`. */
   unclassifiedAmount: number;
 }
 
@@ -148,9 +172,6 @@ export interface BudgetSpend {
   total: number;
   /** Contributions per bucket; the key is a category id, or null for unassigned. */
   effectRows: Map<string | null, EffectRow[]>;
-  /** Split parents whose split rows do not sum to the parent amount (cent-exact). They are
-   *  allocated exactly as stored — the legacy behaviour — and surfaced here (see design §13 Q3). */
-  splitMismatches: { transactionId: string; parentAmount: number; splitTotal: number }[];
 }
 
 export const LOAN_INTEREST_CATEGORY = 'LOAN_INTEREST';
@@ -167,6 +188,7 @@ export interface MonthlyBreakdownSemantic {
     transfersExternal: number;
     creditCardPaymentsTracked: number;
     creditCardPaymentsUntracked: number;
+    creditCardPaymentsReturnedUntracked: number;
     debtPayments: number;
   };
   effectRows: Map<string, EffectRow[]>;
@@ -190,15 +212,52 @@ export class SemanticAggregationIntegrityError extends SemanticIntegrityError {
   }
 }
 
+/**
+ * Trevor's decision on design §13 Q3: when a spending-eligible transaction's splits do not sum to it
+ * in integer cents, the BUDGET aggregate is refused until the splits are corrected — stored splits
+ * are never modified and no unassigned adjustment is invented. Deliberately NOT a
+ * `SemanticIntegrityError`: this is a budget-allocation problem, not loan data, and must not be
+ * shown as one. Only `aggregateBudgetSpend` raises it; cash flow and the Monthly Breakdown (which
+ * never read splits) stay available. `transactionId` is the first affected row; every affected row
+ * is in `mismatches`.
+ */
+export class SplitAllocationMismatchError extends Error {
+  readonly code = 'split_allocation_mismatch';
+  readonly transactionId: string;
+  constructor(readonly mismatches: { transactionId: string; parentAmount: number; splitTotal: number }[]) {
+    const first = mismatches[0];
+    super(
+      `split_allocation_mismatch: transaction ${first.transactionId}: its splits total ${first.splitTotal.toFixed(2)} but the ` +
+        `transaction is ${first.parentAmount.toFixed(2)}` +
+        (mismatches.length > 1 ? ` (and ${mismatches.length - 1} more)` : '') +
+        '; budget figures are paused until the splits are corrected'
+    );
+    this.transactionId = first.transactionId;
+  }
+}
+
 // ---- Constants ---------------------------------------------------------------------------------
 
 /** Same window Phase A reconciliation pairs transfers with (`TRANSFER_WINDOW_DAYS`). */
 export const TRANSFER_PAIR_WINDOW_DAYS = 3;
 /** Card-payment legs post with a delay (design §4.3). */
 export const CARD_PAYMENT_PAIR_WINDOW_DAYS = 5;
-/** How far outside the reporting period a caller must fetch rows so every in-period leg can find
- *  its partner — the larger of the two windows. */
-export const PAIRING_PAD_DAYS = Math.max(TRANSFER_PAIR_WINDOW_DAYS, CARD_PAYMENT_PAIR_WINDOW_DAYS);
+/** How far outside the reporting period a caller must fetch rows: TWO of the widest matching window
+ *  (reciprocal matching is two hops deep — see the fetched-context contract above). The matching
+ *  windows themselves are unchanged; only the evidence fetched around the period grows. */
+export const PAIRING_PAD_DAYS = 2 * Math.max(TRANSFER_PAIR_WINDOW_DAYS, CARD_PAYMENT_PAIR_WINDOW_DAYS);
+
+function shiftDate(date: string, days: number): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+/** The rows a caller must supply for `period`: [start − PAIRING_PAD_DAYS, end + PAIRING_PAD_DAYS),
+ *  the same half-open convention as the period. */
+export function pairingContextRange(period: AggregationPeriod): AggregationPeriod {
+  return { start: shiftDate(period.start, -PAIRING_PAD_DAYS), end: shiftDate(period.end, PAIRING_PAD_DAYS) };
+}
 
 const SEMANTIC_ROLES: ReadonlySet<string> = new Set<SemanticRole>([
   'expense',
@@ -340,6 +399,11 @@ function pairReciprocally(
   return paired;
 }
 
+/** A card-payment leg on a credit account is the liability side; any other account holds cash. */
+function isCreditSide(row: ResolvedRow): boolean {
+  return row.account.type === 'credit';
+}
+
 function resolvePairs(rows: ResolvedRow[]): void {
   // Transfers: both legs must carry the internal_transfer role (a leg whose other side is still
   // classified as income/expense is not a pair — design §13 Q2).
@@ -353,19 +417,16 @@ function resolvePairs(rows: ResolvedRow[]): void {
   );
   for (const leg of transferLegs) leg.pair = pairedTransfers.has(leg.txn.id) ? 'paired' : 'unpaired';
 
-  // Card payments: a payer leg (+) pairs only with a card leg (−) on a `credit` account.
+  // Card payments: a cash-side leg (non-credit account) pairs only with a credit-side leg (`credit`
+  // account) of the opposite sign — a payment (cash +, credit −) or its return (cash −, credit +).
   const cardLegs = rows.filter((r) => r.role === 'credit_card_payment' && r.amountCents !== 0);
-  const isPayer = (r: ResolvedRow) => r.amountCents > 0;
-  const isCardSide = (r: ResolvedRow) => r.amountCents < 0 && r.account.type === 'credit';
-  const pairedCards = pairReciprocally(cardLegs, (leg, other) => {
-    const oppositeKinds = (isPayer(leg) && isCardSide(other)) || (isCardSide(leg) && isPayer(other));
-    return (
-      oppositeKinds &&
+  const pairedCards = pairReciprocally(
+    cardLegs,
+    (leg, other) =>
+      isCreditSide(leg) !== isCreditSide(other) &&
       other.amountCents === -leg.amountCents &&
-      other.txn.accountId !== leg.txn.accountId &&
       daysBetween(leg.txn.date, other.txn.date) <= CARD_PAYMENT_PAIR_WINDOW_DAYS
-    );
-  });
+  );
   for (const leg of cardLegs) leg.pair = pairedCards.has(leg.txn.id) ? 'paired' : 'unpaired';
 }
 
@@ -397,7 +458,10 @@ interface CentTotals {
   transfersExternal: number;
   creditCardPaymentsTracked: number;
   creditCardPaymentsUntracked: number;
+  creditCardPaymentsReturnedTracked: number;
+  creditCardPaymentsReturnedUntracked: number;
   creditCardPaymentsExternallyFunded: number;
+  creditCardPaymentsReversedExternally: number;
   refunds: number;
   unclassifiedCount: number;
   unclassifiedAmount: number;
@@ -413,7 +477,10 @@ function emptyCentTotals(): CentTotals {
     transfersExternal: 0,
     creditCardPaymentsTracked: 0,
     creditCardPaymentsUntracked: 0,
+    creditCardPaymentsReturnedTracked: 0,
+    creditCardPaymentsReturnedUntracked: 0,
     creditCardPaymentsExternallyFunded: 0,
+    creditCardPaymentsReversedExternally: 0,
     refunds: 0,
     unclassifiedCount: 0,
     unclassifiedAmount: 0,
@@ -448,21 +515,37 @@ function addRow(t: CentTotals, row: ResolvedRow): void {
           t.transfersExternal -= effect.cents; // signed as cash: out negative, in positive
         }
         break;
-      case 'credit_card_payment':
-        if (effect.cents > 0) {
-          if (row.pair === 'paired') t.creditCardPaymentsTracked += effect.cents;
-          else t.creditCardPaymentsUntracked += effect.cents;
-        } else if (row.pair !== 'paired') {
-          t.creditCardPaymentsExternallyFunded -= effect.cents;
+      case 'credit_card_payment': {
+        const paired = row.pair === 'paired';
+        if (!isCreditSide(row)) {
+          // Cash side: the only legs that can move tracked cash.
+          if (effect.cents > 0) {
+            if (paired) t.creditCardPaymentsTracked += effect.cents;
+            else t.creditCardPaymentsUntracked += effect.cents;
+          } else if (paired) {
+            t.creditCardPaymentsReturnedTracked -= effect.cents;
+          } else {
+            t.creditCardPaymentsReturnedUntracked -= effect.cents;
+          }
+        } else if (!paired) {
+          // Credit side with no cash leg in the tracked set: a liability moved, no tracked cash did.
+          if (effect.cents < 0) t.creditCardPaymentsExternallyFunded -= effect.cents;
+          else t.creditCardPaymentsReversedExternally += effect.cents;
         }
         break;
+      }
     }
   }
 }
 
 function finish(t: CentTotals): CashFlowTotals {
   const cashFlowCents =
-    t.income - t.spending - t.debtPayments - t.creditCardPaymentsUntracked + t.transfersExternal;
+    t.income -
+    t.spending -
+    t.debtPayments -
+    t.creditCardPaymentsUntracked +
+    t.creditCardPaymentsReturnedUntracked +
+    t.transfersExternal;
   const savingsRate = t.income > 0 ? (cashFlowCents + t.knownPrincipal) / t.income : 0;
   return {
     income: toDollars(t.income),
@@ -474,7 +557,10 @@ function finish(t: CentTotals): CashFlowTotals {
     transfersExternal: toDollars(t.transfersExternal),
     creditCardPaymentsTracked: toDollars(t.creditCardPaymentsTracked),
     creditCardPaymentsUntracked: toDollars(t.creditCardPaymentsUntracked),
+    creditCardPaymentsReturnedTracked: toDollars(t.creditCardPaymentsReturnedTracked),
+    creditCardPaymentsReturnedUntracked: toDollars(t.creditCardPaymentsReturnedUntracked),
     creditCardPaymentsExternallyFunded: toDollars(t.creditCardPaymentsExternallyFunded),
+    creditCardPaymentsReversedExternally: toDollars(t.creditCardPaymentsReversedExternally),
     refunds: toDollars(t.refunds),
     cashFlow: toDollars(cashFlowCents),
     savingsRate,
@@ -522,6 +608,12 @@ function pushEffectRow<K>(map: Map<K, EffectRow[]>, key: K, row: EffectRow): voi
  * unassigned, and its splits are ignored. Transfers, card payments and debt payments contribute
  * nothing, split or not. Every allocation is also returned as an effect row, so a drill-down lists
  * exactly what the total adds up to.
+ *
+ * If any spending-eligible split parent's splits do not sum to it in integer cents (or a split amount
+ * is not a finite number), the whole budget aggregate is refused with `SplitAllocationMismatchError`
+ * naming every affected transaction (Trevor's decision on design §13 Q3). Splits on parents the role
+ * rules exclude (transfers, card payments, debt payments, loan-decomposed rows) are never read, so
+ * they cannot block the budget.
  */
 export function aggregateBudgetSpend(input: AggregationInput & { splits: AggregationSplit[] }): BudgetSpend {
   const splitsByTxn = new Map<string, AggregationSplit[]>();
@@ -533,8 +625,8 @@ export function aggregateBudgetSpend(input: AggregationInput & { splits: Aggrega
 
   const cents = new Map<string | null, number>();
   const effectRows = new Map<string | null, EffectRow[]>();
-  const splitMismatches: BudgetSpend['splitMismatches'] = [];
-  const allocate = (key: string | null, amountCents: number, row: EffectRow) => {
+  const splitMismatches: SplitAllocationMismatchError['mismatches'] = [];
+  const allocate =(key: string | null, amountCents: number, row: EffectRow) => {
     cents.set(key, (cents.get(key) ?? 0) + amountCents);
     pushEffectRow(effectRows, key, row);
   };
@@ -565,29 +657,29 @@ export function aggregateBudgetSpend(input: AggregationInput & { splits: Aggrega
       continue;
     }
 
-    let splitTotal = 0;
-    for (const split of splits) {
-      if (!Number.isFinite(split.amount)) {
-        throw new SemanticAggregationIntegrityError(row.txn.id, `split ${split.id} amount must be a finite number`);
-      }
-      const splitCents = toCents(split.amount);
-      splitTotal += splitCents;
-      allocate(split.budgetCategoryId, splitCents, {
-        ...base,
-        effectRole: effect.role,
-        amount: toDollars(splitCents),
-        allocation: 'split',
-        splitId: split.id,
-      });
-    }
+    // Validate before allocating anything: a mismatched parent must not contribute a partial figure.
+    const splitCents = splits.map((split) => (Number.isFinite(split.amount) ? toCents(split.amount) : Number.NaN));
+    const splitTotal = splitCents.reduce((sum, c) => sum + c, 0);
     if (splitTotal !== effect.cents) {
       splitMismatches.push({
         transactionId: row.txn.id,
         parentAmount: toDollars(effect.cents),
-        splitTotal: toDollars(splitTotal),
+        splitTotal: Number.isFinite(splitTotal) ? toDollars(splitTotal) : Number.NaN,
       });
+      continue;
     }
+    splits.forEach((split, i) =>
+      allocate(split.budgetCategoryId, splitCents[i], {
+        ...base,
+        effectRole: effect.role,
+        amount: toDollars(splitCents[i]),
+        allocation: 'split',
+        splitId: split.id,
+      })
+    );
   }
+
+  if (splitMismatches.length > 0) throw new SplitAllocationMismatchError(splitMismatches);
 
   const byCategory = new Map<string, number>();
   let totalCents = 0;
@@ -600,7 +692,6 @@ export function aggregateBudgetSpend(input: AggregationInput & { splits: Aggrega
     unassigned: toDollars(cents.get(null) ?? 0),
     total: toDollars(totalCents),
     effectRows,
-    splitMismatches,
   };
 }
 
@@ -655,6 +746,7 @@ export function aggregateMonthlyBreakdown(input: AggregationInput): MonthlyBreak
           transfersExternal: t.transfersExternal,
           creditCardPaymentsTracked: t.creditCardPaymentsTracked,
           creditCardPaymentsUntracked: t.creditCardPaymentsUntracked,
+          creditCardPaymentsReturnedUntracked: t.creditCardPaymentsReturnedUntracked,
           debtPayments: t.debtPayments,
         },
         effectRows: acc.effectRows,

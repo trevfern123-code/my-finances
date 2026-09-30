@@ -6,7 +6,10 @@ import {
   aggregateMonthlyBreakdown,
   LOAN_INTEREST_CATEGORY,
   PAIRING_PAD_DAYS,
+  pairingContextRange,
   SemanticAggregationIntegrityError,
+  SplitAllocationMismatchError,
+  type AggregationPeriod,
   type AggregationAccount,
   type AggregationTransaction,
   type BudgetSpend,
@@ -71,6 +74,9 @@ describe('aggregateCashFlow — base fixture, September (design §9.1 "Expected"
     expect(t.creditCardPaymentsTracked).toBe(900);
     expect(t.creditCardPaymentsUntracked).toBe(0);
     expect(t.creditCardPaymentsExternallyFunded).toBe(0);
+    expect(t.creditCardPaymentsReturnedTracked).toBe(0);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(0);
+    expect(t.creditCardPaymentsReversedExternally).toBe(0);
     expect(t.refunds).toBe(-60);
   });
 
@@ -117,7 +123,6 @@ describe('aggregateBudgetSpend — base fixture, September (design §9.1 Budget,
     expect(budget.byCategory.get(CATEGORY.household)).toBe(50);
     expect(budget.unassigned).toBe(125); // SoFi interest 50 + Venmo 75
     expect(budget.total).toBe(525); // equals role-aware spending
-    expect(budget.splitMismatches).toEqual([]);
   });
 
   it('every bucket\'s effect rows sum exactly to the bucket (drill-down reconciliation, design §7.3)', () => {
@@ -165,6 +170,7 @@ describe('aggregateMonthlyBreakdown — base fixture (design §5 C5)', () => {
       transfersExternal: 0,
       creditCardPaymentsTracked: 900,
       creditCardPaymentsUntracked: 0,
+      creditCardPaymentsReturnedUntracked: 0,
       debtPayments: 650,
     });
   });
@@ -301,11 +307,16 @@ describe('account exclusions and the tracked-set principle (design §4.1–§4.3
     expect(t.cashFlow).toBe(102.1);
   });
 
-  // Design conflict, recorded in FINANCIAL_SEMANTICS_PHASE_B_DESIGN.md §13 Q1: §9.1 says marking 4b
-  // as a transfer in this variant "gives Income 2.10 and Cash flow −397.90", but §4.1/§4.2 (the later
-  // tracked-set principle) count an unpaired transfer leg in cash flow with its sign, which gives
-  // 102.10. Deliberately not asserted until the design is reconciled.
-  it.todo('checking not linked, 4b marked as a transfer — awaiting design §13 Q1 (−397.90 vs 102.10)');
+  it('checking not linked, 4b marked as a transfer: an external transfer +500 → income 2.10, cash flow 102.10 (§13 Q1 resolved)', () => {
+    // The approved tracked-set principle (§4.1/§4.2) counts an unpaired transfer leg in cash flow with
+    // its sign; the stale "−397.90" in §9.1 was corrected to this.
+    const rows = fixtureTransactions().filter((r) => r.accountId !== ACCOUNT.C);
+    const accounts = fixtureAccounts().filter((a) => a.id !== ACCOUNT.C);
+    const t = september(rows, accounts);
+    expect(t.income).toBe(2.1);
+    expect(t.transfersExternal).toBe(500);
+    expect(t.cashFlow).toBe(102.1);
+  });
 });
 
 describe('card-payment pairing edge cases (design §4.3, §9.1 "Pairing edge cases")', () => {
@@ -356,14 +367,15 @@ describe('card-payment pairing edge cases (design §4.3, §9.1 "Pairing edge cas
     expect(PAIRING_PAD_DAYS).toBeGreaterThanOrEqual(5);
   });
 
-  it('a card leg must be on a credit account: an opposite leg on a depository account never tracks the payment', () => {
+  it('a card leg must be on a credit account: two cash-side legs never pair, and the money is counted once each way', () => {
+    // 5b moved to savings: checking +900 out, savings −900 in, both labelled card payments.
     const rows = withRow(fixtureTransactions(), '5b', { accountId: ACCOUNT.S });
     const t = september(rows);
     expect(t.creditCardPaymentsTracked).toBe(0);
     expect(t.creditCardPaymentsUntracked).toBe(900);
-    // Pinned current behaviour for a negative card-payment leg on a non-credit account, per §4.3's
-    // sign rule; flagged for confirmation in design §13 Q4.
-    expect(t.creditCardPaymentsExternallyFunded).toBe(900);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(900);
+    expect(t.creditCardPaymentsExternallyFunded).toBe(0);
+    expect(t.cashFlow).toBe(1827.1); // cash stayed within the tracked set
   });
 });
 
@@ -445,14 +457,76 @@ describe('refunds and splits (design §4.5, §4.6)', () => {
     expect(budget.unassigned).toBe(75);
   });
 
-  it('splits that do not sum to their parent are allocated as stored and reported (design §13 Q3)', () => {
+});
+
+describe('split allocation mismatches refuse the budget aggregate (Trevor\'s decision on design §13 Q3)', () => {
+  const budgetFor = (rows: AggregationTransaction[], splits: typeof fixtureSplits extends () => infer R ? R : never) =>
+    aggregateBudgetSpend({ accounts: fixtureAccounts(), transactions: rows, splits, period: SEPTEMBER });
+  const expectRefused = (run: () => unknown, transactionId: string) => {
+    expect(run).toThrow(SplitAllocationMismatchError);
+    try {
+      run();
+    } catch (err) {
+      expect(err).not.toBeInstanceOf(SemanticIntegrityError); // never shown as loan data
+      expect((err as SplitAllocationMismatchError).code).toBe('split_allocation_mismatch');
+      expect((err as SplitAllocationMismatchError).transactionId).toBe(transactionId);
+      return err as SplitAllocationMismatchError;
+    }
+    throw new Error('expected a refusal');
+  };
+
+  it('an expense whose splits are one cent short is refused, naming the transaction; nothing is adjusted', () => {
     const splits = [
       { id: 'split-10a', transactionId: '10', budgetCategoryId: CATEGORY.groceries, amount: 150 },
       { id: 'split-10b', transactionId: '10', budgetCategoryId: CATEGORY.household, amount: 49.99 },
     ];
+    const err = expectRefused(() => budgetFor(fixtureTransactions(), splits), '10');
+    expect(err.mismatches).toEqual([{ transactionId: '10', parentAmount: 200, splitTotal: 199.99 }]);
+    expect(splits[1].amount).toBe(49.99); // the stored split is untouched
+  });
+
+  it('a refund whose splits do not sum to its negative amount is refused', () => {
+    const splits = [...fixtureSplits(), { id: 'split-8b', transactionId: '8b', budgetCategoryId: CATEGORY.shopping, amount: -50 }];
+    const err = expectRefused(() => budgetFor(fixtureTransactions(), splits), '8b');
+    expect(err.mismatches).toEqual([{ transactionId: '8b', parentAmount: -60, splitTotal: -50 }]);
+  });
+
+  it('every mismatched parent is reported, and a non-finite split amount is a mismatch too', () => {
+    const splits = [
+      { id: 'split-10a', transactionId: '10', budgetCategoryId: CATEGORY.groceries, amount: 150 },
+      { id: 'split-10b', transactionId: '10', budgetCategoryId: CATEGORY.household, amount: 40 },
+      { id: 'split-2', transactionId: '2', budgetCategoryId: CATEGORY.groceries, amount: Number.NaN },
+    ];
+    const err = expectRefused(() => budgetFor(fixtureTransactions(), splits), '2');
+    expect(err.mismatches.map((m) => m.transactionId)).toEqual(['2', '10']);
+    expect(err.message).toMatch(/and 1 more/);
+  });
+
+  it('valid splits — including a refund split summing to its negative amount — are accepted', () => {
+    const splits = [...fixtureSplits(), { id: 'split-8b', transactionId: '8b', budgetCategoryId: CATEGORY.household, amount: -60 }];
     const budget = budgetFor(fixtureTransactions(), splits);
-    expect(budget.splitMismatches).toEqual([{ transactionId: '10', parentAmount: 200, splitTotal: 199.99 }]);
-    expect(budget.byCategory.get(CATEGORY.household)).toBe(49.99);
+    expect(budget.byCategory.get(CATEGORY.shopping)).toBe(60);
+    expect(budget.byCategory.get(CATEGORY.household)).toBe(-10);
+    assertBudgetReconciles(budget);
+  });
+
+  it('mismatched splits the role rules already exclude (transfer, card payment, loan-decomposed) never block the budget', () => {
+    const splits = [
+      ...fixtureSplits(),
+      { id: 'split-4a', transactionId: '4a', budgetCategoryId: CATEGORY.household, amount: 1 },
+      { id: 'split-5a', transactionId: '5a', budgetCategoryId: CATEGORY.household, amount: 1 },
+      { id: 'split-6', transactionId: '6', budgetCategoryId: CATEGORY.household, amount: 1 },
+    ];
+    const budget = budgetFor(fixtureTransactions(), splits);
+    expect(budget.total).toBe(525);
+    expect(budget.byCategory.get(CATEGORY.household)).toBe(50);
+  });
+
+  it('cash flow and the Monthly Breakdown stay available while the budget is refused (neither reads splits)', () => {
+    const splits = [{ id: 'split-10a', transactionId: '10', budgetCategoryId: CATEGORY.groceries, amount: 1 }];
+    expect(() => budgetFor(fixtureTransactions(), splits)).toThrow(SplitAllocationMismatchError);
+    expect(september().cashFlow).toBe(1827.1);
+    expect(aggregateMonthlyBreakdown({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: SEPTEMBER })[0].spending).toBe(525);
   });
 });
 
@@ -480,6 +554,18 @@ describe('integrity failures are never masked (R9, invariant I4)', () => {
     expect(() => september(withRow(fixtureTransactions(), '2', { accountId: 'acct-missing' }))).toThrow(/was not supplied/);
   });
 
+  it('unclassifiedAmount is the signed net of unclassified rows, reported with their count (§13 Q6)', () => {
+    const rows = [
+      ...fixtureTransactions(),
+      { ...fixtureTransactions()[15], id: '13b', amount: -20, plaidCategory: 'INCOME', budgetCategoryId: null },
+    ];
+    const aug = aggregateCashFlow({ accounts: fixtureAccounts(), transactions: rows, period: AUGUST });
+    expect(aug.unclassifiedCount).toBe(2);
+    expect(aug.unclassifiedAmount).toBe(25); // +45 purchase, −20 deposit
+    expect(aug.spending).toBe(45);
+    expect(aug.income).toBe(20);
+  });
+
   it('a NULL role is not an integrity failure: it degrades to the sign fallback (R0)', () => {
     const rows = withRow(fixtureTransactions(), '2', { effectiveRole: null });
     const t = september(rows);
@@ -494,5 +580,169 @@ describe('integrity failures are never masked (R9, invariant I4)', () => {
     expect(t.knownPrincipal).toBe(350);
     expect(t.spending).toBe(50);
     expect(only6[0].manualLoanId).toBe(LOAN_M);
+  });
+});
+
+// ---- Fetched-context contract (Codex review finding 1) ---------------------------------------------
+
+/** Rows a caller would fetch for `period` with `padDays` on each side ([start − pad, end + pad)). */
+function fetchedWithPad(rows: AggregationTransaction[], period: AggregationPeriod, padDays: number): AggregationTransaction[] {
+  const shift = (d: string, n: number) => {
+    const x = new Date(`${d}T00:00:00Z`);
+    x.setUTCDate(x.getUTCDate() + n);
+    return x.toISOString().slice(0, 10);
+  };
+  const start = shift(period.start, -padDays);
+  const end = shift(period.end, padDays);
+  return rows.filter((r) => r.date >= start && r.date < end);
+}
+
+const leg = (id: string, date: string, accountId: string, amount: number, role: string): AggregationTransaction => ({
+  id,
+  accountId,
+  date,
+  amount,
+  plaidCategory: role === 'internal_transfer' ? (amount > 0 ? 'TRANSFER_OUT' : 'TRANSFER_IN') : 'LOAN_PAYMENTS',
+  budgetCategoryId: null,
+  effectiveRole: role,
+  userRoleOverride: null,
+  manualLoanId: null,
+  principalPortion: null,
+});
+
+describe('fetched-context contract: reciprocal matching needs two windows of surrounding evidence', () => {
+  it('the documented pad is two of the widest window, and pairingContextRange applies it to both ends', () => {
+    expect(PAIRING_PAD_DAYS).toBe(10);
+    expect(pairingContextRange(SEPTEMBER)).toEqual({ start: '2026-08-22', end: '2026-10-11' });
+  });
+
+  it('card: Sep 1 checking +100, Aug 28 card −100, Aug 24 checking +100 — the card leg is contested, so September stays −100', () => {
+    const rows = [
+      leg('p1', '2026-09-01', ACCOUNT.C, 100, 'credit_card_payment'),
+      leg('k', '2026-08-28', ACCOUNT.X, -100, 'credit_card_payment'),
+      leg('p0', '2026-08-24', ACCOUNT.C, 100, 'credit_card_payment'),
+    ];
+    const accounts = fixtureAccounts();
+    const run = (r: AggregationTransaction[]) => aggregateCashFlow({ accounts, transactions: r, period: SEPTEMBER });
+
+    expect(run(rows).cashFlow).toBe(-100); // complete evidence: k's best match is a tie → no pair
+    expect(run(fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS)).cashFlow).toBe(-100);
+    expect(run(fetchedWithPad(rows, SEPTEMBER, 5)).cashFlow).toBe(0); // the old one-window pad hides p0
+  });
+
+  it('transfer: Sep 30 checking +100, Oct 3 savings −100, Oct 6 checking +100 — ambiguous reciprocal match, September stays −100', () => {
+    const rows = [
+      leg('t1', '2026-09-30', ACCOUNT.C, 100, 'internal_transfer'),
+      leg('t2', '2026-10-03', ACCOUNT.S, -100, 'internal_transfer'),
+      leg('t3', '2026-10-06', ACCOUNT.C, 100, 'internal_transfer'),
+    ];
+    const accounts = fixtureAccounts();
+    const run = (r: AggregationTransaction[]) => aggregateCashFlow({ accounts, transactions: r, period: SEPTEMBER });
+
+    expect(run(rows).cashFlow).toBe(-100);
+    expect(run(rows).transfersExternal).toBe(-100);
+    expect(run(fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS)).cashFlow).toBe(-100);
+    expect(run(fetchedWithPad(rows, SEPTEMBER, 5)).cashFlow).toBe(0);
+  });
+
+  it('for many generated histories, the in-period result with the documented pad equals the result with complete evidence', () => {
+    let seed = 1;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed / 2147483648;
+    };
+    const accounts = [...fixtureAccounts(), { id: 'acct-S2', type: 'depository', excludeFromCashFlow: false }, { id: 'acct-X2', type: 'credit', excludeFromCashFlow: false }];
+    const cash = [ACCOUNT.C, ACCOUNT.S, 'acct-S2'];
+    const credit = [ACCOUNT.X, 'acct-X2'];
+    const pick = <T,>(xs: T[]) => xs[Math.floor(random() * xs.length)];
+    // Legs cluster within ±12 days of the two period boundaries, where two-hop evidence matters.
+    const day = () => {
+      const d = new Date(random() < 0.5 ? '2026-09-01T00:00:00Z' : '2026-10-01T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() + Math.floor(random() * 25) - 12);
+      return d.toISOString().slice(0, 10);
+    };
+
+    let oneWindowDiffers = 0;
+    for (let history = 0; history < 200; history++) {
+      const rows: AggregationTransaction[] = [];
+      for (let i = 0; i < 25; i++) {
+        const transfer = random() < 0.5;
+        const amount = 100 * (random() < 0.5 ? 1 : -1);
+        const account = transfer ? pick(cash) : amount > 0 === random() < 0.8 ? pick(cash) : pick(credit);
+        rows.push(leg(`h${history}-${i}`, day(), account, amount, transfer ? 'internal_transfer' : 'credit_card_payment'));
+      }
+      const full = aggregateCashFlow({ accounts, transactions: rows, period: SEPTEMBER });
+      const documented = aggregateCashFlow({ accounts, transactions: fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS), period: SEPTEMBER });
+      expect(documented).toEqual(full);
+      const oneWindow = aggregateCashFlow({ accounts, transactions: fetchedWithPad(rows, SEPTEMBER, 5), period: SEPTEMBER });
+      if (JSON.stringify(oneWindow) !== JSON.stringify(full)) oneWindowDiffers++;
+    }
+    expect(oneWindowDiffers).toBeGreaterThan(0); // the generator does reach the two-hop cases
+  });
+});
+
+// ---- Returned card payments (Codex review finding 2) ----------------------------------------------
+
+describe('returned card payments: cash arriving in checking vs a payment into a card', () => {
+  const ccp = (id: string, date: string, accountId: string, amount: number) => leg(id, date, accountId, amount, 'credit_card_payment');
+
+  it('a matched return (checking −900 with card +900) nets to zero and is reported once, next to the matched payment', () => {
+    const rows = [...fixtureTransactions(), ccp('ret-c', '2026-09-15', ACCOUNT.C, -900), ccp('ret-x', '2026-09-15', ACCOUNT.X, 900)];
+    const t = september(rows);
+    expect(t.creditCardPaymentsTracked).toBe(900);
+    expect(t.creditCardPaymentsReturnedTracked).toBe(900);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(0);
+    expect(t.creditCardPaymentsReversedExternally).toBe(0);
+    expect(t.income).toBe(3002.1); // a return is never income
+    expect(t.cashFlow).toBe(1827.1);
+  });
+
+  it('card not linked: the payment out (−900) and its return into checking (+900) cancel — no cash vanishes or appears', () => {
+    const rows = [...fixtureTransactions().filter((r) => r.accountId !== ACCOUNT.X), ccp('ret-c', '2026-09-15', ACCOUNT.C, -900)];
+    const accounts = fixtureAccounts().filter((a) => a.id !== ACCOUNT.X);
+    const t = september(rows, accounts);
+    expect(t.creditCardPaymentsUntracked).toBe(900);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(900);
+    expect(t.cashFlow).toBe(2227.1); // = the unlinked-card variant (1 327.10) with the $900 back
+  });
+
+  it('card excluded from cash flow: the same — its +900 reversal is not loaded, the checking return still counts', () => {
+    const rows = [...fixtureTransactions(), ccp('ret-c', '2026-09-15', ACCOUNT.C, -900), ccp('ret-x', '2026-09-15', ACCOUNT.X, 900)];
+    const t = september(rows, fixtureAccounts({ X: { excludeFromCashFlow: true } }));
+    expect(t.creditCardPaymentsUntracked).toBe(900);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(900);
+    expect(t.creditCardPaymentsReturnedTracked).toBe(0);
+    expect(t.cashFlow).toBe(2227.1);
+  });
+
+  it('a return on its own (no payment in range) is cash in: +100 to cash flow, not income', () => {
+    const t = september([...fixtureTransactions(), ccp('ret-only', '2026-09-20', ACCOUNT.C, -100)]);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(100);
+    expect(t.income).toBe(3002.1);
+    expect(t.cashFlow).toBe(1927.1);
+  });
+
+  it('a reversal on the card whose cash side is outside the tracked set moves no tracked cash', () => {
+    const t = september([...fixtureTransactions(), ccp('rev-x', '2026-09-16', ACCOUNT.X, 900)]);
+    expect(t.creditCardPaymentsReversedExternally).toBe(900);
+    expect(t.cashFlow).toBe(1827.1);
+  });
+
+  it('checking not linked: an externally funded payment into the card is still 0 (unchanged)', () => {
+    const rows = fixtureTransactions().filter((r) => r.accountId !== ACCOUNT.C);
+    const t = september(rows, fixtureAccounts().filter((a) => a.id !== ACCOUNT.C));
+    expect(t.creditCardPaymentsExternallyFunded).toBe(900);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(0);
+  });
+
+  it('a payment and a return between the same two accounts pair with their own opposites, never each other', () => {
+    // Payment 09-10 (fixture 5a/5b) and a return two days later: each cash leg pairs with the card leg
+    // of the opposite sign; no leg is counted twice.
+    const rows = [...fixtureTransactions(), ccp('ret-c', '2026-09-12', ACCOUNT.C, -900), ccp('ret-x', '2026-09-12', ACCOUNT.X, 900)];
+    const t = september(rows);
+    expect(t.creditCardPaymentsTracked).toBe(900);
+    expect(t.creditCardPaymentsReturnedTracked).toBe(900);
+    expect(t.creditCardPaymentsUntracked + t.creditCardPaymentsReturnedUntracked + t.creditCardPaymentsExternallyFunded + t.creditCardPaymentsReversedExternally).toBe(0);
+    expect(t.cashFlow).toBe(1827.1);
   });
 });

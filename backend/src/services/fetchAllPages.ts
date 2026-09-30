@@ -16,7 +16,7 @@
  *    `…KeysetFilter` builders below produce the PostgREST `or` filter for the two key shapes the
  *    design names: `(date, id)` for transactions and `(transaction_id, id)` for splits.
  *  - The loop stops only on an EMPTY page. Deliberately not on a "short" page (fewer rows than
- *    requested), which the design sketch suggested: if the server's own row cap is lower than the
+ *    requested), as an earlier design sketch said (§7.4 now agrees, §13 Q5): if the server's own row cap is lower than the
  *    page size we ask for, every page is short, and stopping on the first one would re-create the
  *    exact silent truncation this helper exists to remove. The cost is one extra, empty request.
  *  - It verifies the key strictly increases across every row it receives (a mis-ordered query would
