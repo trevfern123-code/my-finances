@@ -75,9 +75,10 @@ jobs:
 
   database-harness:
     # The adversarial PostgreSQL suites behind the manual-loan and Plaid-link database code: Phase A
-    # (scaffold and history modes, which include the post-audit t07/t08, c07/c08 and g06/g07 tests)
-    # and access_control. Throwaway local containers only. Each suite runs even if an earlier one
-    # failed, so one run reports all three.
+    # (scaffold and history modes, which include the post-audit t07/t08, c07/c08 and g06/g07 tests),
+    # access_control, and the card-payment SQL-evaluator equivalence check (SQL vs the TypeScript
+    # reference evaluator). Throwaway local containers only. Each suite runs even if an earlier one
+    # failed, so one run reports all four.
     runs-on: ubuntu-latest
     env:
       # Supabase's official Docker Hub mirror avoids ECR Public's anonymous-download quota.
@@ -108,5 +109,14 @@ jobs:
       - name: access_control
         if: ${{ !cancelled() }}
         run: bash supabase/tests/access_control/run.sh
+        env:
+          PG_IMAGE: ${{ env.SUPABASE_TEST_PG_IMAGE }}
+
+      # Any difference between the SQL evaluator and the TypeScript oracle, or any rule path the
+      # fixtures fail to reach, exits non-zero and fails this step.
+      - name: card-payment evaluator equivalence
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: bash supabase/tests/card_payment_evaluator/run.sh
         env:
           PG_IMAGE: ${{ env.SUPABASE_TEST_PG_IMAGE }}

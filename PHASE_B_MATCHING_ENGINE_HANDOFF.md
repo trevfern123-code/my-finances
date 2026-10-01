@@ -360,7 +360,7 @@ workflow, sync retry, repair interface or automatic cleanup.
 - API fields and frontend (24–26).
 - The Phase A backfill release gate, and running the audit against production.
 
-## 6. Recommended next slice (planning only — nothing started)
+## 6. Recommended next slice (planned 2026-09-30; slice 2a is now implemented — see §8)
 
 **Slice 2a — schema and SQL evaluator, disconnected**, in a throwaway harness only:
 1. **One migration file (not applied):**
@@ -400,3 +400,248 @@ workflow, sync retry, repair interface or automatic cleanup.
 - There were no migrations, schema changes, database access (local or production), dependency or
   environment changes, commits, pushes, pull requests, merges or deployments.
 - Database concurrency, persistence and live integration are **not** verified by this work.
+
+## 8. Slice 2a — database schema and SQL evaluator (implemented 2026-09-30, uncommitted)
+
+**Branch and state:**
+- Local branch `feature/phase-b-slice2a-sql-evaluator`, created from the reviewed checkpoint
+  `80c724d` (draft PR #8's head). It has not been pushed.
+- Nothing is committed. The migration has been applied only inside throwaway test containers, and
+  never to a hosted database.
+- Historical statements above that say work is "uncommitted" are superseded by the git history
+  (`0647c1e`, `beb032c`, `80c724d`).
+
+**Files:**
+
+| File | What |
+|---|---|
+| `supabase/migrations/20260930120000_card_payment_matching_state.sql` | The disconnected schema: `card_payment_decisions`, `card_payment_eval_versions`, `card_payment_leg_states`, `card_payment_auto_pairs`, `card_payment_decision_states`; the input triggers and `card_payment_bump`; `evaluate_card_payments`, `try_evaluate_card_payments`, `get_card_payment_states`; grants and postconditions |
+| `supabase/tests/access_control/sql/a08_card_payment_grants.sql` | Test 22 at runtime: client roles denied on every table, function and sequence; `service_role` allowed |
+| `supabase/tests/access_control/sql/a09_card_payment_invalidation.sql` | Tests 13 and 16d: every input change bumps in the writer's transaction; non-inputs and same-value updates don't; rollback leaves no bump; item and account cascades bump; user deletion is tolerated; ownership is refused at write time |
+| `supabase/tests/access_control/sql/a10_card_payment_evaluator.sql` | Tests 14, 15, 16a (single session) and 20 at database level |
+| `supabase/tests/access_control/concurrency/c12…c15_card_*` | 16a (both halves), 16b and 16c, with real concurrent sessions |
+| `supabase/tests/card_payment_evaluator/{run.sh,export.cjs,compare.cjs}` | Oracle equivalence: SQL vs the TypeScript evaluator |
+| `backend/src/testUtils/cardPaymentHistories.ts` | The Stage 2 generator, moved **verbatim** out of the adversarial test so the SQL harness can reuse it. It is test-only (excluded from the production build) |
+| `backend/src/services/cardPaymentMatching.adversarial.test.ts` | Now imports the moved generator. Results are unchanged: 127 passed, 10 todo |
+
+**Verified (actual results):**
+
+| Check | Result |
+|---|---|
+| Oracle equivalence (`card_payment_evaluator/run.sh`) | 300 generated histories plus 31 targeted scenarios, 662 user evaluations: **0 differences**, 59 distinct state/candidate shapes. A coverage guard requires every rule path. The scenarios were added after measuring that the generator alone never reaches `matched_leg_not_posted`, `partner_gone` or `return_of_pair` |
+| Harness sensitivity (mutations of the SQL evaluator, restored by sha256) | window 5→6: 23 evaluations differ; horizon 60→61: 3 differ; exception ignoring the included-card condition: 9 differ |
+| `access_control/run.sh` (full) | **25 passed, 0 failed**: every existing test plus a08–a10 and c12–c15 |
+| `phase_a/run.sh` | scaffold: **23 passed**; history: **18 passed, 7 skipped**. The skips are the gate tests that need a pre-migration database, skipped by design in history mode |
+| `replay/run.sh`, emulator tier | **R1–R5 passed**: clean replay with no error or warning, idempotent, historical = CLI schema, production state applies only the pending files |
+| `card_payment_audit/run.sh` | passed |
+| Backend typecheck / suite / build | passed / **1266 passed, 3 expected fail, 10 todo** / passed. The three `it.fails` tests and the 10 todos are unchanged |
+| Runtime importers | none: no route, service, script or frontend file references the engine or any `card_payment_*` object |
+
+**Mutation checks of the database tests** (each restored by sha256):
+- **c12** fails when the evaluator takes no L2 lock: the published version misses the writer's bump.
+  - Removing only `FOR UPDATE` did *not* fail it, because the preceding `INSERT … ON CONFLICT` on the
+    version row also waits for an in-progress bump.
+  - Correctness does not rest on the lock alone. The version is read before the inputs and published
+    as read, so without the lock the user ends stale, not falsely fresh.
+- **c14** deadlocks (`deadlock detected`) when a derived table has a foreign key to `transactions`,
+  which proves the no-FK design is required. The first version of c14 did not detect this. It was
+  rewritten to the RPC shape: L2 is taken through an input write, and the evaluation comes after the
+  deleter locks its row.
+- **a09** fails when the bump's vanishing-user guard is removed.
+- **c13 and c15 were not mutation-checked.** Their assertions are outcome checks: stale-not-fresh, and
+  fresh states equal a re-evaluation.
+
+**Not tested or not done:**
+- *(Superseded by §8.1: the real-CLI replay tier now passes locally, and 16b runs 50 coordinated
+  rounds.)*
+- The equivalence run uses one `as_of`.
+- Frontend checks were not run, because nothing in the frontend changed.
+- **Not implemented** (as scoped):
+  - decision-writing RPCs;
+  - the sync-batch and LIM-removal integration, including evaluating inside those RPCs and converting
+    pairs to `destination_removed_card` (test 18);
+  - the aggregation read protocol and `updating` result (tests 16 and 25);
+  - aggregation integration, so the `it.fails` tests stay failing;
+  - the API and frontend;
+  - backfill evaluation of existing users;
+  - a preflight/postflight file for any real application.
+- **CI:** *(superseded by §8.1: the equivalence harness is now a CI step.)*
+
+**Implementation choices needing review.** These are provisional: engineering choices, not approved
+product rules.
+1. **Two derived outputs beyond the design's table list:** `card_payment_decision_states` and
+   `card_payment_eval_versions.superseded_transaction_ids`. They let the reader return the engine's full
+   output (decision statuses, superseded rows).
+2. **A write-time ownership trigger** on decisions, `card_payment_decisions_same_user`, implementing
+   §3.5's "every row's accounts belong to that user". The evaluator still reports `foreign_account` /
+   `foreign_user` if an account later moves to another user (a10).
+3. **Superset triggers:** besides the §3.7 list, they fire on `plaid_items.user_id` changes and on
+   carry-over `account_id` / `pending_plaid_transaction_id` / `user_id` changes. An extra bump only
+   makes a user stale, which is the safe direction.
+4. **The bump grant:** `card_payment_bump` is executable by `service_role`, because
+   SECURITY INVOKER triggers call it as the writer. It can only make a user stale.
+5. **User deletion:** the bump tolerates a user deleted mid-cascade. The pre-existing
+   `plaid_items.user_id` foreign key does not cascade, so a user with items still cannot be deleted —
+   unchanged behaviour.
+6. **Evaluation time:** `evaluate_card_payments(user, p_as_of default now())` takes an explicit time.
+   Carry-over expiry passing without an input change can make a stored reason's *wording* out of date
+   (`waiting_to_post` vs `partner_gone`) until the next evaluation. Effects and bounds never depend on
+   time (the Stage 2 asOf-invariance test).
+7. **Temporary tables:** the evaluator uses session temp tables (`on commit drop`), which requires
+   `TEMPORARY` privilege for `service_role`. It holds in the Supabase image tested; confirm for the
+   hosted project before any real application.
+8. **`superseded_by` has no foreign key**, so deleting a superseding decision can never reactivate the
+   old one.
+9. **Trigger cost** (still unmeasured; the evaluator itself is measured in §8.1): the triggers are
+   row-level, one version-row update per changed input row, so a
+   large sync batch updates the version row once per row. Measure this in slice 2b.
+10. **The exception condition's sign test:** `sign(new cents) = sign(recorded cents)`, matching the
+    engine.
+
+**Before any application beyond a test container:**
+- Trevor's explicit approval;
+- the usual preflight/postflight file;
+- a decision on the choices above;
+- Codex review of this slice.
+
+The migration is additive, and its rollback is listed in its header.
+
+### 8.1 Follow-up pass (2026-09-30): CI, 16b ×50, bounded waits, evaluator performance
+
+Same local branch `feature/phase-b-slice2a-sql-evaluator` at `80c724d`. Still uncommitted and unpushed.
+The approved financial rules are unchanged: the SQL/TypeScript equivalence is identical before and
+after this pass.
+
+**1. CI.** `.github/workflows/ci.yml`, job `database-harness`, has a new step, **card-payment evaluator
+equivalence**. It runs `bash supabase/tests/card_payment_evaluator/run.sh` with
+`PG_IMAGE=${{ env.SUPABASE_TEST_PG_IMAGE }}` (the pinned Docker Hub mirror digest), `if: !cancelled()` and
+`timeout-minutes: 20`. Any difference, or any rule path left unreached, exits 1. Verified locally: with
+the suggestion horizon mutated 60→61, `run.sh` exited **1** (4 evaluations differ). **Not yet run in
+CI**, and the mirror digest itself has not been pulled or run locally.
+
+**2. Acceptance test 16b ×50, with explicit coordination.**
+- **New helpers** in `supabase/tests/access_control/helpers.sql`:
+  - `th.wait_for_application(name, timeout)` — a session announces a phase in `application_name`, and
+    the other polls `pg_stat_activity`, clearing the stats snapshot on every poll;
+  - `th.wait_until_blocked_by(pid, blocker, timeout)` — uses `pg_blocking_pids`;
+  - `th.session_snapshot()`.
+
+  All have a 30 s default bound and raise **COORDINATION TIMEOUT** with a session snapshot. The
+  existing helpers are unchanged.
+- **c12, c13 and c15** now establish their overlap with these barriers, not sleeps or sub-second timing:
+  - the session holding L2 commits (or proceeds) only after it has *observed* the other session
+    blocked by it;
+  - the timing assertions were replaced by that observation;
+  - the stale-state, published-version and exactly-one-deadlock assertions are unchanged.
+- **c14** is now **50 coordinated rounds**: two procedures, one commit per round.
+  - In each round the deleter takes its row lock and blocks on L2. The holder observes that, then
+    evaluates.
+  - From round 2 on, the holder asserts that the previous round's delete left the user stale. The
+    verify step checks the last round and that all 50 deletes committed.
+  - Sessions poll as `postgres` and switch to `service_role` (`set_config('role', …)`) for the writes
+    and evaluations.
+- **Mutation re-checks on the rewritten tests** (restored by sha256):
+  - derived-table FK → round 1 `deadlock detected` (then a bounded COORDINATION TIMEOUT, not a hang);
+  - no L2 at all → c12 fails "the published version includes the writer's bump".
+
+**3. Bounded waits.** `access_control/run.sh`, `card_payment_evaluator/run.sh` and
+`card_payment_audit/run.sh`:
+- **Startup:** `STARTUP_TIMEOUT` (default 180 s) bounds startup, and each readiness probe has a 10 s
+  limit.
+- **psql runs:** `PSQL_TIMEOUT` (default 600 s) bounds every psql run (migrations, seeds, tests,
+  holder, contender, verify, evaluation). A timeout prints `TIMEOUT: exceeded …` into the log.
+- **Failure paths, demonstrated locally:**
+  - `STARTUP_TIMEOUT=1` → exit 1, "did not accept connections within 1s", plus the last container log
+    lines;
+  - container killed during startup → exit 1, "the database container stopped during startup", plus
+    logs;
+  - container killed just after startup → exit 1 at the first migration;
+  - `timeout 3 docker exec … pg_sleep(30)` → exit 124 after 3 s.
+- Phase A and replay runners were not changed.
+
+**4. Evaluator performance.** Measured with `supabase/tests/card_payment_evaluator/perf.sql`: one user,
+8 accounts, 2 % card legs, pending → posted lineage on a third of all rows, conflicting groups,
+carry-overs and 60 decisions. It ran in a throwaway container as `supabase_admin`.
+- **The bottleneck** (`auto_explain`, nested statements): at 10 000 rows the correlated
+  conflict-group count took 1 596 of 1 919 ms. After fixing it, tier 1's correlated "closest" step
+  took 4 221 of 8 787 ms at 50 000 rows, and the per-leg candidate queries each scanned every row.
+- **Fixes, no rule changes:**
+  - superseded rows and conflict groups are computed once with `DISTINCT` / `GROUP BY … HAVING
+    count(*) > 1`, over **every** row (non-card rows are kept for lineage and role-change handling);
+  - indexes on the temp table: `(account_id, pending_of)` and `(account_id, plaid)`, plus `ANALYZE`
+    after loading;
+  - `in_pool` is set only on qualifying legs;
+  - the pool is materialised in a small temp table, `cpe_pool`, used by tier 1 and the candidates;
+  - tier 1's closest candidate uses window functions, the same reciprocal rule the audit SQL uses.
+
+| Transactions | before | after |
+|---|---|---|
+| 2 000 | 121.6 ms | 48.8 ms |
+| 5 000 | 533.4 ms | 89.6 ms |
+| 10 000 | 1 947.3 ms | 144.2 ms |
+| 20 000 | (not run; quadratic, ~8 s projected) | 298.8 ms |
+| 50 000 | 8 419.1 ms (after the first fix only) | 713.6 ms |
+
+- **Temp-table overhead:** about 25 ms for the first evaluation of a 20-row history in a new session.
+  In one transaction, the first evaluation took 13.5 ms and a second 7.2 ms (tables already present;
+  truncate path). So recreating the temp tables costs about 6 ms per evaluating transaction. They are
+  kept.
+- **Equivalence after the rewrite:** 662 evaluations, **0 differences**.
+
+**Tests actually run in this pass** (final tree, local Docker, disposable containers only):
+
+| Command | Result |
+|---|---|
+| `bash supabase/tests/access_control/run.sh` | **25 passed, 0 failed** (c12–c15 coordinated; c14 = 50 rounds) |
+| `bash supabase/tests/card_payment_evaluator/run.sh` | **662 evaluations, 0 differ**, 59 shapes; PASS |
+| `bash supabase/tests/card_payment_audit/run.sh` | PASS |
+| `bash supabase/tests/phase_a/run.sh` | scaffold **23 passed** |
+| `PHASE_A_BASE=history bash supabase/tests/phase_a/run.sh` | **18 passed, 7 skipped** (the designed gate skips) |
+| `SUPABASE_CLI=<cached supabase@2.117.0 binary> bash supabase/tests/replay/run.sh` | **11 passed, 0 failed**: R1–R5 and **real CLI C0–C5** (`db push` clean / again / production state, schema equality, `db reset`) |
+| backend `npm run typecheck` / `npx vitest run` / `npm run build` | pass / **1266 passed, 3 expected fail, 10 todo** / pass |
+| `git diff --check` and a whitespace scan of the untracked files | clean |
+| runtime-importer search | none |
+
+**How the real-CLI replay was run.** The pinned CLI 2.117.0 was already in the local npx cache from
+earlier sessions, and was invoked directly
+(`…/npm-cache/_npx/6f1b058a4d9555af/node_modules/.bin/supabase`). No new software was installed. The
+replay's scratch project pins the local database image to `17.6.1.155`, which was already present, and
+no image pull appeared in the output. CI uses `supabase/setup-cli` with 2.117.0.
+
+**Awaiting CI** (not run by me):
+- the new equivalence step, and all the existing CI jobs on these changes;
+- the Docker Hub mirror digest (`SUPABASE_TEST_PG_IMAGE`). Locally the equivalent ECR tag was used.
+
+**Remaining limitations:**
+- **Waits:** the concurrency barriers poll every 10 ms, up to 30 s. The harness's own fixed `sleep 1`
+  between holder and contender remains for the older tests; the new tests don't depend on it.
+- **16b vs 16c:** 16b's 50 rounds run as one test. 16c's deadlock is established by the barrier, and
+  PostgreSQL's detector (`deadlock_timeout`, 1 s by default) picks which side aborts; the test accepts
+  either.
+- **Trigger cost** for large sync batches is still unmeasured (choice 9).
+- **One `as_of`** in the equivalence run.
+- **Scope:** everything listed as not implemented above is unchanged. The applied migration is still
+  applied only in throwaway containers.
+
+### 8.2 Review fix (2026-09-30): the migration loop is bounded too
+
+**The finding:** in `supabase/tests/access_control/run.sh` the migration loop called `docker exec` directly,
+bypassing `bounded`, so a stalled migration could hang the run.
+
+**The fix:** the one line now reads
+`if ! bounded docker exec -i "$CONTAINER" psql -X -q -1 -v ON_ERROR_STOP=1 -U postgres -d postgres < "$f" >>"$LOGS/history.log" 2>&1; then`.
+- The flags, the `history.log` logging and the failure branch (`FAILED to apply migration …` plus
+  `tail -20`) are unchanged.
+- The `TIMEOUT` line goes to stderr, so it lands in `history.log` and is printed by that tail.
+- Every `docker exec` in the runner is now bounded: the two psql wrappers and the migration loop
+  through `bounded`, and the readiness probe through its own `timeout 10`.
+
+**Verified** (actual results; disposable local containers only):
+
+| Check | Result |
+|---|---|
+| Stalled migration — a scratch copy of the runner, the repository's migrations plus `29991231000000_deliberate_stall.sql` (`select pg_sleep(600)`), `PSQL_TIMEOUT=20` | **exit 1** after 49 s, `FAILED to apply migration 29991231000000_deliberate_stall.sql:`, `TIMEOUT: exceeded 20s (PSQL_TIMEOUT)`, no leftover container; the repository was untouched |
+| `bash -n` on access_control, card_payment_evaluator and card_payment_audit `run.sh` | all OK |
+| `bash supabase/tests/access_control/run.sh` | **25 passed, 0 failed** |
+
+No financial logic, migration or evaluator code changed in this fix.
