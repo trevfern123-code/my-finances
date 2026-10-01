@@ -47,4 +47,62 @@ $$;
 create function th.claim_token_of(p_id uuid) returns uuid
 language sql stable as $$ select claim_token from public.plaid_link_attempts where id = p_id $$;
 
+-- ---- Bounded cross-session coordination (the card-payment concurrency tests c12–c15) ---------------
+-- Sessions announce a phase by setting application_name; a waiting session polls pg_stat_activity.
+-- Call these as `postgres` (the session user of every harness connection), which sees its own
+-- sessions' application_name and wait state. On timeout they raise with a snapshot of the sessions.
+-- pg_stat_activity is cached for the rest of a transaction on first access, so every poll clears that
+-- snapshot first (pg_stat_clear_snapshot); pg_blocking_pids reads the lock manager live.
+create function th.session_snapshot() returns text
+language sql as $$
+  select pg_stat_clear_snapshot();
+  select coalesce(string_agg(format('pid=%s app=%s state=%s wait=%s/%s blocked_by=%s', a.pid, a.application_name, a.state,
+                                    a.wait_event_type, a.wait_event, pg_blocking_pids(a.pid)), E'\n  ' order by a.pid), '(none)')
+  from pg_stat_activity a where a.datname = current_database() and a.backend_type = 'client backend'
+$$;
+
+-- Waits until another session's application_name is exactly p_name; returns its pid.
+create function th.wait_for_application(p_name text, p_timeout interval default interval '30 seconds') returns integer
+language plpgsql as $$
+declare
+  v_deadline timestamptz := clock_timestamp() + p_timeout;
+  v_pid integer;
+begin
+  loop
+    perform pg_stat_clear_snapshot();
+    select a.pid into v_pid from pg_stat_activity a
+    where a.application_name = p_name and a.pid <> pg_backend_pid() limit 1;
+    if v_pid is not null then
+      return v_pid;
+    end if;
+    if clock_timestamp() > v_deadline then
+      raise exception 'COORDINATION TIMEOUT: no session announced "%" within %; sessions:%', p_name, p_timeout,
+        E'\n  ' || th.session_snapshot();
+    end if;
+    perform pg_sleep(0.01);
+  end loop;
+end;
+$$;
+
+-- Waits until session p_pid is blocked by session p_blocker (pg_blocking_pids), i.e. the intended
+-- overlap is established, not assumed from a sleep.
+create function th.wait_until_blocked_by(p_pid integer, p_blocker integer, p_timeout interval default interval '30 seconds')
+returns void
+language plpgsql as $$
+declare
+  v_deadline timestamptz := clock_timestamp() + p_timeout;
+begin
+  loop
+    if p_blocker = any (pg_blocking_pids(p_pid)) then
+      return;
+    end if;
+    if clock_timestamp() > v_deadline then
+      raise exception 'COORDINATION TIMEOUT: pid % was not blocked by pid % within %; sessions:%', p_pid, p_blocker, p_timeout,
+        E'\n  ' || th.session_snapshot();
+    end if;
+    perform pg_sleep(0.01);
+  end loop;
+end;
+$$;
+
 grant execute on all functions in schema th to postgres, anon, authenticated, service_role;
