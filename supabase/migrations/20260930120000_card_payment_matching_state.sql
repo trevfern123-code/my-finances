@@ -807,9 +807,16 @@ begin
   exception when others then
     v_code := sqlstate;
   end;
-  insert into public.card_payment_eval_versions (user_id) values (p_user_id) on conflict (user_id) do nothing;
-  update public.card_payment_eval_versions set last_error_code = v_code, last_attempt_at = clock_timestamp()
-  where user_id = p_user_id;
+  -- Best-effort bookkeeping, itself in a subtransaction, so it can never abort the caller either (for
+  -- example a user with no auth.users row, or one being deleted). If it cannot be recorded, the user
+  -- simply stays stale — the safe direction.
+  begin
+    insert into public.card_payment_eval_versions (user_id) values (p_user_id) on conflict (user_id) do nothing;
+    update public.card_payment_eval_versions set last_error_code = v_code, last_attempt_at = clock_timestamp()
+    where user_id = p_user_id;
+  exception when others then
+    null;
+  end;
   return false;
 end;
 $$;

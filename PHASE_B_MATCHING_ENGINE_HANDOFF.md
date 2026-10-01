@@ -516,8 +516,8 @@ after this pass.
 equivalence**. It runs `bash supabase/tests/card_payment_evaluator/run.sh` with
 `PG_IMAGE=${{ env.SUPABASE_TEST_PG_IMAGE }}` (the pinned Docker Hub mirror digest), `if: !cancelled()` and
 `timeout-minutes: 20`. Any difference, or any rule path left unreached, exits 1. Verified locally: with
-the suggestion horizon mutated 60→61, `run.sh` exited **1** (4 evaluations differ). **Not yet run in
-CI**, and the mirror digest itself has not been pulled or run locally.
+the suggestion horizon mutated 60→61, `run.sh` exited **1** (4 evaluations differ). *(Since run in CI and
+passed on `bb4e2d1` with the mirror digest — see §8.3.)*
 
 **2. Acceptance test 16b ×50, with explicit coordination.**
 - **New helpers** in `supabase/tests/access_control/helpers.sql`:
@@ -608,9 +608,8 @@ earlier sessions, and was invoked directly
 replay's scratch project pins the local database image to `17.6.1.155`, which was already present, and
 no image pull appeared in the output. CI uses `supabase/setup-cli` with 2.117.0.
 
-**Awaiting CI** (not run by me):
-- the new equivalence step, and all the existing CI jobs on these changes;
-- the Docker Hub mirror digest (`SUPABASE_TEST_PG_IMAGE`). Locally the equivalent ECR tag was used.
+**Awaiting CI** (not run by me): *(superseded — CI ran on `bb4e2d1` and every job passed, including the
+equivalence step on the Docker Hub mirror digest; see §8.3.)*
 
 **Remaining limitations:**
 - **Waits:** the concurrency barriers poll every 10 ms, up to 30 s. The harness's own fixed `sleep 1`
@@ -645,3 +644,68 @@ bypassing `bounded`, so a stalled migration could hang the run.
 | `bash supabase/tests/access_control/run.sh` | **25 passed, 0 failed** |
 
 No financial logic, migration or evaluator code changed in this fix.
+
+### 8.3 GitHub checks and self-review follow-up (2026-10-01)
+
+**CI on `bb4e2d1`** (draft PR #9, workflow run 36812561998; read through the public GitHub API) — every
+check succeeded:
+- `build-and-test`: every step, backend and frontend;
+- `database-harness`: Phase A scaffold and history, access_control, and the new **card-payment
+  evaluator equivalence** step, on the Docker Hub mirror digest;
+- `migration-replay`: emulator, CLI `db push` and CLI `db reset`, with `supabase/setup-cli` 2.117.0;
+- Vercel Preview Comments.
+
+The only annotation was GitHub's notice that the `ubuntu-latest` label will migrate to Ubuntu 26 on
+2026-10-19. The step **logs** need sign-in or admin rights, so the counts inside the CI logs (for
+example "662 evaluations") were not read; step outcomes were.
+
+**Self-review of `80c724d..bb4e2d1`** (my own pass, not an independent review). It found two defects,
+fixed in this commit:
+1. **`try_evaluate_card_payments` could abort its caller.** After a failed evaluation it wrote
+   `last_error_code` into `card_payment_eval_versions` outside any exception block. That table has a
+   foreign key to `auth.users`, so for a user with no `auth.users` row (or one being deleted) the
+   wrapper raised and aborted the caller's transaction — contrary to its documented contract (§3.7,
+   §8: a failed evaluation never blocks the write).
+   - **Fix:** the bookkeeping now runs in its own subtransaction and is best-effort. If it cannot be
+     recorded the user simply stays stale.
+   - **Regression test** (written first, and confirmed failing with the foreign-key error before the
+     fix): the end of `a10_card_payment_evaluator.sql`. A write followed by `try_evaluate` for an
+     unknown user must return false, the write must commit, and no version row may be invented.
+   - The evaluation logic and the financial rules are unchanged.
+2. **The runners' undeclared dependency on GNU `timeout`** (added by the bounded waits in §8.1). Where
+   it is missing (for example macOS without coreutils), every bounded call failed with "command not
+   found" instead of a clear message.
+   - **Fix:** the `Requires:` headers of the access_control, card_payment_evaluator and
+     card_payment_audit `run.sh` now name it, and each runner fails fast with
+     `FAILED: GNU timeout (coreutils) is required to bound database waits`.
+   - The check line was run with `PATH` lacking `timeout` (exit 1, that message) and with it present
+     (continues).
+3. **Documentation:** the §8.1 statements "not yet run in CI" and "awaiting CI" are marked superseded.
+
+**Tests run on the final tree** (disposable local containers only):
+
+| Command | Result |
+|---|---|
+| `bash supabase/tests/access_control/run.sh` | **25 passed, 0 failed** (a10 includes the new regression) |
+| `bash supabase/tests/card_payment_evaluator/run.sh` | **662 evaluations, 0 differ**, 59 shapes; PASS |
+| `bash supabase/tests/card_payment_audit/run.sh` | PASS |
+| `bash supabase/tests/phase_a/run.sh` / `PHASE_A_BASE=history …` | **23 passed** / **18 passed, 7 skipped** (the designed gate skips) |
+| `SUPABASE_CLI=<cached supabase@2.117.0> bash supabase/tests/replay/run.sh` | **11 passed, 0 failed** (R1–R5, CLI C0–C5); no image pull |
+| `bash -n` on the three runners | OK |
+| backend typecheck / `vitest run` / build | pass / **1266 passed, 3 expected fail, 10 todo** / pass (backend unchanged) |
+
+**Remaining gaps:**
+- the CI step logs could not be read without sign-in;
+- trigger cost on large sync batches is unmeasured;
+- the equivalence run uses one `as_of`;
+- the provisional implementation choices of §8 still need a decision;
+- everything listed as not implemented is unchanged.
+
+**Needs independent (Codex) review before release:**
+- the migration as a whole — security properties, the input-trigger coverage, the lock order and
+  publication rule (§3.7), and the ten provisional choices of §8;
+- the SQL evaluator's equivalence approach and its coverage guard;
+- the performance rewrite of §8.1;
+- the concurrency tests' coordination design;
+- this pass's `try_evaluate` change;
+- the preflight/postflight plan that applying the migration to any real database would require.

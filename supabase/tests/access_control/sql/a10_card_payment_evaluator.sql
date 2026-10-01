@@ -130,3 +130,17 @@ select th.assert(pg_temp.leg('00000000-0000-0000-0000-0000000000aa', '00000000-0
   'aa''s pending row is still a leg');
 select th.assert(pg_temp.states('00000000-0000-0000-0000-0000000000aa')->'supersededTransactionIds' = '[]'::jsonb,
   'and is not superseded by bb''s row');
+
+-- REGRESSION (self-review of bb4e2d1): try_evaluate must never abort its caller, even when its own
+-- failure bookkeeping cannot be written — here for a user with no auth.users row, where both the
+-- evaluation and the bookkeeping insert hit the version table's foreign key.
+begin;
+insert into public.transactions (id, account_id, plaid_transaction_id, amount, date) values
+  ('00000000-0000-0000-0000-00000000a0f1', '00000000-0000-0000-0000-00000000aac1', 'ev-a-caller-write', 1, '2026-09-04');
+select th.assert(not public.try_evaluate_card_payments('00000000-0000-0000-0000-0000000000ff'),
+  'try_evaluate for a user without an auth.users row reports failure instead of raising');
+commit;
+select th.assert(exists (select 1 from public.transactions where plaid_transaction_id = 'ev-a-caller-write'),
+  'the caller''s own write committed');
+select th.assert(not exists (select 1 from public.card_payment_eval_versions where user_id = '00000000-0000-0000-0000-0000000000ff'),
+  'and no version row was invented for the unknown user');

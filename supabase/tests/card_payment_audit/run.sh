@@ -6,10 +6,11 @@
 #   supabase/tests/card_payment_audit/run.sh            compare with expected.out
 #   UPDATE=1 supabase/tests/card_payment_audit/run.sh   rewrite expected.out (review the diff!)
 #
-# Requires: docker, bash.  PG_IMAGE=<image> overrides the image.
+# Requires: docker, bash, GNU timeout (coreutils).  PG_IMAGE=<image> overrides the image.
 #   STARTUP_TIMEOUT=s  fail if the database does not accept connections within s seconds (default 180)
 #   PSQL_TIMEOUT=s     fail any single psql run that exceeds s seconds (default 600)
 set -uo pipefail
+command -v timeout >/dev/null 2>&1 || { echo "FAILED: GNU timeout (coreutils) is required to bound database waits"; exit 1; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"

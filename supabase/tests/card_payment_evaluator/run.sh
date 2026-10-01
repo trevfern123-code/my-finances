@@ -10,12 +10,13 @@
 #
 #   supabase/tests/card_payment_evaluator/run.sh
 #
-# Requires: docker, bash, node, and backend dependencies installed (for tsc).
+# Requires: docker, bash, GNU timeout (coreutils), node, and backend dependencies installed (for tsc).
 #   PG_IMAGE=<image>   default public.ecr.aws/supabase/postgres:17.6.1.155
 #   KEEP=1             leave the container and the scratch directory
 #   STARTUP_TIMEOUT=s  fail if the database does not accept connections within s seconds (default 180)
 #   PSQL_TIMEOUT=s     fail any single psql run that exceeds s seconds (default 600)
 set -uo pipefail
+command -v timeout >/dev/null 2>&1 || { echo "FAILED: GNU timeout (coreutils) is required to bound database waits"; exit 1; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"

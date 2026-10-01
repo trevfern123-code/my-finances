@@ -14,7 +14,7 @@
 # background, contender.sql one second later, then verify.sql). Queries run under `set role authenticated` + `request.jwt.claims`,
 # which is exactly how PostgREST executes a request made with the anon key and a user's JWT.
 #
-# Requires: docker, bash.
+# Requires: docker, bash, GNU timeout (coreutils).
 #   PG_IMAGE=<image>   override the image (default public.ecr.aws/supabase/postgres:17.6.1.155)
 #   EXCLUDE=<file>     skip one migration by basename — e.g. the one under test, to watch its tests
 #                      fail against the schema it was written to fix
@@ -24,6 +24,7 @@
 #   PSQL_TIMEOUT=s     fail any single psql run (migration, seed, test, holder, contender, verify)
 #                      that exceeds s seconds (default 600); the transcript says TIMEOUT
 set -uo pipefail
+command -v timeout >/dev/null 2>&1 || { echo "FAILED: GNU timeout (coreutils) is required to bound database waits"; exit 1; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
