@@ -3,6 +3,7 @@ import * as dataService from './dataService';
 import * as loansService from './loans';
 import { reconcileRelationalRoles, repairExistingRelationalRoles } from './roleReconciliation';
 import { summarizeErrorSafely } from './errorSanitizer';
+import { evaluateCardPaymentsAfterSync } from './cardPaymentEvaluation';
 
 /**
  * Syncs one Plaid item's transactions and advances its cursor. Shared by the authenticated
@@ -27,6 +28,23 @@ import { summarizeErrorSafely } from './errorSanitizer';
  * manual-sync endpoint surfaces it as a failed, retryable request; the webhook receiver logs it
  * and lets the next natural webhook/manual sync for this item retry, per its own existing
  * fire-and-forget error handling — see webhookController.ts).
+ *
+ * The sync is NOT one atomic transaction: each step below commits on its own. When a later step fails,
+ * the earlier steps' committed writes stay committed. The failure boundaries are:
+ * - Before the cursor advances (Plaid, the batch, the status transition, reconciliation, the repair
+ *   sweep, or the cursor write itself): the error propagates and the cursor is normally unadvanced,
+ *   so the next sync re-delivers the batch. A failed or uncertain cursor write (the request may have
+ *   reached the database even though the client saw an error) is not guaranteed to leave the cursor
+ *   unchanged.
+ * - After the cursor advances (recording last_synced_at): the error still propagates, but the cursor
+ *   has already moved on.
+ * - Already best-effort (caught here or internally): loan auto-linking, the carry-over sweep, and the
+ *   recurring-stream refresh.
+ * - Card-payment matching evaluation (Phase B 2b-2a, off unless CARD_PAYMENT_SYNC_EVALUATION_ENABLED
+ *   is "true", case-insensitive): best-effort, never throws, never gates or changes the cursor. It is attempted only on
+ *   the success path, once every matching-input step has run. A sync that failed earlier leaves
+ *   matching stale until a later successful sync evaluates — including a sync with no new transactions,
+ *   so an empty batch still attempts it.
  */
 export async function syncItemTransactions(item: {
   id: string;
@@ -99,6 +117,16 @@ export async function syncItemTransactions(item: {
   } catch (err) {
     console.error(`Failed to sweep transaction carry-overs for item ${item.id}:`, summarizeErrorSafely(err));
   }
+
+  // Card-payment matching (Financial Semantics Phase B, packet 2b-2a; CARD_PAYMENT_PAIRING_DESIGN.md
+  // §3.7). This is one evaluation of the whole user, run after EVERY matching-input step above: the
+  // batch, loan auto-linking, reconciliation, the repair sweep, and the carry-over sweep (whose deletes
+  // are inputs too). It still runs when the sweep failed above. It runs before the recurring-stream
+  // refresh, which is not an input, so matching never waits on that Plaid request. It is a no-op unless
+  // the flag is on, never throws, and never touches the cursor, the sync's response or any input. Its
+  // outcome is logged inside, deliberately not returned: success describes that one evaluation, not "fresh
+  // after this sync".
+  await evaluateCardPaymentsAfterSync(item.user_id);
 
   // Best-effort: recurring-stream detection is a separate Plaid call and a nice-to-have, not
   // core to syncing transactions — a failure here shouldn't fail the sync that triggered it. Runs

@@ -1,0 +1,51 @@
+MUTANT                         RESULT   DETAIL
+naive_once_per_tx              ok       expected: a14: 17: the next input write still invalidates (a skip requires a stale row)
+                                        tests: a09_card_payment_invalidation:pass a14:FAIL a15_card_payment_bump_coalescing_effect:pass c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a14: 17: the next input write still invalidates (a skip requires a stale row)
+naive_once_per_tx_without_reset ok       expected: a14: 4: stale after the second write (post-evaluation write re-invalidates)
+                                        tests: a09_card_payment_invalidation:pass a14:FAIL a15:FAIL c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a14: 4: stale after the second write (post-evaluation write re-invalidates)
+                                        first failure in a15: write, evaluate, two writes: deltas aa=1 bb=0 (expected 2, 0)
+stale_only_skip                ok       expected: a14: 5: the surviving write advanced input_version in its own transaction
+                                        tests: a09:FAIL a14:FAIL a15:FAIL c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25:FAIL
+                                        first failure in a09: inside the writer's transaction, each owner advanced
+                                        first failure in a14: 5: the surviving write advanced input_version in its own transaction
+                                        first failure in a15: three statements in one transaction: deltas aa=0 bb=0 (expected 1, 0)
+unbound_marker                 ok       expected: a14: 8: a leftover session-level value did not suppress the bump
+                                        tests: a09_card_payment_invalidation:pass a14:FAIL a15_card_payment_bump_coalescing_effect:pass c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a14: 8: a leftover session-level value did not suppress the bump
+unkeyed_marker                 ok       expected: a14: 10: each user written in the transaction advanced in that transaction
+                                        tests: a09:FAIL a14:FAIL a15:FAIL c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a09: inside the writer's transaction, each owner advanced
+                                        first failure in a14: 10: each user written in the transaction advanced in that transaction
+                                        first failure in a15: inside the transaction the marker is bound to it
+session_marker                 ok       expected: SURVIVES a14; a15: no marker after commit
+                                        tests: a09_card_payment_invalidation:pass a14_card_payment_bump_coalescing:pass a15:FAIL c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a15: no marker after commit
+session_unbound                ok       expected: a14: 5: the surviving write advanced input_version in its own transaction
+                                        tests: a09:FAIL a14:FAIL a15:FAIL c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a09: inside the writer's transaction, each owner advanced
+                                        first failure in a14: 5: the surviving write advanced input_version in its own transaction
+                                        first failure in a15: three statements in one transaction: deltas aa=0 bb=0 (expected 1, 0)
+no_row_check                   ok       expected: SURVIVES a14 (redundant with the staleness check)
+                                        tests: a09_card_payment_invalidation:pass a14_card_payment_bump_coalescing:pass a15_card_payment_bump_coalescing_effect:pass c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+no_evaluator_reset             ok       expected: a14: 14a: a write after the capture leaves the publication stale, inside the transaction
+                                        tests: a09_card_payment_invalidation:pass a14:FAIL a15:FAIL c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a14: 14a: a write after the capture leaves the publication stale, inside the transaction
+                                        first failure in a15: the evaluation cleared the marker
+late_evaluator_reset           ok       expected: a14: 14a: a write after the capture leaves the publication stale, inside the transaction
+                                        tests: a09_card_payment_invalidation:pass a14:FAIL a15_card_payment_bump_coalescing_effect:pass c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a14: 14a: a write after the capture leaves the publication stale, inside the transaction
+wrong_key_reset                ok       expected: a14: 14a: a write after the capture leaves the publication stale, inside the transaction
+                                        tests: a09_card_payment_invalidation:pass a14:FAIL a15:FAIL c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a14: 14a: a write after the capture leaves the publication stale, inside the transaction
+                                        first failure in a15: the evaluation cleared the marker
+account_insert_no_bump         ok       expected: a09: account inserts advanced each owner
+                                        tests: a09:FAIL a14_card_payment_bump_coalescing:pass a15_card_payment_bump_coalescing_effect:pass c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a09: account inserts advanced each owner
+account_insert_single_owner    ok       expected: a09: account inserts advanced each owner
+                                        tests: a09:FAIL a14_card_payment_bump_coalescing:pass a15_card_payment_bump_coalescing_effect:pass c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a09: account inserts advanced each owner
+account_insert_overbroad       ok       expected: a09: an unrelated owner did not advance and stays fresh
+                                        tests: a09:FAIL a14_card_payment_bump_coalescing:pass a15_card_payment_bump_coalescing_effect:pass c23_card_coalesced_writer_then_evaluator:pass c24_card_evaluator_then_coalesced_writer:pass c25_card_stale_writer_then_evaluator:pass
+                                        first failure in a09: an unrelated owner did not advance and stays fresh
