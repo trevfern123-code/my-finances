@@ -724,3 +724,226 @@ fixed in this commit:
 - the concurrency tests' coordination design;
 - this pass's `try_evaluate` change;
 - the preflight/postflight plan that applying the migration to any real database would require.
+
+## 9. Slice 2b-1 — card-payment decision RPCs (2026-10-01; disconnected)
+
+**Branch and base:**
+- Worktree `C:\Users\Trevor\dev\my-finances-phase-b-2b`, branch `feature/phase-b-slice2b-decision-rpcs`.
+- Incremental base: `afa29ee` (draft PR #9's head). The slice is two commits on top of it:
+  - `f77fb4c` — docs-only status reconciliation;
+  - the implementation commit that carries this section.
+- Its draft PR targets `main` (CI runs only for PRs into `main`), so the PR's full diff also contains
+  PR #8 and PR #9.
+- Nothing is merged. The migration has been applied only to throwaway test containers.
+
+**What it adds** — migration `20261001120000_card_payment_decision_rpcs.sql`, additive. It leaves
+`20260930120000` unchanged and creates no table.
+
+The four RPCs:
+
+| RPC | User action | Writes |
+|---|---|---|
+| `link_card_payment(user, transaction, counterpart, accepted_difference_cents, expected_version)` | Match · Match return · Match with difference · Choose the matching card transaction | `pair` (a = cash leg, b = card leg) |
+| `mark_card_payment_destination(user, transaction, expected_version)` | It went to a card I haven't linked | `destination_unlinked` |
+| `dismiss_card_payment_candidate(user, transaction, candidate, expected_version)` | Not this one | `not_this_pair` (a = the leg being resolved, b = the candidate) |
+| `undo_card_payment_decision(user, decision, expected_version)` | Undo | `superseded_by` := its own id |
+
+Seven helpers:
+- `card_payment_decision_begin` — READ COMMITTED, L1, L2 and the version check;
+- `card_payment_decision_target` — ownership plus the evaluator's leg facts;
+- `card_payment_decision_check_leg`;
+- `card_payment_lineage_row` — the evaluator's §3.6 lineage rule;
+- `card_payment_live_decisions`;
+- `card_payment_decision_rows`;
+- `card_payment_decision_result` — evaluation and the response.
+
+All are SECURITY INVOKER with `search_path` pinned empty, service_role only, with postconditions. The
+column comment on `card_payment_decisions.superseded_by` records the undo convention.
+
+**Decisions inherited** (Trevor, 2026-10-01), implemented as specified:
+1. **The version check is per user.** The expected version must equal both `input_version` and
+   `evaluated_version`. It is checked under L1 then L2. NULL, missing, stale or unevaluated versions are
+   refused, and the server's version is never substituted. Inputs are re-read under the locks.
+2. **Validation happens at write time.** It covers ownership; eligible current lineages (no choice
+   between conflicting replacements, no superseded pending row); opposite sides; direction; and the exact
+   explicit difference. Manual matching has no 60-day or $5 limit. A destination can be confirmed only
+   on a cash-side leg, and `destination_removed_card` cannot be created. Unknown and foreign targets get
+   the identical refusal, before any target-specific detail.
+3. **Replacement is scoped:**
+   - whole decisions are replaced;
+   - a counterpart held by another affirmative decision (active or inactive) is refused;
+   - dismissals are edge-specific and coexist; a dismissal supersedes nothing;
+   - a confirmation of a dismissed pair supersedes exactly that dismissal;
+   - overlap is found by lineage resolution, through pending and posted aliases;
+   - existing `superseded_by` pointers are never overwritten.
+4. **Undo:**
+   - `superseded_by` = its own id;
+   - ownership-scoped, with no leg checks;
+   - never reactivates an older decision or moves a replacement pointer;
+   - an older, replaced id is refused (`card_payment_decision_replaced`);
+   - a repeated undo returns `unchanged/already_undone` with the current version, or the standard
+     stale refusal with a stale version.
+5. **Evaluation:**
+   - the whole user is evaluated in `try_evaluate_card_payments`;
+   - a caught failure returns `saved` with `matching: 'pending'`, and no legs or figures;
+   - a failure or rollback of the outer transaction is not a save.
+
+**Decisions made while implementing** (provisional; for review):
+1. **The client names targets by transaction id**, from `get_card_payment_states`. Each id is resolved
+   under the locks. The stored lineage key is the row's own Plaid id: the pending id while it is pending,
+   the posted id after.
+2. **A dismissal also requires opposite sides and opposite directions.** Any other leg can never be a
+   candidate.
+3. **Dismissing the exact edge of a saved pair is refused** (`card_payment_pair_confirmed`: undo the
+   match first), rather than stored next to it.
+4. **Undo refuses `destination_removed_card`** (`system_decision`). It is system-written by an
+   institution removal, and §6.1 offers no user action for it. *(Product question.)*
+5. **A user decision never supersedes a `destination_removed_card` decision.** The user decision ranks
+   above it in the evaluator, and the system record stays as dormant history (§4.7).
+6. **A user may undo their own decision after one of its accounts moved to another user.** The evaluator
+   already rejects such a decision as `foreign_account`. The response names only the user's own rows.
+   *(Product question.)*
+7. **Identical requests are explicit no-ops with nothing written.** Status is `unchanged`, with
+   `already_confirmed` or `already_dismissed`. "Identical" means the same resolved legs, the same recorded
+   cents and the same accepted difference. A changed amount is therefore a real replacement.
+8. **A destination confirmation is allowed on a cash leg of an excluded account.** It is harmless: such a
+   leg never counts.
+9. **The RPCs take no `as_of`.** Their evaluation uses `now()`. Tests compare at a fixed time by
+   re-evaluating.
+10. **Refusals raise prefixed messages**, the house convention for RPC refusals. No-ops return a status.
+
+**Response contract** (migration header):
+
+`{status, reason, decisionId, supersededDecisionIds, matching, inputVersion, evaluatedVersion, legs | lastErrorCode}`
+
+`legs` holds the fresh states of the named transactions and of the legs of the decisions the call
+superseded. It is **not** the complete set of changes: a decision can dissolve a tier 1 pair or free a
+candidate elsewhere. Callers holding other states must refresh them through `get_card_payment_states`
+and compare `evaluatedVersion`.
+
+**Locking** (corrected after self-review): the order is L1 → L2.
+- The RPCs take no row lock on `transactions`.
+- The decision INSERT's foreign-key checks take KEY SHARE on the referenced `accounts` and `auth.users`
+  rows. Superseding updates lock the decision rows they change.
+- So a **lock-free** writer that deletes one of those accounts (or the user) during an RPC can close a
+  cycle with L2. PostgreSQL detects it and one side rolls back completely: the §3.7 lock-free-writer
+  class. c22 establishes this cycle deterministically and verifies it.
+- Writers that take L1 (the sync batch, LIM removal) are serialized instead (c17, c18).
+
+**Tests added:**
+- `a11_card_payment_decision_rpcs.sql` — single session; each call is its own transaction, and outcomes
+  are re-read from new transactions after commit:
+  - version gating: before evaluation, NULL, ±1, stale after a direct write, unevaluated latest version;
+    and the cases that do *not* refuse: an empty sync batch and a non-input column edit;
+  - the response and the durable lineage-keyed row;
+  - unknown vs foreign subject, counterpart, destination, dismissal and undo, all identical;
+  - every validation refusal, with nothing written;
+  - manual matches 111 days apart and $9.00 different;
+  - replacement rules A–F, including pending → posted aliases on both the subject and counterpart side;
+  - no-ops, and correcting an invalidated confirmation;
+  - undo: waiting, role changed, repeated, stale repeat, older replaced id, undo of a replacement,
+    a dismissal, a system decision;
+  - the injected evaluator failure, then recovery;
+  - outer rollback and REPEATABLE READ;
+  - a colliding pending id on another user's account;
+  - undo after an account moved.
+- `a12_card_payment_decision_grants.sql` — the catalog plus runtime denial for `authenticated` and
+  `anon`.
+- Concurrency — real sessions, with barriers on `pg_blocking_pids`:
+  - c16: two confirmations with the same version;
+  - c17 and c18: sync then link, and link then sync;
+  - c19 and c20: link then lock-free writer, and writer then link;
+  - c21: the lock order (the RPC holds no L2 while it waits on L1);
+  - c22: the KEY SHARE cycle with a lock-free account delete.
+- `card_payment_evaluator/rpc_sequences.sql` + `compare_rpc.cjs` — 8 RPC-driven sequences (Q1–Q8). The
+  reference evaluator, run on exactly the decisions the RPCs wrote, must equal the SQL states, plus
+  per-sequence expected step outcomes, leg states and live-decision counts. It runs inside the existing
+  CI equivalence step.
+
+**Tests run on the final tree** (disposable local containers only; no hosted database):
+
+| Command | Result |
+|---|---|
+| `bash supabase/tests/access_control/run.sh` | **34 passed, 0 failed** (the 25 earlier tests plus a11, a12 and c16–c22) |
+| `bash supabase/tests/card_payment_evaluator/run.sh` | **662 evaluations, 0 differ**, 59 shapes; **RPC sequences: 8 scenarios, 16 user evaluations, 0 failures** |
+| `bash supabase/tests/card_payment_audit/run.sh` | PASS |
+| `bash supabase/tests/phase_a/run.sh` / `PHASE_A_BASE=history …` | **23 passed** / **18 passed, 7 skipped** (the designed gate skips) |
+| `SUPABASE_CLI=<cached supabase@2.117.0> bash supabase/tests/replay/run.sh` | **11 passed, 0 failed** (R1–R5, CLI C0–C5); nothing downloaded |
+| backend `tsc --noEmit` / `vitest run` (CI placeholder env) / `npm run build` | pass / **1266 passed, 3 expected fail, 5 todo** / pass |
+| `git diff --check` | clean |
+
+**Mutation checks** — each safeguard was removed in turn, the listed tests were run, and the
+migration's sha256 was verified afterwards:
+
+| Removed safeguard | Detected by |
+|---|---|
+| M1 the version check | a11 ("expected … stale_version … but the statement succeeded"), c16, c17, c20. c20 fails through the authoritative re-read: the writer's −98 makes the 0 difference invalid (`difference_not_accepted`) |
+| M2 L1 in the RPC preamble | **c21 only**. c16–c18 still pass, because L2 alone serializes those interleavings; L1's role is the lock order, which c21 measures |
+| M3 target ownership | a11 ("a foreign counterpart and an unknown one give the same message") |
+| M3b undo ownership | a11 ("undoing another user's decision looks exactly like undoing an unknown one") |
+| M4 counterpart reservation | a11; equivalence Q5 |
+| M5 the conflicting-replacement check | a11 ("… lineage_ambiguous … but the statement succeeded"). The test was strengthened in this pass: it first refused for another reason |
+| M6 pending-id aliases in lineage resolution | a11 ("naming the posted row replaces the match saved under the pending id"); equivalence Q2 |
+| M7 undo's replaced guard | a11 (the refusal becomes `stale_version`; the update's `superseded_by is null` predicate still protects the pointer) |
+| M7b the guard and that predicate | a11 (an older id is undone); equivalence Q1 |
+| M8 exact-edge dismissal supersession | a11 ("the other dismissal is preserved"); equivalence Q3 |
+| M9 evaluation isolation (`try_evaluate` → `evaluate`) | a11 (the injected failure aborts the call) |
+| M10 the refusal to dismiss a saved pair | a11; equivalence Q3 |
+
+**The `superseded_by is null` predicate in link and mark is defense in depth.** Under the locks it is
+unreachable, because only live decisions are ever selected, so no test can detect its removal there.
+For undo it is exercised by M7b.
+
+**Self-review** (Claude, a fresh-context read-only pass; **not** independent cross-family review). It
+found no rule violation. Its findings and their dispositions:
+1. **The header said "no data-row lock".** That was wrong, because of the foreign-key KEY SHARE locks.
+   Corrected in the header and c19, and c22 added.
+2. **Live decisions were resolved up to 6 times per call.** Now once per RPC, plus targeted lookups. The
+   review's "no index" premise was wrong: `transactions_pending_transaction_id_idx` (continuity) and the
+   unique Plaid id cover the lookups. The cost is still linear in the user's live decisions, and nothing
+   purges dismissals yet.
+3. **Documentation:** the stale "only migration" and CAS wording were fixed, and this §9 now exists.
+4. **Product choices:** flagged as decisions 4 and 6 above. Undo's response is now scoped to the user's
+   own rows.
+5. **Tests:**
+   - removed a seed row that formed an unintended tier 1 pair;
+   - `leg()` now fails on missing or stale states instead of reading NULL;
+   - `like` checks were added to the equality refusals;
+   - added the foreign-subject, colliding-pending-id and moved-account undo cases;
+   - fixed comment mismatches.
+
+**Limitations and TODOs:**
+- **Disconnected:** no backend function, route or frontend calls these RPCs.
+- **The sync batch does not evaluate yet (slice 2b-2).** After any sync a user is stale, and every RPC
+  refuses until a standalone evaluation runs.
+- **There is no constraint against conflicting affirmative decisions written by arbitrary service_role
+  SQL.** The RPCs prevent them on their own path, and the evaluator keeps treating external conflicts
+  conservatively.
+- **A conflicting replacement cannot be resolved through these RPCs** (it is refused). The persistent
+  review path recorded in the design is still unbuilt.
+- **Not tested:** concurrency with the role-override, account-inclusion and LIM-removal writers. They are
+  not built, or not integrated yet.
+- **Still unmeasured:** trigger cost on large syncs (from 2a), and RPC cost for users with many live
+  decisions. There is no purge of decision history (design §3.5's 30-day purge).
+- **Not run:** frontend checks (nothing in the frontend changed), and CI step logs (they need sign-in).
+
+**Needs independent review** before any release decision:
+- the four RPCs against the approved rules;
+- the lock analysis, including the KEY SHARE cycle;
+- the version check;
+- implementation decisions 1–10, especially the product questions 4 and 6;
+- test validity, including the mutation evidence;
+- the RPC-sequence comparison.
+
+**Recommended next slice — 2b-2: sync and LIM-removal integration** (not started):
+- evaluate inside the sync batch (`apply_synced_transaction_batch_v2`, or a v3 for coexistence with an
+  old backend) and in `remove_plaid_item_local`;
+- convert pairs touching a removed card into `destination_removed_card` **before** the deletes (§4.7,
+  acceptance test 18);
+- measure trigger and evaluation cost on large batches.
+
+Without it, the RPCs refuse after every sync, so it unblocks real use. The alternative is 2c (the
+aggregation read protocol and `updating`), which can proceed in parallel at the TypeScript level.
+
+**Confirmation:** no hosted migration, merge, backfill, production data change, production
+configuration change or deployment.

@@ -4,6 +4,9 @@
 # (backend/src/services/cardPaymentMatching.ts) produces, on the Stage 2 generated histories
 # (backend/src/testUtils/cardPaymentHistories.ts, seeds 1000–1299, two users each).
 #
+# It also runs rpc_sequences.sql (slice 2b-1): decision sequences written through the RPCs, compared the
+# same way by compare_rpc.cjs.
+#
 # Nothing here touches any real database: a throwaway container of Supabase's PostgreSQL 17 image gets
 # the repository's migration history, then each generated history is loaded (as supabase_admin),
 # evaluated and read back as service_role, and compared with the oracle.
@@ -73,3 +76,11 @@ echo "migration history applied"
 bounded docker exec -i "$CONTAINER" psql -X -q -At -v ON_ERROR_STOP=1 -U supabase_admin -d postgres < "$WORK/seed.sql" >"$WORK/actual.txt" 2>"$WORK/psql.err" \
   || { echo "FAILED while evaluating:"; tail -20 "$WORK/psql.err"; exit 1; }
 node "$HERE/compare.cjs" "$WORK/expected.json" "$WORK/actual.txt"
+status=$?
+
+# 5. Decision RPC sequences (slice 2b-1): drive the RPCs, then require the reference evaluator, run on exactly
+#    the decisions they wrote, to equal the SQL states, with each sequence's expected outcome.
+bounded docker exec -i "$CONTAINER" psql -X -q -At -v ON_ERROR_STOP=1 -U supabase_admin -d postgres < "$HERE/rpc_sequences.sql" >"$WORK/actual_rpc.txt" 2>"$WORK/psql_rpc.err" \
+  || { echo "FAILED while running the RPC sequences:"; tail -20 "$WORK/psql_rpc.err"; exit 1; }
+node "$HERE/compare_rpc.cjs" "$WORK/compiled" "$WORK/actual_rpc.txt" || status=1
+exit "$status"

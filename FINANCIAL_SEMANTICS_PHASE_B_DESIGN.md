@@ -2,8 +2,8 @@
 
 **Status:** revision 6, approved at design level (Codex). **Implementation in progress on draft PRs,
 nothing released** — see §14 for the current status. Phase B has changed no endpoint, response field,
-live calculation or production data. Its only migration so far, `20260930120000` (draft PR #9), is
-unmerged and has been applied only to throwaway test databases.
+live calculation or production data. Its migrations so far — `20260930120000` (draft PR #9) and
+`20261001120000` (slice 2b-1) — are unmerged and have been applied only to throwaway test databases.
 
 **Reconciled 2026-09-29 with the completed continuity release** (`PENDING_POSTED_CONTINUITY_RELEASE.md`):
 pending→posted continuity shipped in PR #6 (merge `a1b4120`), migration `20260927120000` is applied in

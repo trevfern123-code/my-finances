@@ -699,7 +699,9 @@ The API: `status`, `cashFlow: number | null`, `cashFlowRange`, `savingsRateRange
    - `evaluate_card_payments` and `get_card_payment_states`;
    - decision RPCs: `link_card_payment`, `mark_card_payment_destination`,
      `dismiss_card_payment_candidate`, `undo_card_payment_decision`, each with a CAS on
-     `computed_at_version`;
+     `computed_at_version`. *(As implemented in slice 2b-1: a per-user check that the expected version
+     equals both `input_version` and `evaluated_version` — equivalent, because the whole-user evaluation
+     stamps every leg with the same version.)*
    - the sync batch RPC and LIM removal RPC extended (or a v3, if coexistence with an old backend
      requires it, as continuity did);
    - grants, and postconditions as in the continuity migration.

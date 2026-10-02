@@ -594,9 +594,15 @@ describe('§6.2 / §4.2 period ranges: each leg in its own month, no cross-month
 //   16d    account trigger scope                            a09
 //   10     the SQL evaluator equals this oracle             supabase/tests/card_payment_evaluator (a CI step)
 //   22     grants on the slice 2a objects                   sql/a08_card_payment_grants.sql
+// Covered at the database level by slice 2b-1 (the decision RPCs, migration 20261001120000):
+//   20     RPC ownership refusals (unknown = foreign)       sql/a11_card_payment_decision_rpcs.sql
+//   21     link vs link (same version), vs a sync batch      concurrency/c16–c20; lock order c21
+//          (both orders), vs a lock-free writer (both orders)
+//   22     grants on the RPCs                               sql/a12_card_payment_decision_grants.sql
+//          RPC-written decisions vs this oracle             supabase/tests/card_payment_evaluator/rpc_sequences.sql
 describe('not covered by the pure evaluator (database / application integration)', () => {
   it.todo('§3.7 aggregation read protocol: an inconsistent or stale read returns `updating` with no figures (14–16, application side)');
-  it.todo('decision RPCs: ownership refusals, CAS on the evaluated version, their concurrency and grants (20–22)');
+  it.todo('decision RPCs vs the role override, the account-inclusion change and LIM removal (21, remaining pairs; those writers are not built)');
   it.todo('LIM removal writes destination_removed_card before its deletes, in one transaction (18)');
   it.todo('semanticAggregation.ts consumes stored states; its three it.fails tests flip to it (§5)');
   it.todo('frontend: reasons, actions, review list, ranges and the `updating` state (24–26)');
