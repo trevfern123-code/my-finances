@@ -2,15 +2,14 @@
 -- every input change advances the owner's input_version IN THE WRITER'S OWN TRANSACTION; non-input
 -- changes and same-value updates do not; cascades are covered level by level; a decision naming
 -- another user's account is refused at write time (§3.5).
+-- An owner that none of the account writes below touch.
+insert into auth.users (id, email) values ('00000000-0000-0000-0000-0000000000ee', 'unrelated@example.test');
 set role service_role;
-
-insert into public.accounts (id, item_id, plaid_account_id, name, type) values
-  ('00000000-0000-0000-0000-0000000009a1', '00000000-0000-0000-0000-000000000001', 'inv-c', 'Checking', 'depository'),
-  ('00000000-0000-0000-0000-0000000009a2', '00000000-0000-0000-0000-000000000001', 'inv-x', 'Card', 'credit'),
-  ('00000000-0000-0000-0000-0000000009b1', '00000000-0000-0000-0000-000000000002', 'inv-b', 'BB Checking', 'depository');
 
 create function pg_temp.v(p_user text) returns bigint
 language sql as $$ select coalesce((select input_version from public.card_payment_eval_versions where user_id = p_user::uuid), 0) $$;
+create function pg_temp.fresh(p_user text) returns boolean
+language sql as $$ select coalesce((public.get_card_payment_states(p_user::uuid)->>'fresh')::boolean, false) $$;
 create function pg_temp.check_bump(p_label text, p_sql text, p_aa int, p_bb int default 0) returns void
 language plpgsql as $$
 declare
@@ -24,9 +23,48 @@ begin
     format('%s: bb bumped by %s (expected %s)', p_label, pg_temp.v('00000000-0000-0000-0000-0000000000bb') - b0, p_bb));
 end $$;
 
--- Account inserts bumped already (three of them: aa twice, bb once).
-select th.assert(pg_temp.v('00000000-0000-0000-0000-0000000000aa') = 2 and pg_temp.v('00000000-0000-0000-0000-0000000000bb') = 1,
-  'account inserts bumped their owners');
+-- Account inserts, as ONE three-row statement (aa twice, bb once). The contract, not a per-row count
+-- (one transaction may coalesce its increments, 20261002120000):
+--   * each affected owner advances and is stale, in the writer's own transaction;
+--   * an unrelated owner neither advances nor goes stale;
+--   * a rolled-back insert leaves every version as it was;
+--   * a later input-changing transaction advances its owner again, though that owner is already stale.
+select public.evaluate_card_payments('00000000-0000-0000-0000-0000000000aa');
+select public.evaluate_card_payments('00000000-0000-0000-0000-0000000000bb');
+select public.evaluate_card_payments('00000000-0000-0000-0000-0000000000ee');
+create temporary table acct_probe as
+  select pg_temp.v('00000000-0000-0000-0000-0000000000aa') as aa, pg_temp.v('00000000-0000-0000-0000-0000000000bb') as bb,
+         pg_temp.v('00000000-0000-0000-0000-0000000000ee') as ee;
+insert into public.accounts (id, item_id, plaid_account_id, name, type) values
+  ('00000000-0000-0000-0000-0000000009a1', '00000000-0000-0000-0000-000000000001', 'inv-c', 'Checking', 'depository'),
+  ('00000000-0000-0000-0000-0000000009a2', '00000000-0000-0000-0000-000000000001', 'inv-x', 'Card', 'credit'),
+  ('00000000-0000-0000-0000-0000000009b1', '00000000-0000-0000-0000-000000000002', 'inv-b', 'BB Checking', 'depository');
+select th.assert(pg_temp.v('00000000-0000-0000-0000-0000000000aa') > (select aa from acct_probe)
+                 and pg_temp.v('00000000-0000-0000-0000-0000000000bb') > (select bb from acct_probe),
+  'account inserts advanced each owner');
+select th.assert(not pg_temp.fresh('00000000-0000-0000-0000-0000000000aa') and not pg_temp.fresh('00000000-0000-0000-0000-0000000000bb'),
+  'account inserts left each owner stale');
+select th.assert(pg_temp.v('00000000-0000-0000-0000-0000000000ee') = (select ee from acct_probe) and pg_temp.fresh('00000000-0000-0000-0000-0000000000ee'),
+  'an unrelated owner did not advance and stays fresh');
+update acct_probe set aa = pg_temp.v('00000000-0000-0000-0000-0000000000aa'), bb = pg_temp.v('00000000-0000-0000-0000-0000000000bb');
+begin;
+insert into public.accounts (id, item_id, plaid_account_id, name, type) values
+  ('00000000-0000-0000-0000-0000000009a3', '00000000-0000-0000-0000-000000000001', 'inv-r1', 'Rolled back', 'depository'),
+  ('00000000-0000-0000-0000-0000000009b3', '00000000-0000-0000-0000-000000000002', 'inv-r2', 'Rolled back', 'depository');
+select th.assert(pg_temp.v('00000000-0000-0000-0000-0000000000aa') > (select aa from acct_probe)
+                 and pg_temp.v('00000000-0000-0000-0000-0000000000bb') > (select bb from acct_probe),
+  'inside the writer''s transaction, each owner advanced');
+rollback;
+select th.assert(pg_temp.v('00000000-0000-0000-0000-0000000000aa') = (select aa from acct_probe)
+                 and pg_temp.v('00000000-0000-0000-0000-0000000000bb') = (select bb from acct_probe)
+                 and pg_temp.v('00000000-0000-0000-0000-0000000000ee') = (select ee from acct_probe),
+  'a rolled-back account insert leaves every version as it was');
+insert into public.accounts (id, item_id, plaid_account_id, name, type) values
+  ('00000000-0000-0000-0000-0000000009a3', '00000000-0000-0000-0000-000000000001', 'inv-s', 'Savings', 'depository');
+select th.assert(pg_temp.v('00000000-0000-0000-0000-0000000000aa') > (select aa from acct_probe)
+                 and pg_temp.v('00000000-0000-0000-0000-0000000000bb') = (select bb from acct_probe)
+                 and pg_temp.v('00000000-0000-0000-0000-0000000000ee') = (select ee from acct_probe),
+  'a later account-insert transaction advances its (already stale) owner again, and only it');
 
 -- ---- transactions: insert, delete, every listed column; nothing else -----------------------------------
 select pg_temp.check_bump('transaction insert', $q$

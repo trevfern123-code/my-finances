@@ -376,6 +376,26 @@ time.
 **Invalidation happens in the writer's transaction.** AFTER row triggers on each input table call
 `card_payment_bump(user_id)`, which does
 `input_version = input_version + 1` (upsert) in the same transaction as the change.
+- **Coalescing (20261002120000).** A transaction bumps a user's version row once, not once per changed
+  row. A bump is skipped only when all three of these hold:
+  1. the transaction's own earlier bump still stands. A transaction-local, per-user marker equals the
+     current transaction id.
+  2. the row exists.
+  3. the row is stale.
+
+  Why that is safe, and what follows from it:
+  - **Nothing can change meanwhile.** The earlier bump holds L2 until commit, or, if it created the
+    row, holds that uncommitted row. So no other transaction can capture, publish or bump this user
+    in between.
+  - **The evaluator clears the marker.** It does this when it captures `v` (step 3). So a write after
+    the capture always bumps, leaves the publication stale, and can never be coalesced into an earlier
+    bump. A publication with no later write leaves the row fresh, so the next write bumps again.
+  - **`input_version` advances at least once per input-changing transaction**, and again after each
+    publication within it. Its exact value is not a contract; equality and the expected-version
+    checks are.
+  - **Each database connection keeps one setting name per distinct user it has bumped.** The value is
+    cleared at every commit and rollback, but the name lasts for the connection's lifetime.
+    `P2_C1_IMPLEMENTATION_HANDOFF.md` measures the cost.
 - **The user** is found through the row → account → item.
 - **Cascaded deletes are covered level by level.** A transaction delete whose account is already
   gone is covered by the account's own delete trigger, and an account whose item is gone by the item's
@@ -415,7 +435,8 @@ holds, while that writer waits on L2 for its own bump. That is a cycle.
    version it reads.
 2. **Take L1.**
 3. **Take L2 and read the version:** `select input_version into v … for update`, creating the row
-   first if it is missing.
+   first if it is missing. Then clear this user's bump-coalescing marker, so any input this transaction
+   writes from here on bumps again.
 4. **Read the inputs**, in statements that run after step 3. Each takes a fresh snapshot, so it sees:
    - every input change committed before L2 was granted. A change and its bump commit together, so
      every bump counted in `v` has its change visible;
@@ -867,7 +888,9 @@ future review path that does not make the user guess; it is not built.
     - rejecting its only candidate leaves it unresolved;
     - an exact candidate 61 days away or $5.01 different is not suggested, but is offered by the
       manual picker.
-13. **Invalidation** — each input change of §3.7 bumps `input_version` in its own transaction:
+13. **Invalidation** — each input change of §3.7 bumps `input_version` in its own transaction. Several
+    changes in one transaction may share one increment (coalescing); every affected owner still
+    advances and is stale:
     - transaction insert, delete, and every listed column update;
     - account insert, delete, `type`, `exclude_from_cash_flow` and `item_id`;
     - item delete (cascade);

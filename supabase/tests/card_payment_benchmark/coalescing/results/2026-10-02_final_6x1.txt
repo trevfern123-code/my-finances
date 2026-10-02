@@ -1,0 +1,340 @@
+started 2026-10-02T19:09:24Z
+environment: image public.ecr.aws/supabase/postgres:17.6.1.155; server 17.6; docker 29.7.2, 12 CPUs, 8297000960 bytes memory, Docker Desktop
+settings: fsync=on shared_buffers=16384 synchronous_commit=on work_mem=4096
+samples per configuration: 6 measured after 1 warm-up
+applying the real migration file 20261002120000_card_payment_bump_coalescing.sql (one transaction)
+ use
+-----
+
+(1 row)
+
+                                                              ?column?
+-------------------------------------------------------------------------------------------------------------------------------------
+ baseline: public.card_payment_bump 9b67a29937db09a4661f0f906cf80563, public.evaluate_card_payments c43128295a457d62b83448083eb6f7d2
+ final: public.card_payment_bump 3fa11a0ed807dfb54aad20ba576e567c, public.evaluate_card_payments f620515feaee49b382965cc8b73f02e2
+(2 rows)
+
+       ?column?
+-----------------------
+ loan links made: 2100
+(1 row)
+
+ use
+-----
+
+(1 row)
+
+                   ?column?
+----------------------------------------------
+ both functions are the baseline at end: true
+(1 row)
+
+                   ?column?
+----------------------------------------------
+ card_payment_bump_* triggers enabled: 9 of 9
+(1 row)
+
+
+=== timings, committed (ms; n = measured samples; p25/p75 = interquartile; iv_delta and version_updates per sample, min-max)
+         case_name          | size  |   mode   | n | median_ms | p25_ms | p75_ms | min_ms | max_ms |  iv_delta   | version_updates
+----------------------------+-------+----------+---+-----------+--------+--------+--------+--------+-------------+-----------------
+ batch_then_evaluate        |  5000 | baseline | 6 |    1591.4 | 1571.2 | 1600.8 | 1561.1 | 1615.2 | 5000-5000   | 5001-5001
+ batch_then_evaluate        |  5000 | final    | 6 |    1301.5 | 1298.1 | 1317.7 | 1287.5 | 1367.9 | 1-1         | 2-2
+ batch_then_evaluate        |  5000 | off      | 6 |    1149.5 | 1146.5 | 1169.5 | 1130.4 | 1191.8 | 0-0         | 1-1
+ bump_100_users_one_tx      |  5000 | baseline | 6 |     161.2 |  158.3 |  165.0 |  153.7 |  182.8 | 5000-5000   | 5000-5000
+ bump_100_users_one_tx      |  5000 | final    | 6 |      50.7 |   50.4 |   51.1 |   50.1 |   51.7 | 100-100     | 100-100
+ bump_100_users_one_tx      | 20000 | baseline | 6 |    1187.8 | 1177.5 | 1200.7 | 1172.8 | 1205.3 | 20000-20000 | 20000-20000
+ bump_100_users_one_tx      | 20000 | final    | 6 |     207.8 |  192.6 |  224.0 |  190.2 |  228.3 | 100-100     | 100-100
+ bump_one_per_tx_1000_tx    |  1000 | baseline | 6 |     582.4 |  579.1 |  591.1 |  574.7 |  594.1 | 1000-1000   | 1000-1000
+ bump_one_per_tx_1000_tx    |  1000 | final    | 6 |     578.9 |  574.0 |  586.7 |  570.6 |  608.9 | 1000-1000   | 1000-1000
+ bump_same_user_one_tx      |  5000 | baseline | 6 |     299.3 |  298.8 |  306.4 |  297.0 |  309.4 | 5000-5000   | 5000-5000
+ bump_same_user_one_tx      |  5000 | final    | 6 |      42.9 |   42.7 |   43.7 |   42.6 |   43.9 | 1-1         | 1-1
+ bump_same_user_one_tx      | 20000 | baseline | 6 |    3720.2 | 3640.5 | 3755.0 | 3604.9 | 3776.3 | 20000-20000 | 20000-20000
+ bump_same_user_one_tx      | 20000 | final    | 6 |     189.3 |  172.5 |  190.1 |  165.2 |  203.1 | 1-1         | 1-1
+ carryover_sweep            |  1000 | baseline | 6 |      34.2 |   33.9 |   34.3 |   33.8 |   34.9 | 1000-1000   | 1000-1000
+ carryover_sweep            |  1000 | final    | 6 |      14.5 |   13.9 |   14.6 |   13.6 |   15.7 | 1-1         | 1-1
+ carryover_sweep            |  1000 | off      | 6 |       3.5 |    3.3 |    3.7 |    3.3 |    4.8 | 0-0         | 0-0
+ carryover_sweep            |  5000 | baseline | 6 |     323.0 |  322.5 |  323.7 |  318.3 |  326.9 | 5000-5000   | 5000-5000
+ carryover_sweep            |  5000 | final    | 6 |      59.7 |   59.6 |   60.2 |   59.1 |   60.9 | 1-1         | 1-1
+ carryover_sweep            |  5000 | off      | 6 |       9.2 |    9.1 |    9.6 |    9.0 |    9.8 | 0-0         | 0-0
+ evaluate_only              | 20000 | baseline | 6 |     289.9 |  288.6 |  290.5 |  285.1 |  294.6 | 0-0         | 1-1
+ evaluate_only              | 20000 | final    | 6 |     292.7 |  291.3 |  295.1 |  287.2 |  308.0 | 0-0         | 1-1
+ insert_batch               |  5000 | baseline | 6 |    1156.7 | 1147.9 | 1162.8 | 1138.1 | 1188.2 | 5000-5000   | 5000-5000
+ insert_batch               |  5000 | final    | 6 |     900.2 |  890.1 |  901.0 |  885.8 |  913.4 | 1-1         | 1-1
+ insert_batch               |  5000 | off      | 6 |     711.0 |  707.7 |  720.2 |  706.2 |  723.3 | 0-0         | 0-0
+ insert_batch               | 20000 | baseline | 6 |    7263.1 | 7234.1 | 7271.7 | 7212.1 | 7476.0 | 20000-20000 | 20000-20000
+ insert_batch               | 20000 | final    | 6 |    3727.7 | 3717.8 | 3750.2 | 3684.4 | 3956.0 | 1-1         | 1-1
+ insert_batch               | 20000 | off      | 6 |    2958.9 | 2938.9 | 3092.0 | 2912.5 | 3142.1 | 0-0         | 0-0
+ item_delete_cascade        |  5000 | baseline | 6 |     130.8 |  130.2 |  132.2 |  128.5 |  151.5 | 51-51       | 51-51
+ item_delete_cascade        |  5000 | final    | 6 |     129.9 |  128.6 |  132.6 |  128.3 |  134.6 | 1-1         | 1-1
+ item_delete_cascade        |  5000 | off      | 6 |      40.3 |   39.9 |   41.3 |   39.8 |   43.0 | 0-0         | 0-0
+ item_delete_cascade        | 20000 | baseline | 6 |     509.6 |  499.1 |  518.1 |  497.1 |  519.0 | 51-51       | 51-51
+ item_delete_cascade        | 20000 | final    | 6 |     513.5 |  513.1 |  514.0 |  509.6 |  529.7 | 1-1         | 1-1
+ item_delete_cascade        | 20000 | off      | 6 |     152.6 |  150.5 |  154.3 |  147.9 |  179.6 | 0-0         | 0-0
+ loan_link_100_single_calls |   100 | baseline | 6 |      97.8 |   97.1 |   98.9 |   96.0 |  101.0 | 100-100     | 100-100
+ loan_link_100_single_calls |   100 | final    | 6 |      99.1 |   98.9 |  101.0 |   96.1 |  101.5 | 100-100     | 100-100
+ loan_link_100_single_calls |   100 | off      | 6 |      91.1 |   90.3 |   92.7 |   89.5 |   97.5 | 0-0         | 0-0
+ multi_user_insert_10_users |  5000 | baseline | 6 |     307.6 |  305.6 |  310.0 |  303.7 |  312.4 | 5000-5000   | 5000-5000
+ multi_user_insert_10_users |  5000 | final    | 6 |     214.4 |  211.9 |  217.7 |  211.2 |  233.9 | 10-10       | 10-10
+ multi_user_insert_10_users |  5000 | off      | 6 |      82.1 |   79.9 |   89.1 |   78.8 |   97.2 | 0-0         | 0-0
+ reconcile_200_single_calls |   200 | baseline | 6 |     237.9 |  236.2 |  239.4 |  235.2 |  242.0 | 200-200     | 200-200
+ reconcile_200_single_calls |   200 | final    | 6 |     240.3 |  235.6 |  240.7 |  233.7 |  242.4 | 200-200     | 200-200
+ reconcile_200_single_calls |   200 | off      | 6 |     221.7 |  221.0 |  222.6 |  217.7 |  223.3 | 0-0         | 0-0
+ sync_one_row_100_calls     |   100 | baseline | 6 |     143.1 |  138.1 |  146.3 |  133.0 |  147.9 | 100-100     | 100-100
+ sync_one_row_100_calls     |   100 | final    | 6 |     145.2 |  139.4 |  147.8 |  136.8 |  164.8 | 100-100     | 100-100
+ sync_one_row_100_calls     |   100 | off      | 6 |     139.4 |  137.6 |  149.0 |  133.1 |  153.3 | 0-0         | 0-0
+ update_batch               |  5000 | baseline | 6 |     525.2 |  520.8 |  532.3 |  519.6 |  534.3 | 5000-5000   | 5000-5000
+ update_batch               |  5000 | final    | 6 |     264.9 |  263.1 |  269.9 |  259.1 |  278.7 | 1-1         | 1-1
+ update_batch               |  5000 | off      | 6 |      95.7 |   95.0 |  104.9 |   94.4 |  108.3 | 0-0         | 0-0
+ update_batch               | 20000 | baseline | 6 |    4753.3 | 4736.0 | 4834.1 | 4728.9 | 4868.6 | 20000-20000 | 20000-20000
+ update_batch               | 20000 | final    | 6 |    1159.3 | 1158.3 | 1162.8 | 1142.7 | 1183.8 | 1-1         | 1-1
+ update_batch               | 20000 | off      | 6 |     454.6 |  449.5 |  463.1 |  447.7 |  471.0 | 0-0         | 0-0
+(51 rows)
+
+=== baseline vs final (medians; off = diagnostic lower bound with the triggers disabled)
+         case_name          | size  | baseline_ms | final_ms | off_ms | final_minus_baseline_ms | final_vs_baseline_pct | baseline_added_ms | final_added_ms
+----------------------------+-------+-------------+----------+--------+-------------------------+-----------------------+-------------------+----------------
+ batch_then_evaluate        |  5000 |      1591.4 |   1301.5 | 1149.5 |                  -289.9 |                 -18.2 |             441.9 |          152.1
+ bump_100_users_one_tx      |  5000 |       161.2 |     50.7 |        |                  -110.5 |                 -68.6 |                   |
+ bump_100_users_one_tx      | 20000 |      1187.8 |    207.8 |        |                  -979.9 |                 -82.5 |                   |
+ bump_one_per_tx_1000_tx    |  1000 |       582.4 |    578.9 |        |                    -3.5 |                  -0.6 |                   |
+ bump_same_user_one_tx      |  5000 |       299.3 |     42.9 |        |                  -256.4 |                 -85.7 |                   |
+ bump_same_user_one_tx      | 20000 |      3720.2 |    189.3 |        |                 -3530.9 |                 -94.9 |                   |
+ carryover_sweep            |  1000 |        34.2 |     14.5 |    3.5 |                   -19.7 |                 -57.7 |              30.7 |           11.0
+ carryover_sweep            |  5000 |       323.0 |     59.7 |    9.2 |                  -263.3 |                 -81.5 |             313.8 |           50.5
+ evaluate_only              | 20000 |       289.9 |    292.7 |        |                     2.7 |                   0.9 |                   |
+ insert_batch               |  5000 |      1156.7 |    900.2 |  711.0 |                  -256.4 |                 -22.2 |             445.7 |          189.2
+ insert_batch               | 20000 |      7263.1 |   3727.7 | 2958.9 |                 -3535.4 |                 -48.7 |            4304.2 |          768.8
+ item_delete_cascade        |  5000 |       130.8 |    129.9 |   40.3 |                    -0.9 |                  -0.7 |              90.5 |           89.6
+ item_delete_cascade        | 20000 |       509.6 |    513.5 |  152.6 |                     3.9 |                   0.8 |             357.0 |          360.9
+ loan_link_100_single_calls |   100 |        97.8 |     99.1 |   91.1 |                     1.4 |                   1.4 |               6.6 |            8.0
+ multi_user_insert_10_users |  5000 |       307.6 |    214.4 |   82.1 |                   -93.2 |                 -30.3 |             225.5 |          132.3
+ reconcile_200_single_calls |   200 |       237.9 |    240.3 |  221.7 |                     2.4 |                   1.0 |              16.2 |           18.6
+ sync_one_row_100_calls     |   100 |       143.1 |    145.2 |  139.4 |                     2.1 |                   1.4 |               3.7 |            5.8
+ update_batch               |  5000 |       525.2 |    264.9 |   95.7 |                  -260.4 |                 -49.6 |             429.6 |          169.2
+ update_batch               | 20000 |      4753.3 |   1159.3 |  454.6 |                 -3594.0 |                 -75.6 |            4298.7 |          704.7
+(19 rows)
+
+=== per-sample paired difference final - baseline (same sample index; ms): median, min, max
+         case_name          | size  | pairs | median_diff_ms | min_diff_ms | max_diff_ms | final_faster_in
+----------------------------+-------+-------+----------------+-------------+-------------+-----------------
+ batch_then_evaluate        |  5000 |     6 |         -271.3 |      -317.1 |      -223.9 |               6
+ bump_100_users_one_tx      |  5000 |     6 |         -110.9 |      -132.4 |      -102.5 |               6
+ bump_100_users_one_tx      | 20000 |     6 |         -981.0 |     -1012.4 |      -950.0 |               6
+ bump_one_per_tx_1000_tx    |  1000 |     6 |           -0.7 |       -18.7 |        14.9 |               3
+ bump_same_user_one_tx      |  5000 |     6 |         -256.1 |      -266.8 |      -253.1 |               6
+ bump_same_user_one_tx      | 20000 |     6 |        -3530.2 |     -3576.5 |     -3437.7 |               6
+ carryover_sweep            |  1000 |     6 |          -19.9 |       -20.7 |       -18.1 |               6
+ carryover_sweep            |  5000 |     6 |         -263.4 |      -266.6 |      -258.7 |               6
+ evaluate_only              | 20000 |     6 |            1.7 |        -1.0 |        18.1 |               1
+ insert_batch               |  5000 |     6 |         -259.5 |      -274.8 |      -252.3 |               6
+ insert_batch               | 20000 |     6 |        -3514.3 |     -3760.1 |     -3299.5 |               6
+ item_delete_cascade        |  5000 |     6 |           -1.9 |       -18.4 |         6.1 |               5
+ item_delete_cascade        | 20000 |     6 |           11.3 |        -5.7 |        17.0 |               2
+ loan_link_100_single_calls |   100 |     6 |            1.3 |        -1.6 |         4.6 |               3
+ multi_user_insert_10_users |  5000 |     6 |          -92.5 |      -100.6 |       -73.5 |               6
+ reconcile_200_single_calls |   200 |     6 |            1.1 |        -8.3 |         5.2 |               2
+ sync_one_row_100_calls     |   100 |     6 |            2.3 |        -2.6 |        20.6 |               1
+ update_batch               |  5000 |     6 |         -264.2 |      -271.0 |      -241.6 |               6
+ update_batch               | 20000 |     6 |        -3596.0 |     -3708.8 |     -3550.0 |               6
+(19 rows)
+
+--- PROFILE (rolled back): EXPLAIN ANALYZE of the inner multirow INSERT shape, 5000 rows, baseline
+                                      QUERY PLAN
+---------------------------------------------------------------------------------------
+ Insert on transactions (actual time=43.136..43.137 rows=0 loops=1)
+   ->  Function Scan on generate_series g (actual time=0.194..5.779 rows=5000 loops=1)
+ Planning Time: 0.083 ms
+ Trigger for constraint transactions_account_id_fkey: time=28.572 calls=5000
+ Trigger for constraint transactions_budget_category_id_fkey: time=4.467 calls=5000
+ Trigger for constraint transactions_manual_loan_id_fkey: time=2.712 calls=5000
+ Trigger card_payment_bump_transactions_ins_del: time=381.950 calls=5000
+ Execution Time: 461.859 ms
+(8 rows)
+
+                   ?column?
+-----------------------------------------------
+ version-row updates in this transaction: 5000
+(1 row)
+
+--- PROFILE (rolled back): EXPLAIN ANALYZE of the inner multirow INSERT shape, 20000 rows, baseline
+                                       QUERY PLAN
+-----------------------------------------------------------------------------------------
+ Insert on transactions (actual time=178.317..178.318 rows=0 loops=1)
+   ->  Function Scan on generate_series g (actual time=0.577..22.570 rows=20000 loops=1)
+ Planning Time: 0.040 ms
+ Trigger for constraint transactions_account_id_fkey: time=119.587 calls=20000
+ Trigger for constraint transactions_budget_category_id_fkey: time=19.508 calls=20000
+ Trigger for constraint transactions_manual_loan_id_fkey: time=11.343 calls=20000
+ Trigger card_payment_bump_transactions_ins_del: time=3991.383 calls=20000
+ Execution Time: 4324.467 ms
+(8 rows)
+
+                    ?column?
+------------------------------------------------
+ version-row updates in this transaction: 20000
+(1 row)
+
+--- PROFILE (rolled back): EXPLAIN ANALYZE of the inner multirow INSERT shape, 5000 rows, final
+                                      QUERY PLAN
+---------------------------------------------------------------------------------------
+ Insert on transactions (actual time=45.465..45.465 rows=0 loops=1)
+   ->  Function Scan on generate_series g (actual time=0.173..5.758 rows=5000 loops=1)
+ Planning Time: 0.039 ms
+ Trigger for constraint transactions_account_id_fkey: time=30.846 calls=5000
+ Trigger for constraint transactions_budget_category_id_fkey: time=4.046 calls=5000
+ Trigger for constraint transactions_manual_loan_id_fkey: time=2.558 calls=5000
+ Trigger card_payment_bump_transactions_ins_del: time=123.246 calls=5000
+ Execution Time: 206.982 ms
+(8 rows)
+
+                  ?column?
+--------------------------------------------
+ version-row updates in this transaction: 1
+(1 row)
+
+--- PROFILE (rolled back): EXPLAIN ANALYZE of the inner multirow INSERT shape, 20000 rows, final
+                                       QUERY PLAN
+-----------------------------------------------------------------------------------------
+ Insert on transactions (actual time=206.944..206.945 rows=0 loops=1)
+   ->  Function Scan on generate_series g (actual time=0.628..24.435 rows=20000 loops=1)
+ Planning Time: 0.039 ms
+ Trigger for constraint transactions_account_id_fkey: time=120.604 calls=20000
+ Trigger for constraint transactions_budget_category_id_fkey: time=15.960 calls=20000
+ Trigger for constraint transactions_manual_loan_id_fkey: time=10.187 calls=20000
+ Trigger card_payment_bump_transactions_ins_del: time=492.681 calls=20000
+ Execution Time: 849.809 ms
+(8 rows)
+
+                  ?column?
+--------------------------------------------
+ version-row updates in this transaction: 1
+(1 row)
+
+ use
+-----
+
+(1 row)
+
+                       ?column?
+-------------------------------------------------------
+ both functions are the baseline after profiling: true
+(1 row)
+
+
+=== session growth: one long-lived session per mode, then a fresh session
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+
+--- session growth, mode final
+       step       | distinct_users | guc_bytes | guc_growth_bytes | guc_bytes_per_user | all_bytes | all_growth_bytes | us_per_committed_bump
+------------------+----------------+-----------+------------------+--------------------+-----------+------------------+-----------------------
+ start            |              0 |     65536 |                0 |                    |   2862864 |                0 |
+ distinct users   |            100 |    131072 |            65536 |              655.4 |   3219264 |           356400 |                 619.4
+ distinct users   |           1000 |    524288 |           458752 |              458.8 |   3694400 |           831536 |                 607.9
+ distinct users   |           5000 |   2097152 |          2031616 |              406.3 |   5398336 |          2535472 |                 603.1
+ same users again |          20000 |   8388608 |          8323072 |              416.2 |  12476224 |          9613360 |                 594.8
+ distinct users   |          20000 |   8388608 |          8323072 |              416.2 |  12476224 |          9613360 |                 600.5
+ after RESET ALL  |          20000 |   8388608 |          8323072 |              416.2 |  12476224 |          9613360 |
+(7 rows)
+
+user 1 marker after its transaction committed: ''
+never-bumped user (no placeholder): <no such setting>
+user 1 marker after RESET ALL: ''
+                                            after_discard_all
+---------------------------------------------------------------------------------------------------------
+ after DISCARD ALL: GUCMemoryContext 8388608 bytes; all memory contexts 12359440 bytes; user 1 marker ''
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+ mem
+-----
+
+(1 row)
+
+
+--- session growth, mode baseline
+       step       | distinct_users | guc_bytes | guc_growth_bytes | guc_bytes_per_user | all_bytes | all_growth_bytes | us_per_committed_bump
+------------------+----------------+-----------+------------------+--------------------+-----------+------------------+-----------------------
+ start            |              0 |     65536 |                0 |                    |   2777168 |                0 |
+ distinct users   |            100 |     65536 |                0 |                0.0 |   3085120 |           307952 |                 596.6
+ distinct users   |           1000 |     65536 |                0 |                0.0 |   3068736 |           291568 |                 601.9
+ distinct users   |           5000 |     65536 |                0 |                0.0 |   3068736 |           291568 |                 578.7
+ same users again |          20000 |     65536 |                0 |                0.0 |   3062592 |           285424 |                 589.8
+ distinct users   |          20000 |     65536 |                0 |                0.0 |   3062592 |           285424 |                 582.8
+ after RESET ALL  |          20000 |     65536 |                0 |                0.0 |   3062592 |           285424 |
+(7 rows)
+
+user 1 marker after its transaction committed: <no such setting>
+never-bumped user (no placeholder): <no such setting>
+user 1 marker after RESET ALL: <no such setting>
+                                                  after_discard_all
+---------------------------------------------------------------------------------------------------------------------
+ after DISCARD ALL: GUCMemoryContext 65536 bytes; all memory contexts 2945808 bytes; user 1 marker <no such setting>
+(1 row)
+
+fresh session: GUCMemoryContext 65536 bytes; all memory contexts 1473832 bytes
+exit=0
+finished 2026-10-02T19:18:50Z
