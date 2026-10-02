@@ -584,14 +584,19 @@ describe('§6.2 / §4.2 period ranges: each leg in its own month, no cross-month
 
 // Requirements the pure evaluator does NOT satisfy. They are database or application integration
 // work (design §3.5, §3.7, §11) and stay open until that work is built and verified there.
+//
+// Covered at the DATABASE level by slice 2a (draft PR #9), not by this file, and so no longer todos here:
+//   13     input triggers bump in the writer's transaction  supabase/tests/access_control/sql/a09_card_payment_invalidation.sql
+//   14, 15 stale states never readable; a failed evaluation  supabase/tests/access_control/sql/a10_card_payment_evaluator.sql
+//          leaves the user stale (the reader half only)
+//   16a    lock order L1 → L2, READ COMMITTED, publication     a10 (single session); concurrency/c12, c13
+//   16b/c  no evaluator deadlock; RPC vs lock-free cycle      concurrency/c14 (50 rounds), c15
+//   16d    account trigger scope                            a09
+//   10     the SQL evaluator equals this oracle             supabase/tests/card_payment_evaluator (a CI step)
+//   22     grants on the slice 2a objects                   sql/a08_card_payment_grants.sql
 describe('not covered by the pure evaluator (database / application integration)', () => {
-  it.todo('§3.7 input triggers bump input_version in the writer transaction (acceptance test 13)');
-  it.todo('§3.7 stale states are never returned; the read protocol returns `updating` with no figures (14–16)');
-  it.todo('§3.7 evaluator lock order L1 → L2, READ COMMITTED, publishes the version read under L2 (16a)');
-  it.todo('§3.7 no evaluator deadlock with lock-free writers; RPC vs lock-free cycle rolls back cleanly (16b, 16c)');
-  it.todo('§3.7 account trigger scope (16d)');
-  it.todo('§3.8 SQL evaluator equals this TypeScript oracle on generated histories (10)');
-  it.todo('RPC ownership refusals, CAS on computed_at_version, concurrency, grants (20–22)');
+  it.todo('§3.7 aggregation read protocol: an inconsistent or stale read returns `updating` with no figures (14–16, application side)');
+  it.todo('decision RPCs: ownership refusals, CAS on the evaluated version, their concurrency and grants (20–22)');
   it.todo('LIM removal writes destination_removed_card before its deletes, in one transaction (18)');
   it.todo('semanticAggregation.ts consumes stored states; its three it.fails tests flip to it (§5)');
   it.todo('frontend: reasons, actions, review list, ranges and the `updating` state (24–26)');

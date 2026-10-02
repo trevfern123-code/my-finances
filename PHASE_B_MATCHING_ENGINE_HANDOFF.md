@@ -1,5 +1,16 @@
 # Phase B — card-payment matching engine: handoff for review
 
+> **Current status (2026-10-01).** This document is a chronological record. Statements in the earlier
+> sections such as "nothing is committed", "uncommitted" or "not pushed" describe the checkpoints at
+> the time; they are superseded by git history.
+> - **Draft PR #8** (head `80c724d`): slice 1 plus the engine and design work — `0647c1e`, `beb032c`,
+>   `80c724d` and earlier.
+> - **Draft PR #9** (head `afa29ee`): slice 2a — `bb4e2d1`, `afa29ee`. CI passed.
+> - **Slice 2b-1**, the decision RPCs, is §9.
+>
+> Nothing is merged, applied to a hosted database or released. The live app does not consume any of
+> this work.
+
 Prepared 2026-09-29/30 (overnight, autonomous). Scope: Stage 1 (the pure reference evaluator) and
 Stage 2 (adversarial tests) of `CARD_PAYMENT_PAIRING_DESIGN.md` rev 3. **Nothing is committed.**
 
@@ -348,7 +359,11 @@ clear review path that shows the user the conflict without asking them to guess 
 transaction is real (design §3.6, §10). Today the evaluator only holds the rows; there is no review
 workflow, sync retry, repair interface or automatic cleanup.
 
-**Not implemented** — database or application work. Pure tests here do **not** satisfy any of these:
+**Not implemented** (as of this section; current coverage is in §8 and §9) — database or application
+work. Pure tests here do **not** satisfy any of these. *Since done at the database level by slice 2a
+(§8):* the tables and triggers (13), the stale-state half of 14–15, 16a–16d, the SQL evaluator and
+its equivalence (10), and grants on the 2a objects (22). The decision RPCs are §9. The rest remain
+open.
 - §3.5 tables and §3.7 input triggers (acceptance test 13).
 - The stale-state and read protocol returning `updating` with no figures (14–16).
 - **16a–16d:** lock order, publication, deadlock behaviour and trigger scope. These are database
@@ -401,9 +416,9 @@ workflow, sync retry, repair interface or automatic cleanup.
   environment changes, commits, pushes, pull requests, merges or deployments.
 - Database concurrency, persistence and live integration are **not** verified by this work.
 
-## 8. Slice 2a — database schema and SQL evaluator (implemented 2026-09-30, uncommitted)
+## 8. Slice 2a — database schema and SQL evaluator (implemented 2026-09-30; since committed as `bb4e2d1` + `afa29ee`, draft PR #9)
 
-**Branch and state:**
+**Branch and state** *(as at implementation; superseded — the branch was committed and pushed, §8.3)*:
 - Local branch `feature/phase-b-slice2a-sql-evaluator`, created from the reviewed checkpoint
   `80c724d` (draft PR #8's head). It has not been pushed.
 - Nothing is committed. The migration has been applied only inside throwaway test containers, and

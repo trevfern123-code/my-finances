@@ -1,7 +1,19 @@
 # Card-Payment Pairing — resolving Phase B §13 R3 (design proposal, rev 3)
 
-Status: **proposal for review — nothing implemented.** There is no migration, endpoint or
-live-calculation change. The document completes option (a) of `FINANCIAL_SEMANTICS_PHASE_B_DESIGN.md`
+Status (updated 2026-10-01): **design rev 3, approved product choices; partly implemented on draft
+PRs, nothing merged or released.**
+- The reference engine (§3.8 oracle, draft PR #8) and the §3.5 tables, §3.7 triggers, SQL evaluator
+  and reader (migration `20260930120000`, draft PR #9) exist. They are disconnected from the app and
+  applied only to throwaway test databases.
+- The decision RPCs of §8 are slice 2b-1.
+- **Not built:** the sync and LIM integration, the §3.7 aggregation read protocol, the §5 module
+  change, the API and frontend, and the backfill. The live app's cash flow is unchanged.
+- Details and verification: `PHASE_B_MATCHING_ENGINE_HANDOFF.md`.
+
+*Original status line (rev 3, 2026-09-29), kept for history:* proposal for review — nothing
+implemented. There is no migration, endpoint or live-calculation change.
+
+The document completes option (a) of `FINANCIAL_SEMANTICS_PHASE_B_DESIGN.md`
 §13 R3 while preserving D5. **Trevor approved the first-version product choices on 2026-09-29**
 (§10). Two items are deferred and not part of this release: recurring destination rules (T8) and
 the payment-and-return shortcut. Acceptance tests are in §11. The read-only audit draft is `supabase/preflight/phase_b_card_payment_matching_audit.sql`
@@ -679,7 +691,7 @@ The API: `status`, `cashFlow: number | null`, `cashFlowRange`, `savingsRateRange
 | Fee remainder | (not covered by D5) | §4.3: D5's boundary rule applied to the excess (T6) |
 | Destination not established | — | both D5 values reported; the headline per T1 |
 
-## 8. Implementation outline (sizing only; not written)
+## 8. Implementation outline (written as a sizing outline; items 1–2 partly implemented since — see the status above)
 
 1. **Migration:**
    - the four tables of §3.5;

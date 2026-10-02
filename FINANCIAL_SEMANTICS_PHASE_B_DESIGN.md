@@ -1,8 +1,9 @@
 # Financial Semantics Phase B — Design for review
 
-**Status:** revision 6, approved at design level (Codex). **Implementation slice 1 in progress** on
-`feature/phase-b-aggregation-slice1` — see §14. No migration, endpoint, production data or live
-calculation has been changed by Phase B.
+**Status:** revision 6, approved at design level (Codex). **Implementation in progress on draft PRs,
+nothing released** — see §14 for the current status. Phase B has changed no endpoint, response field,
+live calculation or production data. Its only migration so far, `20260930120000` (draft PR #9), is
+unmerged and has been applied only to throwaway test databases.
 
 **Reconciled 2026-09-29 with the completed continuity release** (`PENDING_POSTED_CONTINUITY_RELEASE.md`):
 pending→posted continuity shipped in PR #6 (merge `a1b4120`), migration `20260927120000` is applied in
@@ -1565,8 +1566,25 @@ decisions (C1–C5) are listed there.
   migration or loan bookkeeping changed.
 - **Known limitation (open, §13 R3):** card-payment legs on included accounts that do not pair (more
   than 5 days apart, or amounts differ) shift cash flow by the full amount. Characterization and
-  `it.fails` tests pin it. It blocks live integration of card-payment figures. Proposed
-  resolution: `CARD_PAYMENT_PAIRING_DESIGN.md` (not implemented).
+  `it.fails` tests pin it. It blocks live integration of card-payment figures. Resolution:
+  `CARD_PAYMENT_PAIRING_DESIGN.md` — partly implemented, see below.
+
+**R3 status (2026-10-01; draft PRs, nothing merged or released):**
+- **Exists, disconnected:**
+  - the pure reference matching engine `cardPaymentMatching.ts` and its adversarial tests (PR #8);
+  - the matching schema, input triggers, SQL evaluator and state reader — migration `20260930120000`
+    (PR #9, head `afa29ee`), never applied outside throwaway test databases;
+  - its database tests and the SQL-vs-reference equivalence harness (a CI step).
+- **Not built:**
+  - aggregation integration — `semanticAggregation.ts` still uses slice 1's own pairing, and its three
+    `it.fails` card-payment tests still fail as expected;
+  - the read protocol and `updating` result;
+  - the sync and LIM-removal integration;
+  - the API fields and frontend;
+  - the matching backfill.
+- **The decision-writing RPCs** are slice 2b-1 (`PHASE_B_MATCHING_ENGINE_HANDOFF.md` §9), also
+  disconnected.
+- **R3 is therefore still open for the live app**, which does not consume any of this work.
 
 **Planned (not implemented):** routing the aggregate fetches through `fetchAllPages` with role
 columns and ±`PAIRING_PAD_DAYS` padding; the new response fields (§5, §6.1) behind API level 2; the
