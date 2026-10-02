@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { parseOptInFlag } from './flags';
 
 function required(name: string): string {
   const value = process.env[name];
@@ -35,4 +36,11 @@ export const env = {
   plaidHostedLinkCompletionRedirectUri:
     process.env.PLAID_HOSTED_LINK_COMPLETION_REDIRECT_URI ||
     `${frontendUrl.replace(/\/+$/, '')}/plaid-link-complete.html`,
+
+  // Optional, default OFF (Financial Semantics Phase B, packet 2b-2a). When "true" (case-insensitive,
+  // trimmed), every successful transaction sync ends with one best-effort card-payment matching
+  // evaluation for the user (services/cardPaymentEvaluation.ts). Requires the Phase B matching migrations
+  // (20260930120000 onward); nothing reads the evaluated states yet. Any other value, including
+  // "false", leaves it off, and then no matching RPC is ever called.
+  cardPaymentSyncEvaluationEnabled: parseOptInFlag(process.env.CARD_PAYMENT_SYNC_EVALUATION_ENABLED),
 };

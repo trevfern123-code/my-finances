@@ -14,6 +14,7 @@ const mockUpdateItemCursor = vi.hoisted(() => vi.fn());
 const mockTransitionItemStatus = vi.hoisted(() => vi.fn());
 const mockRecordItemSyncedAt = vi.hoisted(() => vi.fn());
 const mockUpsertRecurringStreams = vi.hoisted(() => vi.fn());
+const mockSweepTransactionCarryovers = vi.hoisted(() => vi.fn());
 vi.mock('./dataService', () => ({
   getAccountIdMapForItem: mockGetAccountIdMapForItem,
   applyTransactionChanges: mockApplyTransactionChanges,
@@ -21,6 +22,12 @@ vi.mock('./dataService', () => ({
   transitionItemStatus: mockTransitionItemStatus,
   recordItemSyncedAt: mockRecordItemSyncedAt,
   upsertRecurringStreams: mockUpsertRecurringStreams,
+  sweepTransactionCarryovers: mockSweepTransactionCarryovers,
+}));
+
+const mockEvaluateCardPaymentsAfterSync = vi.hoisted(() => vi.fn());
+vi.mock('./cardPaymentEvaluation', () => ({
+  evaluateCardPaymentsAfterSync: mockEvaluateCardPaymentsAfterSync,
 }));
 
 const mockLinkNewTransactionsToManualLoans = vi.hoisted(() => vi.fn());
@@ -50,6 +57,8 @@ beforeEach(() => {
   mockGetRecurringStreams.mockResolvedValue({ inflowStreams: [], outflowStreams: [] });
   mockReconcileRelationalRoles.mockResolvedValue(undefined);
   mockRepairExistingRelationalRoles.mockResolvedValue(undefined);
+  mockSweepTransactionCarryovers.mockResolvedValue(undefined);
+  mockEvaluateCardPaymentsAfterSync.mockResolvedValue('disabled');
 });
 
 describe('syncItemTransactions', () => {
@@ -290,5 +299,142 @@ describe('syncItemTransactions', () => {
 
     expect(mockUpdateItemCursor).toHaveBeenCalledTimes(1);
     expect(mockUpdateItemCursor).toHaveBeenCalledWith('item-row-1', 'new-cursor');
+  });
+
+  describe('end-of-sync card-payment matching evaluation (Phase B 2b-2a)', () => {
+    // vi.clearAllMocks keeps implementations: reset every mock these tests reconfigure.
+    beforeEach(() => {
+      mockUpdateItemCursor.mockReset().mockResolvedValue(undefined);
+      mockRecordItemSyncedAt.mockReset().mockResolvedValue(undefined);
+      mockLinkNewTransactionsToManualLoans.mockReset().mockResolvedValue(undefined);
+      mockApplyTransactionChanges.mockReset().mockResolvedValue({ insertedTransactions: [], touchedTransactionIds: [] });
+      mockReconcileRelationalRoles.mockReset().mockResolvedValue(undefined);
+      mockRepairExistingRelationalRoles.mockReset().mockResolvedValue(undefined);
+      mockSweepTransactionCarryovers.mockReset().mockResolvedValue(undefined);
+      mockEvaluateCardPaymentsAfterSync.mockReset().mockResolvedValue('disabled');
+      mockGetRecurringStreams.mockReset().mockResolvedValue({ inflowStreams: [], outflowStreams: [] });
+    });
+
+    /** Records the order of every step that matters for matching. */
+    function recordOrder() {
+      const order: string[] = [];
+      mockApplyTransactionChanges.mockImplementation(async () => {
+        order.push('batch');
+        return { insertedTransactions: [], touchedTransactionIds: [] };
+      });
+      mockLinkNewTransactionsToManualLoans.mockImplementation(async () => void order.push('loan_links'));
+      mockReconcileRelationalRoles.mockImplementation(async () => void order.push('reconcile'));
+      mockRepairExistingRelationalRoles.mockImplementation(async () => void order.push('repair'));
+      mockUpdateItemCursor.mockImplementation(async () => void order.push('cursor'));
+      mockRecordItemSyncedAt.mockImplementation(async () => void order.push('synced_at'));
+      mockSweepTransactionCarryovers.mockImplementation(async () => void order.push('carryover_sweep'));
+      mockEvaluateCardPaymentsAfterSync.mockImplementation(async () => {
+        order.push('evaluate');
+        return 'evaluated';
+      });
+      mockGetRecurringStreams.mockImplementation(async () => {
+        order.push('recurring');
+        return { inflowStreams: [], outflowStreams: [] };
+      });
+      return order;
+    }
+
+    it('attempts exactly one evaluation, for the synced item\'s user (the wrapper evaluates the whole user)', async () => {
+      await syncItemTransactions(item);
+      expect(mockEvaluateCardPaymentsAfterSync).toHaveBeenCalledTimes(1);
+      expect(mockEvaluateCardPaymentsAfterSync).toHaveBeenCalledWith('user-1');
+    });
+
+    it('runs after every matching-input step (batch, loan links, reconciliation, repair, cursor, carry-over sweep) and before the recurring-stream refresh', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [{ transaction_id: 't1' }], modified: [], removed: [], cursor: 'new-cursor' });
+      const order = recordOrder();
+      await syncItemTransactions(item);
+      expect(order).toEqual(['batch', 'loan_links', 'reconcile', 'repair', 'cursor', 'synced_at', 'carryover_sweep', 'evaluate', 'recurring']);
+    });
+
+    it('a caught carry-over sweep failure still reaches the evaluation', async () => {
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+      mockSweepTransactionCarryovers.mockRejectedValueOnce(new Error('sweep down'));
+      const result = await syncItemTransactions(item);
+      expect(result).toEqual({ added: 0, modified: 0, removed: 0 });
+      expect(mockEvaluateCardPaymentsAfterSync).toHaveBeenCalledTimes(1);
+      errorLog.mockRestore();
+    });
+
+    it.each(['disabled', 'evaluated', 'evaluation_failed', 'rpc_missing', 'rpc_error', 'timeout', 'request_failed', 'unexpected_response'])(
+      'evaluation outcome %s: the cursor advanced exactly once beforehand and the sync response is unchanged',
+      async (outcome) => {
+        mockSyncTransactions.mockResolvedValue({ added: [{}, {}], modified: [{}], removed: [], cursor: 'new-cursor' });
+        mockEvaluateCardPaymentsAfterSync.mockResolvedValue(outcome);
+        const result = await syncItemTransactions(item);
+        expect(result).toEqual({ added: 2, modified: 1, removed: 0 });
+        expect(mockUpdateItemCursor).toHaveBeenCalledTimes(1);
+        expect(mockUpdateItemCursor).toHaveBeenCalledWith('item-row-1', 'new-cursor');
+        expect(mockUpdateItemCursor.mock.invocationCallOrder[0]).toBeLessThan(mockEvaluateCardPaymentsAfterSync.mock.invocationCallOrder[0]);
+        expect(mockGetRecurringStreams).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    it('pre-cursor failure (reconciliation): the error propagates as before, the cursor does not advance, and no evaluation is attempted', async () => {
+      mockReconcileRelationalRoles.mockRejectedValueOnce(new Error('reconciliation query failed'));
+      await expect(syncItemTransactions(item)).rejects.toThrow('reconciliation query failed');
+      expect(mockUpdateItemCursor).not.toHaveBeenCalled();
+      expect(mockEvaluateCardPaymentsAfterSync).not.toHaveBeenCalled();
+    });
+
+    it('a failed cursor write propagates and no evaluation is attempted (the cursor write may or may not have reached the database)', async () => {
+      mockUpdateItemCursor.mockRejectedValueOnce(new Error('Failed to update sync cursor: connection reset'));
+      await expect(syncItemTransactions(item)).rejects.toThrow('Failed to update sync cursor');
+      expect(mockEvaluateCardPaymentsAfterSync).not.toHaveBeenCalled();
+    });
+
+    it('post-cursor failure (recording last_synced_at): the error still propagates AFTER the cursor advanced, and no evaluation is attempted — as before this packet', async () => {
+      mockRecordItemSyncedAt.mockRejectedValueOnce(new Error('synced_at write failed'));
+      await expect(syncItemTransactions(item)).rejects.toThrow('synced_at write failed');
+      expect(mockUpdateItemCursor).toHaveBeenCalledWith('item-row-1', 'new-cursor');
+      expect(mockEvaluateCardPaymentsAfterSync).not.toHaveBeenCalled();
+    });
+
+    it('an empty batch still attempts evaluation, so a later sync with nothing new recovers an earlier failed evaluation', async () => {
+      mockSyncTransactions.mockResolvedValue({ added: [{ transaction_id: 't1' }], modified: [], removed: [], cursor: 'c1' });
+      mockEvaluateCardPaymentsAfterSync.mockResolvedValueOnce('timeout');
+      await syncItemTransactions(item);
+
+      mockSyncTransactions.mockResolvedValue({ added: [], modified: [], removed: [], cursor: 'c1' });
+      mockEvaluateCardPaymentsAfterSync.mockResolvedValueOnce('evaluated');
+      const second = await syncItemTransactions({ ...item, transactions_cursor: 'c1' });
+
+      expect(second).toEqual({ added: 0, modified: 0, removed: 0 });
+      expect(mockEvaluateCardPaymentsAfterSync).toHaveBeenCalledTimes(2);
+      expect(mockEvaluateCardPaymentsAfterSync).toHaveBeenNthCalledWith(2, 'user-1');
+    });
+
+    it('a recurring-stream failure stays independent: the evaluation already ran and the sync still succeeds', async () => {
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const order = recordOrder();
+      mockGetRecurringStreams.mockImplementation(async () => {
+        order.push('recurring');
+        throw new Error('recurring endpoint down');
+      });
+      const result = await syncItemTransactions(item);
+      expect(result).toEqual({ added: 0, modified: 0, removed: 0 });
+      expect(order.indexOf('evaluate')).toBeGreaterThan(-1);
+      expect(order.indexOf('evaluate')).toBeLessThan(order.indexOf('recurring'));
+      errorLog.mockRestore();
+    });
+
+    it('the evaluation does not wait for, or depend on, the recurring-stream Plaid request', async () => {
+      let releaseRecurring: () => void = () => {};
+      mockGetRecurringStreams.mockImplementation(
+        () => new Promise((resolve) => {
+          releaseRecurring = () => resolve({ inflowStreams: [], outflowStreams: [] });
+        })
+      );
+      const syncing = syncItemTransactions(item);
+      await vi.waitFor(() => expect(mockGetRecurringStreams).toHaveBeenCalled());
+      expect(mockEvaluateCardPaymentsAfterSync).toHaveBeenCalledTimes(1);
+      releaseRecurring();
+      await syncing;
+    });
   });
 });
