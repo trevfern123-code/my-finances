@@ -947,3 +947,241 @@ aggregation read protocol and `updating`), which can proceed in parallel at the 
 
 **Confirmation:** no hosted migration, merge, backfill, production data change, production
 configuration change or deployment.
+
+## 10. Packet 2b-2a — end-of-sync card-payment evaluation, behind a default-off flag (2026-10-01)
+
+**Branch and base:**
+- Worktree `C:\Users\Trevor\dev\my-finances-phase-b-2b2a`, branch `feature/phase-b-2b2a-sync-evaluation`.
+- Incremental base: `7e14d43` (draft PR #10's head; CI passed).
+- Any PR for it targets `main` (CI runs only for PRs into `main`), so its full diff also contains PRs #8,
+  #9 and #10.
+- No migration or released SQL function changed. Institution removal is untouched (packet 2b-2b).
+
+**Decisions (Trevor, 2026-10-01):**
+1. One end-of-sync evaluation instead of evaluating inside every sync-related RPC. This is recorded as a
+   schedule-only amendment in `CARD_PAYMENT_PAIRING_DESIGN.md` §3.7; the rules and the freshness
+   guarantee are unchanged.
+2. A server flag, default off.
+3. The performance threshold (more than 20% overhead or more than 1 s added on a 5k-row batch) is a
+   reason to report and propose, not to redesign triggers.
+4. Removal stays deferred.
+
+**What it adds:**
+- **`CARD_PAYMENT_SYNC_EVALUATION_ENABLED`** (`backend/src/config/env.ts`, parsed by
+  `config/flags.ts`):
+  - only "true" (case-insensitive, surrounding whitespace ignored) enables it;
+  - absent, empty, "false", "1", "yes", typos and every other value leave it **off**.
+  - Documented in `backend/.env.example`. No production setting was changed.
+- **`services/cardPaymentEvaluation.ts`** — `evaluateCardPaymentsAfterSync(userId)`:
+  - flag off: returns `disabled` and makes no RPC call, so no database object is required;
+  - flag on: one call of the existing `try_evaluate_card_payments(p_user_id)`, which evaluates the
+    whole user (every item);
+  - a timeout of `CARD_PAYMENT_EVALUATION_TIMEOUT_MS = 10000`, through postgrest-js 2.112.3's
+    `abortSignal()` and `AbortSignal.timeout`;
+  - the client does not retry this POST.
+  - Outcomes:
+    - `evaluated` and `evaluation_failed` — the RPC returned true or false;
+    - `rpc_missing` — PGRST202 / 42883, with its own configuration warning naming the flag;
+    - `rpc_error`;
+    - `timeout` — detected from the wrapper's own signal, not by parsing messages;
+    - `request_failed` — the installed client reports a network failure as a resolved error with HTTP
+      status 0 and no code; a thrown value is also handled;
+    - `unexpected_response`.
+  - Never throws and never retries. Logs only the outcome plus an error code or error name (no
+    messages, payloads or user ids).
+  - Abandoning a timed-out request stops the client waiting; it is not proof that the server rolled
+    back.
+- **`services/syncService.ts`** — exactly one `await evaluateCardPaymentsAfterSync(item.user_id)`:
+  - after the carry-over sweep's existing catch block, so a caught sweep failure still evaluates;
+  - before the independent recurring-stream refresh.
+  - The result is not returned, and the sync response is unchanged.
+  - The function's doc comment now states the real failure boundaries (below).
+- **Frequency:** once per successful **item** sync. A manual sync of a user with K items
+  (`plaidController.syncTransactions` loops over them) makes K whole-user evaluations. Each is
+  invalidated by the next item's batch, and only the last can leave the user fresh. Each evaluation is
+  bounded by the 10 s timeout. This matches the agreed design; it is listed under limitations.
+
+**Failure and recovery contract (as implemented and tested):**
+- **The sync is not atomic.** Each step commits on its own, and a later failure leaves earlier commits
+  in place.
+- **Failure before the cursor advances** (Plaid, batch, status, reconciliation, repair): propagates as
+  before, the cursor is normally unadvanced, and no evaluation is attempted.
+- **A failed cursor write:** also propagates. An uncertain write may have landed anyway, so the cursor
+  is not guaranteed unchanged.
+- **Failure after the cursor advances** (recording `last_synced_at`): propagates as before, also
+  without evaluation.
+- **Best-effort steps** (loan links, carry-over sweep, recurring streams): caught as before.
+- **Evaluation-only failures:** logged; the sync succeeds with the same response.
+- **Recovery:** the next successful sync evaluates again, even with an empty batch.
+- **Not built:** retry-on-read, background recovery, and evaluation after other user actions
+  (manual-loan link/unlink, transfer confirmation, the account toggle). Those writers leave the user
+  stale until the next sync.
+
+**Tests added:**
+- `config/flags.test.ts`: the parser for absent / empty / "false" (any case) / other values / "true";
+  `env` loaded with the variable absent, "false" and "true". `dotenv/config` is stubbed, so a local
+  `.env` cannot interfere.
+- `services/cardPaymentEvaluation.test.ts` (17 tests):
+  - flag off makes no call; flag on through `env`;
+  - the exact RPC name and arguments, and the abort signal; a finite timeout;
+  - false;
+  - a returned error, with the code logged but not the message or user id;
+  - missing function (both codes);
+  - a network failure as the installed client reports it (status 0); a thrown request; a synchronous
+    throw;
+  - timeout, both when the client resolves on abort and when it rejects;
+  - four unexpected response shapes.
+- `services/syncService.test.ts`, 17 new tests in a block that resets every mock it reconfigures:
+  - one call, for the right user;
+  - the full order: batch → loan links → reconcile → repair → cursor → synced_at → carry-over sweep →
+    evaluate → recurring;
+  - a caught sweep failure still evaluates;
+  - all 8 outcomes leave the cursor advanced exactly once, before the evaluation, with the response
+    unchanged;
+  - pre-cursor failure, failed cursor write and post-cursor failure: each propagates with no evaluation;
+  - an empty-batch retry after a failed evaluation;
+  - a recurring-stream failure stays independent;
+  - the evaluation does not wait on the recurring request.
+- `supabase/tests/access_control/sql/a13_card_payment_sync_sequence.sql` (real database, every step its
+  own transaction):
+  - the batch RPC, a reconciliation-style `apply_transaction_semantic_roles` write and the carry-over
+    sweep's delete (its expired-unconsumed branch) each advance the version and invalidate;
+  - the wrapper's exact call then publishes fresh, matched states;
+  - a later batch plus an injected evaluation failure returns false and withholds the old states (the
+    old derived rows still exist), with the sync's write committed;
+  - an empty batch changes no input (same version); a new evaluation recovers, and the recorded error
+    code is cleared;
+  - a later input change invalidates again.
+  - Loan auto-linking and the repair sweep write the same kinds of inputs through their own RPCs and are
+    not separately represented.
+
+**Validation run** (disposable local containers only; no hosted database):
+
+| Command | Result |
+|---|---|
+| backend `tsc --noEmit` / `vitest run` (CI placeholder env) / `npm run build` | pass / **1307 passed, 3 expected fail, 5 todo** (+41 new) / pass; test files are not in `dist` |
+| `bash supabase/tests/access_control/run.sh` | **35 passed, 0 failed** (34 earlier + a13; re-run after the self-review fixes) |
+| `bash supabase/tests/card_payment_evaluator/run.sh` | **662 evaluations, 0 differ**; RPC sequences: 8 scenarios, 0 failures |
+| `bash supabase/tests/card_payment_audit/run.sh` | PASS |
+| `bash supabase/tests/phase_a/run.sh` / `PHASE_A_BASE=history …` | **23 passed** / **18 passed, 7 skipped** (the designed gate skips) |
+| `SUPABASE_CLI=<cached 2.117.0> bash supabase/tests/replay/run.sh` | **11 passed, 0 failed** |
+| benchmark safety guard | without `-v bench_disposable=1`: refused (exit 3). With it but `auth.users` non-empty: refused, and the row is untouched |
+| `git diff --check` | clean |
+
+**Measurements** (`supabase/tests/card_payment_benchmark/run.sh`, 6 measured samples after 1 warm-up
+for every configuration). These are for reporting only: not a CI gate, never correctness evidence.
+- **Environment:** synthetic data in one throwaway Supabase Postgres 17.6.1.155 container, Docker
+  Desktop 29.7.2 on Windows, 12 CPUs, 8 GB, `fsync=on`, `synchronous_commit=on`, default
+  `shared_buffers` (128 MB). Nothing else was running.
+- **Insert and update batches:**
+  - On and off are interleaved on matched fixtures, alternating which goes first (3:3). "Off" disables
+    only the two `card_payment_bump_transactions_*` triggers, in that disposable database.
+  - Each sample is a committed transaction, timed from just before BEGIN to just after COMMIT. That
+    includes about four local statement round trips, identical in both modes, so the **added
+    milliseconds** are the reliable figure and the percentage is slightly understated.
+  - Between samples, untimed: insert rows are deleted, update payloads are rebuilt from the current rows
+    (every row's amount moves ±1 cent), and both affected tables are vacuumed.
+- **Decision-RPC samples** are rolled back, so each starts from the same state (commit excluded).
+
+| Batch via `apply_synced_transaction_batch_v2` | rows | triggers off (median) | triggers on (median) | added | overhead |
+|---|---|---|---|---|---|
+| inserts (user with 1k-row history) | 1,000 | 146 ms | 193 ms | +48 ms | +33% |
+| | 5,000 | 736 ms | 1,146 ms | +410 ms | **+56%** |
+| | 10,000 | 1,490 ms | 2,766 ms | **+1,277 ms** | +86% |
+| | 20,000 | 2,992 ms | 7,439 ms | **+4,446 ms** | +149% |
+| amount updates of every row | 1,000 | 20 ms | 65 ms | +45 ms | +229% |
+| | 5,000 | 90 ms | 492 ms | +402 ms | **+448%** |
+| | 10,000 | 180 ms | 1,432 ms | **+1,252 ms** | +696% |
+| | 20,000 | 408 ms | 4,619 ms | **+4,211 ms** | +1,032% |
+
+Ranges were tight (for example, inserts at 5k with the triggers on: 1,136–1,156 ms).
+
+| Full-user `evaluate_card_payments` | 1k | 5k | 10k | 20k |
+|---|---|---|---|---|
+| median of 6 | 26 ms | 76 ms | 141 ms | 286 ms |
+
+Decision RPCs. The user has 2,082 transactions; each call evaluates the whole user inside the RPC.
+Times are medians of 6:
+
+| Live decisions | `evaluate` alone | `link_card_payment` | `dismiss_card_payment_candidate` |
+|---|---|---|---|
+| 10 | 64 ms | 69 ms | 68 ms |
+| 100 | 70 ms | 78 ms | 77 ms |
+| 1,000 | 125 ms | 170 ms | 169 ms |
+
+**The timeout:** 10 s, about 35× the 20k-row evaluation. It only bounds how long one sync can be held
+up; a timeout leaves the user stale, never wrong.
+
+**Material finding — reported, not acted on (decision 3):**
+- **The slice 2a matching-invalidation triggers exceed the threshold on a 5k-row batch:** +56% for
+  inserts and +448% for updates (+0.4 s each). They add more than 1 s from 10k rows, and about 4.2–4.4 s
+  at 20k.
+- **The cost is superlinear:** the added time per row rises from ~0.05 ms (1k) to ~0.22 ms (20k).
+- **The likely cause, a hypothesis not yet verified:** every row's AFTER trigger updates the same
+  per-user version row inside one transaction. Each update creates another row version that cannot be
+  pruned while the transaction is open, so locating the current version gets slower as the batch grows.
+- **Practical exposure is limited today:**
+  - large batches come from initial or historical syncs, since `syncTransactions` accumulates every
+    Plaid page into one batch call;
+  - the production history at the 2026-09-26 audit was 221 transactions in 12 months;
+  - the triggers have no effect in production until migration `20260930120000` is applied.
+- **Not optimized here. Possible follow-ups, for a separate decision:**
+  - statement-level triggers with transition tables (one bump per statement per user);
+  - a per-transaction "already bumped since the last evaluation" guard. This must keep 16a: an input
+    written after an evaluation in the same transaction must still leave the user stale.
+  - Either one changes `20260930120000`'s triggers before release, or adds a replacing migration, and
+    needs the a09 invalidation tests, the concurrency tests and mutation checks again.
+- **Decision RPCs:** at 1,000 live decisions, the lineage resolution adds ~45 ms on top of the
+  evaluation. That is acceptable, but it grows with unpurged dismissals.
+
+**Unmeasured:**
+- hosted hardware, network and PostgREST overhead;
+- concurrent syncs, and multi-item manual syncs (K evaluations);
+- removal cascades (2b-2b);
+- the account, plaid-item and carry-over triggers;
+- WAL and replication effects;
+- evaluation beyond 20k rows (2a measured ~0.7 s at 50k).
+
+**Self-review** (Claude, a fresh-context read-only pass; **not** independent cross-family review). It
+found no blocking defect. Its findings and their dispositions:
+1. **The benchmark script had no guard of its own** (it truncates `auth.users`). Fixed: it refuses
+   without the marker `run.sh` passes, and refuses if `auth.users` is non-empty. Both refusals were
+   verified.
+2. **The timing citations had no source** (this section did not exist yet). Fixed: this section,
+   updated to this run's numbers.
+3. **A network failure resolves with status 0 and was logged as `rpc_error`.** Fixed: classified as
+   `request_failed`, with a test.
+4. **The docs said "exactly true" while the parser trims and ignores case.** Wording fixed everywhere.
+5. **a13:** the "error code cleared" check was vacuous, the empty-batch check didn't compare the version,
+   and one evaluation wasn't asserted. All three fixed.
+6. **a13's header overstated which input steps it covers.** Corrected.
+7. **The design amendment said "reads see stale states"**; it now says they are unreadable. It now also
+   names failed syncs and per-item evaluation, and notes that the sync path's only retry is the next
+   sync.
+8. **The flag test could depend on a local `.env`.** Fixed by stubbing `dotenv/config`.
+9. **Benchmark method:** the round-trip statement was corrected; an untimed VACUUM was added between
+   samples; and 6 samples balance the order. Both the earlier 5-sample run and this one show the same
+   finding.
+10. **A manual sync with K items makes K evaluations.** Documented here and in the wrapper.
+
+**Remaining before any release of Phase B matching:**
+- packet 2b-2b, removal conversion (fail-closed direction preferred; needs its own reviewed design of
+  recovery and locking);
+- a decision on the trigger cost above;
+- the read protocol and `updating` result, with retry-on-read (2c);
+- evaluation after the other input-changing user actions;
+- API and frontend;
+- the backfill (219 of 221 `auto_role IS NULL`);
+- hosted preflight and postflight;
+- applying the migrations, and only then turning the flag on (a Railway configuration change, Trevor's
+  step).
+
+**Recommendations for 2b-2b:**
+- Decide on the trigger cost first: removal's cascade deletes fire the same per-row bumps.
+- Measure removal of items with 1k / 10k / 50k transactions on the current triggers.
+- Then implement the in-transaction strict evaluation and conversion before the delete (fail closed),
+  with the standalone evaluation after the removal follow-ups, and review its recovery and lock order
+  separately.
+
+**Confirmation:** no hosted migration, merge, backfill, production data or configuration change, or
+deployment.

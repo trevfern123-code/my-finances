@@ -432,6 +432,26 @@ holds, while that writer waits on L2 for its own bump. That is a cycle.
 - **Where it runs:** at the end of every new RPC that changes an input — the sync batch, the role
   override, the decision RPCs, the account-inclusion update and the LIM removal. It runs in a
   subtransaction (`begin … exception when others then …`).
+  - **Amended for the sync path (Trevor, 2026-10-01; packet 2b-2a).** This changes only the execution
+    schedule. The financial rules and the freshness guarantee (states readable only at exactly the
+    current input version) are unchanged.
+    - **Why:** a sync is not one transaction. The batch RPC, loan auto-linking, role reconciliation, the
+      repair sweep and the carry-over sweep each commit separately, and each can change inputs.
+    - **What changes:** the sync does not evaluate inside each of those RPCs. It runs **one** standalone,
+      best-effort `try_evaluate_card_payments(user)` after all of them, in its own transaction, before
+      the unrelated recurring-stream refresh (`syncService.ts`, `cardPaymentEvaluation.ts`).
+    - **Gated:** it runs only behind the default-off server flag `CARD_PAYMENT_SYNC_EVALUATION_ENABLED`
+      (only "true", case-insensitive and trimmed, enables it).
+    - **Cost:** the states are unreadable (`fresh = false`, no states; `updating` once the read
+      protocol exists) while a sync is between steps, after a sync that failed before reaching the
+      evaluation (before or after its cursor advanced), and after an evaluation that failed or timed out.
+      A sync of a user with several items evaluates once per item; only the last can leave the user fresh.
+    - **Recovery:** the next successful sync evaluates again, even one with an empty batch. On the sync path
+      that is the only retry for now: the "retries after commit" of the bullet below is not built for it
+      (retry-on-read is later work).
+    - **Unchanged:** the decision RPCs still evaluate in-RPC.
+    - **Still open:** institution removal (packet 2b-2b); retry-on-read and evaluation after other user
+      actions (later slices).
 - **On failure** only the evaluation rolls back. The write commits, `evaluated_version` stays behind
   `input_version`, `last_error_code` records a sanitized code, and the backend retries after commit
   and on the next sync. **A failed evaluation never blocks the sync and never leaves a stale state
