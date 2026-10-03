@@ -16,17 +16,25 @@ import { env } from '../config/env';
  *   change committed afterwards (a concurrent sync of another item, a user action) bumps the version
  *   and makes the states unreadable again until the next evaluation. It is NOT a guarantee that
  *   matching is fresh "after this sync", and nothing reports it as one.
- * - every other outcome: the user's states stay (or become) stale. Readers never see stale states as
- *   fresh — that is enforced by the version mechanism in the database, not by this call. The next
- *   successful sync tries again; there is no retry loop here and no background recovery (retry-on-read
- *   and evaluation after other user actions are later Phase B work).
+ * - every other outcome: THIS call is not known to have published fresh states. It says nothing more
+ *   about freshness:
+ *     - a timed-out or unanswered request has an UNKNOWN server outcome: the evaluation may still finish
+ *       and publish after the client stopped waiting;
+ *     - a failed evaluation publishes nothing, so the user's freshness is whatever it already was
+ *       (stale if an input changed since the last publication, still fresh if none did).
+ *   Freshness is decided only by the versions stored in the database, as read through
+ *   get_card_payment_states. It is never decided by this outcome, and no caller may use this outcome to
+ *   authorize figures. Readers never see stale states as fresh. The next successful sync tries again;
+ *   there is no retry loop here and no background recovery (retry-on-read and evaluation after other
+ *   user actions are later Phase B work).
  *
  * Disabled (the default: `CARD_PAYMENT_SYNC_EVALUATION_ENABLED` is not "true", compared case-insensitively
  * with surrounding whitespace ignored): no RPC call at all, so no Phase B database object is required.
  *
- * Frequency: one call per successful item sync. A manual sync of a user with K items runs K item syncs in
- * turn, so it makes K whole-user evaluations. Each one is invalidated by the next item's batch, and only the
- * last can leave the user fresh.
+ * Frequency: one call per successful item sync, including one with an empty batch. A manual sync of a
+ * user with K items runs K item syncs in turn, so it makes K whole-user evaluations. A later item's batch
+ * that changes a matching input invalidates the earlier evaluation; one that changes none (an empty
+ * batch, for example) does not. Whether the user ends fresh depends only on the stored versions.
  *
  * The call never throws: false results, returned PostgREST errors, a missing function, rejected
  * requests, timeouts and unexpected responses all resolve to an outcome and a sanitized log line (an
@@ -47,8 +55,9 @@ import { env } from '../config/env';
  * - **Headroom:** 10 s is about 30× the 20k-row time, leaving room for network latency and a cold
  *   cache. Real users are far smaller today (221 transactions in the last 12 months at the 2026-09-26
  *   audit).
- * - **What it bounds:** only how long one sync can be held up by a slow or hung evaluation. A timeout
- *   leaves the user stale, never wrong.
+ * - **What it bounds:** only how long one sync waits for an evaluation. It does not bound the
+ *   server-side evaluation, and a timeout says nothing about freshness: the evaluation may still
+ *   complete. Reads stay correct either way, because states are served only when the versions match.
  */
 export const CARD_PAYMENT_EVALUATION_TIMEOUT_MS = 10_000;
 
@@ -57,8 +66,9 @@ export type CardPaymentEvaluationOutcome =
   | 'disabled'
   /** The RPC returned true: an evaluation committed. */
   | 'evaluated'
-  /** The RPC returned false: the evaluation failed and rolled back alone; the database recorded a
-   *  sanitized SQLSTATE in card_payment_eval_versions.last_error_code. */
+  /** The RPC returned false: the evaluation failed and rolled back alone. The database records a
+   *  sanitized SQLSTATE in card_payment_eval_versions.last_error_code on a best-effort basis; that row is
+   *  not guaranteed (for example, for a user being deleted). */
   | 'evaluation_failed'
   /** The flag is on but the database has no try_evaluate_card_payments: a configuration/dependency
    *  problem (the Phase B migrations are not applied), not an evaluation failure. */
@@ -67,8 +77,8 @@ export type CardPaymentEvaluationOutcome =
   | 'rpc_error'
   /** The request was abandoned after the timeout (outcome on the server unknown). */
   | 'timeout'
-  /** The request never got a response: a network failure (the installed postgrest-js resolves it as an
-   *  error with HTTP status 0 and no code), or a value thrown by the client. */
+  /** The client returned no usable evaluation result, and the timeout had not aborted the request: it resolved
+   *  an error with HTTP status 0 and no code, or it threw. Whether the server executed the request is not established. */
   | 'request_failed'
   /** A response that is neither true nor false. */
   | 'unexpected_response';
@@ -103,15 +113,15 @@ export async function evaluateCardPaymentsAfterSync(
     if (error) {
       const code = errorCode(error);
       if (signal.aborted) {
-        console.warn('Card-payment matching evaluation timed out after sync; matching stays stale until a later evaluation', {
+        console.warn('Card-payment matching evaluation timed out after sync; the server outcome is unknown (it may still complete)', {
           outcome: 'timeout',
           timeoutMs,
         });
         return 'timeout';
       }
       if (status === 0 && code === undefined) {
-        // postgrest-js reports a fetch that never reached the server (without throwOnError) this way.
-        console.warn('Card-payment matching evaluation request failed after sync; matching stays stale', {
+        // The client returned no usable evaluation result (status 0, no error code); this does not establish whether the server executed the request.
+        console.warn('Card-payment matching evaluation request failed after sync; no usable evaluation result was obtained (server outcome unconfirmed)', {
           outcome: 'request_failed',
           errorName: 'FetchError',
         });
@@ -125,7 +135,7 @@ export async function evaluateCardPaymentsAfterSync(
         );
         return 'rpc_missing';
       }
-      console.warn('Card-payment matching evaluation request returned an error after sync; matching stays stale', {
+      console.warn('Card-payment matching evaluation request returned an error after sync; no evaluation result was received', {
         outcome: 'rpc_error',
         code: code ?? 'none',
       });
@@ -134,7 +144,7 @@ export async function evaluateCardPaymentsAfterSync(
     if (data === true) return 'evaluated';
     if (data === false) {
       console.warn(
-        'Card-payment matching evaluation failed after sync (rolled back alone; the database recorded its SQLSTATE); matching stays stale',
+        'Card-payment matching evaluation failed after sync (rolled back alone; error bookkeeping is best-effort); this attempt published nothing',
         { outcome: 'evaluation_failed' }
       );
       return 'evaluation_failed';
@@ -146,13 +156,13 @@ export async function evaluateCardPaymentsAfterSync(
     return 'unexpected_response';
   } catch (err) {
     if (signal?.aborted) {
-      console.warn('Card-payment matching evaluation timed out after sync; matching stays stale until a later evaluation', {
+      console.warn('Card-payment matching evaluation timed out after sync; the server outcome is unknown (it may still complete)', {
         outcome: 'timeout',
         timeoutMs,
       });
       return 'timeout';
     }
-    console.warn('Card-payment matching evaluation request failed after sync; matching stays stale', {
+    console.warn('Card-payment matching evaluation request failed after sync; no usable evaluation result was obtained (server outcome unconfirmed)', {
       outcome: 'request_failed',
       errorName: errorName(err),
     });

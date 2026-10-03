@@ -682,7 +682,8 @@ fixed in this commit:
    wrapper raised and aborted the caller's transaction — contrary to its documented contract (§3.7,
    §8: a failed evaluation never blocks the write).
    - **Fix:** the bookkeeping now runs in its own subtransaction and is best-effort. If it cannot be
-     recorded the user simply stays stale.
+     recorded, no error row is written and nothing else changes: freshness stays whatever the stored
+     versions say (a stale user stays stale).
    - **Regression test** (written first, and confirmed failing with the foreign-key error before the
      fix): the end of `a10_card_payment_evaluator.sql`. A write followed by `try_evaluate` for an
      unknown user must return false, the write must commit, and no version row may be invented.
@@ -997,9 +998,11 @@ configuration change or deployment.
   - The result is not returned, and the sync response is unchanged.
   - The function's doc comment now states the real failure boundaries (below).
 - **Frequency:** once per successful **item** sync. A manual sync of a user with K items
-  (`plaidController.syncTransactions` loops over them) makes K whole-user evaluations. Each is
-  invalidated by the next item's batch, and only the last can leave the user fresh. Each evaluation is
-  bounded by the 10 s timeout. This matches the agreed design; it is listed under limitations.
+  (`plaidController.syncTransactions` loops over them) makes K whole-user evaluations. A later item's
+  batch that changes a matching input invalidates the earlier evaluation; one that changes none (an
+  empty batch, for example) does not. The 10 s timeout bounds how long the sync waits for each
+  evaluation, not the server-side evaluation itself. This matches the agreed design; it is listed under
+  limitations.
 
 **Failure and recovery contract (as implemented and tested):**
 - **The sync is not atomic.** Each step commits on its own, and a later failure leaves earlier commits
@@ -1109,8 +1112,10 @@ Times are medians of 6:
 | 100 | 70 ms | 78 ms | 77 ms |
 | 1,000 | 125 ms | 170 ms | 169 ms |
 
-**The timeout:** 10 s, about 35× the 20k-row evaluation. It only bounds how long one sync can be held
-up; a timeout leaves the user stale, never wrong.
+**The timeout:** 10 s, about 35× the 20k-row evaluation. It only bounds how long one sync waits. A
+timeout stops the client waiting and says nothing about freshness: the server-side evaluation may still
+complete and publish. Reads stay correct either way, because states are served only when the stored
+versions match.
 
 **Material finding — reported, not acted on (decision 3):**
 - **The slice 2a matching-invalidation triggers exceed the threshold on a 5k-row batch:** +56% for

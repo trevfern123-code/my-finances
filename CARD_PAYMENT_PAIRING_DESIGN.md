@@ -431,8 +431,8 @@ holds, while that writer waits on L2 for its own bump. That is a cycle.
 
 **Steps** — publishing exactly the evaluated version:
 1. **Require READ COMMITTED.** If `transaction_isolation` is anything else, raise. The subtransaction
-   fails, the user stays stale, and that is safe. Under REPEATABLE READ the snapshot could predate the
-   version it reads.
+   fails and publishes nothing, so freshness is unchanged (a stale user stays stale), and that is safe.
+   Under REPEATABLE READ the snapshot could predate the version it reads.
 2. **Take L1.**
 3. **Take L2 and read the version:** `select input_version into v … for update`, creating the row
    first if it is missing. Then clear this user's bump-coalescing marker, so any input this transaction
@@ -464,9 +464,18 @@ holds, while that writer waits on L2 for its own bump. That is a cycle.
     - **Gated:** it runs only behind the default-off server flag `CARD_PAYMENT_SYNC_EVALUATION_ENABLED`
       (only "true", case-insensitive and trimmed, enables it).
     - **Cost:** the states are unreadable (`fresh = false`, no states; `updating` once the read
-      protocol exists) while a sync is between steps, after a sync that failed before reaching the
-      evaluation (before or after its cursor advanced), and after an evaluation that failed or timed out.
-      A sync of a user with several items evaluates once per item; only the last can leave the user fresh.
+      protocol exists) whenever a matching input has changed since the last publication. That covers:
+      - a sync that is between steps;
+      - a sync that failed before reaching the evaluation (before or after its cursor advanced);
+      - a failed evaluation, which publishes nothing.
+
+      Two qualifications:
+      - **A timed-out request has an unknown server outcome.** The timeout stops the client waiting.
+        The evaluation may still complete and publish, or fail and roll back. Freshness is whatever the
+        stored versions say.
+      - **A sync of a user with several items evaluates once per item.** A later item's batch that
+        changes a matching input invalidates the earlier evaluation; one that changes none (an empty
+        batch, for example) does not.
     - **Recovery:** the next successful sync evaluates again, even one with an empty batch. On the sync path
       that is the only retry for now: the "retries after commit" of the bullet below is not built for it
       (retry-on-read is later work).
@@ -919,7 +928,8 @@ future review path that does not make the user guess; it is not built.
     - one still uncommitted when L2 is granted is neither, and leaves the user stale after commit;
     - an input written in the same transaction after step 3 leaves `input_version > evaluated_version`;
     - `evaluated_version` always equals the `v` read under L2;
-    - evaluation under REPEATABLE READ raises inside the subtransaction and leaves the user stale.
+    - evaluation under REPEATABLE READ raises inside the subtransaction and publishes nothing (a stale
+      user stays stale).
 16b. **The evaluator never deadlocks:** a lock-free transaction delete or update (holding L3,
     waiting on L2) runs concurrently with the evaluator 50 times. The evaluator never waits on L3,
     both complete, and no deadlock is reported. The derived tables have no FK to data rows.
