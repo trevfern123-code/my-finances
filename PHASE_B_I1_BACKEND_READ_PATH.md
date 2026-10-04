@@ -59,7 +59,7 @@ The matching state is read inside the snapshot, so fresh states describe exactly
 
 ### Levels
 
-- **Below API level 2** (every released bundle): exactly today's body, from the frozen reads. No snapshot is read and no semantic failure can occur. The drill-down endpoint answers 404.
+- **Below API level 2** (every released bundle): exactly today's body, from the frozen reads. A frozen read that fits one response uses the single legacy request. A range beyond one response uses the snapshot function's legacy projection, so level 1 is not independent of that function; if completeness cannot be established, the request fails closed rather than returning a truncated total (§2). No role-aware calculation runs, no card state is requested and no semantic failure can occur. The drill-down endpoint answers 404.
 - **Level 2:** frozen and role-aware fields are computed from the same snapshot rows. `API_LEVEL` stays 1 and `MIN_CLIENT_API_LEVEL` stays 0.
 
 ### Statuses
@@ -150,7 +150,7 @@ The total is the signed net of those legs as credits to the card: a payment into
 |---|---|---|
 | 1 | `unavailable` stays distinct from `updating` | Separate status; both withhold figures |
 | 2 | Backend API level stays 1; every semantic surface is level-2 opt-in, including the drill-down endpoint | Level gate on all four endpoints; 404 for the drill-down below level 2 |
-| 4 | Level-1 keeps frozen behaviour; level-2 fails closed | No snapshot and no semantic failure below level 2 |
+| 4 | Level-1 keeps frozen behaviour; level-2 fails closed | No role-aware calculation, card-state request or semantic failure below level 2. A level-1 range beyond one response uses the snapshot function's legacy projection, else fails closed (§2) |
 | 5 | Budget split mismatch: HTTP 200, list and frozen fields kept, result refused, every new figure withheld | `semantic_status: refused` |
 | 7 | Unresolved credit-side legs are never "externally funded" | `card_payments_unresolved_credit` |
 | 8 | Retry-on-read stays out of I1 | The read path never evaluates |
