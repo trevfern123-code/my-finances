@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
+import { AggregateSnapshotUnavailableError, fetchAllPages } from './fetchAllPages';
+import { readFinancialSnapshot, type FinancialSnapshot } from './financialSnapshot';
 import { STATUS_TRANSITIONS, SYNCABLE_ITEM_STATUSES, type ItemStatusTransition } from './itemStatus';
 import { classifyRowLevel, CURRENT_CLASSIFIER_VERSION, type SemanticRole } from './transactionClassifier';
 import { buildLoanDeletionReclassifyPayload, type LinkedTransactionClassifierInputs } from './loanDeletionReclassify';
@@ -826,20 +828,39 @@ export async function getNetWorthHistory(
    *  the reporting-range presets that deliberately include the current in-progress period. */
   untilDate?: string
 ): Promise<{ date: string; net_worth: number; total_assets: number; total_liabilities: number }[]> {
-  let query = supabaseAdmin
-    .from('net_worth_snapshots')
-    .select('date, net_worth, total_assets, total_liabilities')
-    .eq('user_id', userId)
-    .gte('date', sinceDate);
-  if (untilDate) query = query.lt('date', untilDate);
+  type Row = { date: string; net_worth: number; total_assets: number; total_liabilities: number };
+  const filtered = () => {
+    let query = supabaseAdmin
+      .from('net_worth_snapshots')
+      .select('date, net_worth, total_assets, total_liabilities', { count: 'exact' })
+      .eq('user_id', userId)
+      .gte('date', sinceDate);
+    if (untilDate) query = query.lt('date', untilDate);
+    return query;
+  };
 
-  const { data, error } = await query.order('date', { ascending: true });
+  // One request, as before, proven complete by its exact count.
+  const first = await readCompleteOrNull<Row>('Failed to load net worth history', filtered().order('date', { ascending: true }));
+  if (first !== null) return first;
 
-  if (error) throw new Error(`Failed to load net worth history: ${error.message}`);
-  return data;
+  // More snapshots than one response holds. Each row is an independent fact — one per date, never
+  // replaced by a row with another key — so keyset pages cannot double count or mix states.
+  return fetchAllPages<Row, string>({
+    label: 'net worth history',
+    keyOf: (row) => row.date,
+    compareKeys: (a, b) => (a < b ? -1 : a > b ? 1 : 0),
+    fetchPage: async (after, limit) => {
+      let query = filtered();
+      if (after !== null) query = query.gt('date', after);
+
+      const { data, error } = await query.order('date', { ascending: true }).limit(limit);
+
+      if (error) throw new Error(`Failed to load net worth history: ${error.message}`);
+      return (data ?? []) as Row[];
+    },
+  });
 }
 
-/** Inserts new accounts and updates existing ones (by plaid_account_id) for a Plaid item — used both at initial link and on balance refresh. */
 export async function upsertAccountsForItem(
   itemRowId: string,
   plaidAccounts: AccountBase[]
@@ -1399,10 +1420,47 @@ export async function getTransactionItemForUser(userId: string, transactionId: s
   return data;
 }
 
+// ---- Coherent, complete aggregate reads (Financial Semantics Phase B, slice I1) -------------------
+//
+// A published aggregate must be computed from ONE coherent financial state and must never be silently
+// truncated. PostgREST caps a response at its `max-rows` setting, and several requests are several
+// committed database states — a pending row from one and the posted row that replaced it from the
+// next would both be counted. So the frozen (sign-based) reads below are ONE statement:
+//
+//   1. the same single request as before, now asking for the exact row count. The count is computed
+//      by the same statement as the rows, so when it equals the rows returned the read is complete,
+//      and it is one snapshot — exactly the pre-existing behaviour, with completeness proven;
+//   2. when the range does not fit one response, `get_financial_read_snapshot` (one statement, one
+//      snapshot, not subject to the row cap);
+//   3. when that function cannot be used, the read FAILS (`AggregateSnapshotUnavailableError`). It is
+//      never truncated and never paged across snapshots.
+
+/** The rows of a single request made with `{ count: 'exact' }`, or null when the response did not
+ *  hold every matching row. A missing count is a failure: completeness would be unproven. */
+async function readCompleteOrNull<Row>(
+  failure: string,
+  query: PromiseLike<{ data: unknown; error: { message: string } | null; count?: number | null }>
+): Promise<Row[] | null> {
+  const { data, error, count } = await query;
+  if (error) throw new Error(`${failure}: ${error.message}`);
+  const rows = (data ?? []) as Row[];
+  if (typeof count !== 'number') {
+    throw new Error(`${failure}: the row count was not returned, so the read cannot be shown to be complete`);
+  }
+  return count === rows.length ? rows : null;
+}
+
+/** The snapshot a frozen aggregate falls back to when its range exceeds one response. */
+async function readLegacySnapshot(label: string, userId: string, range: { start: string; end?: string }, splits: boolean): Promise<FinancialSnapshot> {
+  const read = await readFinancialSnapshot(userId, { rows: range, splits });
+  if (read.kind === 'unavailable') throw new AggregateSnapshotUnavailableError(label, read.reason);
+  return read.snapshot;
+}
+
 /** Excludes transactions on an account flagged exclude_from_cash_flow — feeds Monthly
  *  Spending/Cash Flow Pace/Savings Rate, all personal cash-flow aggregates. The individual
  *  transactions still appear in the main feed (getRecentTransactionsForUser), which deliberately
- *  has no such filter. */
+ *  has no such filter. Complete and from one database snapshot (see the note above). */
 export async function getTransactionsSince(
   userId: string,
   sinceDate: string,
@@ -1412,16 +1470,20 @@ export async function getTransactionsSince(
 ): Promise<{ amount: number; date: string }[]> {
   let query = supabaseAdmin
     .from('transactions')
-    .select('amount, date, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))')
+    .select('amount, date, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))', { count: 'exact' })
     .eq('accounts.plaid_items.user_id', userId)
     .eq('accounts.exclude_from_cash_flow', false)
     .gte('date', sinceDate);
   if (untilDate) query = query.lt('date', untilDate);
 
-  const { data, error } = await query.order('date', { ascending: true });
+  const rows = await readCompleteOrNull<{ amount: number; date: string }>(
+    'Failed to load transaction history',
+    query.order('date', { ascending: true }).order('id', { ascending: true })
+  );
+  if (rows !== null) return rows.map((row) => ({ amount: row.amount, date: row.date }));
 
-  if (error) throw new Error(`Failed to load transaction history: ${error.message}`);
-  return data;
+  const snapshot = await readLegacySnapshot('transaction history', userId, { start: sinceDate, end: untilDate }, false);
+  return snapshot.transactions.map((row) => ({ amount: row.amount, date: row.date }));
 }
 
 /** Like getTransactionsSince, but also includes Plaid's own category — for the monthly
@@ -1434,16 +1496,20 @@ export async function getCategorizedTransactionsSince(
 ): Promise<{ amount: number; date: string; category: string | null }[]> {
   let query = supabaseAdmin
     .from('transactions')
-    .select('amount, date, category, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))')
+    .select('amount, date, category, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))', { count: 'exact' })
     .eq('accounts.plaid_items.user_id', userId)
     .eq('accounts.exclude_from_cash_flow', false)
     .gte('date', sinceDate);
   if (untilDate) query = query.lt('date', untilDate);
 
-  const { data, error } = await query.order('date', { ascending: true });
+  const rows = await readCompleteOrNull<{ amount: number; date: string; category: string | null }>(
+    'Failed to load categorized transaction history',
+    query.order('date', { ascending: true }).order('id', { ascending: true })
+  );
+  if (rows !== null) return rows.map((row) => ({ amount: row.amount, date: row.date, category: row.category }));
 
-  if (error) throw new Error(`Failed to load categorized transaction history: ${error.message}`);
-  return data;
+  const snapshot = await readLegacySnapshot('categorized transaction history', userId, { start: sinceDate, end: untilDate }, false);
+  return snapshot.transactions.map((row) => ({ amount: row.amount, date: row.date, category: row.category }));
 }
 
 /** Returns the owning user_id for a transaction (via accounts -> plaid_items), or null if it doesn't exist. */
@@ -2304,45 +2370,66 @@ export async function listBudgetCategories(userId: string): Promise<BudgetCatego
  *  instead of its own budget_category_id/amount — the splits are the source of truth for how a
  *  split transaction's amount is categorized, so its own row is dropped entirely to avoid
  *  double-counting. */
+/**
+ * The frozen per-category spend rows of a set of transactions and their splits: a transaction with
+ * one or more splits contributes its split rows INSTEAD of its own budget_category_id/amount. The one
+ * definition of that rule — used for the two-request read below and for a coherent snapshot alike.
+ */
+export function categorySpendRowsOf(
+  transactions: { id: string; budget_category_id: string | null; amount: number }[],
+  splits: { transaction_id: string; budget_category_id: string; amount: number }[]
+): { budget_category_id: string | null; amount: number }[] {
+  const splitTransactionIds = new Set(splits.map((s) => s.transaction_id));
+  return [
+    ...transactions.filter((t) => !splitTransactionIds.has(t.id)).map((t) => ({ budget_category_id: t.budget_category_id, amount: t.amount })),
+    ...splits.map((s) => ({ budget_category_id: s.budget_category_id, amount: s.amount })),
+  ];
+}
+
 export async function getCategorySpendRows(
   userId: string,
   range: { start: string; end: string }
 ): Promise<{ budget_category_id: string | null; amount: number }[]> {
-  const { data: transactions, error: txnError } = await supabaseAdmin
-    .from('transactions')
-    .select('id, budget_category_id, amount, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))')
-    .eq('accounts.plaid_items.user_id', userId)
-    .eq('accounts.exclude_from_cash_flow', false)
-    .gte('date', range.start)
-    .lt('date', range.end);
+  // The two requests main has always made: transactions, then their splits. Each is now proven
+  // complete by its exact count. (They are still two statements — the pre-existing exposure of this
+  // frozen read, documented and unchanged in I1. A level-2 request reads both in one snapshot.)
+  const transactions = await readCompleteOrNull<{ id: string; budget_category_id: string | null; amount: number }>(
+    'Failed to load category spend',
+    supabaseAdmin
+      .from('transactions')
+      .select('id, budget_category_id, amount, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id))', { count: 'exact' })
+      .eq('accounts.plaid_items.user_id', userId)
+      .eq('accounts.exclude_from_cash_flow', false)
+      .gte('date', range.start)
+      .lt('date', range.end)
+      .order('date', { ascending: true })
+      .order('id', { ascending: true })
+  );
 
-  if (txnError) throw new Error(`Failed to load category spend: ${txnError.message}`);
+  const splits =
+    transactions === null
+      ? null
+      : await readCompleteOrNull<{ transaction_id: string; budget_category_id: string; amount: number }>(
+          'Failed to load split spend',
+          supabaseAdmin
+            .from('transaction_splits')
+            .select(
+              'transaction_id, budget_category_id, amount, transactions!inner(date, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id)))',
+              { count: 'exact' }
+            )
+            .eq('transactions.accounts.plaid_items.user_id', userId)
+            .eq('transactions.accounts.exclude_from_cash_flow', false)
+            .gte('transactions.date', range.start)
+            .lt('transactions.date', range.end)
+            .order('transaction_id', { ascending: true })
+            .order('id', { ascending: true })
+        );
 
-  const { data: splits, error: splitError } = await supabaseAdmin
-    .from('transaction_splits')
-    .select(
-      'transaction_id, budget_category_id, amount, transactions!inner(date, accounts!inner(exclude_from_cash_flow, plaid_items!inner(user_id)))'
-    )
-    .eq('transactions.accounts.plaid_items.user_id', userId)
-    .eq('transactions.accounts.exclude_from_cash_flow', false)
-    .gte('transactions.date', range.start)
-    .lt('transactions.date', range.end);
+  if (transactions !== null && splits !== null) return categorySpendRowsOf(transactions, splits);
 
-  if (splitError) throw new Error(`Failed to load split spend: ${splitError.message}`);
-
-  const splitRows = splits as unknown as { transaction_id: string; budget_category_id: string; amount: number }[];
-  const splitTransactionIds = new Set(splitRows.map((s) => s.transaction_id));
-
-  const unsplitTransactionRows = (
-    transactions as unknown as { id: string; budget_category_id: string | null; amount: number }[]
-  )
-    .filter((t) => !splitTransactionIds.has(t.id))
-    .map((t) => ({ budget_category_id: t.budget_category_id, amount: t.amount }));
-
-  return [
-    ...unsplitTransactionRows,
-    ...splitRows.map((s) => ({ budget_category_id: s.budget_category_id, amount: s.amount })),
-  ];
+  // Either read exceeds one response: one coherent snapshot of both, never pages.
+  const snapshot = await readLegacySnapshot('category spend', userId, range, true);
+  return categorySpendRowsOf(snapshot.transactions, snapshot.splits ?? []);
 }
 
 export async function createBudgetCategory(

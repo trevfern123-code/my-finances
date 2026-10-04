@@ -1180,13 +1180,16 @@ describe('applyTransactionChanges', () => {
 
 describe('getCategorySpendRows', () => {
   const range = { start: '2026-08-01', end: '2026-09-01' };
+  // Each of the two reads asks for its exact row count: equal to the rows returned, it proves the read
+  // complete (one statement, never paged).
 
   it("uses a transaction's own budget_category_id/amount when it has no splits", async () => {
     const transactionsQuery = createQueryBuilder({
       data: [{ id: 'txn-1', budget_category_id: 'cat-a', amount: 25 }],
       error: null,
+      count: 1,
     });
-    const splitsQuery = createQueryBuilder({ data: [], error: null });
+    const splitsQuery = createQueryBuilder({ data: [], error: null, count: 0 });
     mockFrom.mockReturnValueOnce(transactionsQuery).mockReturnValueOnce(splitsQuery);
 
     const result = await getCategorySpendRows('user-1', range);
@@ -1201,6 +1204,7 @@ describe('getCategorySpendRows', () => {
         { id: 'txn-2', budget_category_id: 'cat-b', amount: 10 },
       ],
       error: null,
+      count: 2,
     });
     const splitsQuery = createQueryBuilder({
       data: [
@@ -1208,6 +1212,7 @@ describe('getCategorySpendRows', () => {
         { transaction_id: 'txn-1', budget_category_id: 'cat-groceries', amount: 20 },
       ],
       error: null,
+      count: 2,
     });
     mockFrom.mockReturnValueOnce(transactionsQuery).mockReturnValueOnce(splitsQuery);
 
@@ -2302,7 +2307,7 @@ describe('getRecurringStreamsForUser', () => {
 
 describe('getTransactionsSince', () => {
   it('queries only a lower bound when untilDate is omitted, matching the pre-existing open-ended behavior', async () => {
-    const query = createQueryBuilder({ data: [], error: null });
+    const query = createQueryBuilder({ data: [], error: null, count: 0 });
     mockFrom.mockReturnValueOnce(query);
 
     await getTransactionsSince('user-1', '2026-03-01');
@@ -2312,7 +2317,7 @@ describe('getTransactionsSince', () => {
   });
 
   it('also applies an exclusive upper bound when untilDate is given', async () => {
-    const query = createQueryBuilder({ data: [], error: null });
+    const query = createQueryBuilder({ data: [], error: null, count: 0 });
     mockFrom.mockReturnValueOnce(query);
 
     await getTransactionsSince('user-1', '2026-07-01', '2026-08-01');

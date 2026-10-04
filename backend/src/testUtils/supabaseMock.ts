@@ -4,9 +4,10 @@ import { vi } from 'vitest';
  * A minimal fake for supabase-js's chainable query builder. Every filter/modifier method
  * returns the same builder (so `.from().select().eq().eq()` chains work), and the builder
  * itself is thenable — awaiting it (with or without a trailing `.single()`/`.maybeSingle()`)
- * resolves to the given `{ data, error }`, matching how the real client behaves.
+ * resolves to the given `{ data, error }`, matching how the real client behaves. `count` is what a
+ * query made with `{ count: 'exact' }` returns beside its rows.
  */
-export function createQueryBuilder(result: { data: unknown; error: unknown }) {
+export function createQueryBuilder(result: { data: unknown; error: unknown; count?: number | null }) {
   const builder: Record<string, unknown> = {};
   const chainMethods = [
     'select',
