@@ -120,13 +120,15 @@ describe('fetchAllPages — complete results beyond the server response limit', 
       principalPortion: null,
     });
     const accounts = [{ id: 'acct', type: 'depository', excludeFromCashFlow: false }];
+    // None of these rows is a card payment, so no stored card-payment state is needed.
+    const cardPayments = { legs: [], supersededTransactionIds: [] };
 
     const paged = await fetchTransactions(fakeServer(data, ['date', 'id'], 1000));
-    expect(aggregateCashFlow({ accounts, transactions: paged.map(toAggregationRow) }).spending).toBe(trueTotal);
+    expect(aggregateCashFlow({ accounts, transactions: paged.map(toAggregationRow), cardPayments }).spending).toBe(trueTotal);
 
     const singleRequest = fakeServer(data, ['date', 'id'], 1000).query(null, 100000);
     expect(singleRequest).toHaveLength(1000);
-    expect(aggregateCashFlow({ accounts, transactions: singleRequest.map(toAggregationRow) }).spending).toBeLessThan(trueTotal);
+    expect(aggregateCashFlow({ accounts, transactions: singleRequest.map(toAggregationRow), cardPayments }).spending).toBeLessThan(trueTotal);
   });
 
   it('1 200 splits keyed (transaction_id, id), several per transaction straddling page boundaries', async () => {

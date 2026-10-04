@@ -851,6 +851,10 @@ pure module that produces the totals:
 
 ### 7.4 Every aggregate fetch pages internally (I7)
 
+> **Amended for integration slice I1 (Trevor, 2026-10-03) — see §14.** Paging is replaced by
+> single-statement reads: an aggregate must come from one coherent database state *and* must not be
+> truncated. The text below is kept as written for history.
+
 Supabase/PostgREST returns at most 1 000 rows per request by default (`max-rows`), and
 `getTransactionsSince`, `getCategorizedTransactionsSince`, `getCategorySpendRows` (both queries) and
 `getNetWorthHistory` use no `.range()`/keyset — a 12-month range with more than 1 000 transactions
@@ -1078,6 +1082,8 @@ Spending = 50 + 75 = 125; 5a has no card leg → **untracked card outflow 900**;
 UI shows "Card payments to a card that isn't linked: $900 — link the card to see that spending". The
 "Chase card payment" stream is now a **bill** (nothing covers it). Cash did not vanish.
 
+*(Amended for I1, 2026-10-03 — §14: 5b is reported as an unresolved card credit of 900, not as
+externally funded; every other figure of this variant is unchanged.)*
 **Externally funded variant:** delete account C instead (rows 1, 4a, 5a, 6, 7, 9 disappear). 5b has
 no payer leg → **externally funded inflow 900**, excluded from Income and Cash flow. 4b has lost its
 counterpart too, so it is no longer `account_pair_match`: it falls back to `income` /
@@ -1591,3 +1597,37 @@ columns and ±`PAIRING_PAD_DAYS` padding; the new response fields (§5, §6.1) b
 effects endpoint; recurring-stream merging (§4.8); the Phase B migration (`set_transaction_role_override`,
 replaced `replace_transaction_splits`, index); `PATCH /role`; feed pagination; frontend; preflight,
 the Phase A backfill (release gate) and release.
+
+**Integration slice I1 (2026-10-03; implementation candidate pending independent re-review, nothing
+merged or released):** `PHASE_B_I1_BACKEND_READ_PATH.md`. It supersedes these statements above for
+that candidate only:
+- the aggregate reads are complete and coherent — one statement each (the §7.4 amendment below), with
+  the role columns;
+- `semanticAggregation.ts` reads card-payment legs from stored states and no longer pairs them
+  itself, so the three `it.fails` tests are plain tests;
+- the new response fields (§5, §6.1) and the effects endpoint (§7.3) exist, served only to a client
+  that declares API level 2. `API_LEVEL` itself is not raised.
+
+Still not built: everything else in the "Planned" list above, retry-on-read, and the frontend.
+
+**Amendments decided by Trevor for I1 (2026-10-03).** They change the text they name; nothing else:
+- **§7.4.** The rule is now: *a published aggregate must be computed from one coherent financial
+  state and must never be silently truncated.* Keyset paging met the second half but not the first —
+  pages are separate database states, so a pending row and the posted row that replaced it could both
+  be counted. Each aggregate read is therefore ONE statement: a single request proven complete by its
+  exact row count, or the additive function `get_financial_read_snapshot` (migration
+  `20261004120000`), limited to 10 000 transactions and 25 000 splits and failing with
+  `aggregate_too_large` beyond that. `fetchAllPages` remains only for net-worth snapshots, whose rows
+  are independent.
+- **§4.1 and §9.1, credit-side legs.** A credit-side card leg whose stored state is `unresolved` is no
+  longer "externally funded" or "reversed externally": nothing establishes its source of funds. It is
+  reported under `card_payments_unresolved_credit` ("Unresolved card credits"), with the same zero
+  cash-flow effect. In the §9.1 "Externally funded variant", 5b is therefore an unresolved card credit
+  of 900 and `credit_card_payments_externally_funded` is 0; Income, Spending and Cash flow are as
+  written.
+- **§7.3.** The drill-down cursor carries a fingerprint of the complete result; a later page whose
+  result differs is refused with 409 `effects_restart_required`. `spending` may be requested without a
+  bucket (the summary's own total), and every published amount has a measure.
+- **§4.1 R9 and §13 Q3.** The integrity failure and the split refusal apply to level-2 requests; a
+  level-1 request keeps its frozen fields. A split mismatch on `/api/budget-categories` answers 200
+  with the category list, the frozen fields and a `refused` status, and no role-aware figure.

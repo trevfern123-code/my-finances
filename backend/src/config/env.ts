@@ -40,7 +40,9 @@ export const env = {
   // Optional, default OFF (Financial Semantics Phase B, packet 2b-2a). When "true" (case-insensitive,
   // trimmed), every successful transaction sync ends with one best-effort card-payment matching
   // evaluation for the user (services/cardPaymentEvaluation.ts). Requires the Phase B matching migrations
-  // (20260930120000 onward); nothing reads the evaluated states yet. Any other value, including
-  // "false", leaves it off, and then no matching RPC is ever called.
+  // (20260930120000 onward). Any other value, including "false", leaves it off, and then no matching
+  // evaluation is ever requested. This flag controls the evaluation only. The evaluated states are
+  // read, never written, by the role-aware read path (services/semanticReadPath.ts), which runs only
+  // for a client at API level 2 or above and is independent of this flag.
   cardPaymentSyncEvaluationEnabled: parseOptInFlag(process.env.CARD_PAYMENT_SYNC_EVALUATION_ENABLED),
 };

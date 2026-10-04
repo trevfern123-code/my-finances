@@ -600,10 +600,14 @@ describe('§6.2 / §4.2 period ranges: each leg in its own month, no cross-month
 //          (both orders), vs a lock-free writer (both orders)
 //   22     grants on the RPCs                               sql/a12_card_payment_decision_grants.sql
 //          RPC-written decisions vs this oracle             supabase/tests/card_payment_evaluator/rpc_sequences.sql
+// Covered at the application level by integration slice I1 (the backend read path). These two were
+// `it.todo` placeholders here until the work existed; they are real tests now, in the files named:
+//   14–16  §3.7 aggregation read protocol: a stale or      semanticReadPath.test.ts ("read protocol — …"),
+//          inconsistent read returns `updating`, no figures  controllers/semanticEndpoints.test.ts
+//   §5     semanticAggregation.ts consumes stored states;   semanticAggregation.test.ts ("§13 R3", "R7",
+//          its three it.fails tests are plain `it` tests     "card payments from stored states")
 describe('not covered by the pure evaluator (database / application integration)', () => {
-  it.todo('§3.7 aggregation read protocol: an inconsistent or stale read returns `updating` with no figures (14–16, application side)');
   it.todo('decision RPCs vs the role override, the account-inclusion change and LIM removal (21, remaining pairs; those writers are not built)');
   it.todo('LIM removal writes destination_removed_card before its deletes, in one transaction (18)');
-  it.todo('semanticAggregation.ts consumes stored states; its three it.fails tests flip to it (§5)');
   it.todo('frontend: reasons, actions, review list, ranges and the `updating` state (24–26)');
 });

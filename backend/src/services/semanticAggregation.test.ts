@@ -5,14 +5,21 @@ import {
   aggregateCashFlowByMonth,
   aggregateMonthlyBreakdown,
   LOAN_INTEREST_CATEGORY,
+  aggregateCashFlowDetail,
+  aggregateSpendByPlaidCategory,
+  CardPaymentStateIntegrityError,
+  CASH_FLOW_MEASURES,
   PAIRING_PAD_DAYS,
   pairingContextRange,
   SemanticAggregationIntegrityError,
+  TRANSFER_PAIR_WINDOW_DAYS,
   SplitAllocationMismatchError,
   type AggregationPeriod,
   type AggregationAccount,
   type AggregationTransaction,
   type BudgetSpend,
+  type CardLegStateInput,
+  type CashFlowTotals,
   type EffectRow,
 } from './semanticAggregation';
 import { SemanticIntegrityError } from './semanticEffects';
@@ -28,12 +35,22 @@ import {
   fixtureTransactions,
   withRow,
 } from '../testUtils/phaseBFixture';
+import { cardStatesFor, cashFlowInput, pairDecision, unlinkedDecision } from '../testUtils/cardStatesFromOracle';
+import type { MatchingDecision } from './cardPaymentMatching';
 
-// Financial Semantics Phase B, slice 1: the pure aggregation module against the canonical fixture
-// of FINANCIAL_SEMANTICS_PHASE_B_DESIGN.md §9.1. Every expected number below is the design's own.
+// Financial Semantics Phase B: the pure aggregation module against the canonical fixture of
+// FINANCIAL_SEMANTICS_PHASE_B_DESIGN.md §9.1. Every expected number below is the design's own.
+//
+// Card-payment legs are no longer paired inside the module (CARD_PAYMENT_PAIRING_DESIGN.md §5): they
+// arrive with their stored matching state. Here the states are computed by the reference evaluator
+// (`cashFlowInput` → `cardPaymentMatching.ts`), which the SQL evaluator is required to equal, so every
+// card figure below is the approved matching rule's, not slice 1's ±5-day in-module pairing.
 
-const september = (transactions: AggregationTransaction[] = fixtureTransactions(), accounts: AggregationAccount[] = fixtureAccounts()) =>
-  aggregateCashFlow({ accounts, transactions, period: SEPTEMBER });
+const september = (
+  transactions: AggregationTransaction[] = fixtureTransactions(),
+  accounts: AggregationAccount[] = fixtureAccounts(),
+  decisions: MatchingDecision[] = []
+) => aggregateCashFlow(cashFlowInput({ accounts, transactions, period: SEPTEMBER, decisions }));
 
 function sumEffectRows(rows: EffectRow[] | undefined): number {
   return Math.round((rows ?? []).reduce((s, r) => s + Math.round(r.amount * 100), 0)) / 100;
@@ -83,7 +100,7 @@ describe('aggregateCashFlow — base fixture, September (design §9.1 "Expected"
   it('cash flow is cash retained after debt service (1 827.10); savings rate adds back known principal (72.5 %)', () => {
     expect(t.cashFlow).toBe(1827.1);
     expect(t.savingsRate).toBeCloseTo((1827.1 + 350) / 3002.1, 10);
-    expect(Math.round(t.savingsRate * 1000) / 10).toBe(72.5);
+    expect(Math.round(t.savingsRate! * 1000) / 10).toBe(72.5);
   });
 
   it('the excluded account E (row 12, $999) contributes nothing', () => {
@@ -93,7 +110,7 @@ describe('aggregateCashFlow — base fixture, September (design §9.1 "Expected"
 
   it('September has no unclassified rows; August\'s row 13 is counted by its sign AND reported (R0)', () => {
     expect(t.unclassifiedCount).toBe(0);
-    const aug = aggregateCashFlow({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: AUGUST });
+    const aug = aggregateCashFlow(cashFlowInput({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: AUGUST }));
     expect(aug.spending).toBe(45);
     expect(aug.unclassifiedCount).toBe(1);
     expect(aug.unclassifiedAmount).toBe(45);
@@ -101,7 +118,7 @@ describe('aggregateCashFlow — base fixture, September (design §9.1 "Expected"
   });
 
   it('per-month view: August and September, ascending, each with its own figures', () => {
-    const months = aggregateCashFlowByMonth({ accounts: fixtureAccounts(), transactions: fixtureTransactions() });
+    const months = aggregateCashFlowByMonth(cashFlowInput({ accounts: fixtureAccounts(), transactions: fixtureTransactions() }));
     expect(months.map((m) => m.month)).toEqual(['2026-08', '2026-09']);
     expect(months[1].cashFlow).toBe(1827.1);
     expect(months[0].unclassifiedCount).toBe(1);
@@ -150,7 +167,7 @@ describe('aggregateBudgetSpend — base fixture, September (design §9.1 Budget,
 });
 
 describe('aggregateMonthlyBreakdown — base fixture (design §5 C5)', () => {
-  const [aug, sept] = aggregateMonthlyBreakdown({ accounts: fixtureAccounts(), transactions: fixtureTransactions() });
+  const [aug, sept] = aggregateMonthlyBreakdown(cashFlowInput({ accounts: fixtureAccounts(), transactions: fixtureTransactions() }));
 
   it('September by Plaid category, with manual-loan interest under LOAN_INTEREST', () => {
     expect(sept.month).toBe('2026-09');
@@ -172,7 +189,31 @@ describe('aggregateMonthlyBreakdown — base fixture (design §5 C5)', () => {
       creditCardPaymentsUntracked: 0,
       creditCardPaymentsReturnedUntracked: 0,
       debtPayments: 650,
+      cardPaymentsUnresolved: { count: 0, paymentsAmount: 0, returnsAmount: 0, byReason: {} },
     });
+  });
+
+  it('an unresolved card payment is reported in the month\'s footer, in neither card line', () => {
+    const rows = [
+      ...fixtureTransactions().filter((r) => r.id !== '5b'),
+      { ...fixtureTransactions().find((r) => r.id === '5b')!, date: '2026-09-17' }, // the card leg, 7 days late
+    ];
+    const month = aggregateMonthlyBreakdown(cashFlowInput({ accounts: fixtureAccounts(), transactions: rows })).find((m) => m.month === '2026-09')!;
+    expect(month.excluded.creditCardPaymentsTracked).toBe(0);
+    expect(month.excluded.creditCardPaymentsUntracked).toBe(0);
+    expect(month.excluded.cardPaymentsUnresolved).toEqual({ count: 1, paymentsAmount: 900, returnsAmount: 0, byReason: { possible_match: 1 } });
+    // Spending and its categories do not depend on the card payment at all.
+    expect(month.spending).toBe(525);
+  });
+
+  it('aggregateSpendByPlaidCategory gives the same buckets and rows for the period, reading no card state', () => {
+    const period = aggregateSpendByPlaidCategory({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: SEPTEMBER });
+    expect(Object.fromEntries(period.byCategory)).toEqual(Object.fromEntries(sept.byCategory));
+    expect(period.total).toBe(sept.spending);
+    for (const [category, rows] of period.effectRows) {
+      expect(rows).toEqual(sept.effectRows.get(category));
+      expect(sumEffectRows(rows)).toBe(period.byCategory.get(category));
+    }
   });
 
   it('splits are never used here: Costco stays whole under FOOD_AND_DRINK', () => {
@@ -198,11 +239,11 @@ describe('user role corrections (design §9.1 override variants)', () => {
     expect(t.spending).toBe(450);
     expect(t.transfersExternal).toBe(-75);
     expect(t.cashFlow).toBe(1827.1);
-    expect(Math.round(t.savingsRate * 1000) / 10).toBe(72.5);
+    expect(Math.round(t.savingsRate! * 1000) / 10).toBe(72.5);
 
     const budget = aggregateBudgetSpend({ accounts: fixtureAccounts(), transactions: rows, splits: fixtureSplits(), period: SEPTEMBER });
     expect(budget.unassigned).toBe(50);
-    const sept = aggregateMonthlyBreakdown({ accounts: fixtureAccounts(), transactions: rows, period: SEPTEMBER })[0];
+    const sept = aggregateMonthlyBreakdown(cashFlowInput({ accounts: fixtureAccounts(), transactions: rows, period: SEPTEMBER }))[0];
     expect(sept.byCategory.has('TRANSFER_OUT')).toBe(false);
   });
 
@@ -213,7 +254,7 @@ describe('user role corrections (design §9.1 override variants)', () => {
     expect(t.debtPayments).toBe(300);
     expect(t.knownPrincipal).toBe(0);
     expect(t.cashFlow).toBe(1827.1);
-    expect(Math.round(t.savingsRate * 1000) / 10).toBe(60.9);
+    expect(Math.round(t.savingsRate! * 1000) / 10).toBe(60.9);
   });
 
   it('#6 with an explicit debt_payment override: whole 400 is a debt payment, spending 475', () => {
@@ -270,7 +311,7 @@ describe('account exclusions and the tracked-set principle (design §4.1–§4.3
     expect(t.transfersInternal).toBe(0);
     expect(t.transfersExternal).toBe(-500);
     expect(t.cashFlow).toBe(1325);
-    expect(Math.round(t.savingsRate * 1000) / 10).toBe(55.8);
+    expect(Math.round(t.savingsRate! * 1000) / 10).toBe(55.8);
   });
 
   it('card account excluded: 5a is an untracked card outflow of 900; spending 125; cash flow 1 327.10', () => {
@@ -288,10 +329,10 @@ describe('account exclusions and the tracked-set principle (design §4.1–§4.3
     expect(t.spending).toBe(125);
     expect(t.creditCardPaymentsUntracked).toBe(900);
     expect(t.cashFlow).toBe(1327.1);
-    expect(Math.round(t.savingsRate * 1000) / 10).toBe(55.9);
+    expect(Math.round(t.savingsRate! * 1000) / 10).toBe(55.9);
   });
 
-  it('checking not linked (externally funded card payment): 5b contributes 0; 4b reclassified as income → cash flow 102.10', () => {
+  it('checking not linked: the card leg 5b is an unresolved card credit (no source of funds asserted) and contributes 0; 4b reclassified as income → cash flow 102.10', () => {
     // Per §9.1, with C gone reconciliation no longer pairs 4b: it falls back to income.
     const rows = withRow(
       fixtureTransactions().filter((r) => r.accountId !== ACCOUNT.C),
@@ -303,7 +344,10 @@ describe('account exclusions and the tracked-set principle (design §4.1–§4.3
     expect(t.income).toBe(502.1);
     expect(t.spending).toBe(400);
     expect(t.debtPayments).toBe(0);
-    expect(t.creditCardPaymentsExternallyFunded).toBe(900);
+    // Nothing establishes where the $900 came from, so it is NOT called externally funded (decided for
+    // I1; this replaces §9.1's earlier "externally funded inflow 900"). Its cash-flow effect stays 0.
+    expect(t.creditCardPaymentsExternallyFunded).toBe(0);
+    expect(t.cardPaymentsUnresolvedCredit).toBe(900);
     expect(t.cashFlow).toBe(102.1);
   });
 
@@ -343,39 +387,59 @@ describe('card-payment pairing edge cases (design §4.3, §9.1 "Pairing edge cas
     expect(t.cashFlow).toBe(1827.1);
   });
 
-  it('one payer leg with two card legs at equal distance is ambiguous: untracked, never guessed', () => {
+  it('one payer leg with two card legs at equal distance is ambiguous: unresolved — a range, never guessed', () => {
     const rows = [
       ...fixtureTransactions().filter((r) => r.id !== '5b'),
       extra('card-early', '2026-09-09', ACCOUNT.X, -900),
       extra('card-late', '2026-09-11', X2, -900),
     ];
     const t = september(rows, accountsWithX2);
+    // Neither tracked nor untracked: the destination is not established (pairing design §4.4).
     expect(t.creditCardPaymentsTracked).toBe(0);
-    expect(t.creditCardPaymentsUntracked).toBe(900);
-    expect(t.creditCardPaymentsExternallyFunded).toBe(1800);
-    expect(t.cashFlow).toBe(927.1);
+    expect(t.creditCardPaymentsUntracked).toBe(0);
+    expect(t.cardPaymentsUnresolved).toEqual({ count: 1, paymentsAmount: 900, returnsAmount: 0, byReason: { ambiguous: 1 } });
+    expect(t.creditCardPaymentsExternallyFunded).toBe(0);
+    expect(t.cardPaymentsUnresolvedCredit).toBe(1800); // the two card legs, equally unresolved
+    expect(t.cashFlow).toBeNull();
+    expect(t.savingsRate).toBeNull();
+    expect(t.cashFlowRange).toEqual({ low: 927.1, high: 1827.1 }); // if untracked … if tracked
   });
 
-  it('a payment on 09-29 whose card leg posts 10-02 is tracked in September only when the fetch is padded', () => {
+  it('a payment on 09-29 whose card leg posts 10-02 is tracked in September from its stored state, whatever was fetched', () => {
     const late = [extra('5late', '2026-09-29', ACCOUNT.C, 250), extra('5late-card', '2026-10-02', ACCOUNT.X, -250)];
-    const padded = september([...fixtureTransactions(), ...late]);
-    expect(padded.creditCardPaymentsTracked).toBe(1150);
-    expect(padded.creditCardPaymentsUntracked).toBe(0);
-    // Without the padding row the same payment would wrongly look untracked.
-    const unpadded = september([...fixtureTransactions(), late[0]]);
-    expect(unpadded.creditCardPaymentsUntracked).toBe(250);
-    expect(PAIRING_PAD_DAYS).toBeGreaterThanOrEqual(5);
+    const history = [...fixtureTransactions(), ...late];
+    const everything = september(history);
+    expect(everything.creditCardPaymentsTracked).toBe(1150);
+    expect(everything.creditCardPaymentsUntracked).toBe(0);
+    // The states are computed over the whole history in the database, so the card leg does not have
+    // to be among the fetched rows: slice 1 wrongly called this payment untracked without it.
+    const withoutCardLeg = aggregateCashFlow(
+      cashFlowInput({ accounts: fixtureAccounts(), transactions: [...fixtureTransactions(), late[0]], history, period: SEPTEMBER })
+    );
+    expect(withoutCardLeg).toEqual(everything);
   });
 
-  it('a card leg must be on a credit account: two cash-side legs never pair, and the money is counted once each way', () => {
+  it('a card leg must be on a credit account: two cash-side legs never pair — each is unresolved on its own, then counted once each way', () => {
     // 5b moved to savings: checking +900 out, savings −900 in, both labelled card payments.
     const rows = withRow(fixtureTransactions(), '5b', { accountId: ACCOUNT.S });
-    const t = september(rows);
+    const pay = rows.find((r) => r.id === '5a')!;
+    const ret = rows.find((r) => r.id === '5b')!;
+    const unconfirmed = september(rows);
+    expect(unconfirmed.creditCardPaymentsTracked).toBe(0);
+    expect(unconfirmed.creditCardPaymentsUntracked).toBe(0);
+    expect(unconfirmed.cardPaymentsUnresolved).toMatchObject({ count: 2, paymentsAmount: 900, returnsAmount: 900 });
+    expect(unconfirmed.cashFlow).toBeNull();
+    expect(unconfirmed.cashFlowRange).toEqual({ low: 927.1, high: 2727.1 });
+
+    // Confirmed one transaction at a time (no automatic "unlinked", T4): the money is counted once
+    // each way, so cash stayed within the tracked set.
+    const t = september(rows, fixtureAccounts(), [unlinkedDecision('d-pay', pay), unlinkedDecision('d-ret', ret)]);
     expect(t.creditCardPaymentsTracked).toBe(0);
     expect(t.creditCardPaymentsUntracked).toBe(900);
     expect(t.creditCardPaymentsReturnedUntracked).toBe(900);
     expect(t.creditCardPaymentsExternallyFunded).toBe(0);
-    expect(t.cashFlow).toBe(1827.1); // cash stayed within the tracked set
+    expect(t.cashFlow).toBe(1827.1);
+    expect(t.cashFlowRange).toEqual({ low: 1827.1, high: 1827.1 });
   });
 });
 
@@ -526,7 +590,7 @@ describe('split allocation mismatches refuse the budget aggregate (Trevor\'s dec
     const splits = [{ id: 'split-10a', transactionId: '10', budgetCategoryId: CATEGORY.groceries, amount: 1 }];
     expect(() => budgetFor(fixtureTransactions(), splits)).toThrow(SplitAllocationMismatchError);
     expect(september().cashFlow).toBe(1827.1);
-    expect(aggregateMonthlyBreakdown({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: SEPTEMBER })[0].spending).toBe(525);
+    expect(aggregateMonthlyBreakdown(cashFlowInput({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: SEPTEMBER }))[0].spending).toBe(525);
   });
 });
 
@@ -545,7 +609,7 @@ describe('integrity failures are never masked (R9, invariant I4)', () => {
     expect(() => aggregateBudgetSpend({ accounts: fixtureAccounts(), transactions: rows, splits: [], period: SEPTEMBER })).toThrow(
       SemanticAggregationIntegrityError
     );
-    expect(() => aggregateMonthlyBreakdown({ accounts: fixtureAccounts(), transactions: rows })).toThrow(SemanticAggregationIntegrityError);
+    expect(() => aggregateMonthlyBreakdown(cashFlowInput({ accounts: fixtureAccounts(), transactions: rows }))).toThrow(SemanticAggregationIntegrityError);
   });
 
   it('a role outside the six Phase A roles, a non-finite amount, or an unknown account is an integrity failure', () => {
@@ -559,7 +623,7 @@ describe('integrity failures are never masked (R9, invariant I4)', () => {
       ...fixtureTransactions(),
       { ...fixtureTransactions()[15], id: '13b', amount: -20, plaidCategory: 'INCOME', budgetCategoryId: null },
     ];
-    const aug = aggregateCashFlow({ accounts: fixtureAccounts(), transactions: rows, period: AUGUST });
+    const aug = aggregateCashFlow(cashFlowInput({ accounts: fixtureAccounts(), transactions: rows, period: AUGUST }));
     expect(aug.unclassifiedCount).toBe(2);
     expect(aug.unclassifiedAmount).toBe(25); // +45 purchase, −20 deposit
     expect(aug.spending).toBe(45);
@@ -611,23 +675,31 @@ const leg = (id: string, date: string, accountId: string, amount: number, role: 
 });
 
 describe('fetched-context contract: reciprocal matching needs two windows of surrounding evidence', () => {
-  it('the documented pad is two of the widest window, and pairingContextRange applies it to both ends', () => {
-    expect(PAIRING_PAD_DAYS).toBe(10);
-    expect(pairingContextRange(SEPTEMBER)).toEqual({ start: '2026-08-22', end: '2026-10-11' });
+  it('the documented pad is two transfer windows, and pairingContextRange applies it to both ends', () => {
+    // Card payments left the pad (pairing design §5): their matching runs over the whole history.
+    expect(PAIRING_PAD_DAYS).toBe(2 * TRANSFER_PAIR_WINDOW_DAYS);
+    expect(PAIRING_PAD_DAYS).toBe(6);
+    expect(pairingContextRange(SEPTEMBER)).toEqual({ start: '2026-08-26', end: '2026-10-07' });
   });
 
-  it('card: Sep 1 checking +100, Aug 28 card −100, Aug 24 checking +100 — the card leg is contested, so September stays −100', () => {
+  it('card: Sep 1 checking +100, Aug 28 card −100, Aug 24 checking +100 — the card leg is contested, so September is a range, whatever was fetched', () => {
     const rows = [
       leg('p1', '2026-09-01', ACCOUNT.C, 100, 'credit_card_payment'),
       leg('k', '2026-08-28', ACCOUNT.X, -100, 'credit_card_payment'),
       leg('p0', '2026-08-24', ACCOUNT.C, 100, 'credit_card_payment'),
     ];
     const accounts = fixtureAccounts();
-    const run = (r: AggregationTransaction[]) => aggregateCashFlow({ accounts, transactions: r, period: SEPTEMBER });
+    const run = (fetched: AggregationTransaction[]) =>
+      aggregateCashFlow(cashFlowInput({ accounts, transactions: fetched, history: rows, period: SEPTEMBER }));
 
-    expect(run(rows).cashFlow).toBe(-100); // complete evidence: k's best match is a tie → no pair
-    expect(run(fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS)).cashFlow).toBe(-100);
-    expect(run(fetchedWithPad(rows, SEPTEMBER, 5)).cashFlow).toBe(0); // the old one-window pad hides p0
+    // Complete evidence: k's best match is a tie → ambiguous. Slice 1 turned that into −100 (and, with
+    // one window of padding, into 0); the stored state keeps both possibilities.
+    for (const fetched of [rows, fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS), fetchedWithPad(rows, SEPTEMBER, 0)]) {
+      const t = run(fetched);
+      expect(t.cashFlow).toBeNull();
+      expect(t.cashFlowRange).toEqual({ low: -100, high: 0 });
+      expect(t.cardPaymentsUnresolved).toEqual({ count: 1, paymentsAmount: 100, returnsAmount: 0, byReason: { ambiguous: 1 } });
+    }
   });
 
   it('transfer: Sep 30 checking +100, Oct 3 savings −100, Oct 6 checking +100 — ambiguous reciprocal match, September stays −100', () => {
@@ -637,12 +709,12 @@ describe('fetched-context contract: reciprocal matching needs two windows of sur
       leg('t3', '2026-10-06', ACCOUNT.C, 100, 'internal_transfer'),
     ];
     const accounts = fixtureAccounts();
-    const run = (r: AggregationTransaction[]) => aggregateCashFlow({ accounts, transactions: r, period: SEPTEMBER });
+    const run = (r: AggregationTransaction[]) => aggregateCashFlow(cashFlowInput({ accounts, transactions: r, period: SEPTEMBER }));
 
     expect(run(rows).cashFlow).toBe(-100);
     expect(run(rows).transfersExternal).toBe(-100);
     expect(run(fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS)).cashFlow).toBe(-100);
-    expect(run(fetchedWithPad(rows, SEPTEMBER, 5)).cashFlow).toBe(0);
+    expect(run(fetchedWithPad(rows, SEPTEMBER, TRANSFER_PAIR_WINDOW_DAYS)).cashFlow).toBe(0); // one window hides t3
   });
 
   it('for many generated histories, the in-period result with the documented pad equals the result with complete evidence', () => {
@@ -671,10 +743,16 @@ describe('fetched-context contract: reciprocal matching needs two windows of sur
         const account = transfer ? pick(cash) : amount > 0 === random() < 0.8 ? pick(cash) : pick(credit);
         rows.push(leg(`h${history}-${i}`, day(), account, amount, transfer ? 'internal_transfer' : 'credit_card_payment'));
       }
-      const full = aggregateCashFlow({ accounts, transactions: rows, period: SEPTEMBER });
-      const documented = aggregateCashFlow({ accounts, transactions: fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS), period: SEPTEMBER });
+      // The card states always come from the whole history (`history: rows`), as in the database; only
+      // the rows fetched for the transfer pairing vary.
+      const full = aggregateCashFlow(cashFlowInput({ accounts, transactions: rows, history: rows, period: SEPTEMBER }));
+      const documented = aggregateCashFlow(
+        cashFlowInput({ accounts, transactions: fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS), history: rows, period: SEPTEMBER })
+      );
       expect(documented).toEqual(full);
-      const oneWindow = aggregateCashFlow({ accounts, transactions: fetchedWithPad(rows, SEPTEMBER, 5), period: SEPTEMBER });
+      const oneWindow = aggregateCashFlow(
+        cashFlowInput({ accounts, transactions: fetchedWithPad(rows, SEPTEMBER, TRANSFER_PAIR_WINDOW_DAYS), history: rows, period: SEPTEMBER })
+      );
       if (JSON.stringify(oneWindow) !== JSON.stringify(full)) oneWindowDiffers++;
     }
     expect(oneWindowDiffers).toBeGreaterThan(0); // the generator does reach the two-hop cases
@@ -715,24 +793,47 @@ describe('returned card payments: cash arriving in checking vs a payment into a 
     expect(t.cashFlow).toBe(2227.1);
   });
 
-  it('a return on its own (no payment in range) is cash in: +100 to cash flow, not income', () => {
-    const t = september([...fixtureTransactions(), ccp('ret-only', '2026-09-20', ACCOUNT.C, -100)]);
+  it('a return on its own is unresolved while an included card exists; once confirmed it is cash in: +100, never income', () => {
+    const ret = ccp('ret-only', '2026-09-20', ACCOUNT.C, -100);
+    const rows = [...fixtureTransactions(), ret];
+    // The user has an included card, so "it came back from a card I haven't linked" is not assumed (T4).
+    const unconfirmed = september(rows);
+    expect(unconfirmed.creditCardPaymentsReturnedUntracked).toBe(0);
+    expect(unconfirmed.cardPaymentsUnresolved).toMatchObject({ count: 1, paymentsAmount: 0, returnsAmount: 100 });
+    expect(unconfirmed.cashFlow).toBeNull();
+    expect(unconfirmed.cashFlowRange).toEqual({ low: 1827.1, high: 1927.1 });
+
+    const t = september(rows, fixtureAccounts(), [unlinkedDecision('d-ret', ret)]);
     expect(t.creditCardPaymentsReturnedUntracked).toBe(100);
     expect(t.income).toBe(3002.1);
     expect(t.cashFlow).toBe(1927.1);
   });
 
-  it('a reversal on the card whose cash side is outside the tracked set moves no tracked cash', () => {
+  it('an unmatched reversal on the card moves no tracked cash and is an unresolved card credit (negative), not "reversed externally"', () => {
     const t = september([...fixtureTransactions(), ccp('rev-x', '2026-09-16', ACCOUNT.X, 900)]);
-    expect(t.creditCardPaymentsReversedExternally).toBe(900);
+    expect(t.creditCardPaymentsReversedExternally).toBe(0);
+    expect(t.cardPaymentsUnresolvedCredit).toBe(-900); // a reversal is a negative credit to the card
     expect(t.cashFlow).toBe(1827.1);
   });
 
-  it('checking not linked: an externally funded payment into the card is still 0 (unchanged)', () => {
+  it('checking not linked: the unmatched payment into the card is still 0 in cash flow (unchanged)', () => {
     const rows = fixtureTransactions().filter((r) => r.accountId !== ACCOUNT.C);
     const t = september(rows, fixtureAccounts().filter((a) => a.id !== ACCOUNT.C));
-    expect(t.creditCardPaymentsExternallyFunded).toBe(900);
+    expect(t.creditCardPaymentsExternallyFunded).toBe(0);
+    expect(t.cardPaymentsUnresolvedCredit).toBe(900);
     expect(t.creditCardPaymentsReturnedUntracked).toBe(0);
+  });
+
+  it('a card leg ESTABLISHED as paid from outside the tracked set is externally funded; an unresolved one never is', () => {
+    // F is a cash account excluded from cash flow: its leg pairs with the card's (evidence, T5), which
+    // establishes that the card was paid from outside the tracked set.
+    const accounts = [...fixtureAccounts(), { id: 'acct-F', type: 'depository', excludeFromCashFlow: true }];
+    const rows = [ccp('f-pay', '2026-09-04', 'acct-F', 300), ccp('x-card', '2026-09-04', ACCOUNT.X, -300), ccp('x-lone', '2026-09-20', ACCOUNT.X, -70)];
+    const t = aggregateCashFlow(cashFlowInput({ accounts, transactions: rows, period: SEPTEMBER }));
+    expect(t.creditCardPaymentsExternallyFunded).toBe(300);
+    expect(t.cardPaymentsUnresolvedCredit).toBe(70);
+    expect(t.cashFlow).toBe(0);
+    expect(t.cashFlowRange).toEqual({ low: 0, high: 0 }); // credit-side legs never move cash flow
   });
 
   it('a payment and a return between the same two accounts pair with their own opposites, never each other', () => {
@@ -747,23 +848,23 @@ describe('returned card payments: cash arriving in checking vs a payment into a 
   });
 });
 
-// ---- Design §13 R3: both legs tracked but outside the matching window (Codex review of 4e31fb3) ----
+// ---- Design §13 R3: both legs tracked but outside the automatic ±5-day window ----------------------
 //
-// Both legs of a payment (or of a return) are in the tracked set but farther apart than the ±5-day
-// card window, so they do not pair. That is NOT only a labelling difference: the unpaired cash-side
-// leg is counted as cash crossing the tracked-set boundary while its unpaired credit-side leg is
-// non-cash, so cash flow is off by the full amount, permanently. The characterization tests pin
-// today's numbers; the `it.fails` tests state the correct figure and are EXPECTED to fail until the
-// resolution proposed in design §13 R3 is decided and built (vitest passes them while they fail and
-// flags them the moment they start passing). This is a known limitation, not an accepted one.
+// Slice 1 paired card legs inside this module and turned "no partner within ±5 days" into "untracked",
+// which moved cash flow by the full amount (the R3 defect: +100 for a late return, −100 for a late
+// card leg). The module now reads each leg's STORED state (CARD_PAYMENT_PAIRING_DESIGN.md §5): such a
+// leg is `unresolved`, the period shows a range instead of a guessed figure, and the correct figure
+// appears once the user confirms the match. The two former `it.fails` tests are plain `it` tests now —
+// they pass through a stored user decision, exactly as the pairing design §5 says they must.
 
-describe('§13 R3 — tracked legs outside the ±5-day card window change cash flow, not just labels', () => {
+describe('§13 R3 — tracked legs outside the automatic window are a range until confirmed, never a guessed figure', () => {
   const accounts: AggregationAccount[] = [
     { id: ACCOUNT.C, type: 'depository', excludeFromCashFlow: false },
     { id: ACCOUNT.X, type: 'credit', excludeFromCashFlow: false },
   ];
   const ccp = (id: string, date: string, accountId: string, amount: number) => leg(id, date, accountId, amount, 'credit_card_payment');
-  const run = (rows: AggregationTransaction[]) => aggregateCashFlow({ accounts, transactions: rows, period: SEPTEMBER });
+  const run = (rows: AggregationTransaction[], decisions: MatchingDecision[] = []) =>
+    aggregateCashFlow(cashFlowInput({ accounts, transactions: rows, period: SEPTEMBER, decisions }));
   // Codex's reproduction: checking +100 Sep 1 and card −100 Sep 2 (a pair); card reversal +100 Sep 10;
   // checking return −100 on `returnDate`.
   const paymentAndReturn = (returnDate: string) => [
@@ -772,8 +873,9 @@ describe('§13 R3 — tracked legs outside the ±5-day card window change cash f
     ccp('rev', '2026-09-10', ACCOUNT.X, 100),
     ccp('ret', returnDate, ACCOUNT.C, -100),
   ];
+  const byId = (rows: AggregationTransaction[], id: string) => rows.find((r) => r.id === id)!;
 
-  it('characterization: the checking return 5 days after the card reversal pairs with it → cash flow 0', () => {
+  it('the checking return 5 days after the card reversal pairs automatically → cash flow 0', () => {
     const t = run(paymentAndReturn('2026-09-15'));
     expect(t.creditCardPaymentsTracked).toBe(100);
     expect(t.creditCardPaymentsReturnedTracked).toBe(100);
@@ -782,56 +884,81 @@ describe('§13 R3 — tracked legs outside the ±5-day card window change cash f
     expect(t.cashFlow).toBe(0);
   });
 
-  it("characterization: one day later (6 days) the return legs do not pair → cash flow +100 (today's behaviour)", () => {
+  it('one day later (6 days) the return is unresolved: a range [0, +100], never +100 (slice 1 said +100)', () => {
     const t = run(paymentAndReturn('2026-09-16'));
     expect(t.creditCardPaymentsTracked).toBe(100); // the payment still pairs: 0 cash
-    expect(t.creditCardPaymentsReturnedUntracked).toBe(100); // the checking return is counted as cash in: +100
-    expect(t.creditCardPaymentsReversedExternally).toBe(100); // the card reversal is counted as non-cash: 0
-    expect(t.cashFlow).toBe(100);
+    expect(t.creditCardPaymentsReturnedUntracked).toBe(0); // NOT counted as cash in
+    expect(t.cardPaymentsUnresolved).toMatchObject({ count: 1, paymentsAmount: 0, returnsAmount: 100 });
+    expect(t.cashFlow).toBeNull();
+    expect(t.cashFlowRange).toEqual({ low: 0, high: 100 });
   });
 
-  it.fails('correct figure: a payment and its return between two TRACKED accounts net to 0 however far apart the legs are', () => {
-    // Checking −100 then +100, card −100 then +100: no cash crossed the tracked-set boundary.
-    expect(run(paymentAndReturn('2026-09-16')).cashFlow).toBe(0);
+  it('correct figure: a payment and its return between two TRACKED accounts net to 0 however far apart the legs are', () => {
+    // Checking −100 then +100, card −100 then +100: no cash crossed the tracked-set boundary. The user
+    // confirms the return against the card's reversal (a stored pair decision).
+    const rows = paymentAndReturn('2026-09-16');
+    const t = run(rows, [pairDecision('d-return', byId(rows, 'ret'), byId(rows, 'rev'))]);
+    expect(t.cashFlow).toBe(0);
+    expect(t.cashFlowRange).toEqual({ low: 0, high: 0 });
+    expect(t.creditCardPaymentsReturnedTracked).toBe(100);
+    expect(t.cardPaymentsUnresolved.count).toBe(0);
   });
 
-  it("characterization: §4.3's late-card-leg residual is the same mechanism — payment Sep 1, card leg Sep 7 → −100, Sep 6 → 0", () => {
+  it('a card leg 6 days late is a range [−100, 0], never −100; 5 days late it pairs automatically → 0', () => {
     const late = run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('card', '2026-09-07', ACCOUNT.X, -100)]);
-    expect(late.creditCardPaymentsUntracked).toBe(100);
-    expect(late.creditCardPaymentsExternallyFunded).toBe(100);
-    expect(late.cashFlow).toBe(-100);
+    expect(late.creditCardPaymentsUntracked).toBe(0); // slice 1 counted 100 here
+    expect(late.cardPaymentsUnresolved).toEqual({ count: 1, paymentsAmount: 100, returnsAmount: 0, byReason: { possible_match: 1 } });
+    expect(late.cashFlow).toBeNull();
+    expect(late.cashFlowRange).toEqual({ low: -100, high: 0 });
     const onTime = run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('card', '2026-09-06', ACCOUNT.X, -100)]);
     expect(onTime.creditCardPaymentsTracked).toBe(100);
     expect(onTime.cashFlow).toBe(0);
   });
 
-  it.fails('correct figure: a payment whose card leg posts 6 days later is still internal to the tracked set', () => {
-    // The late leg having "arrived" does not self-correct anything: both legs are present, unpaired.
-    expect(run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('card', '2026-09-07', ACCOUNT.X, -100)]).cashFlow).toBe(0);
+  it('correct figure: a payment whose card leg posts 6 days later is still internal to the tracked set', () => {
+    const rows = [ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('card', '2026-09-07', ACCOUNT.X, -100)];
+    const t = run(rows, [pairDecision('d-late', rows[0], rows[1])]);
+    expect(t.cashFlow).toBe(0);
+    expect(t.creditCardPaymentsTracked).toBe(100);
+    expect(t.creditCardPaymentsExternallyFunded).toBe(0);
   });
 
-  it('not a fetched-context artefact: every leg is inside the period, and the documented pad gives the same result', () => {
+  it('the result never depends on which card legs were fetched: the states come from the whole history', () => {
     const rows = paymentAndReturn('2026-09-16');
-    const padded = aggregateCashFlow({ accounts, transactions: fetchedWithPad(rows, SEPTEMBER, PAIRING_PAD_DAYS), period: SEPTEMBER });
-    expect(padded).toEqual(run(rows));
-    expect(padded.cashFlow).toBe(100);
+    const whole = run(rows);
+    const onlyTheReturn = aggregateCashFlow(
+      cashFlowInput({ accounts, transactions: rows.filter((r) => r.id === 'ret'), history: rows, period: { start: '2026-09-16', end: '2026-09-17' } })
+    );
+    expect(whole.cashFlowRange).toEqual({ low: 0, high: 100 });
+    expect(onlyTheReturn.cashFlowRange).toEqual({ low: 0, high: 100 });
   });
 
-  it('the untracked-card cases the rule exists for are unaffected: payment −100, and payment + return net 0', () => {
-    expect(run([ccp('pay', '2026-09-01', ACCOUNT.C, 100)]).cashFlow).toBe(-100);
-    expect(run([ccp('pay', '2026-09-01', ACCOUNT.C, 100), ccp('ret', '2026-09-16', ACCOUNT.C, -100)]).cashFlow).toBe(0);
+  it('a payment to a card that is not linked: unresolved while an included card exists (T4), −100 once established', () => {
+    const pay = ccp('pay', '2026-09-01', ACCOUNT.C, 100);
+    const ret = ccp('ret', '2026-09-16', ACCOUNT.C, -100);
+    // An included card exists: no automatic "unlinked", however old the payment is.
+    expect(run([pay]).cashFlow).toBeNull();
+    expect(run([pay]).cashFlowRange).toEqual({ low: -100, high: 0 });
+    // The user's confirmation, per transaction.
+    expect(run([pay], [unlinkedDecision('d1', pay)]).cashFlow).toBe(-100);
+    expect(run([pay, ret], [unlinkedDecision('d1', pay), unlinkedDecision('d2', ret)]).cashFlow).toBe(0);
+    // No included card at all is proof on its own: −100 immediately, and payment + return net 0.
+    const cashOnly = accounts.filter((a) => a.type !== 'credit');
+    const noCard = (rows: AggregationTransaction[]) => aggregateCashFlow(cashFlowInput({ accounts: cashOnly, transactions: rows, period: SEPTEMBER }));
+    expect(noCard([pay]).cashFlow).toBe(-100);
+    expect(noCard([pay]).creditCardPaymentsUntracked).toBe(100);
+    expect(noCard([pay, ret]).cashFlow).toBe(0);
   });
 });
 
 // ---- R7: an excluded card leg closer than the included one (CARD_PAYMENT_PAIRING_DESIGN.md §4.6) --
 //
-// Trevor approved T5 (2026-09-29): legs on excluded accounts are matching evidence. Slice 1 never sees
-// them, so it pairs checking with the included card. Under the approved rule the excluded card's leg is
-// the closer reciprocal match, so the payment went outside the tracked set: a CONFIRMED difference of
-// −100 with zero unresolved exposure, not a range. The characterization test pins slice 1; the
-// `it.fails` test states the approved figure and flips when the stored-pairing slice lands.
+// Trevor approved T5 (2026-09-29): legs on excluded accounts are matching evidence. The excluded card's
+// leg is the closer reciprocal match, so the payment went outside the tracked set: a CONFIRMED −100
+// with zero unresolved exposure, not a range. Slice 1 never saw the excluded card and paired checking
+// with the included card (0); that characterization is gone with the in-module pairing it described.
 
-describe('R7 — an excluded card closer than the included card: a confirmed difference from slice 1', () => {
+describe('R7 — an excluded card closer than the included card', () => {
   const accounts: AggregationAccount[] = [
     { id: ACCOUNT.C, type: 'depository', excludeFromCashFlow: false },
     { id: ACCOUNT.X, type: 'credit', excludeFromCashFlow: false },
@@ -842,16 +969,381 @@ describe('R7 — an excluded card closer than the included card: a confirmed dif
     leg('included-card', '2026-09-03', ACCOUNT.X, -100, 'credit_card_payment'),
     leg('excluded-card', '2026-09-02', ACCOUNT.E, -100, 'credit_card_payment'),
   ];
-  const run = () => aggregateCashFlow({ accounts, transactions: rows, period: SEPTEMBER });
+  const run = () => aggregateCashFlow(cashFlowInput({ accounts, transactions: rows, period: SEPTEMBER }));
 
-  it('characterization: slice 1 ignores the excluded card and pairs checking with the included card → 0', () => {
+  it('approved rule (T5): the closer excluded-card leg is the partner → −100, confirmed (no range)', () => {
     const t = run();
-    expect(t.creditCardPaymentsTracked).toBe(100);
-    expect(t.creditCardPaymentsUntracked).toBe(0);
-    expect(t.cashFlow).toBe(0);
+    expect(t.cashFlow).toBe(-100);
+    expect(t.cashFlowRange).toEqual({ low: -100, high: -100 });
+    expect(t.creditCardPaymentsTracked).toBe(0);
+    expect(t.creditCardPaymentsUntracked).toBe(100);
+    expect(t.cardPaymentsUnresolved.count).toBe(0);
+    // The included card's own leg is unresolved: an unresolved card credit, never cash flow, and no
+    // claim about who paid it.
+    expect(t.creditCardPaymentsExternallyFunded).toBe(0);
+    expect(t.cardPaymentsUnresolvedCredit).toBe(100);
   });
 
-  it.fails('approved rule (T5): the closer excluded-card leg is the partner → −100, confirmed (no range)', () => {
-    expect(run().cashFlow).toBe(-100);
+  it('the excluded account\'s rows are evidence only: whether or not they were fetched, nothing of theirs is counted', () => {
+    const fetchedWithoutExcluded = aggregateCashFlow(
+      cashFlowInput({ accounts, transactions: rows.filter((r) => r.accountId !== ACCOUNT.E), history: rows, period: SEPTEMBER })
+    );
+    expect(fetchedWithoutExcluded).toEqual(run());
+  });
+});
+
+// ---- Stored card-payment states (CARD_PAYMENT_PAIRING_DESIGN.md §5, acceptance tests §11 1–9a) ----
+
+describe('card payments from stored states (pairing design §11, pure module)', () => {
+  const accounts: AggregationAccount[] = [
+    { id: ACCOUNT.C, type: 'depository', excludeFromCashFlow: false },
+    { id: ACCOUNT.X, type: 'credit', excludeFromCashFlow: false },
+    { id: ACCOUNT.E, type: 'credit', excludeFromCashFlow: true },
+    { id: 'acct-F', type: 'depository', excludeFromCashFlow: true },
+  ];
+  const ccp = (id: string, date: string, accountId: string, amount: number) => leg(id, date, accountId, amount, 'credit_card_payment');
+  const run = (rows: AggregationTransaction[], decisions: MatchingDecision[] = [], accts = accounts, period = SEPTEMBER) =>
+    aggregateCashFlow(cashFlowInput({ accounts: accts, transactions: rows, period, decisions }));
+  const notThisPair = (id: string, a: AggregationTransaction, b: AggregationTransaction): MatchingDecision => ({
+    ...pairDecision(id, a, b),
+    kind: 'not_this_pair',
+    acceptedDifferenceCents: null,
+  });
+
+  it('1. late leg: range, then 0 when paired, STILL a range after "not this one", −100 after "a card I haven\'t linked"', () => {
+    const pay = ccp('pay', '2026-09-01', ACCOUNT.C, 100);
+    const card = ccp('card', '2026-09-07', ACCOUNT.X, -100);
+    expect(run([pay, card])).toMatchObject({ cashFlow: null, cashFlowRange: { low: -100, high: 0 } });
+    expect(run([pay, card], [pairDecision('d', pay, card)]).cashFlow).toBe(0);
+    // Rejecting the candidate is never proof of an unlinked card (pairing design §3.4).
+    const rejected = run([pay, card], [notThisPair('d', pay, card)]);
+    expect(rejected).toMatchObject({ cashFlow: null, cashFlowRange: { low: -100, high: 0 }, creditCardPaymentsUntracked: 0 });
+    expect(run([pay, card], [unlinkedDecision('d', pay)]).cashFlow).toBe(-100);
+  });
+
+  it('3. a payment and its return with an unconfirmed destination: bounds [−100, +100] in one month; each month its own across months', () => {
+    const pay = ccp('pay', '2026-09-01', ACCOUNT.C, 100);
+    const sameMonth = ccp('ret', '2026-09-12', ACCOUNT.C, -100);
+    expect(run([pay, sameMonth]).cashFlowRange).toEqual({ low: -100, high: 100 });
+    expect(run([pay, sameMonth], [unlinkedDecision('a', pay), unlinkedDecision('b', sameMonth)]).cashFlow).toBe(0);
+
+    const nextMonth = ccp('ret', '2026-10-12', ACCOUNT.C, -100);
+    const OCTOBER = { start: '2026-10-01', end: '2026-11-01' };
+    const decisions = [unlinkedDecision('a', pay), unlinkedDecision('b', nextMonth)];
+    expect(run([pay, nextMonth]).cashFlowRange).toEqual({ low: -100, high: 0 });
+    expect(run([pay, nextMonth], [], accounts, OCTOBER).cashFlowRange).toEqual({ low: 0, high: 100 });
+    // No cross-month cancellation: −100 in September, +100 in October.
+    expect(run([pay, nextMonth], decisions).cashFlow).toBe(-100);
+    expect(run([pay, nextMonth], decisions, accounts, OCTOBER).cashFlow).toBe(100);
+  });
+
+  it('4. fee matrix (§4.3): the cash excess counts like an unpaired cash leg, the card excess never does', () => {
+    const pairOf = (cashAmount: number, cardAccount: string, cardAmount: number, cashAccount: string = ACCOUNT.C) => {
+      const cash = ccp('cash', '2026-09-01', cashAccount, cashAmount);
+      const card = ccp('card', '2026-09-02', cardAccount, cardAmount);
+      return run([cash, card], [pairDecision('d', cash, card)]);
+    };
+    // Payment, cash larger: −2.00 left checking and did not reach an included card.
+    expect(pairOf(100, ACCOUNT.X, -98)).toMatchObject({ cashFlow: -2, creditCardPaymentsTracked: 98, creditCardPaymentsUntracked: 2, creditCardPaymentsExternallyFunded: 0 });
+    // Payment, card larger: 0 — the card's extra 2 came from outside (externally funded).
+    expect(pairOf(98, ACCOUNT.X, -100)).toMatchObject({ cashFlow: 0, creditCardPaymentsTracked: 98, creditCardPaymentsUntracked: 0, creditCardPaymentsExternallyFunded: 2 });
+    // Return, cash larger: +2.00 arrived in checking from outside.
+    expect(pairOf(-100, ACCOUNT.X, 98)).toMatchObject({ cashFlow: 2, creditCardPaymentsReturnedTracked: 98, creditCardPaymentsReturnedUntracked: 2, creditCardPaymentsReversedExternally: 0 });
+    // Return, card larger: 0 — the card's extra 2 went outside (reversed externally).
+    expect(pairOf(-98, ACCOUNT.X, 100)).toMatchObject({ cashFlow: 0, creditCardPaymentsReturnedTracked: 98, creditCardPaymentsReturnedUntracked: 0, creditCardPaymentsReversedExternally: 2 });
+    // Excluded card: the whole cash leg, any difference.
+    expect(pairOf(100, ACCOUNT.E, -98)).toMatchObject({ cashFlow: -100, creditCardPaymentsTracked: 0, creditCardPaymentsUntracked: 100 });
+    // Excluded cash account funding an included card: 0; the card leg is funded from outside the tracked set.
+    expect(pairOf(100, ACCOUNT.X, -98, 'acct-F')).toMatchObject({ cashFlow: 0, creditCardPaymentsTracked: 0, creditCardPaymentsUntracked: 0, creditCardPaymentsExternallyFunded: 98 });
+  });
+
+  it('4b. including the excluded card later switches −100 to −2.00 (the pair stores both amounts)', () => {
+    const cash = ccp('cash', '2026-09-01', ACCOUNT.C, 100);
+    const card = ccp('card', '2026-09-02', ACCOUNT.E, -98);
+    const included = accounts.map((a) => (a.id === ACCOUNT.E ? { ...a, excludeFromCashFlow: false } : a));
+    expect(run([cash, card], [pairDecision('d', cash, card)]).cashFlow).toBe(-100);
+    expect(run([cash, card], [pairDecision('d', cash, card)], included).cashFlow).toBe(-2);
+  });
+
+  it('5. ties: two payments and one card credit give [−800, 0]; after picking one, the other stays unresolved (not untracked)', () => {
+    const first = ccp('p1', '2026-09-01', ACCOUNT.C, 400);
+    const second = ccp('p2', '2026-09-03', ACCOUNT.C, 400);
+    const card = ccp('k', '2026-09-02', ACCOUNT.X, -400);
+    expect(run([first, second, card])).toMatchObject({ cashFlow: null, cashFlowRange: { low: -800, high: 0 } });
+    const picked = run([first, second, card], [pairDecision('d', first, card)]);
+    expect(picked).toMatchObject({ cashFlow: null, cashFlowRange: { low: -400, high: 0 }, creditCardPaymentsTracked: 400, creditCardPaymentsUntracked: 0 });
+    expect(picked.cardPaymentsUnresolved).toMatchObject({ count: 1, paymentsAmount: 400 });
+  });
+
+  it('6. an excluded-card pair is −500 with no range; no included card is −250 with no range', () => {
+    const toExcluded = run([ccp('c', '2026-09-01', ACCOUNT.C, 500), ccp('e', '2026-09-01', ACCOUNT.E, -500)]);
+    expect(toExcluded).toMatchObject({ cashFlow: -500, cashFlowRange: { low: -500, high: -500 }, creditCardPaymentsUntracked: 500 });
+    const noIncludedCard = run([ccp('c', '2026-09-01', ACCOUNT.C, 250)], [], accounts.filter((a) => a.id !== ACCOUNT.X));
+    expect(noIncludedCard).toMatchObject({ cashFlow: -250, cashFlowRange: { low: -250, high: -250 }, creditCardPaymentsUntracked: 250 });
+  });
+
+  it('7. generated histories: low ≤ high; high − low = Σ |unresolved cash-side|; resolved ⇒ one figure; credit-side legs never move a bound', () => {
+    let seed = 7;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed / 2147483648;
+    };
+    const pool = [...accounts, { id: 'acct-X2', type: 'credit', excludeFromCashFlow: false }, { id: ACCOUNT.S, type: 'depository', excludeFromCashFlow: false }];
+    const pick = <T,>(xs: T[]) => xs[Math.floor(random() * xs.length)];
+    let sawUnresolved = 0;
+    let sawResolved = 0;
+    for (let history = 0; history < 300; history++) {
+      const rows: AggregationTransaction[] = [];
+      const count = 1 + Math.floor(random() * 8);
+      for (let i = 0; i < count; i++) {
+        const day = String(1 + Math.floor(random() * 28)).padStart(2, '0');
+        const amount = pick([100, -100, 98, -98]);
+        rows.push(ccp(`g${history}-${i}`, `2026-09-${day}`, pick(pool).id, amount));
+      }
+      const input = cashFlowInput({ accounts: pool, transactions: rows, period: SEPTEMBER });
+      const t = aggregateCashFlow(input);
+      const unresolvedCash = input.cardPayments.legs.filter((l) => l.side === 'cash' && l.accountIncluded && l.state === 'unresolved');
+      const exposure = unresolvedCash.reduce((sum, l) => sum + Math.abs(l.amountCents), 0) / 100;
+
+      expect(t.cashFlowRange.low).toBeLessThanOrEqual(t.cashFlowRange.high);
+      expect(Math.round((t.cashFlowRange.high - t.cashFlowRange.low) * 100) / 100).toBe(exposure);
+      expect(t.cardPaymentsUnresolved.count).toBe(unresolvedCash.length);
+      expect(Math.round((t.cardPaymentsUnresolved.paymentsAmount + t.cardPaymentsUnresolved.returnsAmount) * 100) / 100).toBe(exposure);
+      // Only card rows exist here, so the bounds are exactly the established cash-side effects plus the
+      // unresolved ones — a credit-side leg, paired or not, contributes to neither.
+      const established = Math.round((t.creditCardPaymentsReturnedUntracked - t.creditCardPaymentsUntracked) * 100) / 100;
+      expect(t.cashFlowRange.low).toBe(Math.round((established - t.cardPaymentsUnresolved.paymentsAmount) * 100) / 100);
+      expect(t.cashFlowRange.high).toBe(Math.round((established + t.cardPaymentsUnresolved.returnsAmount) * 100) / 100);
+      if (unresolvedCash.length === 0) {
+        expect(t.cashFlow).toBe(t.cashFlowRange.low);
+        expect(t.cashFlowRange.high).toBe(t.cashFlowRange.low);
+        sawResolved++;
+      } else {
+        expect(t.cashFlow).toBeNull();
+        expect(t.savingsRate).toBeNull();
+        // `no_candidate` is never read as untracked.
+        expect(unresolvedCash.every((l) => l.effectCents === null)).toBe(true);
+        sawUnresolved++;
+      }
+    }
+    expect(sawUnresolved).toBeGreaterThan(20);
+    expect(sawResolved).toBeGreaterThan(20);
+  });
+
+  it('the savings-rate range follows the cash-flow range; income ≤ 0 gives 0', () => {
+    const rows = [
+      leg('pay', '2026-09-01', ACCOUNT.C, 100, 'credit_card_payment'),
+      leg('card', '2026-09-07', ACCOUNT.X, -100, 'credit_card_payment'),
+      { ...leg('salary', '2026-09-01', ACCOUNT.C, -1000, 'income'), plaidCategory: 'INCOME' },
+    ];
+    const t = run(rows);
+    expect(t.cashFlowRange).toEqual({ low: 900, high: 1000 });
+    expect(t.savingsRate).toBeNull();
+    expect(t.savingsRateRange).toEqual({ low: 0.9, high: 1 });
+    expect(run(rows.slice(0, 2)).savingsRateRange).toEqual({ low: 0, high: 0 });
+  });
+
+  describe('8. a card leg without a usable stored state is an integrity failure — never untracked, never a fallback to pairing', () => {
+    const pay = ccp('pay', '2026-09-01', ACCOUNT.C, 100);
+    const card = ccp('card', '2026-09-02', ACCOUNT.X, -100);
+    const rows = [pay, card];
+    const states = () => cardStatesFor(accounts, rows);
+    const withState = (id: string, change: Partial<CardLegStateInput>) => ({
+      legs: states().legs.map((l) => (l.transactionId === id ? { ...l, ...change } : l)),
+      supersededTransactionIds: [],
+    });
+    const aggregate = (cardPayments: { legs: CardLegStateInput[]; supersededTransactionIds: string[] }) =>
+      aggregateCashFlow({ accounts, transactions: rows, period: SEPTEMBER, cardPayments });
+    const expectIntegrity = (cardPayments: Parameters<typeof aggregate>[0], id: string, message: RegExp) => {
+      let thrown: unknown;
+      try {
+        aggregate(cardPayments);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(CardPaymentStateIntegrityError);
+      expect((thrown as CardPaymentStateIntegrityError).transactionId).toBe(id);
+      expect((thrown as CardPaymentStateIntegrityError).code).toBe('card_payment_state_integrity');
+      expect((thrown as Error).message).toMatch(message);
+      // Not a loan-data problem: it must never be presented as a SemanticIntegrityError.
+      expect(thrown).not.toBeInstanceOf(SemanticIntegrityError);
+    };
+
+    it('control: with the stored pair the figure is 0', () => {
+      expect(aggregate(states()).cashFlow).toBe(0);
+    });
+
+    it('a missing state — with no states at all, or with only the other leg\'s — names the row', () => {
+      expectIntegrity({ legs: [], supersededTransactionIds: [] }, 'pay', /no stored matching state/);
+      expectIntegrity({ legs: states().legs.filter((l) => l.transactionId !== 'card'), supersededTransactionIds: [] }, 'card', /no stored matching state/);
+    });
+
+    it('a state for another amount, account or side means rows and states are not one version', () => {
+      expectIntegrity(withState('pay', { amountCents: 9800 }), 'pay', /different amount/);
+      expectIntegrity(withState('pay', { accountId: ACCOUNT.S }), 'pay', /different account/);
+      expectIntegrity(withState('pay', { side: 'credit' }), 'pay', /'credit' side/);
+      expectIntegrity(withState('pay', { accountIncluded: false }), 'pay', /excluded from cash flow/);
+    });
+
+    it('an effect the leg cannot have, an unknown state, or a duplicate state is refused', () => {
+      expectIntegrity(withState('pay', { effectCents: 100 }), 'pay', /outside the range/); // a payment cannot add cash
+      expectIntegrity(withState('pay', { effectCents: -20000 }), 'pay', /outside the range/);
+      expectIntegrity(withState('pay', { effectCents: null }), 'pay', /integer effect/);
+      expectIntegrity(withState('pay', { state: 'untracked', effectCents: -5000 }), 'pay', /count in full/);
+      expectIntegrity(withState('pay', { effectCents: -200 }), 'pay', /exactly its cash excess/); // tracked, but no fee pair
+      expectIntegrity(withState('pay', { state: 'unresolved' }), 'pay', /no effect and the bounds/);
+      expectIntegrity(withState('pay', { state: 'not_counted' }), 'pay', /not a cash-side state/);
+      expectIntegrity(withState('card', { effectCents: -10000 }), 'card', /zero effect/);
+      expectIntegrity(withState('card', { state: 'tracked' }), 'card', /not a credit-side state/);
+      expectIntegrity(withState('card', { cardExcessCents: 20000 }), 'card', /card excess/);
+      expectIntegrity({ legs: [...states().legs, states().legs[0]], supersededTransactionIds: [] }, states().legs[0].transactionId, /more than one/);
+    });
+
+    it('the Monthly Breakdown, which reports card lines, fails the same way; the budget, which reads no card state, does not', () => {
+      expect(() => aggregateMonthlyBreakdown({ accounts, transactions: rows, cardPayments: { legs: [], supersededTransactionIds: [] } })).toThrow(
+        CardPaymentStateIntegrityError
+      );
+      expect(aggregateBudgetSpend({ accounts, transactions: rows, splits: [], period: SEPTEMBER }).total).toBe(0);
+    });
+
+    it('a superseded pending row and a zero-amount row have no state and count for nothing', () => {
+      const pending = ccp('pending-pay', '2026-09-01', ACCOUNT.C, 100);
+      const zero = ccp('zero', '2026-09-03', ACCOUNT.C, 0);
+      const t = aggregateCashFlow({
+        accounts,
+        transactions: [...rows, pending, zero],
+        period: SEPTEMBER,
+        cardPayments: { legs: states().legs, supersededTransactionIds: ['pending-pay'] },
+      });
+      expect(t.cashFlow).toBe(0);
+      expect(t.creditCardPaymentsTracked).toBe(100);
+      expect(t.cardPaymentsUnresolved.count).toBe(0);
+    });
+
+    it('a loan-decomposed row reports principal and interest whatever its role says, so it reads no card state', () => {
+      const linked: AggregationTransaction = { ...ccp('linked', '2026-09-05', ACCOUNT.C, 400), manualLoanId: LOAN_M, principalPortion: 350 };
+      const t = aggregateCashFlow({ accounts, transactions: [...rows, linked], period: SEPTEMBER, cardPayments: states() });
+      expect(t).toMatchObject({ debtPayments: 350, knownPrincipal: 350, spending: 50, creditCardPaymentsTracked: 100, cashFlow: -400 });
+    });
+
+    it('a card leg outside the period needs no state (it is never aggregated)', () => {
+      const october = ccp('oct', '2026-10-02', ACCOUNT.C, 50);
+      const t = aggregateCashFlow({ accounts, transactions: [...rows, october], period: SEPTEMBER, cardPayments: states() });
+      expect(t.cashFlow).toBe(0);
+    });
+  });
+
+  it('9. transfers are unchanged by the stored states: the §9.1 fixture still nets 4a/4b to zero', () => {
+    const t = aggregateCashFlow(cashFlowInput({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: SEPTEMBER }));
+    expect(t.transfersInternal).toBe(500);
+    expect(t.transfersExternal).toBe(0);
+  });
+});
+
+// ---- Effect rows behind every published cash-flow total (design §7.3, invariant I6) ---------------
+
+describe('aggregateCashFlowDetail — every total reconciles to its effect rows', () => {
+  const totalOf: Record<(typeof CASH_FLOW_MEASURES)[number], (t: CashFlowTotals) => number> = {
+    spending: (t) => t.spending,
+    income: (t) => t.income,
+    debt_payments: (t) => t.debtPayments,
+    known_principal: (t) => t.knownPrincipal,
+    debt_payments_unknown_principal: (t) => t.debtPaymentsUnknownPrincipal,
+    refunds: (t) => t.refunds,
+    transfers_internal: (t) => t.transfersInternal,
+    transfers_external: (t) => t.transfersExternal,
+    credit_card_payments_tracked: (t) => t.creditCardPaymentsTracked,
+    credit_card_payments_untracked: (t) => t.creditCardPaymentsUntracked,
+    credit_card_payments_returned_tracked: (t) => t.creditCardPaymentsReturnedTracked,
+    credit_card_payments_returned_untracked: (t) => t.creditCardPaymentsReturnedUntracked,
+    credit_card_payments_externally_funded: (t) => t.creditCardPaymentsExternallyFunded,
+    credit_card_payments_reversed_externally: (t) => t.creditCardPaymentsReversedExternally,
+    card_payments_unresolved_credit: (t) => t.cardPaymentsUnresolvedCredit,
+    card_payments_unresolved_payments: (t) => t.cardPaymentsUnresolved.paymentsAmount,
+    card_payments_unresolved_returns: (t) => t.cardPaymentsUnresolved.returnsAmount,
+    unclassified: (t) => t.unclassifiedAmount,
+  };
+  const assertReconciles = (input: Parameters<typeof aggregateCashFlowDetail>[0]) => {
+    const detail = aggregateCashFlowDetail(input);
+    expect(detail.totals).toEqual(aggregateCashFlow(input)); // one code path for totals and rows
+    for (const measure of CASH_FLOW_MEASURES) {
+      expect(sumEffectRows(detail.effectRows.get(measure)), measure).toBe(totalOf[measure](detail.totals));
+    }
+    expect(detail.effectRows.get('unclassified')!.length).toBe(detail.totals.unclassifiedCount);
+    return detail;
+  };
+
+  it('base fixture, September and August', () => {
+    const sept = assertReconciles(cashFlowInput({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: SEPTEMBER }));
+    // The loan-linked payment #6 explains two totals with two different effects of the same row.
+    expect(sept.effectRows.get('spending')!.find((r) => r.transactionId === '6')).toMatchObject({ amount: 50, allocation: 'interest', effectRole: 'expense' });
+    expect(sept.effectRows.get('debt_payments')!.find((r) => r.transactionId === '6')).toMatchObject({ amount: 350, allocation: 'principal' });
+    expect(sept.effectRows.get('debt_payments')!.find((r) => r.transactionId === '7')).toMatchObject({ amount: 300, allocation: 'row' });
+    expect(sept.effectRows.get('known_principal')!.map((r) => r.transactionId)).toEqual(['6']);
+    // The unknown-principal total is exactly the debt-payment effects with no manual-loan split: #7.
+    expect(sept.effectRows.get('debt_payments_unknown_principal')!.map((r) => [r.transactionId, r.amount, r.allocation])).toEqual([['7', 300, 'row']]);
+    expect(sept.totals.debtPaymentsUnknownPrincipal).toBe(300);
+    // Income rows are listed by their contribution (positive), a refund by its own sign (negative).
+    expect(sept.effectRows.get('income')!.find((r) => r.transactionId === '1')!.amount).toBe(3000);
+    expect(sept.effectRows.get('refunds')!.map((r) => [r.transactionId, r.amount])).toEqual([['8b', -60]]);
+    // A paired transfer is listed once, by its outgoing leg; a tracked card payment by its cash leg.
+    expect(sept.effectRows.get('transfers_internal')!.map((r) => r.transactionId)).toEqual(['4a']);
+    expect(sept.effectRows.get('credit_card_payments_tracked')!.map((r) => r.transactionId)).toEqual(['5a']);
+
+    const aug = assertReconciles(cashFlowInput({ accounts: fixtureAccounts(), transactions: fixtureTransactions(), period: AUGUST }));
+    expect(aug.effectRows.get('unclassified')!.map((r) => [r.transactionId, r.amount])).toEqual([['13', 45]]);
+  });
+
+  it('every §9.1 variant and the card-payment cases', () => {
+    const withoutX = { accounts: fixtureAccounts().filter((a) => a.id !== ACCOUNT.X), rows: fixtureTransactions().filter((r) => r.accountId !== ACCOUNT.X) };
+    const withoutC = { accounts: fixtureAccounts().filter((a) => a.id !== ACCOUNT.C), rows: fixtureTransactions().filter((r) => r.accountId !== ACCOUNT.C) };
+    const cases: Parameters<typeof cashFlowInput>[0][] = [
+      { accounts: fixtureAccounts({ S: { excludeFromCashFlow: true } }), transactions: fixtureTransactions() },
+      { accounts: fixtureAccounts({ X: { excludeFromCashFlow: true } }), transactions: fixtureTransactions() },
+      { accounts: withoutX.accounts, transactions: withoutX.rows },
+      { accounts: withoutC.accounts, transactions: withoutC.rows },
+      { accounts: fixtureAccounts(), transactions: withRow(fixtureTransactions(), '9', { effectiveRole: 'internal_transfer', userRoleOverride: 'internal_transfer' }) },
+      { accounts: fixtureAccounts(), transactions: withRow(fixtureTransactions(), '6', { effectiveRole: 'expense', userRoleOverride: 'expense' }) },
+      { accounts: fixtureAccounts(), transactions: withRow(fixtureTransactions(), '2', { effectiveRole: null }) },
+      // A fee pair and a return, so every card measure has rows.
+      {
+        accounts: fixtureAccounts(),
+        transactions: [
+          ...fixtureTransactions(),
+          leg('fee-cash', '2026-09-14', ACCOUNT.C, 100, 'credit_card_payment'),
+          leg('fee-card', '2026-09-14', ACCOUNT.X, -98, 'credit_card_payment'),
+          leg('ret-c', '2026-09-20', ACCOUNT.C, -900, 'credit_card_payment'),
+          leg('ret-x', '2026-09-20', ACCOUNT.X, 900, 'credit_card_payment'),
+          leg('rev-x', '2026-09-26', ACCOUNT.X, 40, 'credit_card_payment'),
+        ],
+        decisions: [
+          pairDecision('fee', leg('fee-cash', '2026-09-14', ACCOUNT.C, 100, 'credit_card_payment'), leg('fee-card', '2026-09-14', ACCOUNT.X, -98, 'credit_card_payment')),
+        ],
+      },
+    ];
+    for (const c of cases) assertReconciles(cashFlowInput({ ...c, period: SEPTEMBER }));
+  });
+
+  it('unresolved legs are listed only under the unresolved measures: the cash leg by its amount, the card leg as an unresolved card credit', () => {
+    const rows = [
+      leg('pay', '2026-09-01', ACCOUNT.C, 100, 'credit_card_payment'),
+      leg('card', '2026-09-07', ACCOUNT.X, -100, 'credit_card_payment'),
+      leg('ret', '2026-09-20', ACCOUNT.C, -40, 'credit_card_payment'),
+      leg('rev', '2026-09-28', ACCOUNT.X, 15, 'credit_card_payment'),
+    ];
+    const detail = assertReconciles(cashFlowInput({ accounts: fixtureAccounts(), transactions: rows, period: SEPTEMBER }));
+    expect(detail.totals.cardPaymentsUnresolved).toMatchObject({ count: 2, paymentsAmount: 100, returnsAmount: 40 });
+    expect(detail.totals.cardPaymentsUnresolvedCredit).toBe(85); // +100 payment into the card, −15 reversal
+    expect(detail.effectRows.get('card_payments_unresolved_payments')!.map((r) => [r.transactionId, r.amount])).toEqual([['pay', 100]]);
+    expect(detail.effectRows.get('card_payments_unresolved_returns')!.map((r) => [r.transactionId, r.amount])).toEqual([['ret', 40]]);
+    expect(detail.effectRows.get('card_payments_unresolved_credit')!.map((r) => [r.transactionId, r.amount])).toEqual([
+      ['card', 100],
+      ['rev', -15],
+    ]);
+    const unresolvedMeasures = ['card_payments_unresolved_payments', 'card_payments_unresolved_returns', 'card_payments_unresolved_credit'];
+    for (const measure of CASH_FLOW_MEASURES) {
+      if (unresolvedMeasures.includes(measure)) continue;
+      expect(detail.effectRows.get(measure)!.some((r) => r.transactionId === 'pay'), measure).toBe(false);
+    }
   });
 });

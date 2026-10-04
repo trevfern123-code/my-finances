@@ -9,6 +9,19 @@ PRs, nothing merged or released.**
 - **Not built:** the sync and LIM integration, the §3.7 aggregation read protocol, the §5 module
   change, the API and frontend, and the backfill. The live app's cash flow is unchanged.
 - Details and verification: `PHASE_B_MATCHING_ENGINE_HANDOFF.md`.
+- **Since (2026-10-03, integration slice I1 — an implementation candidate pending independent
+  re-review, nothing merged or released):** the §5 module change and the aggregation's read exist in
+  the backend read path. See `PHASE_B_I1_BACKEND_READ_PATH.md`.
+  - **The read differs from §3.7's "aggregation's read protocol" (amended by Trevor, 2026-10-03).**
+    Instead of reading the states, paging the transactions and reading the version again, the
+    application reads the states AND the transactions in one statement
+    (`get_financial_read_snapshot`, which calls `get_card_payment_states` on its own snapshot). Fresh
+    states then describe exactly the rows beside them, and inputs the matching version does not watch
+    (principal, the loan link, categories, splits) are coherent too. The freshness rule itself is
+    unchanged. `inputs_changing` is no longer reachable in that implementation.
+  - **Credit-side `unresolved` legs** are published as "unresolved card credits"
+    (`card_payments_unresolved_credit`), never as externally funded; their effect stays 0 (D5).
+  - Retry-on-read, the removal integration, the frontend and the backfill are still not built.
 
 *Original status line (rev 3, 2026-09-29), kept for history:* proposal for review — nothing
 implemented. There is no migration, endpoint or live-calculation change.

@@ -1,24 +1,27 @@
 /**
- * Financial Semantics Phase B — complete keyset-paged fetches for aggregates
+ * Financial Semantics Phase B — keyset paging for reads whose rows are INDEPENDENT facts
  * (FINANCIAL_SEMANTICS_PHASE_B_DESIGN.md §7.4, invariant I7: no aggregate is computed from a
  * truncated fetch).
  *
- * NOT WIRED INTO ANY LIVE QUERY YET (implementation slice 1). Today's aggregate fetches
- * (`getTransactionsSince`, `getCategorizedTransactionsSince`, `getCategorySpendRows`,
- * `getNetWorthHistory`) issue one request with no paging, and Supabase/PostgREST caps a response at
- * its `max-rows` setting (1 000 by default) — so a large enough range silently yields a
- * complete-looking but truncated total. A later slice routes those fetches through this helper.
+ * Supabase/PostgREST caps a response at its `max-rows` setting (1 000 by default), so a large enough
+ * single request silently yields a complete-looking but truncated set. This helper pages to completion.
+ *
+ * IT IS NOT A SNAPSHOT. Each page is its own committed database state. That is only safe when the rows
+ * do not depend on one another — the daily net-worth snapshots, one row per date, which is the helper's
+ * one remaining caller. It must NOT be used for transactions or splits: a pending row on one page and
+ * the posted row that replaced it on the next would both be counted. Those reads use one statement —
+ * a single request proven complete by its exact count, or `get_financial_read_snapshot`
+ * (`financialSnapshot.ts`, integration slice I1). The `(date, id)` and `(transaction_id, id)` key
+ * builders below are kept for the helper's own tests; no application read uses them.
  *
  * Design: keyset (never OFFSET) pagination over a strictly increasing key, one page at a time:
  *
  *  - The caller supplies `fetchPage(after, limit)`, which must return rows ordered by the key,
- *    ascending, strictly after `after` (null = from the beginning), at most `limit` of them. The
- *    `…KeysetFilter` builders below produce the PostgREST `or` filter for the two key shapes the
- *    design names: `(date, id)` for transactions and `(transaction_id, id)` for splits.
+ *    ascending, strictly after `after` (null = from the beginning), at most `limit` of them.
  *  - The loop stops only on an EMPTY page. Deliberately not on a "short" page (fewer rows than
- *    requested), as an earlier design sketch said (§7.4 now agrees, §13 Q5): if the server's own row cap is lower than the
- *    page size we ask for, every page is short, and stopping on the first one would re-create the
- *    exact silent truncation this helper exists to remove. The cost is one extra, empty request.
+ *    requested; design §13 Q5): if the server's own row cap is lower than the page size we ask for,
+ *    every page is short, and stopping on the first one would re-create the silent truncation this
+ *    helper exists to remove. The cost is one extra, empty request.
  *  - It verifies the key strictly increases across every row it receives (a mis-ordered query would
  *    otherwise skip or repeat rows) and fails if it does not.
  *  - A hard page ceiling fails the request with `AggregateTooLargeError` rather than returning a
@@ -27,8 +30,25 @@
 
 export class AggregateTooLargeError extends Error {
   readonly code = 'aggregate_too_large';
-  constructor(label: string, maxPages: number, pageSize: number) {
-    super(`aggregate_too_large: ${label} exceeded ${maxPages} pages of ${pageSize} rows; refusing to return a partial result`);
+  /** `detail` completes "<label> …", e.g. "exceeded 200 pages of 1000 rows". */
+  constructor(label: string, detail: string) {
+    super(`aggregate_too_large: ${label} ${detail}; refusing to return a partial result`);
+  }
+}
+
+/**
+ * A frozen (sign-based) aggregate whose range does not fit one response needs the coherent snapshot
+ * function, and that function could not be used. The request FAILS: the alternative would be a
+ * truncated total, or one assembled from several database states. `reason` says why the function
+ * was unusable (see `cardPaymentStateReader.ts`); it carries no row data.
+ */
+export class AggregateSnapshotUnavailableError extends Error {
+  readonly code = 'aggregate_snapshot_unavailable';
+  constructor(
+    label: string,
+    readonly reason: string
+  ) {
+    super(`aggregate_snapshot_unavailable: ${label} does not fit one response and the financial snapshot is unavailable (${reason}); refusing to return a partial result`);
   }
 }
 
@@ -64,7 +84,7 @@ export async function fetchAllPages<Row, Key>(options: FetchAllPagesOptions<Row,
   for (let page = 0; ; page++) {
     const rows = await options.fetchPage(after, pageSize);
     if (rows.length === 0) return all;
-    if (page >= maxPages) throw new AggregateTooLargeError(options.label, maxPages, pageSize);
+    if (page >= maxPages) throw new AggregateTooLargeError(options.label, `exceeded ${maxPages} pages of ${pageSize} rows`);
     if (rows.length > pageSize) {
       throw new KeysetOrderError(`${options.label}: a page returned ${rows.length} rows, more than the ${pageSize} requested`);
     }
