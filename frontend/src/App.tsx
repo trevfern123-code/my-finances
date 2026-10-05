@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabaseClient';
 import {
@@ -48,7 +48,7 @@ import {
   type ManualLoan,
   type ManualLoanInput,
   type ManualPaymentInput,
-  type MonthBreakdown,
+  type MonthlyBreakdownResponse,
   type NavLayoutEntry,
   type NetWorthPoint,
   type RecurringStream,
@@ -102,11 +102,25 @@ import { DashboardCustomizer } from './components/DashboardCustomizer';
 import { ReportingRangeSelector } from './components/ReportingRangeSelector';
 import { TabNav } from './components/TabNav';
 import { SaveStatusIndicator } from './components/SaveStatusIndicator';
+import { SemanticNotice } from './components/SemanticNotice';
+import { useUpdatingRefetch } from './hooks/useUpdatingRefetch';
+import {
+  failureOf,
+  readBudgetSemantics,
+  readMonthlyBreakdownSemantics,
+  readSummarySemantics,
+  withAutoRetry,
+  type BudgetView,
+  type MonthlyBreakdownView,
+  type SemanticFailedState,
+  type SummaryView,
+} from './lib/semanticModel';
 import './App.css';
 
 // The backend caps /api/plaid/transactions at 200 regardless of what's requested — fetching the
-// max lets the Monthly Breakdown and Budget tab drill-downs (both filtered client-side from this
-// same in-memory list) cover as much history as the API allows, rather than the default 50.
+// max gives the transactions feed as much history as the API allows, rather than the default 50.
+// (The Monthly Breakdown and Budget drill-downs no longer read this list: they ask the server for
+// the effect rows behind each total — Financial Semantics Phase B, design §7.3.)
 const TRANSACTIONS_FETCH_LIMIT = 200;
 
 /**
@@ -325,9 +339,27 @@ export default function App() {
   const [isSandbox, setIsSandbox] = useState(false);
   const [transactions, setTransactions] = useState<TransactionItem[]>([]);
   const [budgetCategories, setBudgetCategories] = useState<BudgetCategory[]>([]);
+  // Financial Semantics Phase B: the role-aware spending per budget category, committed together
+  // with `budgetCategories` from the same response — or the state in which no figure is shown.
+  const [budgetSemantics, setBudgetSemantics] = useState<BudgetView>({ kind: 'loading' });
   const [summary, setSummary] = useState<SpendingSummary | null>(null);
   const [netWorthHistory, setNetWorthHistory] = useState<NetWorthPoint[]>([]);
-  const [monthlyBreakdown, setMonthlyBreakdown] = useState<MonthBreakdown[]>([]);
+  const [monthlyBreakdown, setMonthlyBreakdown] = useState<MonthlyBreakdownResponse | null>(null);
+  // Why the current range's summary / breakdown request failed, when it did. Cleared with the data
+  // at the start of every attempt, so a failure never sits beside figures of another attempt.
+  const [summaryFailure, setSummaryFailure] = useState<SemanticFailedState | null>(null);
+  const [breakdownFailure, setBreakdownFailure] = useState<SemanticFailedState | null>(null);
+  // The role-aware figures every card reads, validated from the response — or a state with no
+  // figure. Never the frozen sign-based fields of the same response. (`summaryView` /
+  // `breakdownView`, further down, are these with the automatic-refetch marking.)
+  const summaryRead: SummaryView = useMemo(
+    () => (summary ? readSummarySemantics(summary) : (summaryFailure ?? { kind: 'loading' })),
+    [summary, summaryFailure]
+  );
+  const breakdownRead: MonthlyBreakdownView = useMemo(
+    () => (monthlyBreakdown ? readMonthlyBreakdownSemantics(monthlyBreakdown) : (breakdownFailure ?? { kind: 'loading' })),
+    [monthlyBreakdown, breakdownFailure]
+  );
   const [recurringStreams, setRecurringStreams] = useState<RecurringStream[]>([]);
   const [totalMonthlyOutflow, setTotalMonthlyOutflow] = useState(0);
   const [totalMonthlyInflow, setTotalMonthlyInflow] = useState(0);
@@ -479,6 +511,50 @@ export default function App() {
   // *current* id — and therefore still be accepted — for the entire window between a lifecycle
   // change and that new lifecycle's own first applyReportingRange call.
   const rangeDataRequestIdRef = useRef(0);
+
+  // Financial Semantics Phase B: the client's bounded refetch after an `updating` answer
+  // (lib/updatingRefetch.ts). One scheduler per resource, so each has one timer and one request at
+  // a time. `loadKey` is the range-data ownership id above: applyReportingRange and a lifecycle
+  // change mint a new one, which is a new load with a fresh attempt budget; the automatic refetch
+  // below deliberately does NOT mint one, so it stays inside the load it belongs to and cannot
+  // invalidate that load's still-pending sibling requests.
+  //
+  // A load also belongs to ONE login lifecycle, and ends with it — on a sign-out as much as on a
+  // sign-in as someone else. App stays mounted across both, so nothing here may rely on an unmount:
+  // - `retryLifecycleIsCurrent` is false in the very render in which `sessionId` changes
+  //   (sessionIdRef still holds the previous lifecycle until that render's layout effect) and
+  //   whenever nobody is signed in. The schedulers then get no answer, so their pending waits are
+  //   cancelled in that same commit, before any effect of the next lifecycle runs.
+  // - `loadKey` carries the lifecycle, so the attempt budget never passes from one login to another.
+  // - The session effect below invalidates the load and clears the answers for EVERY lifecycle
+  //   change, including the change to "signed out".
+  // - The refetch functions ask nothing when nobody is signed in, and commit an answer only to the
+  //   lifecycle AND the load that asked.
+  const retryLifecycleIsCurrent = sessionId !== null && sessionIdRef.current === sessionId;
+  const retryLoadKey = `${sessionId ?? ''}|${rangeDataRequestIdRef.current}`;
+  const summaryRefetch = useUpdatingRefetch({
+    answer: retryLifecycleIsCurrent && summaryRead.kind === 'updating' ? summary : null,
+    retryAfterMs: summaryRead.kind === 'updating' ? summaryRead.retryAfterMs : null,
+    loadKey: retryLoadKey,
+    refetch: refetchSummaryAfterUpdating,
+  });
+  const breakdownRefetch = useUpdatingRefetch({
+    answer: retryLifecycleIsCurrent && breakdownRead.kind === 'updating' ? monthlyBreakdown : null,
+    retryAfterMs: breakdownRead.kind === 'updating' ? breakdownRead.retryAfterMs : null,
+    loadKey: retryLoadKey,
+    refetch: refetchBreakdownAfterUpdating,
+  });
+  const summaryView: SummaryView = useMemo(() => withAutoRetry(summaryRead, summaryRefetch.autoRetrying), [summaryRead, summaryRefetch.autoRetrying]);
+  const breakdownView: MonthlyBreakdownView = useMemo(
+    () => withAutoRetry(breakdownRead, breakdownRefetch.autoRetrying),
+    [breakdownRead, breakdownRefetch.autoRetrying]
+  );
+
+  // The newest budget READ reserved, grouped or targeted (a version from resourceVersionsRef's
+  // `budgets` counter). A read that finds the counter past its own version was superseded. If it is
+  // still the newest READ, what moved the counter was a local edit of the category list (create,
+  // rename, reorder, …), and no other read is on its way — see refreshBudgetCategories.
+  const latestBudgetReadRef = useRef(0);
 
   // A single tab-wide monotonically increasing counter — the ownership tag for preference-
   // bootstrap/refetch invocations specifically (bootstrapPreferences below), distinct from
@@ -717,6 +793,11 @@ export default function App() {
     const itemsVersion = ++resourceVersionsRef.current.items;
     const transactionsVersion = ++resourceVersionsRef.current.transactions;
     const budgetsVersion = ++resourceVersionsRef.current.budgets;
+    latestBudgetReadRef.current = budgetsVersion;
+    // A grouped read follows something that can change what the figures are (a new link, a removed
+    // institution, a new lifecycle). The figures on screen are withheld from now, not from when the
+    // read finishes; the category list itself stays.
+    setBudgetSemantics({ kind: 'loading' });
     const recurringVersion = ++resourceVersionsRef.current.recurringStreams;
     const loansVersion = ++resourceVersionsRef.current.loans;
     const assetsVersion = ++resourceVersionsRef.current.assets;
@@ -769,8 +850,19 @@ export default function App() {
     ) {
       setTransactions(transactionsRes.value.transactions);
     }
-    if (categoriesRes.status === 'fulfilled' && stillCurrent && budgetsVersion === resourceVersionsRef.current.budgets) {
-      setBudgetCategories(categoriesRes.value.categories);
+    if (stillCurrent && budgetsVersion === resourceVersionsRef.current.budgets) {
+      if (categoriesRes.status === 'fulfilled') {
+        setBudgetCategories(categoriesRes.value.categories);
+        setBudgetSemantics(readBudgetSemantics(categoriesRes.value));
+      } else {
+        // The list on screen (if any) is from an earlier read; its figures are no longer shown.
+        setBudgetSemantics(failureOf(categoriesRes.reason));
+      }
+    } else if (stillCurrent && latestBudgetReadRef.current === budgetsVersion) {
+      // Superseded only by a local edit of the list (see latestBudgetReadRef): this read's list must
+      // not replace the edited one, and no other read is coming. The figures were withheld when this
+      // read started, so read again rather than leave them withheld for good.
+      refreshBudgetCategories();
     }
     if (
       recurringRes.status === 'fulfilled' &&
@@ -869,7 +961,15 @@ export default function App() {
     // unchanged (still A), so a userId-keyed effect would never re-fire and Navigation/Preferences
     // would stay hydrated from A1's stale data — sessionId genuinely changes across that exact
     // transition, so this effect correctly re-fires and refetches for A3's own data.
-    if (!sessionId) return;
+    //
+    // Everything from here to the `if (!sessionId) return` below runs for EVERY lifecycle change,
+    // including the change to "signed out". App stays mounted across a sign-out (it renders the
+    // sign-in screen), so the previous lifecycle's range-data load must be ended here: its in-flight
+    // requests invalidated, its datasets cleared — and with them the `updating` answers the
+    // automatic refetch (lib/updatingRefetch.ts) schedules from. Returning first would leave a
+    // signed-out App holding a live load: a pending wait could still fire, and a late `updating`
+    // answer could still be accepted and schedule another.
+    //
     // Invalidates any range-data request still in flight from the *previous* lifecycle — bumped
     // synchronously here, immediately on the lifecycle change, before ANY async gap. Without this,
     // an old lifecycle's already-issued request could still resolve holding what was, until this
@@ -891,7 +991,11 @@ export default function App() {
     // them outright rather than thread a tag through every read site.
     setSummary(null);
     setNetWorthHistory([]);
-    setMonthlyBreakdown([]);
+    setMonthlyBreakdown(null);
+    setSummaryFailure(null);
+    setBreakdownFailure(null);
+    // Nobody is signed in: the previous lifecycle is ended above, and there is nothing to load.
+    if (!sessionId) return;
     // Two independent calls, not one combined fetch — see bootstrapPreferences' and
     // refreshFinancialData's own comments for why they're kept separate. Both are still fired
     // together here, unconditionally, on every genuine lifecycle change. This call is automatically
@@ -933,15 +1037,20 @@ export default function App() {
     // nothing is preferable to showing something wrong.
     setSummary(null);
     setNetWorthHistory([]);
-    setMonthlyBreakdown([]);
+    setMonthlyBreakdown(null);
+    setSummaryFailure(null);
+    setBreakdownFailure(null);
 
     getSpendingSummary(range).then(
       (res) => {
         if (requestId === rangeDataRequestIdRef.current) setSummary(res);
       },
-      () => {
-        // ignore — a failed request for what is still the current attempt leaves summary cleared
-        // (see above), never any other lifecycle's or range's data.
+      (err) => {
+        // A failed request for what is still the current attempt leaves summary cleared (see
+        // above), never any other lifecycle's or range's data — and says that it failed, so the
+        // cards show why instead of nothing (Phase B: an integrity error is never replaced by a
+        // figure).
+        if (requestId === rangeDataRequestIdRef.current) setSummaryFailure(failureOf(err));
       }
     );
     getNetWorthHistory(range).then(
@@ -952,10 +1061,83 @@ export default function App() {
     );
     getMonthlyBreakdown(range).then(
       (res) => {
-        if (requestId === rangeDataRequestIdRef.current) setMonthlyBreakdown(res.months);
+        if (requestId === rangeDataRequestIdRef.current) setMonthlyBreakdown(res);
       },
-      () => {}
+      (err) => {
+        if (requestId === rangeDataRequestIdRef.current) setBreakdownFailure(failureOf(err));
+      }
     );
+  }
+
+  /** The user's "Check again" for the range-dependent figures: the same single fetch path. */
+  function retryRangeData() {
+    applyReportingRange(reportingRangeRef.current);
+  }
+
+  /**
+   * The automatic refetch of the summary after an `updating` answer (lib/updatingRefetch.ts). A read
+   * of this one resource, inside the current load: no new ownership id, nothing cleared (what is on
+   * screen is the `updating` answer, which shows no role-aware figure), and no other dataset
+   * re-requested. Its answer is committed only if the load that scheduled it is still the current
+   * one — a range change, a "Check again", a sync or a sign-in in between drops it. A failure is
+   * recorded like any failed summary request: no figure, and nothing retried by itself.
+   *
+   * It also belongs to the login lifecycle that asked: nothing is requested when nobody is signed
+   * in, and an answer — a success, another `updating`, or a failure — that arrives after a sign-out
+   * or a sign-in as someone else changes nothing, so it cannot schedule a further refetch either.
+   */
+  function refetchSummaryAfterUpdating() {
+    const lifecycle = sessionIdRef.current;
+    if (!lifecycle) return;
+    const loadId = rangeDataRequestIdRef.current;
+    const stillOwned = () => lifecycle === sessionIdRef.current && loadId === rangeDataRequestIdRef.current;
+    getSpendingSummary(reportingRangeRef.current).then(
+      (res) => {
+        if (stillOwned()) setSummary(res);
+      },
+      (err) => {
+        if (!stillOwned()) return;
+        setSummary(null);
+        setSummaryFailure(failureOf(err));
+      }
+    );
+  }
+
+  /** The same for the monthly breakdown. */
+  function refetchBreakdownAfterUpdating() {
+    const lifecycle = sessionIdRef.current;
+    if (!lifecycle) return;
+    const loadId = rangeDataRequestIdRef.current;
+    const stillOwned = () => lifecycle === sessionIdRef.current && loadId === rangeDataRequestIdRef.current;
+    getMonthlyBreakdown(reportingRangeRef.current).then(
+      (res) => {
+        if (stillOwned()) setMonthlyBreakdown(res);
+      },
+      (err) => {
+        if (!stillOwned()) return;
+        setMonthlyBreakdown(null);
+        setBreakdownFailure(failureOf(err));
+      }
+    );
+  }
+
+  /**
+   * Financial Semantics Phase B: whether a payment is linked to a manual loan, and with how much
+   * principal, decides how it is counted — the principal as a debt payment, the rest as interest
+   * under spending and outside its budget category. So anything that can create, change or remove a
+   * link (adding, editing or deleting a loan; editing or unlinking a linked payment) makes the
+   * role-aware figures on screen out of date. Refetch them, exactly as a sync does, rather than
+   * leave figures of the previous state looking current. Called only after the mutation committed
+   * under the session that started it.
+   *
+   * Both calls withhold what is on screen at once, before their requests are answered:
+   * applyReportingRange clears the summary and the breakdown, and refreshBudgetCategories moves the
+   * budget figures to "loading". So the old figures are never shown while the new ones are pending,
+   * however long that takes; and if a request fails, they stay withheld.
+   */
+  function refreshRoleAwareFigures() {
+    applyReportingRange(reportingRangeRef.current);
+    refreshBudgetCategories();
   }
 
   // These four targeted, single-resource refreshes (plus the two direct transaction refetches in
@@ -1020,17 +1202,36 @@ export default function App() {
   // `spent`/`recent_avg_spent` are only computed on the list endpoint, not returned by the
   // create/update/categorize endpoints — anything that can change a category's spend needs to
   // refetch the list to stay accurate, rather than trying to patch the values in locally.
+  //
+  // Financial Semantics Phase B: every caller of this is either the user asking again or the
+  // follow-up of a change that can alter the figures (a sync, a categorisation, a split, a mapping
+  // backfill, a loan link, an account's cash-flow setting). So the figures on screen are withheld
+  // the moment the read STARTS — not when it is answered, which can be arbitrarily later. The
+  // category list, names and budgeted amounts stay; only the role-aware figures go to "loading".
   async function refreshBudgetCategories() {
     const expectedSessionId = sessionIdRef.current;
     const version = ++resourceVersionsRef.current.budgets;
+    latestBudgetReadRef.current = version;
+    setBudgetSemantics({ kind: 'loading' });
     try {
       const res = await getBudgetCategories();
-      if (expectedSessionId !== sessionIdRef.current || version !== resourceVersionsRef.current.budgets) {
+      if (expectedSessionId !== sessionIdRef.current) return;
+      if (version !== resourceVersionsRef.current.budgets) {
+        // Superseded. A newer read will commit its own answer. But if this is still the newest READ,
+        // what superseded it was a local edit of the list: its (older) list must not replace the
+        // edited one, and nobody else is going to bring the figures back — so read again.
+        if (latestBudgetReadRef.current === version) refreshBudgetCategories();
         return;
       }
       setBudgetCategories(res.categories);
-    } catch {
-      // ignore
+      setBudgetSemantics(readBudgetSemantics(res));
+    } catch (err) {
+      // The category list stays as it was. Its figures do not: they were withheld when this read
+      // started, and a failed read cannot bring them back. Recorded whenever this is still the
+      // newest read (a local edit of the list in the meantime does not change that).
+      if (expectedSessionId === sessionIdRef.current && latestBudgetReadRef.current === version) {
+        setBudgetSemantics(failureOf(err));
+      }
     }
   }
 
@@ -1311,6 +1512,13 @@ export default function App() {
       // are always 0 — no need to refetch just to fill in values we already know.
       commitMutationForResource('budgets', expectedSessionId, () => {
         setBudgetCategories((prev) => [...prev, { ...res.category, spent: 0, recent_avg_spent: 0 }]);
+        // The same holds for its role-aware figures: nothing can be allocated to a category that
+        // did not exist. Only added beside figures that are being shown.
+        setBudgetSemantics((prev) =>
+          prev.kind === 'ok'
+            ? { kind: 'ok', byCategoryId: new Map(prev.byCategoryId).set(res.category.id, { spending: 0, recent_avg_spending: 0 }) }
+            : prev
+        );
       });
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
@@ -1599,7 +1807,7 @@ export default function App() {
       }
       await releasePendingManualLoanCreation(owner, idempotencyKey);
       if (userIdRef.current === owner) setPendingLoanCreate(loadPendingManualLoanCreation(owner));
-      commitMutationForResource('manualLoans', expectedSessionId, () => {
+      const committed = commitMutationForResource('manualLoans', expectedSessionId, () => {
         // A retry of an already-successful attempt (e.g. resubmitted from a form remounted while
         // the first request was still in flight) replays the SAME loan — never list it twice.
         setManualLoans((prev) =>
@@ -1608,6 +1816,8 @@ export default function App() {
             : [...prev, res.loan]
         );
       });
+      // Creating a loan links the payments its match text finds.
+      if (committed) refreshRoleAwareFigures();
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to add loan');
@@ -1624,9 +1834,11 @@ export default function App() {
     const ownership = captureOwnership();
     try {
       const res = await updateManualLoan(id, input, ownership.verify);
-      commitMutationForResource('manualLoans', expectedSessionId, () => {
+      const committed = commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === id ? res.loan : l)));
       });
+      // A changed match text links the payments it finds.
+      if (committed) refreshRoleAwareFigures();
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update loan');
@@ -1640,9 +1852,11 @@ export default function App() {
     const ownership = captureOwnership();
     try {
       await deleteManualLoan(id, ownership.verify);
-      commitMutationForResource('manualLoans', expectedSessionId, () => {
+      const committed = commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.filter((l) => l.id !== id));
       });
+      // Its payments are no longer linked to a loan.
+      if (committed) refreshRoleAwareFigures();
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to delete loan');
@@ -1661,9 +1875,11 @@ export default function App() {
     const ownership = captureOwnership();
     try {
       const res = await updateLinkedLoanPayment(loanId, transactionId, principalPortion, ownership.verify);
-      commitMutationForResource('manualLoans', expectedSessionId, () => {
+      const committed = commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
       });
+      // The payment's principal / interest split changed.
+      if (committed) refreshRoleAwareFigures();
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to update payment');
@@ -1678,9 +1894,11 @@ export default function App() {
     const ownership = captureOwnership();
     try {
       const res = await unlinkLoanPayment(loanId, transactionId, ownership.verify);
-      commitMutationForResource('manualLoans', expectedSessionId, () => {
+      const committed = commitMutationForResource('manualLoans', expectedSessionId, () => {
         setManualLoans((prev) => prev.map((l) => (l.id === loanId ? res.loan : l)));
       });
+      // The payment is no longer decomposed into principal and interest.
+      if (committed) refreshRoleAwareFigures();
     } catch (err) {
       if (isStillCurrentSession(expectedSessionId)) {
         setActionError(err instanceof Error ? err.message : 'Failed to unlink payment');
@@ -1950,7 +2168,7 @@ export default function App() {
                         netWorth={summary.net_worth}
                         netWorthHistory={netWorthHistory}
                         assetGroups={assetGroups}
-                        monthlySpending={summary.monthly_spending}
+                        semantics={summaryView}
                       />
                     ) : null;
                   case 'safe_to_spend':
@@ -1961,6 +2179,7 @@ export default function App() {
                         loans={loans}
                         manualLoans={manualLoans}
                         budgetCategories={activeBudgetCategories}
+                        budgetSemantics={budgetSemantics}
                         upcomingBillsDays={financialPreferences.upcomingBillsDays}
                         minimumCashBuffer={financialPreferences.minimumCashBuffer}
                         includeUpcomingBills={financialPreferences.includeUpcomingBills}
@@ -1971,8 +2190,10 @@ export default function App() {
                     return summary ? (
                       <CashFlowPace
                         budgetCategories={activeBudgetCategories}
-                        currentMonthIncome={summary.current_month.income}
-                        currentMonthSpent={summary.current_month.spent}
+                        semantics={summaryView}
+                        budgetSemantics={budgetSemantics}
+                        onRetry={retryRangeData}
+                        onRetryBudget={refreshBudgetCategories}
                       />
                     ) : null;
                   case 'accounts_quick_view':
@@ -1995,7 +2216,7 @@ export default function App() {
                       />
                     );
                   case 'monthly_spending_chart':
-                    return summary ? <MonthlySpendingChart summary={summary} /> : null;
+                    return summary ? <MonthlySpendingChart semantics={summaryView} onRetry={retryRangeData} /> : null;
                   case 'net_worth_chart':
                     return <NetWorthChart history={netWorthHistory} />;
                   default:
@@ -2040,6 +2261,14 @@ export default function App() {
                           <ReportingRangeSelector range={reportingRange.range} onChange={reportingRange.setRange} />
                         )}
 
+                      {/* The summary request failed: say so once, with a way to try again. The cards
+                          that need it stay absent rather than showing anything in its place. */}
+                      {!dashboardLayout.customizing && summary === null && summaryFailure && (
+                        <div className="card">
+                          <SemanticNotice state={summaryFailure} onRetry={retryRangeData} />
+                        </div>
+                      )}
+
                       {dashboardLayout.customizing ? (
                         <DashboardCustomizer
                           layout={dashboardLayout.layout}
@@ -2067,17 +2296,18 @@ export default function App() {
 
                   {activeTab === 'monthly' && (
                     <MonthlyBreakdown
-                      months={monthlyBreakdown}
-                      transactions={transactions}
+                      breakdown={breakdownView}
                       reportingRange={reportingRange.range}
                       onSetReportingRange={reportingRange.setRange}
+                      onRetry={retryRangeData}
                     />
                   )}
 
                   {activeTab === 'budget' && (
                     <BudgetCategories
                       categories={budgetCategories}
-                      transactions={transactions}
+                      semantics={budgetSemantics}
+                      onRetry={refreshBudgetCategories}
                       recentAvgMonths={financialPreferences.recentAvgMonths}
                       onCreate={handleCreateCategory}
                       onUpdate={handleUpdateCategory}
@@ -2124,8 +2354,8 @@ export default function App() {
                       groups={assetGroups}
                       totalAssets={totalAssets}
                       recurringStreams={recurringStreams}
-                      currentMonthIncome={summary?.current_month.income ?? 0}
-                      currentMonthSpent={summary?.current_month.spent ?? 0}
+                      semantics={summaryView}
+                      onRetry={retryRangeData}
                       savingsRateTarget={financialPreferences.savingsRateTarget}
                       onUpdateSavingsGoal={handleUpdateSavingsGoal}
                     />

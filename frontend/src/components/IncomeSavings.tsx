@@ -4,6 +4,16 @@ import type { AssetAccountSummary, AssetGroup, RecurringStream } from '../lib/ap
 import { accountDisplayName } from '../lib/accountDisplay';
 import { formatCurrency } from '../lib/currency';
 import { savingsRateTier } from '../lib/financialPreferences';
+import type { SummaryView } from '../lib/semanticModel';
+import {
+  formatAmountRange,
+  formatRate,
+  formatRateRange,
+  formatSigned,
+  nonPositiveIncomeNote,
+  unresolvedCardPaymentsNote,
+} from '../lib/semanticPresentation';
+import { SemanticNotice } from './SemanticNotice';
 
 const FREQUENCY_LABELS: Record<string, string> = {
   WEEKLY: 'Weekly',
@@ -14,43 +24,80 @@ const FREQUENCY_LABELS: Record<string, string> = {
   UNKNOWN: 'Irregular',
 };
 
+/**
+ * Savings rate of the current calendar month (design §5 C4). The rate, the cash flow and the amounts
+ * named in the copy are the server's: (cash flow + known loan principal) / income. Nothing is
+ * recomputed here, and when a card payment is not matched yet the rate is the server's range.
+ */
 function SavingsRateCard({
-  income,
-  spent,
+  semantics,
   targetPercent,
+  onRetry,
 }: {
-  income: number;
-  spent: number;
+  semantics: SummaryView;
   /** User's savings-rate goal (Settings → Financial preferences), a percentage like 15, not a
-   *  fraction. Changes the target/comparison shown here — never the calculated rate itself. */
+   *  fraction. Changes the target/comparison shown here — never the rate itself. */
   targetPercent: number;
+  onRetry?: () => void;
 }) {
-  const rate = income > 0 ? (income - spent) / income : null;
-  const tier = rate !== null ? savingsRateTier(rate, targetPercent) : 'good';
-  const pct = rate !== null ? Math.max(0, Math.min(rate, 1)) * 100 : 0;
+  if (semantics.kind !== 'ok') {
+    return (
+      <div className="card">
+        <div className="section-header">
+          <h2>Savings rate</h2>
+          <span className="monthly-total-badge">— this month</span>
+        </div>
+        <SemanticNotice state={semantics} onRetry={onRetry} />
+      </div>
+    );
+  }
+
+  const figures = semantics.currentMonth;
+  const rate = figures.savings_rate;
+  // While the rate is a range, the bar and its colour follow the lower bound; the text gives both.
+  const shownRate = rate ?? figures.savings_rate_range.low;
+  const tier = savingsRateTier(shownRate, targetPercent);
+  const pct = Math.max(0, Math.min(shownRate, 1)) * 100;
 
   return (
     <div className="card">
       <div className="section-header">
         <h2>Savings rate</h2>
         <span className={tier === 'good' ? 'monthly-total-badge income' : `monthly-total-badge ${tier}`}>
-          {rate !== null ? `${(rate * 100).toFixed(0)}%` : '—'} this month
+          {rate !== null ? formatRate(rate) : formatRateRange(figures.savings_rate_range)} this month
         </span>
       </div>
-      {rate === null ? (
-        <p className="hint">No income recorded yet this month.</p>
-      ) : (
-        <>
-          <div className="progress-track">
-            <div className={`progress-fill progress-${tier}`} style={{ width: `${pct}%` }} />
-          </div>
-          <p className="hint budget-pace-hint">
-            {formatCurrency(income - spent, null)} saved of {formatCurrency(income, null)} income this month
-            {tier === 'over' && ' — spending exceeded income'}
-          </p>
-          <p className="hint">Goal: {targetPercent}% of income saved</p>
-        </>
+      {/* Zero and negative income are figures, not an absence: say the figure and why the rate is 0%. */}
+      {figures.income_semantic <= 0 && <p className="hint">{nonPositiveIncomeNote(figures.income_semantic)}</p>}
+      <div className="progress-track">
+        <div className={`progress-fill progress-${tier}`} style={{ width: `${pct}%` }} />
+      </div>
+      <p className="hint budget-pace-hint">
+        {figures.cash_flow !== null ? (
+          <>
+            {formatSigned(figures.cash_flow)} cash flow of {formatSigned(figures.income_semantic)} income this month
+            {tier === 'over' && ' — more went out than came in'}
+          </>
+        ) : (
+          <>
+            {formatAmountRange(figures.cash_flow_range)} cash flow of {formatSigned(figures.income_semantic)} income this month ·{' '}
+            {unresolvedCardPaymentsNote(figures.card_payments_unresolved.count)}
+          </>
+        )}
+      </p>
+      <p className="hint">
+        Cash kept after debt service
+        {figures.known_principal !== 0 && `, plus ${formatSigned(figures.known_principal)} of loan principal paid down`}.
+      </p>
+      {figures.debt_payments_unknown_principal !== 0 && (
+        <p className="hint">
+          {formatSigned(figures.debt_payments_unknown_principal)} of loan payments with an unknown principal share counted as outflow.
+        </p>
       )}
+      {figures.transfers_external < 0 && (
+        <p className="hint">{formatCurrency(-figures.transfers_external, null)} transferred to accounts not tracked (not counted as saving).</p>
+      )}
+      <p className="hint">Goal: {targetPercent}% of income saved</p>
     </div>
   );
 }
@@ -160,20 +207,21 @@ export function IncomeSavings({
   groups,
   totalAssets,
   recurringStreams,
-  currentMonthIncome,
-  currentMonthSpent,
+  semantics,
   savingsRateTarget,
   onUpdateSavingsGoal,
+  onRetry,
 }: {
   groups: AssetGroup[];
   totalAssets: number;
   recurringStreams: RecurringStream[];
-  currentMonthIncome: number;
-  currentMonthSpent: number;
+  /** The summary's role-aware figures; the Savings rate card shows the current calendar month. */
+  semantics: SummaryView;
   /** Percentage (e.g. 15), from Settings → Financial preferences. Distinct from a per-account
    *  dollar savings_goal below — this is a single overall rate target, not a balance target. */
   savingsRateTarget: number;
   onUpdateSavingsGoal: (accountId: string, savingsGoal: number | null) => void;
+  onRetry?: () => void;
 }) {
   if (groups.length === 0) {
     return (
@@ -197,7 +245,7 @@ export function IncomeSavings({
         </div>
       </div>
 
-      <SavingsRateCard income={currentMonthIncome} spent={currentMonthSpent} targetPercent={savingsRateTarget} />
+      <SavingsRateCard semantics={semantics} targetPercent={savingsRateTarget} onRetry={onRetry} />
       <IncomeBreakdown recurringStreams={recurringStreams} />
 
       <div className="asset-groups">

@@ -1631,3 +1631,23 @@ Still not built: everything else in the "Planned" list above, retry-on-read, and
 - **§4.1 R9 and §13 Q3.** The integrity failure and the split refusal apply to level-2 requests; a
   level-1 request keeps its frozen fields. A split mismatch on `/api/budget-categories` answers 200
   with the category list, the frozen fields and a `refused` status, and no role-aware figure.
+
+**Integration slice I2 (2026-10-04; implementation candidate pending independent review, nothing
+merged or released):** `PHASE_B_I2_FRONTEND_INTEGRATION.md`. For that candidate only:
+- `API_LEVEL` and the frontend's `CLIENT_API_LEVEL` are 2 (§6.4); `MIN_CLIENT_API_LEVEL` stays 0.
+  No response a level-1 or level-0 client receives changed.
+- The frontend renders the role-aware fields of `/summary`, `/monthly-breakdown` and
+  `/budget-categories` and nothing computed from a transaction's sign: Overview cash flow, Cash flow &
+  budget pace, Savings rate, the monthly spending chart, Monthly Breakdown, Budget and Safe to Spend's
+  remaining budget (§5 C1–C7, without C7's label changes, which belong to §4.8).
+- Drill-downs use the effects endpoint (§7.3) with the restart contract, and reconcile to the
+  server's total in integer cents.
+- `updating`, `unavailable`, `refused`, an integrity error and a response without the new fields
+  (new bundle before new backend, §6.4) show a dash and the reason, never a frozen or rebuilt figure.
+- An `updating` read is asked again by the client after the server's `retry_after_ms`, at most three
+  times per load (pairing design §6.2). That is a read only: evaluation on read stays unbuilt.
+
+Still not built after I2: the feed's role badges, role filter, review queue and pagination (§5 C10,
+§7 — the list endpoint does not return role fields), `PATCH /role` and its migration, recurring-stream
+merging (§4.8), the card-payment review list, retry-on-read, the one-time Budget notice, preflight,
+the Phase A backfill and release.

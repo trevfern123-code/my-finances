@@ -38,8 +38,8 @@ describe('parseClientApiLevel', () => {
 });
 
 describe('production policy constants', () => {
-  it('this release serves level 1 and still accepts every existing (legacy, level 0) client', () => {
-    expect(API_LEVEL).toBe(1);
+  it('this release serves level 2 (Phase B role-aware fields) and still accepts every existing (level 1 and legacy level 0) client', () => {
+    expect(API_LEVEL).toBe(2);
     expect(MIN_CLIENT_API_LEVEL).toBe(0);
   });
 });

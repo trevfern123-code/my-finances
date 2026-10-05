@@ -184,8 +184,8 @@ afterEach(() => {
 });
 
 describe('the compatibility contract this slice relies on', () => {
-  it('the backend level is NOT raised here, no client is refused, and every semantic surface starts at level 2', () => {
-    expect(API_LEVEL).toBe(1);
+  it('the backend level is 2 (raised in slice I2 with the frontend that reads these fields), no client is refused, and every semantic surface starts at level 2', () => {
+    expect(API_LEVEL).toBe(2);
     expect(MIN_CLIENT_API_LEVEL).toBe(0);
     expect(SEMANTIC_FIELDS_MIN_CLIENT_API_LEVEL).toBe(2);
   });

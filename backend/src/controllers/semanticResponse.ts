@@ -15,8 +15,9 @@ import type { SemanticUnavailable, SemanticUpdating } from '../services/semantic
  * (`X-Client-Api-Level`): the new fields on the three aggregate endpoints, and the effects endpoint
  * itself. A client below that — every bundle released so far — gets exactly the response it gets
  * today: the same body, no role-aware read, and no new semantic failure. This backend's own
- * `API_LEVEL` is deliberately NOT raised in this slice (decided for I1): raising it tells every stale
- * bundle that a better version exists, and no such frontend exists yet.
+ * `API_LEVEL` was left at 1 in slice I1 and is raised to 2 in slice I2, together with the frontend
+ * that reads these fields; that tells a stale bundle a newer build exists and changes nothing it
+ * receives.
  *
  * In a level-2 response the frozen and the role-aware fields are computed from the SAME snapshot rows
  * (`semanticReadPath.ts`), so they describe one database state.

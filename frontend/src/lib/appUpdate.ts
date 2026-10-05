@@ -25,8 +25,15 @@
  * tab updated; no cross-tab coordination is needed.
  */
 
-/** The API level this client speaks. Sent as `X-Client-Api-Level` on every app API request. */
-export const CLIENT_API_LEVEL = 1;
+/**
+ * The API level this client speaks. Sent as `X-Client-Api-Level` on every app API request.
+ *
+ * Level 2 (Financial Semantics Phase B): this client reads the role-aware fields and the drill-down
+ * endpoint, and no longer displays the frozen sign-based ones. A backend below level 2 does not
+ * publish those fields; this client then shows "Updating…" in their place, never the frozen figures
+ * (design §6.4).
+ */
+export const CLIENT_API_LEVEL = 2;
 
 export const SW_URL = '/sw.js';
 export const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
