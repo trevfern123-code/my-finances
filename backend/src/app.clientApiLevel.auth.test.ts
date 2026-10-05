@@ -107,7 +107,7 @@ describe('a supported client level never replaces authentication or ownership', 
 
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: 'Missing bearer token' });
-    expect(res.headers.get('x-api-level')).toBe('1');
+    expect(res.headers.get('x-api-level')).toBe('2');
     expect(res.headers.get('x-min-client-api-level')).toBe('0');
   });
 

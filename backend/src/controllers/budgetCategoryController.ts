@@ -5,7 +5,9 @@ import {
   getCurrentMonthRange,
   getRecentMonthsRange,
 } from '../services/budgetPeriod';
-import type { BudgetCategoryWithSpend } from '../types';
+import type { BudgetCategoryRow, BudgetCategoryWithSpend } from '../types';
+import * as semanticReadPath from '../services/semanticReadPath';
+import { clientWantsSemanticFields, semanticStatusOf, splitRefusalStatus } from './semanticResponse';
 
 const DEFAULT_RECENT_AVG_MONTHS = 2;
 
@@ -21,22 +23,56 @@ export async function listBudgetCategories(req: Request, res: Response, next: Ne
     const recentAvgMonths = prefs?.recent_avg_months ?? DEFAULT_RECENT_AVG_MONTHS;
     const recentRange = getRecentMonthsRange(recentAvgMonths);
 
-    const [categories, currentSpendRows, recentSpendRows] = await Promise.all([
-      dataService.listBudgetCategories(userId),
-      dataService.getCategorySpendRows(userId, currentRange),
-      dataService.getCategorySpendRows(userId, recentRange),
-    ]);
+    // `spent` and `recent_avg_spent` are FROZEN at their sign-based meaning (Phase B design §6.4) and
+    // are all a client below API level 2 receives — exactly today's response.
+    type SpendRows = Parameters<typeof aggregateSpendByCategory>[0];
+    const frozenOf = (categories: BudgetCategoryRow[], currentSpendRows: SpendRows, recentSpendRows: SpendRows): BudgetCategoryWithSpend[] => {
+      const currentSpendByCategory = aggregateSpendByCategory(currentSpendRows);
+      const recentSpendByCategory = aggregateSpendByCategory(recentSpendRows);
+      return categories.map((category) => ({
+        ...category,
+        spent: currentSpendByCategory.get(category.id) ?? 0,
+        recent_avg_spent: (recentSpendByCategory.get(category.id) ?? 0) / recentAvgMonths,
+      }));
+    };
+    const readFrozen = async () => {
+      const [categories, currentSpendRows, recentSpendRows] = await Promise.all([
+        dataService.listBudgetCategories(userId),
+        dataService.getCategorySpendRows(userId, currentRange),
+        dataService.getCategorySpendRows(userId, recentRange),
+      ]);
+      return frozenOf(categories, currentSpendRows, recentSpendRows);
+    };
 
-    const currentSpendByCategory = aggregateSpendByCategory(currentSpendRows);
-    const recentSpendByCategory = aggregateSpendByCategory(recentSpendRows);
+    if (!clientWantsSemanticFields(req)) {
+      res.json({ categories: await readFrozen() });
+      return;
+    }
 
-    const categoriesWithSpend: BudgetCategoryWithSpend[] = categories.map((category) => ({
-      ...category,
-      spent: currentSpendByCategory.get(category.id) ?? 0,
-      recent_avg_spent: (recentSpendByCategory.get(category.id) ?? 0) / recentAvgMonths,
-    }));
-
-    res.json({ categories: categoriesWithSpend });
+    // Phase B (design §5 C6), level-2 clients only: role-aware `spending` / `recent_avg_spending`,
+    // signed and never clamped. ONE snapshot supplies the category list, the transactions and their
+    // splits for the frozen and the role-aware fields alike. They do not depend on card-payment
+    // matching.
+    const read = await semanticReadPath.readBudget(userId, { current: currentRange, recent: recentRange });
+    if (read.status === 'unavailable') {
+      res.json({ categories: await readFrozen(), semantic_status: semanticStatusOf(read) });
+      return;
+    }
+    const categories = frozenOf(read.frozen.categories, read.frozen.spendRows.current, read.frozen.spendRows.recent);
+    if (read.status === 'refused') {
+      // A split no longer adds up (design §13 Q3): the budget aggregate is refused. The category list
+      // and the frozen fields are kept; every role-aware figure is withheld and the rows are named.
+      res.json({ categories, semantic_status: splitRefusalStatus(read.mismatch) });
+      return;
+    }
+    res.json({
+      categories: categories.map((category) => ({
+        ...category,
+        spending: read.value.current.byCategory.get(category.id) ?? 0,
+        recent_avg_spending: (read.value.recent.byCategory.get(category.id) ?? 0) / recentAvgMonths,
+      })),
+      semantic_status: semanticStatusOf(read),
+    });
   } catch (err) {
     next(err);
   }

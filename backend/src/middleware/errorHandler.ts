@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 import { summarizeErrorSafely } from '../services/errorSanitizer';
+import { semanticErrorResponse } from './semanticErrors';
 
 /**
  * The request-body failures express.json() (body-parser) reports as the CLIENT's fault, mapped to
@@ -37,6 +38,15 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
     // — never the body or the parser's message, which can quote it.
     console.warn(`Rejected request body: ${(err as { type: string }).type}`);
     res.status(clientError.status).json({ error: clientError.message, code: clientError.code });
+    return;
+  }
+
+  // Explicit failures of the role-aware read path (Financial Semantics Phase B): a fixed message, a
+  // machine-readable code and at most the user's own transaction id — never the underlying message.
+  const semanticError = semanticErrorResponse(err);
+  if (semanticError) {
+    console.error(summarizeErrorSafely(err));
+    res.status(semanticError.status).json(semanticError.body);
     return;
   }
 

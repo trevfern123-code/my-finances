@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import type { TransactionItem, UserPreferences } from './lib/api';
 import { installFakeWebLocks, removeWebLocks } from './testUtils/fakeWebLocks';
+import { breakdownWire, budgetCategoryWire, budgetWire, cashFlowWire, REFUSED_STATUS, summaryWire } from './testUtils/semanticFixtures';
 
 const mockGetSession = vi.hoisted(() => vi.fn());
 const mockOnAuthStateChange = vi.hoisted(() => vi.fn());
@@ -62,6 +63,12 @@ const mockSandboxResetLogin = vi.hoisted(() => vi.fn());
 // Controlled so Round 7's mutation-lifecycle-leakage regression tests can hold each mutation's own
 // response open/reject it on demand.
 const mockCreateManualLoan = vi.hoisted(() => vi.fn());
+// Phase B I2 correction (F2): the other loan mutations, and the payment list they act on.
+const mockUpdateManualLoan = vi.hoisted(() => vi.fn());
+const mockDeleteManualLoan = vi.hoisted(() => vi.fn());
+const mockUpdateLinkedLoanPayment = vi.hoisted(() => vi.fn());
+const mockUnlinkLoanPayment = vi.hoisted(() => vi.fn());
+const mockGetLoanPayments = vi.hoisted(() => vi.fn());
 const mockApproveTransaction = vi.hoisted(() => vi.fn());
 const mockCreateBudgetCategory = vi.hoisted(() => vi.fn());
 const mockSaveCategoryMapping = vi.hoisted(() => vi.fn());
@@ -93,6 +100,11 @@ vi.mock('./lib/api', async (importOriginal) => {
     sandboxResetLogin: mockSandboxResetLogin,
     sandboxFireWebhook: vi.fn().mockResolvedValue({}),
     createManualLoan: mockCreateManualLoan,
+    updateManualLoan: mockUpdateManualLoan,
+    deleteManualLoan: mockDeleteManualLoan,
+    updateLinkedLoanPayment: mockUpdateLinkedLoanPayment,
+    unlinkLoanPayment: mockUnlinkLoanPayment,
+    getLoanPayments: mockGetLoanPayments,
     approveTransaction: mockApproveTransaction,
     createBudgetCategory: mockCreateBudgetCategory,
     saveCategoryMapping: mockSaveCategoryMapping,
@@ -795,7 +807,29 @@ describe('9-10. every refresh group gets a fresh ownership id; siblings within o
     mockGetUserPreferences.mockResolvedValue(fakePreferences());
     mockGetSpendingSummary.mockResolvedValueOnce({ ...emptySummary, net_worth: 42 });
     mockGetMonthlyBreakdown.mockResolvedValueOnce({
-      months: [{ month: '2026-09', total_spent: 500, total_income: 1000, by_category: [] }],
+      months: [
+        {
+          month: '2026-09',
+          total_spent: 500,
+          total_income: 1000,
+          by_category: [],
+          semantic: {
+            spending: 500,
+            income: 1000,
+            by_category: [],
+            excluded: {
+              transfers_internal: 0,
+              transfers_external: 0,
+              credit_card_payments_tracked: 0,
+              credit_card_payments_untracked: 0,
+              credit_card_payments_returned_untracked: 0,
+              debt_payments: 0,
+              card_payments_unresolved: { count: 0, payments_amount: 0, returns_amount: 0, by_reason: {} },
+            },
+          },
+        },
+      ],
+      semantic_status: { status: 'ok' },
     });
     render(<App />);
     act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
@@ -2888,9 +2922,19 @@ describe('51. a successful category mutation invalidates an older, still-pending
     // The older targeted read, reserved before the mutation committed, now resolves. Without
     // Blocker 2's fix, its full-array replacement would silently erase New-Category since the
     // mutation never used to advance the resource version the read checks itself against.
+    //
+    // (Phase B I2 correction: that superseded read is now followed by a fresh one, so the budget
+    // figures it had withheld come back. The server's answer to the fresh read includes the
+    // category it has just created; the stale read's own list is still never used.)
+    mockGetBudgetCategories.mockResolvedValueOnce({
+      categories: [
+        { id: 'cat-new', name: 'New-Category', budget_amount: 200, color: null, sort_order: 0, emoji: null, archived_at: null, spent: 0, recent_avg_spent: 0 },
+      ],
+    });
     await act(async () => {
       groupedBudgets.resolve(fakeBudgetCategories('Old-Targeted-Category'));
       await groupedBudgets.promise.catch(() => {});
+      await Promise.resolve().then(() => Promise.resolve());
     });
 
     expect(screen.getByText(/New-Category/)).toBeTruthy();
@@ -3918,5 +3962,1590 @@ describe('Continuity release closeout: approve a changed-amount posted row, then
     expect(screen.getByText(note)).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
     expect(writes).toBe(1); // failure is not silently retried
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Financial Semantics Phase B, integration slice I2: the real App against level-2 responses.
+// The fixtures' frozen sign-based fields are 9,999 / 8,888 / 7,777 and their cash flow is not
+// income − spending, so a frozen or rebuilt figure anywhere on screen fails these tests.
+// ---------------------------------------------------------------------------------------------
+describe('Phase B I2: role-aware figures, their states, and no fallback to the frozen fields', () => {
+  const FROZEN = /9,999|8,888|7,777|1,111/;
+
+  function cashFlowCard(): HTMLElement {
+    const card = screen.getByText('Monthly cash flow').closest('.stat-card');
+    if (!card) throw new Error('no Monthly cash flow card');
+    return card as HTMLElement;
+  }
+
+  async function boot() {
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+  }
+
+  const integrityError = () =>
+    Object.assign(new Error('SoFi payment on Sep 12 has principal 400.00 larger than its amount 350.00'), {
+      code: 'semantic_integrity_error',
+      status: 500,
+      transaction_id: '7b1f0000-0000-4000-8000-000000000000',
+    });
+
+  it('level-2 backend: the Overview shows the server cash flow, with net worth beside it', async () => {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    await boot();
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+    expect(cashFlowCard().querySelector('.stat-value')?.textContent).toBe('$1,827');
+    expect(document.querySelector('.cash-flow-result')?.textContent).toBe('Cash flow this month: $1,827.10');
+    expect(document.body.textContent).not.toMatch(FROZEN);
+    // income_semantic − spending for the fixture: what a client-side reconstruction would show.
+    expect(document.body.textContent).not.toMatch(/2,477/);
+  });
+
+  it('new bundle before new backend: a response with no role-aware fields shows "—" and "Updating…", never income − spent', async () => {
+    // Exactly what a level-1 backend returns: the frozen fields and nothing else.
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42, status: undefined }));
+    mockGetMonthlyBreakdown.mockResolvedValue(breakdownWire({ status: undefined }));
+    mockGetBudgetCategories.mockResolvedValue(budgetWire({ status: undefined, categories: [budgetCategoryWire({ id: 'cat-1', name: 'Groceries' })] }));
+    await boot();
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+
+    expect(cashFlowCard().querySelector('.stat-value')?.textContent).toBe('—');
+    expect(cashFlowCard().textContent).toContain('Updating…');
+    expect(document.querySelector('.cash-flow-result')).toBeNull();
+    expect(document.body.textContent).not.toMatch(FROZEN);
+
+    act(() => screen.getByText('Monthly Breakdown').click());
+    expect(screen.queryByText('September 2026')).toBeNull();
+    expect(document.querySelector('.semantic-notice')?.textContent).toMatch(/being updated/);
+    expect(document.body.textContent).not.toMatch(FROZEN);
+
+    act(() => screen.getByText('Budget').click());
+    expect(screen.getByText('Groceries')).toBeTruthy();
+    expect(document.querySelector('.budget-category-footer .budget-category-summary')?.textContent).toBe('— of $400.00 spent');
+    expect(document.body.textContent).not.toMatch(FROZEN);
+
+    act(() => screen.getByText('Income & Savings').click());
+    expect(document.body.textContent).not.toMatch(FROZEN);
+  });
+
+  it.each([
+    ['updating', { status: 'updating', retry_after_ms: 5000, reason: 'matching_pending' }, 'Updating…'],
+    ['unavailable', { status: 'unavailable', retry_after_ms: 5000, reason: 'request_failed' }, 'Unavailable'],
+  ])('%s: the cash-flow figures are withheld while net worth stays', async (_name, status, word) => {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42, status }));
+    await boot();
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+    expect(cashFlowCard().querySelector('.stat-value')?.textContent).toBe('—');
+    expect(cashFlowCard().textContent).toContain(word);
+    expect(cashFlowCard().textContent).not.toMatch(/\d/);
+    expect(document.querySelector('.cash-flow-result')).toBeNull();
+    expect(document.body.textContent).not.toMatch(FROZEN);
+  });
+
+  it('an integrity error: one alert with fixed wording, no figure, no server detail — and "Check again" refetches', async () => {
+    mockGetSpendingSummary.mockRejectedValueOnce(integrityError());
+    await boot();
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain('One transaction has inconsistent data, so these figures are paused.');
+    expect(document.body.textContent).not.toMatch(/SoFi|7b1f|400\.00|350\.00/);
+    expect(readNetWorth()).toBeNull();
+    expect(screen.queryByText('Monthly cash flow')).toBeNull();
+
+    const callsBefore = mockGetSpendingSummary.mock.calls.length;
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 77 }));
+    await act(async () => {
+      within(alert).getByRole('button', { name: 'Check again' }).click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(callsBefore + 1);
+    await waitFor(() => expect(readNetWorth()).toBe('$77'));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(cashFlowCard().querySelector('.stat-value')?.textContent).toBe('$1,827');
+  });
+
+  it('figures already on screen do not survive a later failed request for the same range', async () => {
+    mockGetSpendingSummary.mockResolvedValueOnce(summaryWire({ netWorth: 42 }));
+    await boot();
+    await waitFor(() => expect(cashFlowCard().querySelector('.stat-value')?.textContent).toBe('$1,827'));
+
+    mockGetSpendingSummary.mockRejectedValueOnce(integrityError());
+    await act(async () => {
+      screen.getByRole('radio', { checked: true }).click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(screen.queryByText('Monthly cash flow')).toBeNull();
+    expect(document.body.textContent).not.toContain('1,827');
+  });
+
+  it('Monthly Breakdown: a failed request is an alert with a retry, and the months appear once it succeeds', async () => {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetMonthlyBreakdown.mockRejectedValueOnce(Object.assign(new Error('too many'), { code: 'aggregate_too_large', status: 500 }));
+    await boot();
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+    act(() => screen.getByText('Monthly Breakdown').click());
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/too many transactions to total/));
+    expect(screen.queryByText('September 2026')).toBeNull();
+
+    mockGetMonthlyBreakdown.mockResolvedValue(breakdownWire());
+    await act(async () => {
+      screen.getByRole('button', { name: 'Check again' }).click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(screen.getByText('September 2026')).toBeTruthy());
+    expect(document.querySelector('.month-totals')?.textContent).toBe('$525.00 spent$3,002.10 in');
+    expect(document.body.textContent).not.toMatch(FROZEN);
+  });
+
+  it('Budget: role-aware spending renders; a refused budget keeps the list and withholds every figure', async () => {
+    mockGetBudgetCategories.mockResolvedValueOnce(budgetWire());
+    await boot();
+    act(() => screen.getByText('Budget').click());
+    await waitFor(() => expect(screen.getByText('−$60.00 (refund) of $300.00 spent')).toBeTruthy());
+    expect(screen.getByText('$50.00 of $400.00 spent')).toBeTruthy();
+
+    // A sync triggers the targeted budget refresh; this time a split no longer adds up.
+    act(() => screen.getByText('Accounts').click());
+    mockGetBudgetCategories.mockResolvedValueOnce(
+      budgetWire({ status: REFUSED_STATUS, categories: [budgetCategoryWire({ id: 'cat-1', name: 'Groceries' }), budgetCategoryWire({ id: 'cat-2', name: 'Shopping', budget_amount: 300, sort_order: 1 })] })
+    );
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    act(() => screen.getByText('Budget').click());
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/budget figures are paused until its splits are corrected/));
+    expect(screen.getByText('Groceries')).toBeTruthy();
+    expect(screen.getByText('Shopping')).toBeTruthy();
+    expect(Array.from(document.querySelectorAll('.budget-category-footer .budget-category-summary')).map((el) => el.textContent)).toEqual([
+      '— of $400.00 spent',
+      '— of $300.00 spent',
+    ]);
+    expect(document.body.textContent).not.toMatch(FROZEN);
+    expect(document.body.textContent).not.toContain('11111111');
+  });
+
+  it('Budget: figures on screen are withheld when a later refresh fails, rather than left looking current', async () => {
+    mockGetBudgetCategories.mockResolvedValueOnce(budgetWire());
+    await boot();
+    act(() => screen.getByText('Budget').click());
+    await waitFor(() => expect(screen.getByText('$50.00 of $400.00 spent')).toBeTruthy());
+
+    act(() => screen.getByText('Accounts').click());
+    mockGetBudgetCategories.mockRejectedValueOnce(integrityError());
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    act(() => screen.getByText('Budget').click());
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/One transaction has inconsistent data/));
+    expect(screen.getByText('Groceries')).toBeTruthy();
+    expect(screen.queryByText('$50.00 of $400.00 spent')).toBeNull();
+    expect(screen.getByText('— of $400.00 spent')).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/SoFi|7b1f/);
+  });
+
+  it('Budget: a category created just now shows zero spending beside the figures already shown', async () => {
+    mockGetBudgetCategories.mockResolvedValueOnce(budgetWire());
+    await boot();
+    act(() => screen.getByText('Budget').click());
+    await waitFor(() => expect(screen.getByText('$50.00 of $400.00 spent')).toBeTruthy());
+
+    mockCreateBudgetCategory.mockResolvedValueOnce({
+      category: { id: 'cat-new', name: 'New-Category', budget_amount: 200, color: null, sort_order: 2, emoji: null, archived_at: null },
+    });
+    act(() => screen.getByText('Add category').click());
+    const form = screen.getByText('Add a budget category').closest('form') as HTMLElement;
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'New-Category' } });
+    fireEvent.change(within(form).getByLabelText('Monthly budget'), { target: { value: '200' } });
+    await act(async () => {
+      fireEvent.click(within(form).getByText('Add category'));
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(screen.getByText('$0.00 of $200.00 spent')).toBeTruthy());
+  });
+
+  it('Budget: a category created while figures are withheld gets a dash like the rest', async () => {
+    mockGetBudgetCategories.mockResolvedValueOnce(budgetWire({ status: { status: 'unavailable', retry_after_ms: 5000, reason: 'timeout' }, categories: [budgetCategoryWire({ id: 'cat-1', name: 'Groceries' })] }));
+    await boot();
+    act(() => screen.getByText('Budget').click());
+    await waitFor(() => expect(screen.getByText('— of $400.00 spent')).toBeTruthy());
+
+    mockCreateBudgetCategory.mockResolvedValueOnce({
+      category: { id: 'cat-new', name: 'New-Category', budget_amount: 200, color: null, sort_order: 2, emoji: null, archived_at: null },
+    });
+    act(() => screen.getByText('Add category').click());
+    const form = screen.getByText('Add a budget category').closest('form') as HTMLElement;
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'New-Category' } });
+    fireEvent.change(within(form).getByLabelText('Monthly budget'), { target: { value: '200' } });
+    await act(async () => {
+      fireEvent.click(within(form).getByText('Add category'));
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(screen.getByText('— of $200.00 spent')).toBeTruthy());
+    expect(screen.queryByText('$0.00 of $200.00 spent')).toBeNull();
+  });
+
+  it('a summary refresh does not refetch the budget, and opening no drill-down sends no effects request', async () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetBudgetCategories.mockResolvedValue(budgetWire());
+    await boot();
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+    const budgetCalls = mockGetBudgetCategories.mock.calls.length;
+    const summaryCalls = mockGetSpendingSummary.mock.calls.length;
+    expect(summaryCalls).toBe(1);
+
+    await act(async () => {
+      screen.getByRole('radio', { checked: true }).click();
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(summaryCalls + 1);
+    expect(mockGetBudgetCategories.mock.calls.length).toBe(budgetCalls);
+    // The effects endpoint is not mocked in this file: any request to it would reach fetch.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+});
+
+// Self-review regression (I2): before Phase B a manual-loan link changed nothing the Overview or the
+// Budget showed, so loan mutations refreshed neither. Now a link decides how a payment is counted
+// (principal as a debt payment, the rest as interest under spending), so the figures on screen
+// would stay those of the previous state — under an "ok" status — unless they are refetched.
+describe('Phase B I2: a manual-loan change refetches the role-aware figures instead of leaving stale ones', () => {
+  async function bootWithFigures() {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetBudgetCategories.mockResolvedValue(budgetWire());
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+    act(() => screen.getByText('Loans').click());
+  }
+
+  async function addLoan(name: string) {
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: name } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '500' } });
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan(name));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(screen.getAllByText(name).length).toBeGreaterThan(0));
+  }
+
+  it('adding a loan (whose match text can link existing payments) refetches the summary, the breakdown and the budget', async () => {
+    await bootWithFigures();
+    const before = {
+      summary: mockGetSpendingSummary.mock.calls.length,
+      breakdown: mockGetMonthlyBreakdown.mock.calls.length,
+      budget: mockGetBudgetCategories.mock.calls.length,
+    };
+
+    // The server now counts $350 of an existing payment as loan principal: cash flow is unchanged,
+    // spending is not. The refetched figures must replace the ones on screen.
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42, currentMonth: undefined, months: [{ month: '2026-09' }] }));
+    await addLoan('SoFi Loan');
+
+    await waitFor(() => expect(mockGetSpendingSummary.mock.calls.length).toBe(before.summary + 1));
+    expect(mockGetMonthlyBreakdown.mock.calls.length).toBe(before.breakdown + 1);
+    expect(mockGetBudgetCategories.mock.calls.length).toBe(before.budget + 1);
+  });
+
+  it('a loan creation that fails refetches nothing', async () => {
+    await bootWithFigures();
+    const before = { summary: mockGetSpendingSummary.mock.calls.length, budget: mockGetBudgetCategories.mock.calls.length };
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Refused Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '500' } });
+    mockCreateManualLoan.mockRejectedValueOnce(new Error('Could not add the loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(screen.getByText('Could not add the loan')).toBeTruthy());
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(before.summary);
+    expect(mockGetBudgetCategories.mock.calls.length).toBe(before.budget);
+  });
+
+  it('a loan added under user A does not refetch figures for user B once B is signed in', async () => {
+    await bootWithFigures();
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'A Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '500' } });
+    const create = deferred<ReturnType<typeof fakeManualLoan>>();
+    mockCreateManualLoan.mockReturnValueOnce(create.promise);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve();
+    });
+
+    const beforeB = { summary: mockGetSpendingSummary.mock.calls.length, budget: mockGetBudgetCategories.mock.calls.length };
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    // B's own lifecycle loads its figures once (the Loans tab stays selected across the sign-in).
+    await waitFor(() => expect(mockGetSpendingSummary.mock.calls.length).toBe(beforeB.summary + 1));
+    await waitFor(() => expect(mockGetBudgetCategories.mock.calls.length).toBe(beforeB.budget + 1));
+    await waitFor(() => expect(screen.getByText('Add a loan')).toBeTruthy());
+    const afterB = { summary: mockGetSpendingSummary.mock.calls.length, budget: mockGetBudgetCategories.mock.calls.length };
+
+    await act(async () => {
+      create.resolve(fakeManualLoan('A Loan'));
+      await create.promise.catch(() => {});
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(afterB.summary);
+    expect(mockGetBudgetCategories.mock.calls.length).toBe(afterB.budget);
+  });
+});
+
+// =================================================================================================
+// I2 correction pass — independent review findings F1, F2 and F3, against the real App.
+// =================================================================================================
+
+describe('Phase B I2 correction F1: Safe to Spend with an empty category list fails closed', () => {
+  const safeToSpend = () => document.querySelector('.safe-to-spend-value')?.textContent ?? null;
+
+  it('an already-ready session with NO categories: a failed background refresh removes the Safe to Spend number', async () => {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetAssetsSummary.mockResolvedValue(fakeAssetsSummary('A-Bank Checking', 5000));
+    // The budget is valid and empty: zero remaining budget is a real answer here.
+    mockGetBudgetCategories.mockResolvedValueOnce(budgetWire({ categories: [] }));
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    await waitFor(() => expect(safeToSpend()).toBe('$5,000.00'));
+
+    // A sync triggers the budget refresh, which fails. The list on screen is still empty — and is
+    // now an OLD read: a category created elsewhere would be unknown here.
+    act(() => screen.getByText('Accounts').click());
+    mockGetBudgetCategories.mockRejectedValueOnce(new Error('Failed to fetch'));
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    act(() => screen.getByText('Overview').click());
+    await waitFor(() => expect(safeToSpend()).toBe('—'));
+    const card = document.querySelector('.safe-to-spend-card') as HTMLElement;
+    expect(card.textContent).not.toContain('5,000.00Wh');
+    expect(card.querySelector('.safe-to-spend-value')?.textContent).not.toMatch(/\d/);
+    expect(card.textContent).toMatch(/Remaining budget isn't available/);
+  });
+
+  it.each([
+    ['refused', REFUSED_STATUS],
+    ['unavailable', { status: 'unavailable', retry_after_ms: 5000, reason: 'timeout' }],
+    ['updating', { status: 'updating', retry_after_ms: 5000, reason: 'matching_pending' }],
+    ['no role-aware fields (older backend)', undefined],
+  ])('a 200 answer that is %s with an empty list shows no Safe to Spend number', async (_name, status) => {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetAssetsSummary.mockResolvedValue(fakeAssetsSummary('A-Bank Checking', 5000));
+    mockGetBudgetCategories.mockResolvedValue(budgetWire({ categories: [], status }));
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+    expect(safeToSpend()).toBe('—');
+  });
+});
+
+describe('Phase B I2 correction F2: a committed loan change withholds the old figures at once, while the new ones are pending', () => {
+  const PAYMENT = {
+    id: 'txn-linked-1',
+    source: 'linked' as const,
+    date: '2026-09-12',
+    name: 'SoFi payment',
+    merchant_name: null,
+    principal_portion: 350,
+    interest_portion: 50,
+    notes: null,
+  };
+  const safeToSpend = () => document.querySelector('.safe-to-spend-value')?.textContent ?? null;
+  const budgetSummaries = () =>
+    Array.from(document.querySelectorAll('.budget-category-footer .budget-category-summary')).map((el) => el.textContent);
+  const flush = async () => {
+    await act(async () => {
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+  };
+
+  /** Signed in, with figures on screen and one manual loan ("SoFi Loan") on the Loans tab. */
+  async function bootWithLoanAndFigures() {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetBudgetCategories.mockResolvedValue(budgetWire());
+    mockGetAssetsSummary.mockResolvedValue(fakeAssetsSummary('A-Bank Checking', 5000));
+    mockGetLoanPayments.mockResolvedValue({ payments: [PAYMENT] });
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    await waitFor(() => expect(readNetWorth()).toBe('$42'));
+    act(() => screen.getByText('Loans').click());
+    act(() => screen.getByText('Add a loan').click());
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'SoFi Loan' } });
+    fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '500' } });
+    mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('SoFi Loan'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Save loan'));
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(screen.getAllByText('SoFi Loan').length).toBeGreaterThan(0));
+    // The figures (re)loaded after that creation are on screen before the action under test.
+    act(() => screen.getByText('Budget').click());
+    await waitFor(() => expect(budgetSummaries()).toEqual(['$50.00 of $400.00 spent', '−$60.00 (refund) of $300.00 spent']));
+    act(() => screen.getByText('Overview').click());
+    // 5,000 liquid − ((400 − 50) + (300 + 60)) remaining budget.
+    await waitFor(() => expect(safeToSpend()).toBe('$4,290.00'));
+    expect(document.querySelector('.cash-flow-result')?.textContent).toBe('Cash flow this month: $1,827.10');
+    act(() => screen.getByText('Loans').click());
+  }
+
+  const loanCard = () => screen.getAllByText('SoFi Loan')[0].closest('.loan-card') as HTMLElement;
+
+  const ACTIONS: [string, () => Promise<void>, () => number][] = [
+    [
+      'adding a loan',
+      async () => {
+        act(() => screen.getByText('Add a loan').click());
+        fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Second Loan' } });
+        fireEvent.change(screen.getByLabelText('Current balance'), { target: { value: '900' } });
+        mockCreateManualLoan.mockResolvedValueOnce(fakeManualLoan('Second Loan'));
+        await act(async () => {
+          fireEvent.click(screen.getByText('Save loan'));
+          await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+        });
+      },
+      () => mockCreateManualLoan.mock.calls.length,
+    ],
+    [
+      'editing a loan',
+      async () => {
+        act(() => within(loanCard()).getByText('Edit').click());
+        fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'SoFi Loan' } });
+        mockUpdateManualLoan.mockResolvedValueOnce(fakeManualLoan('SoFi Loan'));
+        await act(async () => {
+          fireEvent.click(screen.getByText('Save loan'));
+          await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+        });
+      },
+      () => mockUpdateManualLoan.mock.calls.length,
+    ],
+    [
+      'deleting a loan',
+      async () => {
+        mockDeleteManualLoan.mockResolvedValueOnce(undefined);
+        await act(async () => {
+          within(loanCard()).getByText('Delete').click();
+          await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+        });
+      },
+      () => mockDeleteManualLoan.mock.calls.length,
+    ],
+    [
+      "editing a linked payment's principal",
+      async () => {
+        await act(async () => {
+          within(loanCard()).getByText('Payment history').click();
+          await Promise.resolve().then(() => Promise.resolve());
+        });
+        await waitFor(() => expect(screen.getByText('SoFi payment')).toBeTruthy());
+        fireEvent.change(within(loanCard()).getByLabelText('Principal'), { target: { value: '300' } });
+        mockUpdateLinkedLoanPayment.mockResolvedValueOnce(fakeManualLoan('SoFi Loan'));
+        await act(async () => {
+          within(loanCard()).getByText('Save').click();
+          await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+        });
+      },
+      () => mockUpdateLinkedLoanPayment.mock.calls.length,
+    ],
+    [
+      'unlinking a linked payment',
+      async () => {
+        await act(async () => {
+          within(loanCard()).getByText('Payment history').click();
+          await Promise.resolve().then(() => Promise.resolve());
+        });
+        await waitFor(() => expect(screen.getByText('SoFi payment')).toBeTruthy());
+        mockUnlinkLoanPayment.mockResolvedValueOnce(fakeManualLoan('SoFi Loan'));
+        await act(async () => {
+          within(loanCard()).getByText('Unlink').click();
+          await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+        });
+      },
+      () => mockUnlinkLoanPayment.mock.calls.length,
+    ],
+  ];
+
+  it.each(ACTIONS)('%s: the old budget, Safe to Spend and cash-flow figures are gone while the replacement reads are still pending', async (_name, perform, mutationCalls) => {
+    await bootWithLoanAndFigures();
+
+    // The replacement reads are held open: nothing answers until the test says so.
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    const summaryRead = deferred<ReturnType<typeof summaryWire>>();
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    mockGetSpendingSummary.mockReturnValueOnce(summaryRead.promise);
+    const before = { budget: mockGetBudgetCategories.mock.calls.length, summary: mockGetSpendingSummary.mock.calls.length, mutation: mutationCalls() };
+
+    await perform();
+    await flush();
+
+    // 2–3. The mutation succeeded and the replacement reads were requested, and are unanswered.
+    expect(mutationCalls()).toBe(before.mutation + 1);
+    expect(mockGetBudgetCategories.mock.calls.length).toBe(before.budget + 1);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(before.summary + 1);
+
+    // 4. The old figures are already gone, on every surface that showed them.
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    expect(screen.queryByText('$50.00 of $400.00 spent')).toBeNull();
+    expect(screen.getByText('Groceries')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /transactions for/ })).toBeNull();
+    expect(document.querySelector('.semantic-notice')?.textContent).toMatch(/Loading these figures/);
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('—');
+    expect(document.body.textContent).not.toContain('4,290');
+    expect(document.querySelector('.cash-flow-result')).toBeNull();
+    expect(document.body.textContent).not.toContain('1,827');
+
+    // 5. The replacement answers populate the new figures.
+    await act(async () => {
+      budgetRead.resolve(
+        budgetWire({
+          categories: [
+            budgetCategoryWire({ id: 'cat-1', name: 'Groceries', budget_amount: 400, spending: 20, recent_avg_spending: 0 }),
+            budgetCategoryWire({ id: 'cat-2', name: 'Shopping', budget_amount: 300, sort_order: 1, spending: 0, recent_avg_spending: 0 }),
+          ],
+        })
+      );
+      summaryRead.resolve(summaryWire({ netWorth: 42, currentMonth: cashFlowWire({ cash_flow: 1500, cash_flow_range: { low: 1500, high: 1500 } }) }));
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    // 5,000 − ((400 − 20) + (300 − 0)).
+    await waitFor(() => expect(safeToSpend()).toBe('$4,320.00'));
+    expect(document.querySelector('.cash-flow-result')?.textContent).toBe('Cash flow this month: $1,500.00');
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['$20.00 of $400.00 spent', '$0.00 of $300.00 spent']);
+  });
+
+  it('when the replacement budget read fails, the figures stay withheld (the accepted fail-closed behaviour)', async () => {
+    await bootWithLoanAndFigures();
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    mockDeleteManualLoan.mockResolvedValueOnce(undefined);
+    await act(async () => {
+      within(loanCard()).getByText('Delete').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+
+    await act(async () => {
+      budgetRead.reject(new Error('Failed to fetch'));
+      await budgetRead.promise.catch(() => {});
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    expect(screen.getByRole('alert').textContent).toMatch(/couldn't be loaded/);
+    expect(screen.queryByText('$50.00 of $400.00 spent')).toBeNull();
+  });
+
+  it('a loan change that fails leaves the figures as they were and requests nothing', async () => {
+    await bootWithLoanAndFigures();
+    const before = { budget: mockGetBudgetCategories.mock.calls.length, summary: mockGetSpendingSummary.mock.calls.length };
+    mockDeleteManualLoan.mockRejectedValueOnce(new Error('Could not delete the loan'));
+    await act(async () => {
+      within(loanCard()).getByText('Delete').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    expect(mockGetBudgetCategories.mock.calls.length).toBe(before.budget);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(before.summary);
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['$50.00 of $400.00 spent', '−$60.00 (refund) of $300.00 spent']);
+  });
+
+  it('a sync (targeted refresh) withholds the budget figures while its read is pending, too', async () => {
+    await bootWithLoanAndFigures();
+    act(() => screen.getByText('Accounts').click());
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    await act(async () => {
+      budgetRead.resolve(budgetWire());
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    expect(budgetSummaries()).toEqual(['$50.00 of $400.00 spent', '−$60.00 (refund) of $300.00 spent']);
+  });
+
+  it('a new bank link (grouped refresh) withholds the budget figures while its read is pending', async () => {
+    await bootWithLoanAndFigures();
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,290.00');
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    await openPlaidLink();
+    await act(async () => {
+      finishHostedLink();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(safeToSpend()).toBe('—'));
+    expect(document.body.textContent).not.toContain('4,290');
+    await act(async () => {
+      budgetRead.resolve(budgetWire());
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    await waitFor(() => expect(safeToSpend()).toBe('$4,290.00'));
+  });
+
+  it('a category edited while a budget read is pending does not leave the figures withheld for good: the read is repeated', async () => {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetBudgetCategories.mockResolvedValueOnce(budgetWire());
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    act(() => screen.getByText('Accounts').click());
+
+    // A sync starts a budget read that stays unanswered…
+    const staleRead = deferred<ReturnType<typeof budgetWire>>();
+    mockGetBudgetCategories.mockReturnValueOnce(staleRead.promise);
+    await act(async () => {
+      screen.getByText('Sync transactions').click();
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    // …and meanwhile the user adds a category, which supersedes that read's list.
+    mockCreateBudgetCategory.mockResolvedValueOnce({
+      category: { id: 'cat-new', name: 'New-Category', budget_amount: 200, color: null, sort_order: 2, emoji: null, archived_at: null },
+    });
+    act(() => screen.getByText('Budget').click());
+    act(() => screen.getByText('Add category').click());
+    const form = screen.getByText('Add a budget category').closest('form') as HTMLElement;
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'New-Category' } });
+    fireEvent.change(within(form).getByLabelText('Monthly budget'), { target: { value: '200' } });
+    await act(async () => {
+      fireEvent.click(within(form).getByText('Add category'));
+      await Promise.resolve().then(() => Promise.resolve());
+    });
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent', '— of $200.00 spent']);
+
+    // The stale read answers. Its list is not used; a fresh read is made instead, which the server
+    // answers with the new category included.
+    const callsBefore = mockGetBudgetCategories.mock.calls.length;
+    mockGetBudgetCategories.mockResolvedValueOnce(
+      budgetWire({
+        categories: [
+          budgetCategoryWire({ id: 'cat-1', name: 'Groceries', budget_amount: 400, spending: 50, recent_avg_spending: 0 }),
+          budgetCategoryWire({ id: 'cat-2', name: 'Shopping', budget_amount: 300, sort_order: 1, spending: -60, recent_avg_spending: 0 }),
+          budgetCategoryWire({ id: 'cat-new', name: 'New-Category', budget_amount: 200, sort_order: 2, spending: 0, recent_avg_spending: 0 }),
+        ],
+      })
+    );
+    await act(async () => {
+      staleRead.resolve(budgetWire({ categories: [budgetCategoryWire({ id: 'cat-old', name: 'Old-List-Only', spending: 1, recent_avg_spending: 0 })] }));
+      await Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
+    });
+    expect(mockGetBudgetCategories.mock.calls.length).toBe(callsBefore + 1);
+    await waitFor(() => expect(budgetSummaries()).toEqual(['$50.00 of $400.00 spent', '−$60.00 (refund) of $300.00 spent', '$0.00 of $200.00 spent']));
+    expect(screen.queryByText(/Old-List-Only/)).toBeNull();
+  });
+});
+
+describe('Phase B I2 correction F3: the client refetches an updating read after the server hint, a bounded number of times', () => {
+  const UPDATING = { status: 'updating', retry_after_ms: 5000, reason: 'matching_pending' };
+  const advance = async (ms: number) => {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  };
+  const flush = async () => {
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+  };
+  /**
+   * Two minutes of fake time, in 5-second steps. React commits a new answer (and so schedules the
+   * next wait) only between steps, so one large jump would let at most one wait fire; stepping is
+   * what lets a runaway loop, if there were one, actually run.
+   */
+  const advanceLong = async () => {
+    for (let step = 0; step < 24; step += 1) await advance(5000);
+  };
+  const cashFlowValue = () => screen.queryByText('Monthly cash flow')?.closest('.stat-card')?.querySelector('.stat-value')?.textContent ?? null;
+  const notice = () => document.querySelector('.semantic-notice')?.textContent ?? '';
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Boots the App with real timers while the first summary answer is held back; then fakes the two
+   * timer functions the scheduler uses and lets `first` arrive. From there on time moves only when
+   * the test advances it, and no assertion waits in real time.
+   */
+  async function bootThenAnswer(first: { resolve?: unknown; reject?: unknown }) {
+    const held = deferred<unknown>();
+    mockGetSpendingSummary.mockReturnValueOnce(held.promise);
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    await act(async () => {
+      if ('reject' in first) held.reject(first.reject);
+      else held.resolve(first.resolve);
+      await held.promise.catch(() => {});
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+  }
+
+  it('updating → (5 s) → one refetch of the summary only → ok replaces it; nothing is shown early and net worth never leaves', async () => {
+    const second = deferred<ReturnType<typeof summaryWire>>();
+    mockGetMonthlyBreakdown.mockResolvedValue(breakdownWire());
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: UPDATING }) });
+    mockGetSpendingSummary.mockReturnValueOnce(second.promise);
+    expect(readNetWorth()).toBe('$42');
+    expect(cashFlowValue()).toBe('—');
+    expect(notice()).toBe("Card-payment matching isn't up to date, so these figures are withheld. Checking again automatically. Check again");
+    const calls = { breakdown: mockGetMonthlyBreakdown.mock.calls.length, history: mockGetNetWorthHistory.mock.calls.length };
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await advance(4999);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(1);
+    await advance(1);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(2);
+    // While the refetch is unanswered: still withheld, still there, and no second timer.
+    expect(readNetWorth()).toBe('$42');
+    expect(cashFlowValue()).toBe('—');
+    expect(vi.getTimerCount()).toBe(0);
+    await advance(60_000);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(2);
+
+    await act(async () => {
+      second.resolve(summaryWire({ netWorth: 42 }));
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    expect(cashFlowValue()).toBe('$1,827');
+    // It was a read of the summary alone: no other dataset was requested again.
+    expect(mockGetMonthlyBreakdown.mock.calls.length).toBe(calls.breakdown);
+    expect(mockGetNetWorthHistory.mock.calls.length).toBe(calls.history);
+    expect(vi.getTimerCount()).toBe(0);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(2);
+  });
+
+  it('a summary that stays updating is asked 3 more times and then no more; the wording changes and "Check again" starts a fresh budget', async () => {
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: UPDATING }) });
+    // Every answer is its own object, as every parsed response is.
+    mockGetSpendingSummary.mockImplementation(() => Promise.resolve(summaryWire({ netWorth: 42, status: UPDATING })));
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await advance(5000);
+      expect(mockGetSpendingSummary.mock.calls.length).toBe(1 + attempt);
+      expect(cashFlowValue()).toBe('—');
+    }
+    expect(vi.getTimerCount()).toBe(0);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(4);
+    expect(notice()).toBe("Card-payment matching isn't up to date, so these figures are withheld. Check again");
+
+    await act(async () => {
+      screen.getAllByRole('button', { name: 'Check again' })[0].click();
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(5);
+    expect(notice()).toMatch(/Checking again automatically\./);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(8);
+  });
+
+  it('a zero hint does not spin: it waits the minimum, and the bound holds', async () => {
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: { ...UPDATING, retry_after_ms: 0 } }) });
+    mockGetSpendingSummary.mockImplementation(() => Promise.resolve(summaryWire({ netWorth: 42, status: { ...UPDATING, retry_after_ms: 0 } })));
+    await advance(999);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(1);
+    await advance(1);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(2);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(4);
+  });
+
+  it('changing the range while a wait is pending cancels it: only the new range is requested', async () => {
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: UPDATING }) });
+    await advance(3000);
+    expect(vi.getTimerCount()).toBe(1);
+
+    const newRange = deferred<ReturnType<typeof summaryWire>>();
+    mockGetSpendingSummary.mockReturnValueOnce(newRange.promise);
+    await act(async () => {
+      screen.getByRole('radio', { checked: true }).click();
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(2);
+    // Had the old wait survived the range change, it would fire here and make a third request.
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(2);
+    await act(async () => {
+      newRange.resolve(summaryWire({ netWorth: 77 }));
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    expect(readNetWorth()).toBe('$77');
+    expect(cashFlowValue()).toBe('$1,827');
+  });
+
+  it('an automatic refetch answered AFTER a new load began is dropped, whatever it says', async () => {
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: UPDATING }) });
+    const autoRefetch = deferred<ReturnType<typeof summaryWire>>();
+    mockGetSpendingSummary.mockReturnValueOnce(autoRefetch.promise);
+    await advance(5000);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(2);
+
+    mockGetSpendingSummary.mockResolvedValueOnce(summaryWire({ netWorth: 77 }));
+    await act(async () => {
+      screen.getByRole('radio', { checked: true }).click();
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    expect(readNetWorth()).toBe('$77');
+
+    await act(async () => {
+      autoRefetch.resolve(summaryWire({ netWorth: 999, currentMonth: cashFlowWire({ cash_flow: 9, cash_flow_range: { low: 9, high: 9 } }) }));
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    expect(readNetWorth()).toBe('$77');
+    expect(cashFlowValue()).toBe('$1,827');
+    expect(document.body.textContent).not.toContain('$999');
+  });
+
+  it('an automatic refetch that FAILS after a new load began is dropped too: the new load stays on screen', async () => {
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: UPDATING }) });
+    const autoRefetch = deferred<ReturnType<typeof summaryWire>>();
+    mockGetSpendingSummary.mockReturnValueOnce(autoRefetch.promise);
+    await advance(5000);
+    mockGetSpendingSummary.mockResolvedValueOnce(summaryWire({ netWorth: 77 }));
+    await act(async () => {
+      screen.getByRole('radio', { checked: true }).click();
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    await act(async () => {
+      autoRefetch.reject(Object.assign(new Error('paused'), { code: 'semantic_integrity_error', status: 500 }));
+      await autoRefetch.promise.catch(() => {});
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    expect(readNetWorth()).toBe('$77');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('signing in as someone else while a wait is pending cancels it: the old wait never fires for the new session', async () => {
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: UPDATING }) });
+    await advance(3000);
+    expect(vi.getTimerCount()).toBe(1);
+    const callsBefore = mockGetSpendingSummary.mock.calls.length;
+    // B's own requests stay unanswered, so any request that appears later can only be the old wait.
+    mockGetUserPreferences.mockReturnValueOnce(deferred<UserPreferences>().promise);
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await flush();
+    expect(vi.getTimerCount()).toBe(0);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(callsBefore);
+  });
+
+  it('unmounting while a wait is pending leaves nothing running', async () => {
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: UPDATING }) });
+    await advance(3000);
+    expect(vi.getTimerCount()).toBe(1);
+    cleanup();
+    expect(vi.getTimerCount()).toBe(0);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(1);
+  });
+
+  it.each([
+    ['unavailable', summaryWire({ netWorth: 42, status: { status: 'unavailable', retry_after_ms: 5000, reason: 'request_failed' } })],
+    ['a backend that does not publish the fields', summaryWire({ netWorth: 42, status: undefined })],
+    ['a malformed ok response', { ...summaryWire({ netWorth: 42 }), current_month: { income: 1, spent: 1 } }],
+  ])('%s is not refetched automatically', async (_name, answer) => {
+    await bootThenAnswer({ resolve: answer });
+    expect(readNetWorth()).toBe('$42');
+    expect(cashFlowValue()).toBe('—');
+    expect(vi.getTimerCount()).toBe(0);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(1);
+  });
+
+  it('an integrity failure is not refetched automatically', async () => {
+    await bootThenAnswer({ reject: Object.assign(new Error('paused'), { code: 'semantic_integrity_error', status: 500 }) });
+    expect(screen.getByRole('alert').textContent).toMatch(/One transaction has inconsistent data/);
+    expect(vi.getTimerCount()).toBe(0);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(1);
+  });
+
+  it('an automatic refetch that fails ends it: the failure is shown, with no figure and no further request', async () => {
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42, status: UPDATING }) });
+    mockGetSpendingSummary.mockRejectedValueOnce(Object.assign(new Error('paused'), { code: 'semantic_integrity_error', status: 500 }));
+    await advance(5000);
+    await flush();
+    expect(screen.getByRole('alert').textContent).toMatch(/One transaction has inconsistent data/);
+    expect(cashFlowValue()).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(2);
+  });
+
+  it('the monthly breakdown has its own bounded refetch, independent of the summary', async () => {
+    const heldBreakdown = deferred<ReturnType<typeof breakdownWire>>();
+    mockGetMonthlyBreakdown.mockReturnValueOnce(heldBreakdown.promise);
+    await bootThenAnswer({ resolve: summaryWire({ netWorth: 42 }) });
+    await act(async () => {
+      heldBreakdown.resolve(breakdownWire({ status: UPDATING }));
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+    mockGetMonthlyBreakdown.mockResolvedValueOnce(breakdownWire());
+    act(() => screen.getByText('Monthly Breakdown').click());
+    expect(screen.queryByText('September 2026')).toBeNull();
+    expect(notice()).toMatch(/Checking again automatically\./);
+    const summaryCalls = mockGetSpendingSummary.mock.calls.length;
+    await advance(4999);
+    expect(mockGetMonthlyBreakdown.mock.calls.length).toBe(1);
+    await advance(1);
+    await flush();
+    expect(mockGetMonthlyBreakdown.mock.calls.length).toBe(2);
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(summaryCalls);
+    expect(screen.getByText('September 2026')).toBeTruthy();
+    await advanceLong();
+    expect(mockGetMonthlyBreakdown.mock.calls.length).toBe(2);
+  });
+
+  it('matching_failed is worded as a failure to bring matching up to date, and follows the same bound', async () => {
+    const failed = () => summaryWire({ netWorth: 42, status: { ...UPDATING, reason: 'matching_failed' } });
+    await bootThenAnswer({ resolve: failed() });
+    mockGetSpendingSummary.mockImplementation(() => Promise.resolve(failed()));
+    expect(notice()).toBe("Card-payment matching couldn't be brought up to date, so these figures are withheld. Checking again automatically. Check again");
+    await advanceLong();
+    expect(mockGetSpendingSummary.mock.calls.length).toBe(4);
+    expect(notice()).toBe("Card-payment matching couldn't be brought up to date, so these figures are withheld. Check again");
+  });
+  // ---- Revision 3 (focused re-review, the remaining part of F3): signing OUT ends the retry --------
+  // lifecycle. App stays mounted across a sign-out (it renders the sign-in screen), so nothing here
+  // is covered by the unmount test above, nor by the A -> B test, in which the new session is not null.
+  describe('signing out ends the retry lifecycle', () => {
+    type Resource = 'summary' | 'monthly breakdown';
+    const RESOURCES: Resource[] = ['summary', 'monthly breakdown'];
+    const mockOf = (resource: Resource) => (resource === 'summary' ? mockGetSpendingSummary : mockGetMonthlyBreakdown);
+    const updatingAnswer = (resource: Resource) =>
+      resource === 'summary' ? summaryWire({ netWorth: 42, status: UPDATING }) : breakdownWire({ status: UPDATING });
+    const okAnswer = (resource: Resource) => (resource === 'summary' ? summaryWire({ netWorth: 999 }) : breakdownWire());
+    const signedOutScreen = () => screen.queryByText('Need an account? Sign up') !== null && screen.queryByText('Customize dashboard') === null;
+
+    /** User A signed in, with `resource` answered `updating` and its first automatic wait scheduled. */
+    async function bootWithUpdating(resource: Resource) {
+      if (resource === 'summary') {
+        await bootThenAnswer({ resolve: updatingAnswer('summary') });
+      } else {
+        const held = deferred<ReturnType<typeof breakdownWire>>();
+        mockGetMonthlyBreakdown.mockReturnValueOnce(held.promise);
+        await bootThenAnswer({ resolve: summaryWire({ netWorth: 42 }) });
+        await act(async () => {
+          held.resolve(updatingAnswer('monthly breakdown') as ReturnType<typeof breakdownWire>);
+          for (let i = 0; i < 10; i += 1) await Promise.resolve();
+        });
+      }
+      expect(vi.getTimerCount()).toBe(1);
+    }
+
+    async function signOut() {
+      act(() => emitAuthEvent(null));
+      await flush();
+      expect(signedOutScreen()).toBe(true);
+    }
+
+    it.each(RESOURCES)('CASE A (%s): a wait pending at sign-out is cancelled, and no request is made for the signed-out user', async (resource) => {
+      await bootWithUpdating(resource);
+      const calls = mockOf(resource).mock.calls.length;
+      await advance(3000);
+      expect(vi.getTimerCount()).toBe(1);
+
+      await signOut();
+      expect(vi.getTimerCount()).toBe(0);
+
+      await advanceLong();
+      expect(mockOf(resource).mock.calls.length).toBe(calls);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(signedOutScreen()).toBe(true);
+    });
+
+    const LATE_ANSWERS: [string, (resource: Resource) => { resolve?: unknown; reject?: unknown }][] = [
+      ['updating', (resource) => ({ resolve: updatingAnswer(resource) })],
+      ['ok', (resource) => ({ resolve: okAnswer(resource) })],
+      ['a failure', () => ({ reject: Object.assign(new Error('paused'), { code: 'semantic_integrity_error', status: 500 }) })],
+    ];
+    const CASE_B = RESOURCES.flatMap((resource) => LATE_ANSWERS.map(([name, answer]) => [resource, name, answer] as const));
+
+    it.each(CASE_B)(
+      'CASE B (%s): an automatic request in flight at sign-out that is then answered "%s" is ignored and schedules nothing',
+      async (resource, _name, answer) => {
+        await bootWithUpdating(resource);
+        const inFlight = deferred<unknown>();
+        mockOf(resource).mockReturnValueOnce(inFlight.promise);
+        await advance(5000);
+        const calls = mockOf(resource).mock.calls.length;
+        expect(vi.getTimerCount()).toBe(0);
+
+        await signOut();
+
+        const late = answer(resource);
+        await act(async () => {
+          if ('reject' in late) inFlight.reject(late.reject);
+          else inFlight.resolve(late.resolve);
+          await inFlight.promise.catch(() => {});
+          for (let i = 0; i < 10; i += 1) await Promise.resolve();
+        });
+        // Its result populated nothing and scheduled nothing…
+        expect(vi.getTimerCount()).toBe(0);
+        expect(signedOutScreen()).toBe(true);
+        expect(screen.queryByRole('alert')).toBeNull();
+        expect(document.body.textContent).not.toContain('$999');
+        // …and no later request appears either.
+        await advanceLong();
+        expect(mockOf(resource).mock.calls.length).toBe(calls);
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    );
+
+    it("CASE C: after A signs out and B signs in, no timer, request result or used-up attempt of A's reaches B", async () => {
+      // A: updating; one automatic refetch answered updating again (one of A's three attempts is
+      // used), and A's second automatic refetch is in flight when A signs out.
+      await bootWithUpdating('summary');
+      mockGetSpendingSummary.mockResolvedValueOnce(updatingAnswer('summary'));
+      await advance(5000);
+      const lateForA = deferred<ReturnType<typeof summaryWire>>();
+      mockGetSpendingSummary.mockReturnValueOnce(lateForA.promise);
+      await advance(5000);
+      expect(mockGetSpendingSummary.mock.calls.length).toBe(3);
+
+      await signOut();
+      expect(vi.getTimerCount()).toBe(0);
+
+      // B signs in (booted with real timers, like every other test here), with B's own summary held.
+      vi.useRealTimers();
+      const heldForB = deferred<ReturnType<typeof summaryWire>>();
+      mockGetSpendingSummary.mockReturnValueOnce(heldForB.promise);
+      mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+      act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+      await waitForReady();
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      await act(async () => {
+        heldForB.resolve(summaryWire({ netWorth: 77, status: UPDATING }));
+        for (let i = 0; i < 10; i += 1) await Promise.resolve();
+      });
+      expect(readNetWorth()).toBe('$77');
+      const callsAtB = mockGetSpendingSummary.mock.calls.length;
+      expect(vi.getTimerCount()).toBe(1);
+
+      // A's request is answered now, with figures: B's screen is unaffected.
+      await act(async () => {
+        lateForA.resolve(summaryWire({ netWorth: 999 }));
+        for (let i = 0; i < 10; i += 1) await Promise.resolve();
+      });
+      expect(readNetWorth()).toBe('$77');
+      expect(cashFlowValue()).toBe('—');
+      expect(document.body.textContent).not.toContain('$999');
+      expect(vi.getTimerCount()).toBe(1);
+
+      // B's wait is B's own: counted from B's answer, not from anything of A's.
+      mockGetSpendingSummary.mockImplementation(() => Promise.resolve(summaryWire({ netWorth: 77, status: UPDATING })));
+      await advance(4999);
+      expect(mockGetSpendingSummary.mock.calls.length).toBe(callsAtB);
+      await advance(1);
+      expect(mockGetSpendingSummary.mock.calls.length).toBe(callsAtB + 1);
+      // And B has its full budget of three, although A had used one of its own.
+      await advanceLong();
+      expect(mockGetSpendingSummary.mock.calls.length).toBe(callsAtB + 3);
+      expect(readNetWorth()).toBe('$77');
+      expect(notice()).toBe("Card-payment matching isn't up to date, so these figures are withheld. Check again");
+    });
+  });
+});
+
+// =================================================================================================
+// Cumulative review after I2 — finding CAI2-1, against the real App.
+//
+// A sync, or a category backfill that changed transactions, has already changed what the role-aware
+// figures are computed from by the time it answers. Reading those figures again follows from that
+// write — not from the transaction list being reloaded afterwards. The list reload can stay pending,
+// fail or be superseded, and none of that may leave the figures of before the write looking current.
+// =================================================================================================
+
+describe('Phase B cumulative post-write refresh', () => {
+  const MAPPING = { id: 'map-1', plaid_category: 'FOOD_AND_DRINK', budget_category_id: 'cat-1' };
+  const BACKFILLED = { mapping: MAPPING, backfilled_count: 3 };
+  const FEED_ERROR = 'The transaction list could not be loaded';
+
+  const safeToSpend = () => document.querySelector('.safe-to-spend-value')?.textContent ?? null;
+  const cashFlow = () => document.querySelector('.cash-flow-result')?.textContent ?? null;
+  const budgetPace = () => document.querySelector('.budget-pace .budget-category-summary')?.textContent ?? null;
+  const budgetSummaries = () =>
+    Array.from(document.querySelectorAll('.budget-category-footer .budget-category-summary')).map((el) => el.textContent);
+  const monthTotals = () => document.querySelector('.month-totals')?.textContent ?? null;
+  /** The page-level banner of a failed action (App's `actionError`). */
+  const banner = () => document.querySelector('.dashboard > p.error')?.textContent ?? null;
+  const reads = () => ({
+    summary: mockGetSpendingSummary.mock.calls.length,
+    breakdown: mockGetMonthlyBreakdown.mock.calls.length,
+    budget: mockGetBudgetCategories.mock.calls.length,
+    feed: mockGetTransactions.mock.calls.length,
+  });
+  const settle = async () => {
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+  };
+
+  /** What the server answers after the write: every figure differs from the one of before. */
+  const newSummary = () =>
+    summaryWire({ netWorth: 42, currentMonth: cashFlowWire({ cash_flow: 1500, cash_flow_range: { low: 1500, high: 1500 } }) });
+  const newBreakdown = () => breakdownWire({ months: [{ month: '2026-09', spending: 495, income: 3002.1 }] });
+  const newBudget = () =>
+    budgetWire({
+      categories: [
+        budgetCategoryWire({ id: 'cat-1', name: 'Groceries', budget_amount: 400, spending: 20, recent_avg_spending: 0 }),
+        budgetCategoryWire({ id: 'cat-2', name: 'Shopping', budget_amount: 300, sort_order: 1, spending: 0, recent_avg_spending: 0 }),
+      ],
+    });
+
+  // Each test queues held or one-time answers. Whatever a failing test leaves unanswered must not
+  // become the first answer of the next one.
+  afterEach(() => {
+    for (const mock of [
+      mockGetSpendingSummary,
+      mockGetMonthlyBreakdown,
+      mockGetBudgetCategories,
+      mockGetTransactions,
+      mockSyncTransactions,
+      mockSaveCategoryMapping,
+      mockApproveTransaction,
+    ]) {
+      mock.mockReset();
+    }
+  });
+
+  /** Signed in as A, with role-aware figures on every surface and one transaction in the list. */
+  async function bootWithFigures(transactions: unknown = fakeTransactions('Before-Tx')) {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetMonthlyBreakdown.mockResolvedValue(breakdownWire());
+    mockGetBudgetCategories.mockResolvedValue(budgetWire());
+    mockGetAssetsSummary.mockResolvedValue(fakeAssetsSummary('A-Bank Checking', 5000));
+    mockGetTransactions.mockResolvedValue(transactions);
+    mockGetCategoryMappings.mockResolvedValue({ mappings: [MAPPING] });
+    mockGetPlaidCategories.mockResolvedValue({ categories: ['FOOD_AND_DRINK'] });
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    // 5,000 liquid − ((400 − 50) + (300 + 60)) remaining budget.
+    await waitFor(() => expect(safeToSpend()).toBe('$4,290.00'));
+    expect(readNetWorth()).toBe('$42');
+    expect(cashFlow()).toBe('Cash flow this month: $1,827.10');
+    expect(budgetPace()).toBe('−$10.00 (refund) of $700.00 budgeted');
+  }
+
+  /** After a sync: no role-aware figure of before it is on any surface. Ends on the Overview tab. */
+  function expectSyncFiguresWithheld() {
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    act(() => screen.getByText('Monthly Breakdown').click());
+    expect(monthTotals()).toBeNull();
+    expect(document.body.textContent).not.toContain('$525.00 spent');
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('—');
+    expect(cashFlow()).toBeNull();
+    expect(document.body.textContent).not.toContain('4,290');
+    expect(document.body.textContent).not.toContain('1,827');
+  }
+
+  /** After a backfill: the budget-dependent figures are withheld. Ends on the Overview tab. */
+  function expectBudgetFiguresWithheld() {
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    expect(screen.queryByText('$50.00 of $400.00 spent')).toBeNull();
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('—');
+    expect(budgetPace()).toBe('— of $700.00 budgeted');
+    expect(document.body.textContent).not.toContain('4,290');
+    // A category assignment is not an input of the summary: its cash flow stays.
+    expect(cashFlow()).toBe('Cash flow this month: $1,827.10');
+  }
+
+  function openCategoryMapping() {
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Categories').click());
+    expect(screen.getByText('Apply to existing transactions')).toBeTruthy();
+  }
+
+  it('SYNC: with the list reload held and then rejected, the summary, breakdown and budget are read again at once, the old figures are withheld, and the new ones appear', async () => {
+    await bootWithFigures();
+    act(() => screen.getByText('Monthly Breakdown').click());
+    await waitFor(() => expect(monthTotals()).toBe('$525.00 spent$3,002.10 in'));
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['$50.00 of $400.00 spent', '−$60.00 (refund) of $300.00 spent']);
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/Before-Tx/)).toBeTruthy();
+
+    // Nothing answers until the test says so: not the list reload, not the replacement reads.
+    const feed = deferred<ReturnType<typeof fakeTransactions>>();
+    const summaryRead = deferred<ReturnType<typeof summaryWire>>();
+    const breakdownRead = deferred<ReturnType<typeof breakdownWire>>();
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetSpendingSummary.mockReturnValueOnce(summaryRead.promise);
+    mockGetMonthlyBreakdown.mockReturnValueOnce(breakdownRead.promise);
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    const before = reads();
+    const syncsBefore = mockSyncTransactions.mock.calls.length;
+    const recurringBefore = mockGetRecurringStreams.mock.calls.length;
+
+    act(() => screen.getByText('Sync transactions').click());
+    await settle();
+
+    // The sync itself has succeeded; its reload of the list is unanswered.
+    expect(mockSyncTransactions.mock.calls.length).toBe(syncsBefore + 1);
+    expect(screen.getByText('Syncing...')).toBeTruthy();
+    // The role-aware reads have started — each once — without waiting for the list…
+    const after = { summary: before.summary + 1, breakdown: before.breakdown + 1, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    expect(mockGetRecurringStreams.mock.calls.length).toBe(recurringBefore + 1);
+    // …and the figures of before the sync are already gone, on every surface.
+    expectSyncFiguresWithheld();
+
+    // Only the list reload fails.
+    await act(async () => {
+      feed.reject(new Error(FEED_ERROR));
+      await feed.promise.catch(() => {});
+    });
+    await settle();
+    // It is reported as what it is, the sync is over, and the list keeps what it had.
+    expect(banner()).toBe(FEED_ERROR);
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText('Sync transactions')).toBeTruthy();
+    expect(screen.getByText(/Before-Tx/)).toBeTruthy();
+    // It neither stopped nor repeated the role-aware reads, and it brought no old figure back.
+    expect(reads()).toEqual(after);
+    expectSyncFiguresWithheld();
+
+    // The replacement answers arrive: the new figures appear.
+    await act(async () => {
+      summaryRead.resolve(newSummary());
+      breakdownRead.resolve(newBreakdown());
+      budgetRead.resolve(newBudget());
+    });
+    await settle();
+    // 5,000 − ((400 − 20) + (300 − 0)).
+    expect(safeToSpend()).toBe('$4,320.00');
+    expect(cashFlow()).toBe('Cash flow this month: $1,500.00');
+    expect(readNetWorth()).toBe('$42');
+    expect(budgetPace()).toBe('$20.00 of $700.00 budgeted');
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['$20.00 of $400.00 spent', '$0.00 of $300.00 spent']);
+    act(() => screen.getByText('Monthly Breakdown').click());
+    expect(monthTotals()).toBe('$495.00 spent$3,002.10 in');
+    // Nothing was read twice, and the list's failure is still shown as its own.
+    expect(reads()).toEqual(after);
+    expect(banner()).toBe(FEED_ERROR);
+  });
+
+  it('SYNC: replacement reads that fail stay failed and withheld when the list reload then succeeds, and nothing is read twice', async () => {
+    await bootWithFigures();
+    act(() => screen.getByText('Accounts').click());
+    const feed = deferred<ReturnType<typeof fakeTransactions>>();
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetSpendingSummary.mockRejectedValueOnce(new Error('Failed to fetch'));
+    mockGetMonthlyBreakdown.mockRejectedValueOnce(new Error('Failed to fetch'));
+    mockGetBudgetCategories.mockRejectedValueOnce(new Error('Failed to fetch'));
+    const before = reads();
+
+    act(() => screen.getByText('Sync transactions').click());
+    await settle();
+
+    // The replacement reads were made and failed while the list reload is still out.
+    const after = { summary: before.summary + 1, breakdown: before.breakdown + 1, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    expect(screen.getByRole('alert').textContent).toMatch(/couldn't be loaded/);
+
+    // The list reload now succeeds.
+    await act(async () => {
+      feed.resolve(fakeTransactions('After-Sync-Tx'));
+      await feed.promise;
+    });
+    await settle();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/After-Sync-Tx/)).toBeTruthy();
+    expect(screen.getByText('Sync transactions')).toBeTruthy();
+    expect(banner()).toBeNull();
+    // Its success starts no second round of reads, clears no failure and restores no old figure.
+    expect(reads()).toEqual(after);
+    expectSyncFiguresWithheld();
+    act(() => screen.getByText('Budget').click());
+    expect(screen.getByRole('alert').textContent).toMatch(/couldn't be loaded/);
+    expect(reads()).toEqual(after);
+  });
+
+  it('SYNC: a transaction approved while the list reload is pending supersedes that reload only — the role-aware reads had already started, and their answers are shown', async () => {
+    mockGetLinkedItems.mockResolvedValue(fakeLinkedItems('A-Bank'));
+    await bootWithFigures(fakeTransactionNeedingReview('txn-1', 'Needs-Review-Tx', true));
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText('Approve')).toBeTruthy();
+
+    const feed = deferred<ReturnType<typeof fakeTransactionNeedingReview>>();
+    const summaryRead = deferred<ReturnType<typeof summaryWire>>();
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetSpendingSummary.mockReturnValueOnce(summaryRead.promise);
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    const before = reads();
+
+    act(() => screen.getByText('Sync transactions').click());
+    await settle();
+
+    // The approval commits locally while the sync's list reload is still out.
+    mockApproveTransaction.mockResolvedValueOnce({});
+    act(() => screen.getByText('Approve').click());
+    await settle();
+    expect(screen.queryByText('Approve')).toBeNull();
+
+    // The superseded reload answers with the list of before the approval. It is not used…
+    await act(async () => {
+      feed.resolve(fakeTransactionNeedingReview('txn-1', 'Needs-Review-Tx', true));
+      await feed.promise;
+    });
+    await settle();
+    expect(screen.queryByText('Approve')).toBeNull();
+    expect(banner()).toBeNull();
+    // …and the role-aware reads were neither skipped nor repeated because of it.
+    const after = { summary: before.summary + 1, breakdown: before.breakdown + 1, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+
+    await act(async () => {
+      summaryRead.resolve(newSummary());
+      budgetRead.resolve(newBudget());
+    });
+    await settle();
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,320.00');
+    expect(cashFlow()).toBe('Cash flow this month: $1,500.00');
+    expect(reads()).toEqual(after);
+  });
+
+  it('SYNC: a sync answered after someone else signed in starts none of these reads for the new session', async () => {
+    await bootWithFigures();
+    act(() => screen.getByText('Accounts').click());
+    const sync = deferred<Record<string, never>>();
+    mockSyncTransactions.mockReturnValueOnce(sync.promise);
+    act(() => screen.getByText('Sync transactions').click());
+    await settle();
+
+    // B signs in and loads B's own figures.
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 77 }));
+    mockGetTransactions.mockResolvedValue(fakeTransactions('B-Tx'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText(/B-Tx/)).toBeTruthy());
+    act(() => screen.getByText('Overview').click());
+    await waitFor(() => expect(readNetWorth()).toBe('$77'));
+    await waitFor(() => expect(safeToSpend()).toBe('$4,290.00'));
+    await settle();
+    const atB = reads();
+
+    // A's sync is answered now. Nothing of B's is read again or withheld because of it.
+    await act(async () => {
+      sync.resolve({});
+      await sync.promise;
+    });
+    await settle();
+    expect(reads()).toEqual(atB);
+    expect(readNetWorth()).toBe('$77');
+    expect(safeToSpend()).toBe('$4,290.00');
+    expect(banner()).toBeNull();
+  });
+
+  it('BACKFILL: with the list reload held and then rejected, the budget is read again at once, Budget, budget pace and Safe to Spend are withheld, and the new figures appear', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    const feed = deferred<ReturnType<typeof fakeTransactions>>();
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockSaveCategoryMapping.mockResolvedValueOnce(BACKFILLED);
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    // The backfill itself has succeeded; its reload of the list is unanswered.
+    expect(mockSaveCategoryMapping).toHaveBeenCalledTimes(1);
+    expect(mockSaveCategoryMapping.mock.calls[0].slice(0, 3)).toEqual(['FOOD_AND_DRINK', 'cat-1', true]);
+    // The budget read has started — once — without waiting for the list. A category assignment
+    // changes neither the summary nor the monthly breakdown, and neither is read again.
+    const after = { ...before, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    expectBudgetFiguresWithheld();
+
+    // Only the list reload fails.
+    await act(async () => {
+      feed.reject(new Error(FEED_ERROR));
+      await feed.promise.catch(() => {});
+    });
+    await settle();
+    expect(banner()).toBe(FEED_ERROR);
+    expect(reads()).toEqual(after);
+    expectBudgetFiguresWithheld();
+
+    // The replacement answer arrives: the new figures appear.
+    await act(async () => {
+      budgetRead.resolve(newBudget());
+    });
+    await settle();
+    expect(safeToSpend()).toBe('$4,320.00');
+    expect(budgetPace()).toBe('$20.00 of $700.00 budgeted');
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['$20.00 of $400.00 spent', '$0.00 of $300.00 spent']);
+    expect(reads()).toEqual(after);
+    expect(banner()).toBe(FEED_ERROR);
+  });
+
+  it('BACKFILL: a rejected list reload does not turn the completed backfill into a failed one', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    mockSaveCategoryMapping.mockResolvedValueOnce(BACKFILLED);
+    // Not an Error: the wording shown is App's own for this step.
+    mockGetTransactions.mockRejectedValueOnce('offline');
+    mockGetBudgetCategories.mockResolvedValueOnce(newBudget());
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    // The screen that asked is told the backfill was done, and can be used again.
+    expect(screen.getByText('Updated 3 transactions')).toBeTruthy();
+    expect((screen.getByText('Apply to existing transactions') as HTMLButtonElement).disabled).toBe(false);
+    // The banner speaks of the list, not of the mapping that was saved.
+    expect(banner()).toBe('Failed to reload transactions');
+    expect(reads()).toEqual({ ...before, budget: before.budget + 1, feed: before.feed + 1 });
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,320.00');
+  });
+
+  it('BACKFILL: when the replacement budget read fails as well, the budget figures stay withheld', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    mockSaveCategoryMapping.mockResolvedValueOnce(BACKFILLED);
+    mockGetTransactions.mockRejectedValueOnce(new Error(FEED_ERROR));
+    mockGetBudgetCategories.mockRejectedValueOnce(new Error('Failed to fetch'));
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    const after = { ...before, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    expect(banner()).toBe(FEED_ERROR);
+    expectBudgetFiguresWithheld();
+    act(() => screen.getByText('Budget').click());
+    expect(screen.getByRole('alert').textContent).toMatch(/couldn't be loaded/);
+    // Nothing is read again by itself.
+    await settle();
+    expect(reads()).toEqual(after);
+  });
+
+  it('BACKFILL: when the list reload succeeds, the budget is read once — and its answer does not wait for the list', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    const feed = deferred<ReturnType<typeof fakeTransactions>>();
+    mockSaveCategoryMapping.mockResolvedValueOnce(BACKFILLED);
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetBudgetCategories.mockResolvedValueOnce(newBudget());
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    // The new budget figures are on screen while the list is still being reloaded.
+    const after = { ...before, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,320.00');
+
+    await act(async () => {
+      feed.resolve(fakeTransactions('After-Backfill-Tx'));
+      await feed.promise;
+    });
+    await settle();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/After-Backfill-Tx/)).toBeTruthy();
+    expect(banner()).toBeNull();
+    // The list's success starts no second budget read.
+    expect(reads()).toEqual(after);
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,320.00');
+  });
+
+  it('BACKFILL: a backfill answered after someone else signed in starts none of these reads for the new session', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    const save = deferred<typeof BACKFILLED>();
+    mockSaveCategoryMapping.mockReturnValueOnce(save.promise);
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    // B signs in and loads B's own figures (the Settings tab stays selected across the sign-in).
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 77 }));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText('Settings')).toBeTruthy());
+    act(() => screen.getByText('Overview').click());
+    await waitFor(() => expect(readNetWorth()).toBe('$77'));
+    await waitFor(() => expect(safeToSpend()).toBe('$4,290.00'));
+    await settle();
+    const atB = reads();
+
+    // A's backfill is answered now. Nothing of B's is read again or withheld because of it.
+    await act(async () => {
+      save.resolve(BACKFILLED);
+      await save.promise;
+    });
+    await settle();
+    expect(reads()).toEqual(atB);
+    expect(safeToSpend()).toBe('$4,290.00');
+    expect(banner()).toBeNull();
+  });
+
+  it('BACKFILL: a backfill that changed no transaction reads nothing again and leaves the figures', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    mockSaveCategoryMapping.mockResolvedValueOnce({ mapping: MAPPING, backfilled_count: 0 });
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    expect(screen.getByText('No unmapped transactions matched')).toBeTruthy();
+    expect(reads()).toEqual(before);
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,290.00');
+    expect(budgetPace()).toBe('−$10.00 (refund) of $700.00 budgeted');
   });
 });

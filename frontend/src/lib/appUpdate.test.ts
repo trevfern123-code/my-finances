@@ -348,8 +348,8 @@ describe('app update manager — update required', () => {
   it('a later response saying this level is supported again clears the required state', async () => {
     const tab = fakeTab();
     await tab.start();
-    tab.manager.reportServerLevels(2, 2);
-    tab.manager.reportServerLevels(1, 0);
+    tab.manager.reportServerLevels(CLIENT_API_LEVEL + 1, CLIENT_API_LEVEL + 1);
+    tab.manager.reportServerLevels(CLIENT_API_LEVEL, 0);
     expect(tab.manager.isUpdateRequired()).toBe(false);
     expect(tab.timers.find((t) => t.ms === REQUIRED_UPDATE_CHECK_INTERVAL_MS)?.cleared).toBe(true);
   });
@@ -357,7 +357,7 @@ describe('app update manager — update required', () => {
   it('ignores missing levels (a response without the headers changes nothing)', async () => {
     const tab = fakeTab();
     await tab.start();
-    tab.manager.reportServerLevels(2, 2);
+    tab.manager.reportServerLevels(CLIENT_API_LEVEL + 1, CLIENT_API_LEVEL + 1);
     tab.manager.reportServerLevels(null, null);
     expect(tab.manager.isUpdateRequired()).toBe(true);
   });
@@ -412,7 +412,7 @@ describe('app update manager — reload-loop protection', () => {
     // The "reloaded" page is still build-a (e.g. a CDN still serving the old index.html).
     const second = fakeTab({ visibility: 'hidden', buildId: 'build-a', storage, now: 1_000_000 + RELOAD_COOLDOWN_MS * 3 });
     await second.start();
-    second.manager.reportServerLevels(2, 2); // even "required" does not loop
+    second.manager.reportServerLevels(CLIENT_API_LEVEL + 1, CLIENT_API_LEVEL + 1); // even "required" does not loop
     second.preloadError();
     expect(second.reload).not.toHaveBeenCalled();
     expect(second.manager.getSnapshot().autoReloadSuppressed).toBe(true);

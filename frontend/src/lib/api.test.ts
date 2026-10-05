@@ -346,7 +346,8 @@ describe('authedFetch — client API level', () => {
     for (const call of vi.mocked(fetch).mock.calls) {
       const headers = (call[1] as RequestInit).headers as Record<string, string>;
       expect(headers['X-Client-Api-Level']).toBe(String(CLIENT_API_LEVEL));
-      expect(headers['X-Client-Api-Level']).toBe('1');
+      // Level 2: Financial Semantics Phase B (integration slice I2).
+      expect(headers['X-Client-Api-Level']).toBe('2');
     }
   });
 
@@ -366,7 +367,8 @@ describe('authedFetch — client API level', () => {
   });
 
   it('a minimum above this client blocks new mutations before they are sent (reads still work)', async () => {
-    vi.mocked(fetch).mockResolvedValue(levelResponse({ items: [] }, '2', '2') as never);
+    const above = String(CLIENT_API_LEVEL + 1);
+    vi.mocked(fetch).mockResolvedValue(levelResponse({ items: [] }, above, above) as never);
     await getLinkedItems();
     expect(appUpdate.isUpdateRequired()).toBe(true);
 

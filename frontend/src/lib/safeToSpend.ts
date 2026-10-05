@@ -1,11 +1,14 @@
-import type { BudgetCategory } from './api';
 import type { UpcomingItem } from './upcomingItems';
 
 /** Money still earmarked for a budget category but not yet spent. A category already over
  *  budget contributes 0 here rather than a negative number — the overspend already left the
- *  liquid-cash balance, so subtracting it again would double-count it. */
-export function computeRemainingBudget(categories: BudgetCategory[]): number {
-  return categories.reduce((sum, c) => sum + Math.max(0, c.budget_amount - c.spent), 0);
+ *  liquid-cash balance, so subtracting it again would double-count it.
+ *
+ *  `spending` is the server's role-aware spending for the category (Phase B design §5 C7), signed:
+ *  net refunds leave more than the budgeted amount to spend. The caller supplies it; this function
+ *  never reads the frozen sign-based `spent`. */
+export function computeRemainingBudget(categories: { budget_amount: number; spending: number }[]): number {
+  return categories.reduce((sum, c) => sum + Math.max(0, c.budget_amount - c.spending), 0);
 }
 
 /** Splits collectUpcomingItems' output into the generic upcoming-bills total and the credit-card

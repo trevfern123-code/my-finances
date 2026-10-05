@@ -32,16 +32,28 @@ function fakeItem(overrides: Partial<UpcomingItem> = {}): UpcomingItem {
 
 describe('computeRemainingBudget', () => {
   it('sums unspent budget across categories', () => {
+    // Phase B (design §5 C7): the input is the server's role-aware `spending`, not the frozen `spent`.
     const categories = [
-      fakeCategory({ budget_amount: 200, spent: 50 }),
-      fakeCategory({ id: 'cat-2', budget_amount: 300, spent: 100 }),
+      { ...fakeCategory({ budget_amount: 200 }), spending: 50 },
+      { ...fakeCategory({ id: 'cat-2', budget_amount: 300 }), spending: 100 },
     ];
     expect(computeRemainingBudget(categories)).toBe(350);
   });
 
   it('treats an over-budget category as contributing zero, not negative', () => {
-    const categories = [fakeCategory({ budget_amount: 200, spent: 250 })];
+    const categories = [{ ...fakeCategory({ budget_amount: 200 }), spending: 250 }];
     expect(computeRemainingBudget(categories)).toBe(0);
+  });
+
+  it('reads role-aware spending and ignores the frozen sign-based figure beside it', () => {
+    // `spent` (frozen) says the budget is used up; `spending` says 50 of it is.
+    const categories = [{ ...fakeCategory({ budget_amount: 200, spent: 200 }), spending: 50 }];
+    expect(computeRemainingBudget(categories)).toBe(150);
+  });
+
+  it('keeps net refunds signed: they leave more than the budgeted amount', () => {
+    const categories = [{ ...fakeCategory({ budget_amount: 200 }), spending: -60 }];
+    expect(computeRemainingBudget(categories)).toBe(260);
   });
 });
 
