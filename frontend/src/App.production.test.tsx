@@ -5079,3 +5079,473 @@ describe('Phase B I2 correction F3: the client refetches an updating read after 
     });
   });
 });
+
+// =================================================================================================
+// Cumulative review after I2 — finding CAI2-1, against the real App.
+//
+// A sync, or a category backfill that changed transactions, has already changed what the role-aware
+// figures are computed from by the time it answers. Reading those figures again follows from that
+// write — not from the transaction list being reloaded afterwards. The list reload can stay pending,
+// fail or be superseded, and none of that may leave the figures of before the write looking current.
+// =================================================================================================
+
+describe('Phase B cumulative post-write refresh', () => {
+  const MAPPING = { id: 'map-1', plaid_category: 'FOOD_AND_DRINK', budget_category_id: 'cat-1' };
+  const BACKFILLED = { mapping: MAPPING, backfilled_count: 3 };
+  const FEED_ERROR = 'The transaction list could not be loaded';
+
+  const safeToSpend = () => document.querySelector('.safe-to-spend-value')?.textContent ?? null;
+  const cashFlow = () => document.querySelector('.cash-flow-result')?.textContent ?? null;
+  const budgetPace = () => document.querySelector('.budget-pace .budget-category-summary')?.textContent ?? null;
+  const budgetSummaries = () =>
+    Array.from(document.querySelectorAll('.budget-category-footer .budget-category-summary')).map((el) => el.textContent);
+  const monthTotals = () => document.querySelector('.month-totals')?.textContent ?? null;
+  /** The page-level banner of a failed action (App's `actionError`). */
+  const banner = () => document.querySelector('.dashboard > p.error')?.textContent ?? null;
+  const reads = () => ({
+    summary: mockGetSpendingSummary.mock.calls.length,
+    breakdown: mockGetMonthlyBreakdown.mock.calls.length,
+    budget: mockGetBudgetCategories.mock.calls.length,
+    feed: mockGetTransactions.mock.calls.length,
+  });
+  const settle = async () => {
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+  };
+
+  /** What the server answers after the write: every figure differs from the one of before. */
+  const newSummary = () =>
+    summaryWire({ netWorth: 42, currentMonth: cashFlowWire({ cash_flow: 1500, cash_flow_range: { low: 1500, high: 1500 } }) });
+  const newBreakdown = () => breakdownWire({ months: [{ month: '2026-09', spending: 495, income: 3002.1 }] });
+  const newBudget = () =>
+    budgetWire({
+      categories: [
+        budgetCategoryWire({ id: 'cat-1', name: 'Groceries', budget_amount: 400, spending: 20, recent_avg_spending: 0 }),
+        budgetCategoryWire({ id: 'cat-2', name: 'Shopping', budget_amount: 300, sort_order: 1, spending: 0, recent_avg_spending: 0 }),
+      ],
+    });
+
+  // Each test queues held or one-time answers. Whatever a failing test leaves unanswered must not
+  // become the first answer of the next one.
+  afterEach(() => {
+    for (const mock of [
+      mockGetSpendingSummary,
+      mockGetMonthlyBreakdown,
+      mockGetBudgetCategories,
+      mockGetTransactions,
+      mockSyncTransactions,
+      mockSaveCategoryMapping,
+      mockApproveTransaction,
+    ]) {
+      mock.mockReset();
+    }
+  });
+
+  /** Signed in as A, with role-aware figures on every surface and one transaction in the list. */
+  async function bootWithFigures(transactions: unknown = fakeTransactions('Before-Tx')) {
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 42 }));
+    mockGetMonthlyBreakdown.mockResolvedValue(breakdownWire());
+    mockGetBudgetCategories.mockResolvedValue(budgetWire());
+    mockGetAssetsSummary.mockResolvedValue(fakeAssetsSummary('A-Bank Checking', 5000));
+    mockGetTransactions.mockResolvedValue(transactions);
+    mockGetCategoryMappings.mockResolvedValue({ mappings: [MAPPING] });
+    mockGetPlaidCategories.mockResolvedValue({ categories: ['FOOD_AND_DRINK'] });
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    render(<App />);
+    act(() => emitAuthEvent(fakeSession('user-a', 'sid-a1')));
+    await waitForReady();
+    // 5,000 liquid − ((400 − 50) + (300 + 60)) remaining budget.
+    await waitFor(() => expect(safeToSpend()).toBe('$4,290.00'));
+    expect(readNetWorth()).toBe('$42');
+    expect(cashFlow()).toBe('Cash flow this month: $1,827.10');
+    expect(budgetPace()).toBe('−$10.00 (refund) of $700.00 budgeted');
+  }
+
+  /** After a sync: no role-aware figure of before it is on any surface. Ends on the Overview tab. */
+  function expectSyncFiguresWithheld() {
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    act(() => screen.getByText('Monthly Breakdown').click());
+    expect(monthTotals()).toBeNull();
+    expect(document.body.textContent).not.toContain('$525.00 spent');
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('—');
+    expect(cashFlow()).toBeNull();
+    expect(document.body.textContent).not.toContain('4,290');
+    expect(document.body.textContent).not.toContain('1,827');
+  }
+
+  /** After a backfill: the budget-dependent figures are withheld. Ends on the Overview tab. */
+  function expectBudgetFiguresWithheld() {
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    expect(screen.queryByText('$50.00 of $400.00 spent')).toBeNull();
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('—');
+    expect(budgetPace()).toBe('— of $700.00 budgeted');
+    expect(document.body.textContent).not.toContain('4,290');
+    // A category assignment is not an input of the summary: its cash flow stays.
+    expect(cashFlow()).toBe('Cash flow this month: $1,827.10');
+  }
+
+  function openCategoryMapping() {
+    act(() => screen.getByText('Settings').click());
+    act(() => screen.getByText('Categories').click());
+    expect(screen.getByText('Apply to existing transactions')).toBeTruthy();
+  }
+
+  it('SYNC: with the list reload held and then rejected, the summary, breakdown and budget are read again at once, the old figures are withheld, and the new ones appear', async () => {
+    await bootWithFigures();
+    act(() => screen.getByText('Monthly Breakdown').click());
+    await waitFor(() => expect(monthTotals()).toBe('$525.00 spent$3,002.10 in'));
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['$50.00 of $400.00 spent', '−$60.00 (refund) of $300.00 spent']);
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/Before-Tx/)).toBeTruthy();
+
+    // Nothing answers until the test says so: not the list reload, not the replacement reads.
+    const feed = deferred<ReturnType<typeof fakeTransactions>>();
+    const summaryRead = deferred<ReturnType<typeof summaryWire>>();
+    const breakdownRead = deferred<ReturnType<typeof breakdownWire>>();
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetSpendingSummary.mockReturnValueOnce(summaryRead.promise);
+    mockGetMonthlyBreakdown.mockReturnValueOnce(breakdownRead.promise);
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    const before = reads();
+    const syncsBefore = mockSyncTransactions.mock.calls.length;
+    const recurringBefore = mockGetRecurringStreams.mock.calls.length;
+
+    act(() => screen.getByText('Sync transactions').click());
+    await settle();
+
+    // The sync itself has succeeded; its reload of the list is unanswered.
+    expect(mockSyncTransactions.mock.calls.length).toBe(syncsBefore + 1);
+    expect(screen.getByText('Syncing...')).toBeTruthy();
+    // The role-aware reads have started — each once — without waiting for the list…
+    const after = { summary: before.summary + 1, breakdown: before.breakdown + 1, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    expect(mockGetRecurringStreams.mock.calls.length).toBe(recurringBefore + 1);
+    // …and the figures of before the sync are already gone, on every surface.
+    expectSyncFiguresWithheld();
+
+    // Only the list reload fails.
+    await act(async () => {
+      feed.reject(new Error(FEED_ERROR));
+      await feed.promise.catch(() => {});
+    });
+    await settle();
+    // It is reported as what it is, the sync is over, and the list keeps what it had.
+    expect(banner()).toBe(FEED_ERROR);
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText('Sync transactions')).toBeTruthy();
+    expect(screen.getByText(/Before-Tx/)).toBeTruthy();
+    // It neither stopped nor repeated the role-aware reads, and it brought no old figure back.
+    expect(reads()).toEqual(after);
+    expectSyncFiguresWithheld();
+
+    // The replacement answers arrive: the new figures appear.
+    await act(async () => {
+      summaryRead.resolve(newSummary());
+      breakdownRead.resolve(newBreakdown());
+      budgetRead.resolve(newBudget());
+    });
+    await settle();
+    // 5,000 − ((400 − 20) + (300 − 0)).
+    expect(safeToSpend()).toBe('$4,320.00');
+    expect(cashFlow()).toBe('Cash flow this month: $1,500.00');
+    expect(readNetWorth()).toBe('$42');
+    expect(budgetPace()).toBe('$20.00 of $700.00 budgeted');
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['$20.00 of $400.00 spent', '$0.00 of $300.00 spent']);
+    act(() => screen.getByText('Monthly Breakdown').click());
+    expect(monthTotals()).toBe('$495.00 spent$3,002.10 in');
+    // Nothing was read twice, and the list's failure is still shown as its own.
+    expect(reads()).toEqual(after);
+    expect(banner()).toBe(FEED_ERROR);
+  });
+
+  it('SYNC: replacement reads that fail stay failed and withheld when the list reload then succeeds, and nothing is read twice', async () => {
+    await bootWithFigures();
+    act(() => screen.getByText('Accounts').click());
+    const feed = deferred<ReturnType<typeof fakeTransactions>>();
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetSpendingSummary.mockRejectedValueOnce(new Error('Failed to fetch'));
+    mockGetMonthlyBreakdown.mockRejectedValueOnce(new Error('Failed to fetch'));
+    mockGetBudgetCategories.mockRejectedValueOnce(new Error('Failed to fetch'));
+    const before = reads();
+
+    act(() => screen.getByText('Sync transactions').click());
+    await settle();
+
+    // The replacement reads were made and failed while the list reload is still out.
+    const after = { summary: before.summary + 1, breakdown: before.breakdown + 1, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['— of $400.00 spent', '— of $300.00 spent']);
+    expect(screen.getByRole('alert').textContent).toMatch(/couldn't be loaded/);
+
+    // The list reload now succeeds.
+    await act(async () => {
+      feed.resolve(fakeTransactions('After-Sync-Tx'));
+      await feed.promise;
+    });
+    await settle();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/After-Sync-Tx/)).toBeTruthy();
+    expect(screen.getByText('Sync transactions')).toBeTruthy();
+    expect(banner()).toBeNull();
+    // Its success starts no second round of reads, clears no failure and restores no old figure.
+    expect(reads()).toEqual(after);
+    expectSyncFiguresWithheld();
+    act(() => screen.getByText('Budget').click());
+    expect(screen.getByRole('alert').textContent).toMatch(/couldn't be loaded/);
+    expect(reads()).toEqual(after);
+  });
+
+  it('SYNC: a transaction approved while the list reload is pending supersedes that reload only — the role-aware reads had already started, and their answers are shown', async () => {
+    mockGetLinkedItems.mockResolvedValue(fakeLinkedItems('A-Bank'));
+    await bootWithFigures(fakeTransactionNeedingReview('txn-1', 'Needs-Review-Tx', true));
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText('Approve')).toBeTruthy();
+
+    const feed = deferred<ReturnType<typeof fakeTransactionNeedingReview>>();
+    const summaryRead = deferred<ReturnType<typeof summaryWire>>();
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetSpendingSummary.mockReturnValueOnce(summaryRead.promise);
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    const before = reads();
+
+    act(() => screen.getByText('Sync transactions').click());
+    await settle();
+
+    // The approval commits locally while the sync's list reload is still out.
+    mockApproveTransaction.mockResolvedValueOnce({});
+    act(() => screen.getByText('Approve').click());
+    await settle();
+    expect(screen.queryByText('Approve')).toBeNull();
+
+    // The superseded reload answers with the list of before the approval. It is not used…
+    await act(async () => {
+      feed.resolve(fakeTransactionNeedingReview('txn-1', 'Needs-Review-Tx', true));
+      await feed.promise;
+    });
+    await settle();
+    expect(screen.queryByText('Approve')).toBeNull();
+    expect(banner()).toBeNull();
+    // …and the role-aware reads were neither skipped nor repeated because of it.
+    const after = { summary: before.summary + 1, breakdown: before.breakdown + 1, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+
+    await act(async () => {
+      summaryRead.resolve(newSummary());
+      budgetRead.resolve(newBudget());
+    });
+    await settle();
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,320.00');
+    expect(cashFlow()).toBe('Cash flow this month: $1,500.00');
+    expect(reads()).toEqual(after);
+  });
+
+  it('SYNC: a sync answered after someone else signed in starts none of these reads for the new session', async () => {
+    await bootWithFigures();
+    act(() => screen.getByText('Accounts').click());
+    const sync = deferred<Record<string, never>>();
+    mockSyncTransactions.mockReturnValueOnce(sync.promise);
+    act(() => screen.getByText('Sync transactions').click());
+    await settle();
+
+    // B signs in and loads B's own figures.
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 77 }));
+    mockGetTransactions.mockResolvedValue(fakeTransactions('B-Tx'));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText(/B-Tx/)).toBeTruthy());
+    act(() => screen.getByText('Overview').click());
+    await waitFor(() => expect(readNetWorth()).toBe('$77'));
+    await waitFor(() => expect(safeToSpend()).toBe('$4,290.00'));
+    await settle();
+    const atB = reads();
+
+    // A's sync is answered now. Nothing of B's is read again or withheld because of it.
+    await act(async () => {
+      sync.resolve({});
+      await sync.promise;
+    });
+    await settle();
+    expect(reads()).toEqual(atB);
+    expect(readNetWorth()).toBe('$77');
+    expect(safeToSpend()).toBe('$4,290.00');
+    expect(banner()).toBeNull();
+  });
+
+  it('BACKFILL: with the list reload held and then rejected, the budget is read again at once, Budget, budget pace and Safe to Spend are withheld, and the new figures appear', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    const feed = deferred<ReturnType<typeof fakeTransactions>>();
+    const budgetRead = deferred<ReturnType<typeof budgetWire>>();
+    mockSaveCategoryMapping.mockResolvedValueOnce(BACKFILLED);
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetBudgetCategories.mockReturnValueOnce(budgetRead.promise);
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    // The backfill itself has succeeded; its reload of the list is unanswered.
+    expect(mockSaveCategoryMapping).toHaveBeenCalledTimes(1);
+    expect(mockSaveCategoryMapping.mock.calls[0].slice(0, 3)).toEqual(['FOOD_AND_DRINK', 'cat-1', true]);
+    // The budget read has started — once — without waiting for the list. A category assignment
+    // changes neither the summary nor the monthly breakdown, and neither is read again.
+    const after = { ...before, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    expectBudgetFiguresWithheld();
+
+    // Only the list reload fails.
+    await act(async () => {
+      feed.reject(new Error(FEED_ERROR));
+      await feed.promise.catch(() => {});
+    });
+    await settle();
+    expect(banner()).toBe(FEED_ERROR);
+    expect(reads()).toEqual(after);
+    expectBudgetFiguresWithheld();
+
+    // The replacement answer arrives: the new figures appear.
+    await act(async () => {
+      budgetRead.resolve(newBudget());
+    });
+    await settle();
+    expect(safeToSpend()).toBe('$4,320.00');
+    expect(budgetPace()).toBe('$20.00 of $700.00 budgeted');
+    act(() => screen.getByText('Budget').click());
+    expect(budgetSummaries()).toEqual(['$20.00 of $400.00 spent', '$0.00 of $300.00 spent']);
+    expect(reads()).toEqual(after);
+    expect(banner()).toBe(FEED_ERROR);
+  });
+
+  it('BACKFILL: a rejected list reload does not turn the completed backfill into a failed one', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    mockSaveCategoryMapping.mockResolvedValueOnce(BACKFILLED);
+    // Not an Error: the wording shown is App's own for this step.
+    mockGetTransactions.mockRejectedValueOnce('offline');
+    mockGetBudgetCategories.mockResolvedValueOnce(newBudget());
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    // The screen that asked is told the backfill was done, and can be used again.
+    expect(screen.getByText('Updated 3 transactions')).toBeTruthy();
+    expect((screen.getByText('Apply to existing transactions') as HTMLButtonElement).disabled).toBe(false);
+    // The banner speaks of the list, not of the mapping that was saved.
+    expect(banner()).toBe('Failed to reload transactions');
+    expect(reads()).toEqual({ ...before, budget: before.budget + 1, feed: before.feed + 1 });
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,320.00');
+  });
+
+  it('BACKFILL: when the replacement budget read fails as well, the budget figures stay withheld', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    mockSaveCategoryMapping.mockResolvedValueOnce(BACKFILLED);
+    mockGetTransactions.mockRejectedValueOnce(new Error(FEED_ERROR));
+    mockGetBudgetCategories.mockRejectedValueOnce(new Error('Failed to fetch'));
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    const after = { ...before, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    expect(banner()).toBe(FEED_ERROR);
+    expectBudgetFiguresWithheld();
+    act(() => screen.getByText('Budget').click());
+    expect(screen.getByRole('alert').textContent).toMatch(/couldn't be loaded/);
+    // Nothing is read again by itself.
+    await settle();
+    expect(reads()).toEqual(after);
+  });
+
+  it('BACKFILL: when the list reload succeeds, the budget is read once — and its answer does not wait for the list', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    const feed = deferred<ReturnType<typeof fakeTransactions>>();
+    mockSaveCategoryMapping.mockResolvedValueOnce(BACKFILLED);
+    mockGetTransactions.mockReturnValueOnce(feed.promise);
+    mockGetBudgetCategories.mockResolvedValueOnce(newBudget());
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    // The new budget figures are on screen while the list is still being reloaded.
+    const after = { ...before, budget: before.budget + 1, feed: before.feed + 1 };
+    expect(reads()).toEqual(after);
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,320.00');
+
+    await act(async () => {
+      feed.resolve(fakeTransactions('After-Backfill-Tx'));
+      await feed.promise;
+    });
+    await settle();
+    act(() => screen.getByText('Accounts').click());
+    expect(screen.getByText(/After-Backfill-Tx/)).toBeTruthy();
+    expect(banner()).toBeNull();
+    // The list's success starts no second budget read.
+    expect(reads()).toEqual(after);
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,320.00');
+  });
+
+  it('BACKFILL: a backfill answered after someone else signed in starts none of these reads for the new session', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    const save = deferred<typeof BACKFILLED>();
+    mockSaveCategoryMapping.mockReturnValueOnce(save.promise);
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    // B signs in and loads B's own figures (the Settings tab stays selected across the sign-in).
+    mockGetUserPreferences.mockResolvedValueOnce(fakePreferences());
+    mockGetSpendingSummary.mockResolvedValue(summaryWire({ netWorth: 77 }));
+    act(() => emitAuthEvent(fakeSession('user-b', 'sid-b1')));
+    await waitFor(() => expect(screen.getByText('Settings')).toBeTruthy());
+    act(() => screen.getByText('Overview').click());
+    await waitFor(() => expect(readNetWorth()).toBe('$77'));
+    await waitFor(() => expect(safeToSpend()).toBe('$4,290.00'));
+    await settle();
+    const atB = reads();
+
+    // A's backfill is answered now. Nothing of B's is read again or withheld because of it.
+    await act(async () => {
+      save.resolve(BACKFILLED);
+      await save.promise;
+    });
+    await settle();
+    expect(reads()).toEqual(atB);
+    expect(safeToSpend()).toBe('$4,290.00');
+    expect(banner()).toBeNull();
+  });
+
+  it('BACKFILL: a backfill that changed no transaction reads nothing again and leaves the figures', async () => {
+    await bootWithFigures();
+    openCategoryMapping();
+    mockSaveCategoryMapping.mockResolvedValueOnce({ mapping: MAPPING, backfilled_count: 0 });
+    const before = reads();
+
+    act(() => screen.getByText('Apply to existing transactions').click());
+    await settle();
+
+    expect(screen.getByText('No unmapped transactions matched')).toBeTruthy();
+    expect(reads()).toEqual(before);
+    act(() => screen.getByText('Overview').click());
+    expect(safeToSpend()).toBe('$4,290.00');
+    expect(budgetPace()).toBe('−$10.00 (refund) of $700.00 budgeted');
+  });
+});

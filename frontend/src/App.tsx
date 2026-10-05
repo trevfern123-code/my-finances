@@ -1361,6 +1361,35 @@ export default function App() {
     }
   }
 
+  /**
+   * The reload of the transaction list that follows a sync or a category backfill which has already
+   * succeeded. It is the LIST's own read and nothing else's:
+   *
+   * - its answer is committed only for the session that asked, and only if no newer read or local
+   *   edit of the list has superseded it (`version`, reserved by the caller from
+   *   `resourceVersionsRef.current.transactions`);
+   * - its failure is reported as a failure to reload the list — never as a failure of the write it
+   *   follows, which is done — and it never throws.
+   *
+   * It decides nothing about any other figure. Whatever the write changed is read again by the
+   * caller BEFORE this is requested, and regardless of what becomes of it (cumulative review after
+   * I2, CAI2-1: those reads used to start only once this one had succeeded, so a list reload that
+   * failed, stayed pending or was superseded left the figures of before the write looking current).
+   */
+  async function reloadTransactionsAfterWrite(expectedSessionId: string | null, version: number) {
+    try {
+      const res = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
+      if (!isStillCurrentSession(expectedSessionId) || version !== resourceVersionsRef.current.transactions) {
+        return;
+      }
+      setTransactions(res.transactions);
+    } catch (err) {
+      if (isStillCurrentSession(expectedSessionId)) {
+        setActionError(err instanceof Error ? err.message : 'Failed to reload transactions');
+      }
+    }
+  }
+
   async function handleSyncTransactions() {
     setSyncing(true);
     setActionError(null);
@@ -1371,17 +1400,21 @@ export default function App() {
     const version = ++resourceVersionsRef.current.transactions;
     try {
       await syncTransactionsRequest(ownership.verify);
-      const res = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
-      if (expectedSessionId !== sessionIdRef.current || version !== resourceVersionsRef.current.transactions) {
-        return;
-      }
-      setTransactions(res.transactions);
-      applyReportingRange(reportingRangeRef.current);
-      refreshBudgetCategories();
+      // The sync has succeeded: the server's transactions have changed. If the session has moved
+      // on meanwhile, everything below is another lifecycle's business — a stale completion
+      // withholds nothing of it and starts none of its requests.
+      if (!isStillCurrentSession(expectedSessionId)) return;
+      // What follows from the SYNC starts now, before the list reload below is requested and
+      // whatever becomes of it. The summary, the breakdown and the budget figures on screen are
+      // those of before the sync: refreshRoleAwareFigures withholds them at once and reads them
+      // again (see its own comment), each under its own ownership.
+      refreshRoleAwareFigures();
       // Recurring-stream detection is also refreshed server-side as part of every sync
       // (manual or webhook-driven) — refetch here so this tab reflects that without a reload.
       refreshRecurringStreams();
+      await reloadTransactionsAfterWrite(expectedSessionId, version);
     } catch (err) {
+      // Only the sync request itself can end up here: the reads above report their own failures.
       if (expectedSessionId === sessionIdRef.current) {
         setActionError(err instanceof Error ? err.message : 'Failed to sync transactions');
       }
@@ -1660,29 +1693,27 @@ export default function App() {
         setCategoryMappings((prev) => [...prev.filter((m) => m.plaid_category !== plaidCategory), res.mapping]);
       });
       if (backfill && res.backfilled_count > 0) {
-        // Backfilling updates transaction rows directly in the database — refetch so the
-        // Accounts and Budget tabs reflect the newly-assigned categories. This is a TARGETED
-        // READ, not a direct mutation patch (the response above doesn't include the full
-        // backfilled transaction list) — it reserves its own fresh `transactions` version here,
-        // shared with handleSyncTransactions's own refetch, only now that the session guard
-        // above has already confirmed this continuation is even allowed to run.
-        const version = ++resourceVersionsRef.current.transactions;
-        const transactionsRes = await getTransactions(TRANSACTIONS_FETCH_LIMIT);
-        // A second await boundary — the session can have moved on WHILE getTransactions() was
-        // in flight, even though it hadn't yet at the check above. Re-verifying only before
-        // setTransactions is not enough: refreshBudgetCategories() below is itself an OWNED
-        // follow-up request that reserves a budgets resource version and can commit under
-        // whatever session is current when IT resolves — if that's a newer lifecycle, this
-        // stale call would advance that lifecycle's own budgets version out from under its
-        // already-reserved grouped/targeted budget read, causing that newer read's legitimate
-        // result to be discarded as "stale" even though nothing about it was actually stale.
-        // The whole rest of this continuation — the transactions commit AND the budgets
-        // follow-up — must stop together here if the session has changed.
-        if (!isStillCurrentSession(expectedSessionId)) return res.backfilled_count;
-        if (version === resourceVersionsRef.current.transactions) {
-          setTransactions(transactionsRes.transactions);
-        }
+        // Backfilling updates transaction rows directly in the database — and with them what each
+        // budget category's spending is computed from. Two follow-ups, both started right here:
+        // synchronously after the session guard above, which has just confirmed that this
+        // continuation is allowed to run at all, and before any further await.
+        //
+        // 1. The budget figures are read again NOW. refreshBudgetCategories is an OWNED request
+        //    that reserves a budgets resource version, so it may only ever start under the session
+        //    this continuation belongs to — which is why it starts here and not after the list
+        //    reload's await below, during which the session can move on (a stale call there would
+        //    advance a newer lifecycle's budgets version out from under its already-reserved
+        //    grouped/targeted budget read). It withholds the figures on screen the moment it
+        //    starts, and owes nothing to the list reload: that one failing or staying pending
+        //    neither delays it nor brings the old figures back.
         refreshBudgetCategories();
+        // 2. The transaction list is reloaded so the Accounts tab shows the newly-assigned
+        //    categories. This is a TARGETED READ, not a direct mutation patch (the response above
+        //    doesn't include the full backfilled transaction list) — it reserves its own fresh
+        //    `transactions` version here, shared with handleSyncTransactions's own refetch. Its
+        //    answer is re-verified against the session and that version after its own await, and
+        //    its failure is the list's: the backfill is done, and this still returns its count.
+        await reloadTransactionsAfterWrite(expectedSessionId, ++resourceVersionsRef.current.transactions);
       }
       return res.backfilled_count;
     } catch (err) {
