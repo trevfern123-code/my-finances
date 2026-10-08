@@ -460,8 +460,11 @@ export async function recordItemRemovalAttempt(
   return data as ItemRemovalRecord;
 }
 
-/** The atomic local cleanup (restores manual-loan balances, deletes the item). Refused by the database
- *  unless Plaid removal is confirmed; a replay returns the recorded result. */
+/** The atomic local cleanup (restores manual-loan balances, deletes the item; since 20261006120000 it
+ *  also preserves the known destinations of surviving card payments — failing as a whole if it cannot
+ *  evaluate matching first or cannot record them — and then re-evaluates matching, best-effort: a
+ *  failure there leaves matching stale, not the removal undone). Refused by the database unless Plaid
+ *  removal is confirmed; a replay returns the recorded result. The result's shape is unchanged. */
 export async function removeItemLocally(
   userId: string,
   itemId: string

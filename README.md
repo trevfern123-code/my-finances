@@ -935,6 +935,54 @@ They read the item's status without decrypting its token. `SYNC_UPDATES_AVAILABL
 
   All three happen in one transaction. A replay returns the recorded result and restores nothing
   twice.
+
+  **With migration `20261006120000` (Phase B integration slice I3A — a candidate pending review, not
+  applied to any hosted database)** the same transaction also keeps what card-payment matching knew
+  (`CARD_PAYMENT_PAIRING_DESIGN.md` §4.7, `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md`):
+  - **before the delete** it evaluates matching and records, on every payment from an account of
+    another institution that was matched to a card of this one, that its destination was the removed
+    card (`destination_removed_card`). Those payments then count as money leaving the tracked accounts;
+  - **after the delete** it evaluates again, so the removal normally commits fresh matching states.
+
+  The two evaluations fail differently (Trevor's decision, 2026-10-06):
+  - **The first is strict.** If matching cannot be evaluated before the delete, or the destinations
+    cannot be recorded, the cleanup fails as a whole: nothing is deleted or restored, and the operation
+    stays `plaid_removed` for Retry.
+  - **The last is best-effort.** By then the destinations are recorded and the removal is done. If that
+    evaluation fails, the removal still commits, and matching is left **stale**: no card-payment states
+    are served until a later evaluation succeeds. Nothing retries that evaluation yet except a later
+    sync (only with `CARD_PAYMENT_SYNC_EVALUATION_ENABLED` on); Retry of a cleaned removal does not.
+
+  The result and the stored `loan_adjustments` / `deleted_counts` have the same shape as before.
+
+  **A match the *user* confirmed** with an account of the removed institution survives the removal as
+  the user's own decision (decision kind `pair_counterpart_removed`, migration `20261006110000`), and
+  keeps holding the leg that is left against automatic matching with another card — whether the
+  confirmation was active, waiting to post, or invalidated by a bank change. A confirmation the user
+  had undone, replaced or re-classified is not carried forward. An automatic match becomes the
+  lower-priority system record instead. A preserved confirmation whose removed side was invalid for a
+  reason other than an amount stays unresolved, whatever the amount of the leg that is left later
+  does.
+
+  **A payment that was unresolved** because a card of the removed institution and a card that stays
+  both fitted it is not resolved by the removal: deleting one candidate is not evidence for the other.
+  The cleanup records the ambiguity as a system hold on the pair that is left (decision kinds
+  `ambiguity_hold_removed_card` / `ambiguity_hold_removed_cash_account`, migration `20261006110000`).
+  The payment stays unresolved, with no effect of its own, until new or changed bank data supports a
+  match under the ordinary rules or the user decides. The hold is not a user decision and cannot be
+  undone as one. Accounts excluded from cash flow are covered: the ambiguity is judged on the complete
+  matching pool, not on what a reader is shown.
+
+  **A payment that was matched *automatically*** to a card of the removed institution is not switched
+  to a card that was already there and merely fitted less well. It keeps its recorded destination (the
+  system record) and still counts as money leaving the tracked accounts. The same system hold, on the
+  pair of that payment and the other card's leg, keeps the two from pairing merely because the
+  original destination disappeared. New or changed bank data, a relinked card or the user decide as
+  always. (One limit after a relink is recorded as open, not decided:
+  `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3, question 7.)
+
+  Before it evaluates, the cleanup locks the institution's account rows, so that an account-settings
+  update running at the same moment makes it wait, as it did before, instead of deadlocking.
 - **Blockers: refused before anything happens** (`plaid_item_removal_blocker`, fail closed). Removal
   is refused when any of the item's transactions:
   - is linked to a manual loan that is missing or belongs to another user

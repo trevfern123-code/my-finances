@@ -1,0 +1,208 @@
+# supabase/tests/card_payment_benchmark/removal/run.sh   (2026-10-06, corrected candidate: body 26f4c420dee834396b67be2599e66691, final evaluation best-effort; local, synthetic; defaults: 5 samples after 1 warm-up at 1000, 10000 and 50000)
+environment: image public.ecr.aws/supabase/postgres:17.6.1.155; server 17.6; docker 29.7.2, 12 CPUs, 8297000960 bytes
+settings: fsync=on max_wal_size=1024 shared_buffers=16384 synchronous_commit=on work_mem=4096
+samples per configuration: 5 measured after 1 warm-up; sizes 1000,10000,50000 (transactions on the removed institution; as many again on the kept one)
+size 1000
+conversion plan at size 1000:
+                                                                                                         QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort (actual rows=10 loops=1)
+   Sort Key: t.id
+   Sort Method: quicksort  Memory: 26kB
+   ->  Nested Loop Anti Join (actual rows=10 loops=1)
+         Join Filter: ((d.a_account_id = t.account_id) AND (d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+         ->  Nested Loop (actual rows=10 loops=1)
+               Join Filter: (ci.id = ca.item_id)
+               ->  Nested Loop (actual rows=1 loops=1)
+                     ->  Seq Scan on plaid_items ci (actual rows=1 loops=1)
+                           Filter: ((id <> '685de0a3-3dce-46e1-9e6d-5d0e3e7ccc81'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                           Rows Removed by Filter: 1
+                     ->  Seq Scan on plaid_items pi (actual rows=1 loops=1)
+                           Filter: ((id = '685de0a3-3dce-46e1-9e6d-5d0e3e7ccc81'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                           Rows Removed by Filter: 1
+               ->  Nested Loop (actual rows=10 loops=1)
+                     ->  Nested Loop (actual rows=10 loops=1)
+                           ->  Hash Join (actual rows=20 loops=1)
+                                 Hash Cond: (pt.id = s.partner_transaction_id)
+                                 ->  Seq Scan on transactions pt (actual rows=2000 loops=1)
+                                 ->  Hash (actual rows=20 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 11kB
+                                       ->  Hash Join (actual rows=20 loops=1)
+                                             Hash Cond: (t.id = s.transaction_id)
+                                             ->  Seq Scan on transactions t (actual rows=2000 loops=1)
+                                             ->  Hash (actual rows=20 loops=1)
+                                                   Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                                                   ->  Seq Scan on card_payment_leg_states s (actual rows=20 loops=1)
+                                                         Filter: ((partner_transaction_id IS NOT NULL) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                                         Rows Removed by Filter: 20
+                           ->  Memoize (actual rows=0 loops=20)
+                                 Cache Key: pt.account_id
+                                 Cache Mode: logical
+                                 Hits: 18  Misses: 2  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                                 ->  Index Scan using accounts_pkey on accounts pa (actual rows=0 loops=2)
+                                       Index Cond: (id = pt.account_id)
+                                       Filter: (item_id = '685de0a3-3dce-46e1-9e6d-5d0e3e7ccc81'::uuid)
+                                       Rows Removed by Filter: 0
+                     ->  Memoize (actual rows=1 loops=10)
+                           Cache Key: t.account_id
+                           Cache Mode: logical
+                           Hits: 9  Misses: 1  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                           ->  Index Scan using accounts_pkey on accounts ca (actual rows=1 loops=1)
+                                 Index Cond: (id = t.account_id)
+         ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=10)
+               Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid) AND (kind = 'destination_removed_card'::text))
+(45 rows)
+
+size 10000
+conversion plan at size 10000:
+                                                                                                      QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort (actual rows=100 loops=1)
+   Sort Key: t.id
+   Sort Method: quicksort  Memory: 38kB
+   ->  Nested Loop Anti Join (actual rows=100 loops=1)
+         Join Filter: ((d.a_account_id = t.account_id) AND (d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+         ->  Hash Join (actual rows=100 loops=1)
+               Hash Cond: (pt.account_id = pa.id)
+               ->  Hash Join (actual rows=200 loops=1)
+                     Hash Cond: (pt.id = s.partner_transaction_id)
+                     ->  Seq Scan on transactions pt (actual rows=20000 loops=1)
+                     ->  Hash (actual rows=200 loops=1)
+                           Buckets: 1024  Batches: 1  Memory Usage: 33kB
+                           ->  Hash Join (actual rows=200 loops=1)
+                                 Hash Cond: (t.account_id = ca.id)
+                                 ->  Hash Join (actual rows=200 loops=1)
+                                       Hash Cond: (t.id = s.transaction_id)
+                                       ->  Seq Scan on transactions t (actual rows=20000 loops=1)
+                                       ->  Hash (actual rows=200 loops=1)
+                                             Buckets: 1024  Batches: 1  Memory Usage: 23kB
+                                             ->  Seq Scan on card_payment_leg_states s (actual rows=200 loops=1)
+                                                   Filter: ((partner_transaction_id IS NOT NULL) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                                   Rows Removed by Filter: 200
+                                 ->  Hash (actual rows=2 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                       ->  Nested Loop (actual rows=2 loops=1)
+                                             Join Filter: (ci.id = ca.item_id)
+                                             Rows Removed by Join Filter: 2
+                                             ->  Seq Scan on plaid_items ci (actual rows=1 loops=1)
+                                                   Filter: ((id <> 'a993a132-75a0-4e68-8bb3-f594ba5aac66'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                                   Rows Removed by Filter: 1
+                                             ->  Seq Scan on accounts ca (actual rows=4 loops=1)
+               ->  Hash (actual rows=2 loops=1)
+                     Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                     ->  Nested Loop (actual rows=2 loops=1)
+                           ->  Seq Scan on plaid_items pi (actual rows=1 loops=1)
+                                 Filter: ((id = 'a993a132-75a0-4e68-8bb3-f594ba5aac66'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                 Rows Removed by Filter: 1
+                           ->  Seq Scan on accounts pa (actual rows=2 loops=1)
+                                 Filter: (item_id = 'a993a132-75a0-4e68-8bb3-f594ba5aac66'::uuid)
+                                 Rows Removed by Filter: 2
+         ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=100)
+               Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid) AND (kind = 'destination_removed_card'::text))
+(42 rows)
+
+size 50000
+conversion plan at size 50000:
+                                                                                                         QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Merge (actual rows=500 loops=1)
+   Workers Planned: 1
+   Workers Launched: 1
+   ->  Sort (actual rows=250 loops=2)
+         Sort Key: t.id
+         Sort Method: quicksort  Memory: 60kB
+         Worker 0:  Sort Method: quicksort  Memory: 58kB
+         ->  Hash Join (actual rows=250 loops=2)
+               Hash Cond: (pt.account_id = pa.id)
+               ->  Nested Loop Anti Join (actual rows=500 loops=2)
+                     Join Filter: ((d.a_account_id = t.account_id) AND (d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+                     ->  Parallel Hash Join (actual rows=500 loops=2)
+                           Hash Cond: (pt.id = s.partner_transaction_id)
+                           ->  Parallel Seq Scan on transactions pt (actual rows=50000 loops=2)
+                           ->  Parallel Hash (actual rows=500 loops=2)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 200kB
+                                 ->  Hash Join (actual rows=500 loops=2)
+                                       Hash Cond: (t.account_id = ca.id)
+                                       ->  Hash Join (actual rows=500 loops=2)
+                                             Hash Cond: (t.id = s.transaction_id)
+                                             ->  Parallel Seq Scan on transactions t (actual rows=50000 loops=2)
+                                             ->  Hash (actual rows=1000 loops=2)
+                                                   Buckets: 2048  Batches: 1  Memory Usage: 87kB
+                                                   ->  Seq Scan on card_payment_leg_states s (actual rows=1000 loops=2)
+                                                         Filter: ((partner_transaction_id IS NOT NULL) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                                         Rows Removed by Filter: 1000
+                                       ->  Hash (actual rows=2 loops=2)
+                                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                             ->  Nested Loop (actual rows=2 loops=2)
+                                                   Join Filter: (ci.id = ca.item_id)
+                                                   Rows Removed by Join Filter: 2
+                                                   ->  Nested Loop (actual rows=1 loops=2)
+                                                         ->  Seq Scan on plaid_items ci (actual rows=1 loops=2)
+                                                               Filter: ((id <> 'd429593f-88e2-4360-9ffa-536ca6867bbb'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                               Rows Removed by Filter: 1
+                                                         ->  Seq Scan on plaid_items pi (actual rows=1 loops=2)
+                                                               Filter: ((id = 'd429593f-88e2-4360-9ffa-536ca6867bbb'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                               Rows Removed by Filter: 1
+                                                   ->  Seq Scan on accounts ca (actual rows=4 loops=2)
+                     ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=1000)
+                           Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid) AND (kind = 'destination_removed_card'::text))
+               ->  Hash (actual rows=2 loops=2)
+                     Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                     ->  Seq Scan on accounts pa (actual rows=2 loops=2)
+                           Filter: (item_id = 'd429593f-88e2-4360-9ffa-536ca6867bbb'::uuid)
+                           Rows Removed by Filter: 2
+(46 rows)
+
+
+counts (first measured sample of each size)
+ size  |                         what                          |   n
+-------+-------------------------------------------------------+--------
+  1000 | leg states read by the conversion (all of the user's) |     40
+  1000 | records written by the removal                        |     10
+  1000 | surviving legs evaluated after the removal            |     30
+  1000 | transactions of the user                              |   2000
+  1000 | transactions on the removed institution               |   1000
+ 10000 | leg states read by the conversion (all of the user's) |    400
+ 10000 | records written by the removal                        |    100
+ 10000 | surviving legs evaluated after the removal            |    300
+ 10000 | transactions of the user                              |  20000
+ 10000 | transactions on the removed institution               |  10000
+ 50000 | leg states read by the conversion (all of the user's) |   2000
+ 50000 | records written by the removal                        |    500
+ 50000 | surviving legs evaluated after the removal            |   1500
+ 50000 | transactions of the user                              | 100000
+ 50000 | transactions on the removed institution               |  50000
+(15 rows)
+
+
+timings (milliseconds)
+ size  |                phase                | n | median_ms | min_ms | max_ms
+-------+-------------------------------------+---+-----------+--------+--------
+  1000 | current                             | 5 |      75.1 |   72.9 |   83.5
+  1000 | previous                            | 5 |      24.1 |   23.6 |   24.4
+  1000 | step 1: first evaluation            | 5 |      26.5 |   25.4 |   27.5
+  1000 | step 2: conversion                  | 5 |       3.6 |    3.2 |    4.3
+  1000 | step 3: delete (cascade + triggers) | 5 |      21.2 |   21.0 |   23.8
+  1000 | step 4: final evaluation            | 5 |      15.7 |   15.5 |   15.9
+ 10000 | current                             | 5 |     537.1 |  519.4 |  609.5
+ 10000 | previous                            | 5 |     260.1 |  208.1 |  341.7
+ 10000 | step 1: first evaluation            | 5 |     183.6 |  178.1 |  253.1
+ 10000 | step 2: conversion                  | 5 |       9.9 |    9.2 |   14.3
+ 10000 | step 3: delete (cascade + triggers) | 5 |     215.6 |  210.2 |  298.2
+ 10000 | step 4: final evaluation            | 5 |     107.4 |  103.2 |  146.2
+ 50000 | current                             | 5 |    2538.3 | 2508.2 | 2651.6
+ 50000 | previous                            | 5 |    1075.3 | 1020.6 | 1093.5
+ 50000 | step 1: first evaluation            | 5 |     933.2 |  886.4 | 1048.7
+ 50000 | step 2: conversion                  | 5 |      37.5 |   36.6 |   48.3
+ 50000 | step 3: delete (cascade + triggers) | 5 |    1071.7 | 1051.4 | 1412.9
+ 50000 | step 4: final evaluation            | 5 |     541.8 |  533.6 |  606.3
+(18 rows)
+
+
+added by 20261006120000 (median current - median previous)
+ size  | previous_ms | current_ms | added_ms | added_pct
+-------+-------------+------------+----------+-----------
+  1000 |        24.1 |       75.1 |     51.1 |       212
+ 10000 |       260.1 |      537.1 |    277.0 |       106
+ 50000 |      1075.3 |     2538.3 |   1463.0 |       136
+(3 rows)

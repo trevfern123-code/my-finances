@@ -5,8 +5,17 @@
 --   I|<scenario>|<user>|<json>      the database inputs in the TypeScript reference evaluator's input shape
 --   R|<scenario>|<user>|<json>      get_card_payment_states
 --   E|<scenario>|<json>             the expected reference outcome of the sequence
+--   CI|<scenario>|<stage>|<user>|<json>, CR|<scenario>|<stage>|<user>|<json>
+--                                   the same inputs and states at a named stage INSIDE a sequence (Q13–Q15)
 -- compare_rpc.cjs runs the reference evaluator on each I line (so on exactly the decisions the RPCs wrote,
--- superseded ones included), requires it to equal R, and checks E against it.
+-- superseded ones included), requires it to equal R, and checks E against it. It does the same for every
+-- CI / CR pair, so the hand-written S lines around a checkpoint state what BOTH evaluators computed there.
+-- Q9, Q10 and Q11 (integration slice I3A) do the same for the decisions an institution removal writes
+-- (remove_plaid_item_local, 20261006120000): the SYSTEM record of an automatic pair, and the USER decision
+-- pair_counterpart_removed that preserves a confirmed pair. Q12 does it for the SYSTEM ambiguity hold.
+-- Q13, Q14 and Q15 (revision 5) do it for: a hold whose owner is a leg on an EXCLUDED account (the audit's
+-- finding P1); a preserved pair's frozen invalidity under a later amount correction (P2); and a payment that
+-- was matched automatically to the removed card while a kept card's leg also fitted (Option B).
 \set ON_ERROR_STOP 1
 set client_min_messages = warning;
 
@@ -92,7 +101,11 @@ create function pg_temp.inputs(p_user uuid) returns jsonb language sql as $$
                     'b', case when d.b_account_id is null then null
                               else jsonb_build_object('accountId', d.b_account_id, 'plaidTransactionId', d.b_plaid_transaction_id, 'cents', d.b_cents) end,
                     'acceptedDifferenceCents', d.accepted_difference_cents, 'decidedSeq', d.decided_seq,
-                    'supersededBy', d.superseded_by) order by d.id), '[]'::jsonb)
+                    'supersededBy', d.superseded_by,
+                    'counterpart', case when d.kind = 'pair_counterpart_removed'
+                                        then jsonb_build_object('plaidTransactionId', d.b_plaid_transaction_id, 'cents', d.b_cents,
+                                                                'status', d.counterpart_status) end,
+                    'counterpartDate', to_char(d.counterpart_date, 'YYYY-MM-DD')) order by d.id), '[]'::jsonb)
                   from public.card_payment_decisions d))
 $$;
 create function pg_temp.dump(p_scenario text, p_expect jsonb) returns setof text language plpgsql as $$
@@ -243,3 +256,448 @@ select pg_temp.dump('Q8', jsonb_build_object(
   'steps', jsonb_build_array('saved:fresh', 'undone:fresh', 'unchanged:already_undone:fresh'),
   'legs', jsonb_build_object('q8-wx', 'unresolved/no_candidate'),
   'liveDecisions', 0));
+
+-- ---- Institution removal (20261006120000; design §4.7, T9) -------------------------------------------
+-- The removal writes decisions: the SYSTEM record destination_removed_card for an automatic pair, the USER
+-- decision pair_counterpart_removed for a confirmed one. The reference evaluator, run on exactly those
+-- decisions and the rows the removal left, must equal the SQL states — and the states the removal itself
+-- published must be the states of those final inputs.
+create function pg_temp.card_r() returns uuid language sql as $$ select '00000000-0000-4000-8000-0000000a0c09'::uuid $$;
+create function pg_temp.item_r() returns uuid language sql as $$ select '00000000-0000-4000-8000-00000000a002'::uuid $$;
+-- A second institution of aa holding only card R (the one removed).
+create function pg_temp.add_card_r() returns void language sql as $$
+  insert into public.plaid_items (id, user_id, plaid_item_id, access_token) values (pg_temp.item_r(), pg_temp.aa(), 'rpc-item-a2', 'placeholder');
+  insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+    (pg_temp.card_r(), pg_temp.item_r(), 'rpc-r', 'Card R', 'credit', false);
+$$;
+create function pg_temp.txr(p_plaid text, p_amount numeric, p_date date) returns void language sql as $$
+  insert into public.transactions (account_id, plaid_transaction_id, amount, date, user_role_override)
+  values (pg_temp.card_r(), p_plaid, p_amount, p_date, 'credit_card_payment') $$;
+-- The removal through its state machine, as one step line.
+create function pg_temp.remove_r(p_scenario text, p_name text) returns text language plpgsql as $$
+declare
+  v jsonb;
+begin
+  perform public.begin_plaid_item_removal(pg_temp.aa(), pg_temp.item_r(), public.plaid_item_removal_digest(pg_temp.aa(), pg_temp.item_r()));
+  perform public.record_plaid_item_removal_attempt(pg_temp.aa(), pg_temp.item_r(), 'removed', null);
+  v := public.remove_plaid_item_local(pg_temp.aa(), pg_temp.item_r());
+  return 'S|' || p_scenario || '|' || p_name || '|' || case when (v->>'replayed')::boolean then 'replayed' else 'removed' end
+         || case when coalesce((public.get_card_payment_states(pg_temp.aa())->>'fresh')::boolean, false) then ':fresh' else ':stale' end;
+end $$;
+-- A user's legs and decisions without the time-dependent `recent` label (the removal evaluates at now()).
+create function pg_temp.timeless(p_states jsonb) returns jsonb language sql as $$
+  select jsonb_build_object(
+    'fresh', p_states->'fresh',
+    'legs', (select coalesce(jsonb_agg(l - 'recent' order by l->>'transactionId'), '[]'::jsonb) from jsonb_array_elements(p_states->'legs') l),
+    'decisions', p_states->'decisions', 'supersededTransactionIds', p_states->'supersededTransactionIds') $$;
+create temporary table own (scenario text primary key, s jsonb);
+grant select, insert on pg_temp.own to service_role;
+
+-- ==== Q9: a removal preserves a tier 1 pair (system record), a user pair and a user pair with a difference
+--      (the user's decisions, kept); an unresolved payment and a confirmed unlinked destination are left
+--      alone; a pair with a card that stays is untouched
+select pg_temp.reset();
+select pg_temp.add_card_r();
+select pg_temp.tx('C', 'q9-auto', 100, '2026-09-01'), pg_temp.txr('q9-r-auto', -100, '2026-09-02'),
+       pg_temp.tx('C', 'q9-user', 250, '2026-09-01'), pg_temp.txr('q9-r-user', -250, '2026-09-15'),
+       pg_temp.tx('C', 'q9-diff', 80, '2026-09-03'),  pg_temp.txr('q9-r-diff', -78, '2026-09-04'),
+       pg_temp.tx('C', 'q9-open', 40, '2026-09-01'),  pg_temp.txr('q9-r-open', -40, '2026-09-25'),
+       pg_temp.tx('C', 'q9-unl', 30, '2026-09-07'),
+       pg_temp.tx('C', 'q9-kept', 500, '2026-09-09'), pg_temp.tx('X', 'q9-x', -500, '2026-09-10');
+select pg_temp.evaluate();
+set role service_role;
+select pg_temp.step('Q9', '1-link', pg_temp.link('q9-user', 'q9-r-user', 0));
+select pg_temp.step('Q9', '2-link-diff', pg_temp.link('q9-diff', 'q9-r-diff', 200));
+select pg_temp.step('Q9', '3-mark', pg_temp.mark('q9-unl'));
+select pg_temp.remove_r('Q9', '4-remove');
+insert into pg_temp.own values ('Q9', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select pg_temp.dump('Q9', jsonb_build_object(
+  'steps', jsonb_build_array('saved:fresh', 'saved:fresh', 'saved:fresh', 'removed:fresh', 'own-states:same'),
+  'legs', jsonb_build_object('q9-auto', 'untracked/removed_card', 'q9-user', 'untracked/removed_card', 'q9-diff', 'untracked/removed_card',
+                             'q9-open', 'unresolved/no_candidate', 'q9-unl', 'untracked/user_confirmed_unlinked', 'q9-kept', 'tracked/auto_pair'),
+  'liveDecisions', 4));
+select 'S|Q9|5-own|own-states:' || case when pg_temp.timeless((select s from pg_temp.own where scenario = 'Q9'))
+                                             = pg_temp.timeless(public.get_card_payment_states(pg_temp.aa())) then 'same' else 'DIFFERENT' end;
+
+-- ==== Q10: after a removal, the bank corrects one preserved payment (its record is no longer proof) and the
+--      card is linked again with new ids: a clear tier 1 match re-tracks, the records stay as history
+select pg_temp.reset();
+select pg_temp.add_card_r();
+select pg_temp.tx('C', 'q10-a', 100, '2026-09-01'), pg_temp.txr('q10-r-a', -100, '2026-09-02'),
+       pg_temp.tx('C', 'q10-b', 60, '2026-09-05'),  pg_temp.txr('q10-r-b', -60, '2026-09-06'),
+       pg_temp.tx('C', 'q10-c', 70, '2026-09-08'),  pg_temp.txr('q10-r-c', -70, '2026-09-09');
+select pg_temp.evaluate();
+set role service_role;
+select pg_temp.remove_r('Q10', '1-remove');
+insert into pg_temp.own values ('Q10', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q10|2-own|own-states:' || case when (select count(*) from jsonb_array_elements((select s->'legs' from pg_temp.own where scenario = 'Q10')) l
+                                                where l->>'reason' = 'removed_card') = 3 then 'three-preserved' else 'UNEXPECTED' end;
+-- The bank corrects q10-b; the card comes back as a new institution, account and Plaid ids, re-importing a and c.
+update public.transactions set amount = 58 where plaid_transaction_id = 'q10-b';
+insert into public.plaid_items (id, user_id, plaid_item_id, access_token) values ('00000000-0000-4000-8000-00000000a003', pg_temp.aa(), 'rpc-item-a3', 'placeholder');
+insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+  ('00000000-0000-4000-8000-0000000a0c0a', '00000000-0000-4000-8000-00000000a003', 'rpc-r2', 'Card R (relinked)', 'credit', false);
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, user_role_override) values
+  ('00000000-0000-4000-8000-0000000a0c0a', 'q10-r2-a', -100, '2026-09-02', 'credit_card_payment'),
+  ('00000000-0000-4000-8000-0000000a0c0a', 'q10-r2-b', -58, '2026-09-06', 'credit_card_payment');
+select pg_temp.dump('Q10', jsonb_build_object(
+  'steps', jsonb_build_array('removed:fresh', 'own-states:three-preserved'),
+  'legs', jsonb_build_object('q10-a', 'tracked/auto_pair', 'q10-b', 'tracked/auto_pair', 'q10-c', 'untracked/removed_card'),
+  'liveDecisions', 3));
+
+-- ==== Q11: user-confirmed pairs through a removal, with a competing card (Y) or cash leg (C2) for each: an
+--      active one, one waiting for its card leg, one whose card amount changed, and the mirror case (the CASH
+--      account is on the removed institution, the card leg on Y survives). Then the card is linked again, and
+--      the user re-matches one payment by hand: the newer decision supersedes the preserved one.
+create function pg_temp.cash_r() returns uuid language sql as $$ select '00000000-0000-4000-8000-0000000a0c0b'::uuid $$;
+select pg_temp.reset();
+select pg_temp.add_card_r();
+insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+  (pg_temp.cash_r(), pg_temp.item_r(), 'rpc-rc', 'Checking R', 'depository', false);
+select pg_temp.tx('C', 'q11-act', 100, '2026-09-01'),  pg_temp.txr('q11-r-act', -100, '2026-09-02'),  pg_temp.tx('Y', 'q11-y-act', -100, '2026-09-03'),
+       pg_temp.tx('C', 'q11-wait', 110, '2026-09-05'), pg_temp.tx('Y', 'q11-y-wait', -110, '2026-09-07'),
+       pg_temp.tx('C', 'q11-chg', 120, '2026-09-09'),  pg_temp.txr('q11-r-chg', -120, '2026-09-10'),  pg_temp.tx('Y', 'q11-y-chg', -120, '2026-09-11'),
+       pg_temp.tx('Y', 'q11-y-mir', -130, '2026-09-14'), pg_temp.tx('C2', 'q11-c2-mir', 130, '2026-09-16');
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, pending, user_role_override) values
+  (pg_temp.card_r(), 'q11-r-wait', -110, '2026-09-06', true, 'credit_card_payment'),
+  (pg_temp.cash_r(), 'q11-rc-mir', 130, '2026-09-13', false, 'credit_card_payment');
+select pg_temp.evaluate();
+set role service_role;
+select pg_temp.step('Q11', '1-link-active', pg_temp.link('q11-act', 'q11-r-act', 0));
+select pg_temp.step('Q11', '2-link-waiting', pg_temp.link('q11-wait', 'q11-r-wait', 0));
+select pg_temp.step('Q11', '3-link-changed', pg_temp.link('q11-chg', 'q11-r-chg', 0));
+select pg_temp.step('Q11', '4-link-mirror', pg_temp.link('q11-rc-mir', 'q11-y-mir', 0));
+-- The pending card leg is withdrawn by a sync (it is then waiting to post); the bank corrects another card leg.
+select public.apply_synced_transaction_batch_v2(pg_temp.aa(), '[]'::jsonb, '[]'::jsonb, array['q11-r-wait']) is not null as withdrawn;
+update public.transactions set amount = -119 where plaid_transaction_id = 'q11-r-chg';
+select pg_temp.remove_r('Q11', '5-remove');
+insert into pg_temp.own values ('Q11', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q11|6-preserved|' || coalesce((select string_agg(d.a_plaid_transaction_id || '=' || d.counterpart_status, ',' order by d.a_plaid_transaction_id)
+                                          from public.card_payment_decisions d where d.kind = 'pair_counterpart_removed' and d.superseded_by is null), 'none')
+       || ';system=' || (select count(*) from public.card_payment_decisions d where d.kind = 'destination_removed_card');
+-- A standalone evaluation of the inputs the removal left, at the fixed time: it must equal what the removal published.
+select public.evaluate_card_payments(pg_temp.aa(), '2026-11-15T00:00:00Z') is not null as evaluated;
+select 'S|Q11|7-own|own-states:' || case when pg_temp.timeless((select s from pg_temp.own where scenario = 'Q11'))
+                                              = pg_temp.timeless(public.get_card_payment_states(pg_temp.aa())) then 'same' else 'DIFFERENT' end;
+-- The card comes back as a new institution with new ids; the user matches one payment with it by hand.
+insert into public.plaid_items (id, user_id, plaid_item_id, access_token) values ('00000000-0000-4000-8000-00000000a003', pg_temp.aa(), 'rpc-item-a3', 'placeholder');
+insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+  ('00000000-0000-4000-8000-0000000a0c0a', '00000000-0000-4000-8000-00000000a003', 'rpc-r2', 'Card R (relinked)', 'credit', false);
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, user_role_override) values
+  ('00000000-0000-4000-8000-0000000a0c0a', 'q11-r2-act', -100, '2026-09-02', 'credit_card_payment'),
+  ('00000000-0000-4000-8000-0000000a0c0a', 'q11-r2-chg', -120, '2026-09-10', 'credit_card_payment'),
+  ('00000000-0000-4000-8000-0000000a0c0a', 'q11-r2-wait', -110, '2026-09-06', 'credit_card_payment');
+select pg_temp.evaluate();
+set role service_role;
+select pg_temp.step('Q11', '8-relink-rematch', pg_temp.link('q11-wait', 'q11-r2-wait', 0));
+reset role;
+select pg_temp.dump('Q11', jsonb_build_object(
+  'steps', jsonb_build_array('saved:fresh', 'saved:fresh', 'saved:fresh', 'saved:fresh', 'removed:fresh',
+                             'q11-act=valid,q11-chg=amount_changed,q11-wait=waiting_to_post,q11-y-mir=valid;system=0', 'own-states:same', 'saved:fresh'),
+  'legs', jsonb_build_object(
+    'q11-act', 'untracked/removed_card',          'q11-y-act', 'unresolved/no_candidate',   'q11-r2-act', 'unresolved/no_candidate',
+    'q11-chg', 'unresolved/decision_invalidated', 'q11-y-chg', 'unresolved/no_candidate',   'q11-r2-chg', 'unresolved/no_candidate',
+    'q11-wait', 'tracked/user_pair',              'q11-r2-wait', 'paired/user_pair',        'q11-y-wait', 'unresolved/no_candidate',
+    'q11-y-mir', 'funded_from_excluded/removed_cash_account', 'q11-c2-mir', 'unresolved/no_candidate'),
+  'liveDecisions', 4));
+
+-- ==== Q12: an unresolved payment that a card of the removed institution and a kept card both fitted. The removal
+--      is not evidence for the kept card: it writes a SYSTEM ambiguity hold — for a two-way tie, a three-way
+--      one, and the mirror case (a card leg that a removed cash leg and a kept cash leg both fitted). A payment
+--      whose kept card was strictly closer was paired before, and gets none. Then: the user cannot undo a hold;
+--      the card is linked again (the tie is back by itself); the bank corrects the kept card's leg (the
+--      re-imported leg pairs); a date change brings the mirror's kept cash leg strictly closer (it pairs); and
+--      the user decides the three-way one.
+create function pg_temp.sr(p_plaids text[]) returns text language sql as $$
+  select string_agg(t.plaid_transaction_id || '=' || (l->>'state') || '/' || (l->>'reason'), ',' order by t.plaid_transaction_id collate "C")
+  from jsonb_array_elements(public.get_card_payment_states(pg_temp.aa())->'legs') l
+  join public.transactions t on t.id = (l->>'transactionId')::uuid
+  where t.plaid_transaction_id = any (p_plaids) $$;
+select pg_temp.reset();
+select pg_temp.add_card_r();
+insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+  (pg_temp.cash_r(), pg_temp.item_r(), 'rpc-rc', 'Checking R', 'depository', false);
+select pg_temp.tx('C', 'q12-tie', 700, '2026-09-10'),   pg_temp.txr('q12-r-tie', -700, '2026-09-11'),   pg_temp.tx('Y', 'q12-y-tie', -700, '2026-09-11'),
+       pg_temp.tx('C', 'q12-three', 710, '2026-09-10'), pg_temp.txr('q12-r-three', -710, '2026-09-11'), pg_temp.tx('X', 'q12-x-three', -710, '2026-09-11'),
+                                                        pg_temp.tx('Y', 'q12-y-three', -710, '2026-09-11'),
+       pg_temp.tx('C', 'q12-far', 720, '2026-09-10'),   pg_temp.txr('q12-r-far', -720, '2026-09-13'),   pg_temp.tx('Y', 'q12-y-far', -720, '2026-09-11'),
+       pg_temp.tx('Y', 'q12-y-mir', -740, '2026-09-20'), pg_temp.tx('C2', 'q12-c2-mir', 740, '2026-09-21');
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, user_role_override) values
+  (pg_temp.cash_r(), 'q12-rc-mir', 740, '2026-09-21', 'credit_card_payment');
+select pg_temp.evaluate();
+set role service_role;
+select pg_temp.remove_r('Q12', '1-remove');
+insert into pg_temp.own values ('Q12', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q12|2-holds|' || coalesce((select string_agg(d.kind || ':' || d.a_plaid_transaction_id || '+' || d.b_plaid_transaction_id || '@' || d.counterpart_date,
+                                                       ',' order by d.b_plaid_transaction_id collate "C", d.a_plaid_transaction_id collate "C")
+                                     from public.card_payment_decisions d where d.kind like 'ambiguity_hold_%' and d.superseded_by is null), 'none')
+       || ';other=' || (select count(*) from public.card_payment_decisions d where d.kind not like 'ambiguity_hold_%');
+-- A standalone evaluation of the inputs the removal left, at the fixed time: it must equal what the removal published.
+select public.evaluate_card_payments(pg_temp.aa(), '2026-11-15T00:00:00Z') is not null as evaluated;
+select 'S|Q12|3-own|own-states:' || case when pg_temp.timeless((select s from pg_temp.own where scenario = 'Q12'))
+                                              = pg_temp.timeless(public.get_card_payment_states(pg_temp.aa())) then 'same' else 'DIFFERENT' end;
+select 'S|Q12|4-after|' || pg_temp.sr(array['q12-tie', 'q12-three', 'q12-far', 'q12-y-mir', 'q12-c2-mir']);
+-- A hold is not the user's to undo.
+set role service_role;
+select pg_temp.step('Q12', '5-undo-hold', pg_temp.undo((select d.id from public.card_payment_decisions d
+                                                        where d.kind = 'ambiguity_hold_removed_card' and d.b_plaid_transaction_id = 'q12-tie')));
+reset role;
+-- The card comes back as a new institution with new ids: the tie is there again, by the ordinary rule.
+insert into public.plaid_items (id, user_id, plaid_item_id, access_token) values ('00000000-0000-4000-8000-00000000a003', pg_temp.aa(), 'rpc-item-a3', 'placeholder');
+insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+  ('00000000-0000-4000-8000-0000000a0c0a', '00000000-0000-4000-8000-00000000a003', 'rpc-r2', 'Card R (relinked)', 'credit', false);
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, user_role_override) values
+  ('00000000-0000-4000-8000-0000000a0c0a', 'q12-r2-tie', -700, '2026-09-11', 'credit_card_payment'),
+  ('00000000-0000-4000-8000-0000000a0c0a', 'q12-r2-three', -710, '2026-09-11', 'credit_card_payment');
+select pg_temp.evaluate();
+select 'S|Q12|6-relinked|' || pg_temp.sr(array['q12-tie']);
+-- New evidence: the bank corrects the kept card's leg of the tie; the mirror's kept cash leg is re-dated to the
+-- card leg's own day (strictly closer than the removed candidate was).
+update public.transactions set amount = -699 where plaid_transaction_id = 'q12-y-tie';
+update public.transactions set date = '2026-09-20' where plaid_transaction_id = 'q12-c2-mir';
+select pg_temp.evaluate();
+-- The user decides the three-way one.
+set role service_role;
+select pg_temp.step('Q12', '7-link-three', pg_temp.link('q12-three', 'q12-x-three', 0));
+reset role;
+select pg_temp.dump('Q12', jsonb_build_object(
+  'steps', jsonb_build_array('removed:fresh',
+    'ambiguity_hold_removed_cash_account:q12-y-mir+q12-c2-mir@2026-09-21,ambiguity_hold_removed_card:q12-x-three+q12-three@2026-09-11,'
+      || 'ambiguity_hold_removed_card:q12-y-three+q12-three@2026-09-11,ambiguity_hold_removed_card:q12-y-tie+q12-tie@2026-09-11;other=0',
+    'own-states:same',
+    'q12-c2-mir=unresolved/ambiguous,q12-far=tracked/auto_pair,q12-three=unresolved/ambiguous,q12-tie=unresolved/ambiguous,q12-y-mir=unresolved/ambiguous',
+    'refused:card_payment_invalid', 'q12-tie=unresolved/ambiguous', 'saved:fresh'),
+  'legs', jsonb_build_object(
+    'q12-tie', 'tracked/auto_pair',     'q12-r2-tie', 'paired/auto_pair',     'q12-y-tie', 'unresolved/no_candidate',
+    'q12-three', 'tracked/user_pair',   'q12-x-three', 'paired/user_pair',    'q12-y-three', 'unresolved/no_candidate', 'q12-r2-three', 'unresolved/no_candidate',
+    'q12-far', 'tracked/auto_pair',
+    'q12-y-mir', 'paired/auto_pair',    'q12-c2-mir', 'tracked/auto_pair'),
+  'liveDecisions', 5));
+
+-- ---- Revision 5 (2026-10-07): Q13–Q15 ---------------------------------------------------------------------
+-- Each runs the real removal and states by hand, in its S lines, what a reader must see at every stage. A
+-- checkpoint (CI / CR lines) inside a sequence makes compare_rpc.cjs require the reference evaluator, run on
+-- the inputs as they are at that stage, to equal the SQL states there — not only at the end of the sequence.
+--
+-- Named legs of aa as a reader sees them now, by Plaid id:
+--   <plaid>=<state>/<reason>/<effect>[<low>..<high>]/<detail>><partner's Plaid id>@<kind of the decision named on the leg>
+-- ("-" for no detail, no partner, no decision).
+create function pg_temp.srx(p_plaids text[]) returns text language sql as $$
+  select coalesce(string_agg(
+           t.plaid_transaction_id || '=' || (l->>'state') || '/' || (l->>'reason') || '/' || coalesce(l->>'effectCents', 'null')
+           || '[' || (l->>'lowCents') || '..' || (l->>'highCents') || ']/' || coalesce(l->>'detail', '-')
+           || '>' || coalesce((select p.plaid_transaction_id from public.transactions p where p.id = (l->>'partnerTransactionId')::uuid), '-')
+           || '@' || coalesce((select d.kind from public.card_payment_decisions d where d.id = (l->>'decisionId')::uuid), '-'),
+           ',' order by t.plaid_transaction_id collate "C"), 'NO FRESH STATES')
+  from jsonb_array_elements(public.get_card_payment_states(pg_temp.aa())->'legs') l
+  join public.transactions t on t.id = (l->>'transactionId')::uuid
+  where t.plaid_transaction_id = any (p_plaids) $$;
+-- aa's live decisions as the evaluator reports them: <kind>:<leg a's Plaid id>=<status>[/<detail>], by leg a.
+create function pg_temp.dst() returns text language sql as $$
+  select coalesce(string_agg(d.kind || ':' || d.a_plaid_transaction_id || '=' || (s->>'status') || coalesce('/' || (s->>'detail'), ''),
+                             ',' order by d.a_plaid_transaction_id collate "C", d.kind), 'none')
+  from jsonb_array_elements(public.get_card_payment_states(pg_temp.aa())->'decisions') s
+  join public.card_payment_decisions d on d.id = (s->>'decisionId')::uuid
+  where d.superseded_by is null $$;
+-- A checkpoint inside a sequence: both users evaluated at the fixed time, their inputs and their SQL states.
+create function pg_temp.checkpoint(p_scenario text, p_stage text) returns setof text language plpgsql as $$
+begin
+  perform public.evaluate_card_payments(pg_temp.aa(), '2026-11-15T00:00:00Z');
+  perform public.evaluate_card_payments(pg_temp.bb(), '2026-11-15T00:00:00Z');
+  return next 'CI|' || p_scenario || '|' || p_stage || '|' || pg_temp.aa() || '|' || pg_temp.inputs(pg_temp.aa())::text;
+  return next 'CR|' || p_scenario || '|' || p_stage || '|' || pg_temp.aa() || '|' || public.get_card_payment_states(pg_temp.aa())::text;
+  return next 'CI|' || p_scenario || '|' || p_stage || '|' || pg_temp.bb() || '|' || pg_temp.inputs(pg_temp.bb())::text;
+  return next 'CR|' || p_scenario || '|' || p_stage || '|' || pg_temp.bb() || '|' || public.get_card_payment_states(pg_temp.bb())::text;
+end $$;
+
+-- ==== Q13 (P1, the audit's counterexample): a kept payment (C, +100), a payment of the same amount on a checking
+--      account of the removed institution, and a kept EXCLUDED card's leg (E, −100), all on one day; aa's two
+--      included cards have no legs. The excluded card leg is tied between the two payments; it is published
+--      not_counted, with no candidate list — and it is the OWNER of the ambiguity. The removal must not turn
+--      the kept payment into "paid to the excluded card": exactly one hold, of the removed-CASH kind, on (the
+--      excluded card leg, the kept payment). Then the user confirms that very pair (their decision decides:
+--      untracked / partner_excluded), and undoes it (withheld again, as before they decided).
+select pg_temp.reset();
+select pg_temp.add_card_r();
+insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+  (pg_temp.cash_r(), pg_temp.item_r(), 'rpc-rc', 'Checking R', 'depository', false);
+select pg_temp.tx('C', 'q13-k', 100, '2026-09-10'), pg_temp.tx('E', 'q13-e', -100, '2026-09-10');
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, user_role_override) values
+  (pg_temp.cash_r(), 'q13-rc', 100, '2026-09-10', 'credit_card_payment');
+select pg_temp.evaluate();
+select 'S|Q13|1-before|' || pg_temp.srx(array['q13-k', 'q13-rc', 'q13-e']);
+set role service_role;
+select pg_temp.remove_r('Q13', '2-remove');
+insert into pg_temp.own values ('Q13', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q13|3-decisions|' || coalesce((select string_agg(d.kind || ':' || d.a_plaid_transaction_id || '+' || d.b_plaid_transaction_id || '@' || d.counterpart_date,
+                                                           ',' order by d.b_plaid_transaction_id collate "C", d.a_plaid_transaction_id collate "C")
+                                         from public.card_payment_decisions d where d.kind like 'ambiguity_hold_%' and d.superseded_by is null), 'none')
+       || ';other=' || (select count(*) from public.card_payment_decisions d where d.kind not like 'ambiguity_hold_%');
+-- A standalone evaluation of the inputs the removal left, at the fixed time: it must equal what the removal published.
+select public.evaluate_card_payments(pg_temp.aa(), '2026-11-15T00:00:00Z') is not null as evaluated;
+select 'S|Q13|4-own|own-states:' || case when pg_temp.timeless((select s from pg_temp.own where scenario = 'Q13'))
+                                              = pg_temp.timeless(public.get_card_payment_states(pg_temp.aa())) then 'same' else 'DIFFERENT' end;
+select 'S|Q13|5-after|' || pg_temp.srx(array['q13-k', 'q13-e']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q13', 'after-removal');
+-- The user confirms the payment with the excluded card: their decision decides, the hold is left in place.
+set role service_role;
+select pg_temp.step('Q13', '6-link-excluded', pg_temp.link('q13-k', 'q13-e', 0));
+reset role;
+select 'S|Q13|7-linked|' || pg_temp.srx(array['q13-k', 'q13-e']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q13', 'linked');
+-- ... and undoes it: the pair is withheld again.
+set role service_role;
+select pg_temp.step('Q13', '8-undo', pg_temp.undo(pg_temp.did('Q13', '6-link-excluded')));
+reset role;
+select 'S|Q13|9-undone|' || pg_temp.srx(array['q13-k', 'q13-e']) || ';' || pg_temp.dst();
+select pg_temp.dump('Q13', jsonb_build_object(
+  'steps', jsonb_build_array(
+    'q13-e=not_counted/excluded_account/0[0..0]/->-@-,q13-k=unresolved/ambiguous/null[-10000..0]/->-@-,q13-rc=unresolved/ambiguous/null[-10000..0]/->-@-',
+    'removed:fresh',
+    'ambiguity_hold_removed_cash_account:q13-e+q13-k@2026-09-10;other=0',
+    'own-states:same',
+    'q13-e=not_counted/excluded_account/0[0..0]/->-@-,q13-k=unresolved/ambiguous/null[-10000..0]/->-@-;ambiguity_hold_removed_cash_account:q13-e=active',
+    'saved:fresh',
+    'q13-e=not_counted/excluded_account/0[0..0]/->q13-k@pair,q13-k=untracked/partner_excluded/-10000[-10000..-10000]/->q13-e@pair;'
+      || 'ambiguity_hold_removed_cash_account:q13-e=active,pair:q13-k=active',
+    'undone:fresh',
+    'q13-e=not_counted/excluded_account/0[0..0]/->-@-,q13-k=unresolved/ambiguous/null[-10000..0]/->-@-;ambiguity_hold_removed_cash_account:q13-e=active'),
+  'checkpoints', jsonb_build_array('after-removal', 'linked'),
+  'legs', jsonb_build_object('q13-k', 'unresolved/ambiguous', 'q13-e', 'not_counted/excluded_account'),
+  'liveDecisions', 1));
+
+-- ==== Q14 (P2): two confirmed pairs with the card of the removed institution, which is aa's ONLY card. The pending
+--      card leg of the first gets two conflicting posted replacements before the removal (frozen
+--      lineage_ambiguous); the second is active at the removal (frozen valid). Afterwards aa has no card at all.
+--      Then the bank corrects both surviving payments by −2.00: the first stays reserved and unresolved with its
+--      frozen reason (revision 4 read it untracked / no_included_card); for the second an amount is the only
+--      thing wrong, so the known-effect exception applies. Then both amounts are restored: the first is
+--      unchanged, the second is active again (untracked / removed_card).
+select pg_temp.reset();
+delete from public.accounts where id in (pg_temp.acct('X'), pg_temp.acct('Y'), pg_temp.acct('E'));
+select pg_temp.add_card_r();
+select pg_temp.tx('C', 'q14-la', 100, '2026-09-01'),
+       pg_temp.tx('C', 'q14-va', 200, '2026-09-05'), pg_temp.txr('q14-r-va', -200, '2026-09-06');
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, pending, user_role_override) values
+  (pg_temp.card_r(), 'q14-r-la', -100, '2026-09-02', true, 'credit_card_payment');
+select pg_temp.evaluate();
+set role service_role;
+select pg_temp.step('Q14', '1-link-pending', pg_temp.link('q14-la', 'q14-r-la', 0));
+select pg_temp.step('Q14', '2-link-posted', pg_temp.link('q14-va', 'q14-r-va', 0));
+reset role;
+-- Two posted rows name the confirmed pending card leg.
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, pending, pending_transaction_id, user_role_override) values
+  (pg_temp.card_r(), 'q14-r-la-p1', -100, '2026-09-02', false, 'q14-r-la', 'credit_card_payment'),
+  (pg_temp.card_r(), 'q14-r-la-p2', -100, '2026-09-03', false, 'q14-r-la', 'credit_card_payment');
+select pg_temp.evaluate();
+select 'S|Q14|3-before|' || pg_temp.srx(array['q14-la', 'q14-va']) || ';' || pg_temp.dst();
+set role service_role;
+select pg_temp.remove_r('Q14', '4-remove');
+insert into pg_temp.own values ('Q14', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q14|5-preserved|' || coalesce((select string_agg(d.a_plaid_transaction_id || '=' || d.counterpart_status, ',' order by d.a_plaid_transaction_id)
+                                          from public.card_payment_decisions d where d.kind = 'pair_counterpart_removed' and d.superseded_by is null), 'none')
+       || ';other=' || (select count(*) from public.card_payment_decisions d where d.kind <> 'pair_counterpart_removed')
+       || ';cards=' || (select count(*) from public.accounts a join public.plaid_items i on i.id = a.item_id where i.user_id = pg_temp.aa() and a.type = 'credit');
+select public.evaluate_card_payments(pg_temp.aa(), '2026-11-15T00:00:00Z') is not null as evaluated;
+select 'S|Q14|6-own|own-states:' || case when pg_temp.timeless((select s from pg_temp.own where scenario = 'Q14'))
+                                              = pg_temp.timeless(public.get_card_payment_states(pg_temp.aa())) then 'same' else 'DIFFERENT' end;
+select 'S|Q14|7-after|' || pg_temp.srx(array['q14-la', 'q14-va']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q14', 'after-removal');
+-- The bank corrects both surviving payments by −2.00.
+update public.transactions set amount = amount - 2 where plaid_transaction_id in ('q14-la', 'q14-va');
+select pg_temp.evaluate();
+select 'S|Q14|8-corrected|' || pg_temp.srx(array['q14-la', 'q14-va']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q14', 'corrected');
+-- ... and restores both amounts.
+update public.transactions set amount = amount + 2 where plaid_transaction_id in ('q14-la', 'q14-va');
+select pg_temp.evaluate();
+select 'S|Q14|9-restored|' || pg_temp.srx(array['q14-la', 'q14-va']) || ';' || pg_temp.dst();
+select pg_temp.dump('Q14', jsonb_build_object(
+  'steps', jsonb_build_array(
+    'saved:fresh', 'saved:fresh',
+    'q14-la=unresolved/decision_invalidated/null[-10000..0]/lineage_ambiguous>-@pair,q14-va=tracked/user_pair/0[0..0]/->q14-r-va@pair;'
+      || 'pair:q14-la=inactive/lineage_ambiguous,pair:q14-va=active',
+    'removed:fresh',
+    'q14-la=lineage_ambiguous,q14-va=valid;other=0;cards=0',
+    'own-states:same',
+    'q14-la=unresolved/decision_invalidated/null[-10000..0]/lineage_ambiguous>-@pair_counterpart_removed,'
+      || 'q14-va=untracked/removed_card/-20000[-20000..-20000]/->-@pair_counterpart_removed;'
+      || 'pair_counterpart_removed:q14-la=inactive/lineage_ambiguous,pair_counterpart_removed:q14-va=active',
+    'q14-la=unresolved/decision_invalidated/null[-9800..0]/lineage_ambiguous>-@pair_counterpart_removed,'
+      || 'q14-va=untracked/no_included_card/-19800[-19800..-19800]/amount_changed>-@pair_counterpart_removed;'
+      || 'pair_counterpart_removed:q14-la=inactive/lineage_ambiguous,pair_counterpart_removed:q14-va=inactive/amount_changed',
+    'q14-la=unresolved/decision_invalidated/null[-10000..0]/lineage_ambiguous>-@pair_counterpart_removed,'
+      || 'q14-va=untracked/removed_card/-20000[-20000..-20000]/->-@pair_counterpart_removed;'
+      || 'pair_counterpart_removed:q14-la=inactive/lineage_ambiguous,pair_counterpart_removed:q14-va=active'),
+  'checkpoints', jsonb_build_array('after-removal', 'corrected'),
+  'legs', jsonb_build_object('q14-la', 'unresolved/decision_invalidated', 'q14-va', 'untracked/removed_card'),
+  'liveDecisions', 2));
+
+-- ==== Q15 (Option B): two payments, each matched AUTOMATICALLY to a leg of the removed card one day away, while a
+--      kept card's leg three days away also fitted. The removal keeps each payment's known destination (the
+--      SYSTEM record) and writes a hold on (the kept card's leg, the payment) with the removed leg's date: the
+--      card that was already there does not take the payment merely because the destination disappeared. Then,
+--      for the first payment, a NEW and strictly closer leg arrives on another kept card: new evidence, paired
+--      by the ordinary rule. For the second, the removed card is linked again (a new item, account and ids; the
+--      same date and amount): the re-imported leg is the closest candidate again, and pairs.
+select pg_temp.reset();
+select pg_temp.add_card_r();
+select pg_temp.tx('C', 'q15-k', 300, '2026-09-10'),  pg_temp.txr('q15-r-k', -300, '2026-09-11'),  pg_temp.tx('Y', 'q15-b', -300, '2026-09-13'),
+       pg_temp.tx('C', 'q15-k2', 310, '2026-09-10'), pg_temp.txr('q15-r-k2', -310, '2026-09-11'), pg_temp.tx('Y', 'q15-b2', -310, '2026-09-13');
+select pg_temp.evaluate();
+select 'S|Q15|1-before|' || pg_temp.srx(array['q15-k', 'q15-b', 'q15-k2', 'q15-b2']);
+set role service_role;
+select pg_temp.remove_r('Q15', '2-remove');
+insert into pg_temp.own values ('Q15', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q15|3-decisions|' || coalesce((select string_agg(d.kind || ':' || d.a_plaid_transaction_id || '+' || d.b_plaid_transaction_id || '@' || d.counterpart_date,
+                                                           ',' order by d.b_plaid_transaction_id collate "C", d.a_plaid_transaction_id collate "C")
+                                         from public.card_payment_decisions d where d.kind like 'ambiguity_hold_%' and d.superseded_by is null), 'none')
+       || ';records=' || coalesce((select string_agg(d.a_plaid_transaction_id || ':' || d.a_cents, ',' order by d.a_plaid_transaction_id collate "C")
+                                   from public.card_payment_decisions d where d.kind = 'destination_removed_card' and d.superseded_by is null), 'none')
+       || ';other=' || (select count(*) from public.card_payment_decisions d where d.kind not like 'ambiguity_hold_%' and d.kind <> 'destination_removed_card');
+select public.evaluate_card_payments(pg_temp.aa(), '2026-11-15T00:00:00Z') is not null as evaluated;
+select 'S|Q15|4-own|own-states:' || case when pg_temp.timeless((select s from pg_temp.own where scenario = 'Q15'))
+                                              = pg_temp.timeless(public.get_card_payment_states(pg_temp.aa())) then 'same' else 'DIFFERENT' end;
+select 'S|Q15|5-after|' || pg_temp.srx(array['q15-k', 'q15-b', 'q15-k2', 'q15-b2']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q15', 'after-removal');
+-- New evidence for the first payment: a leg on another kept card, on the payment's own day.
+select pg_temp.tx('X', 'q15-z', -300, '2026-09-10');
+select pg_temp.evaluate();
+select 'S|Q15|6-new-leg|' || pg_temp.srx(array['q15-k', 'q15-z', 'q15-b']);
+select pg_temp.checkpoint('Q15', 'new-leg');
+-- The removed card comes back as a new institution with new ids, re-importing the second payment's leg.
+insert into public.plaid_items (id, user_id, plaid_item_id, access_token) values ('00000000-0000-4000-8000-00000000a003', pg_temp.aa(), 'rpc-item-a3', 'placeholder');
+insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+  ('00000000-0000-4000-8000-0000000a0c0a', '00000000-0000-4000-8000-00000000a003', 'rpc-r2', 'Card R (relinked)', 'credit', false);
+insert into public.transactions (account_id, plaid_transaction_id, amount, date, user_role_override) values
+  ('00000000-0000-4000-8000-0000000a0c0a', 'q15-r2-k2', -310, '2026-09-11', 'credit_card_payment');
+select pg_temp.evaluate();
+select 'S|Q15|7-relinked|' || pg_temp.srx(array['q15-k2', 'q15-r2-k2', 'q15-b2']) || ';' || pg_temp.dst();
+select pg_temp.dump('Q15', jsonb_build_object(
+  'steps', jsonb_build_array(
+    'q15-b=unresolved/ambiguous/0[0..0]/->-@-,q15-b2=unresolved/ambiguous/0[0..0]/->-@-,'
+      || 'q15-k=tracked/auto_pair/0[0..0]/->q15-r-k@-,q15-k2=tracked/auto_pair/0[0..0]/->q15-r-k2@-',
+    'removed:fresh',
+    'ambiguity_hold_removed_card:q15-b+q15-k@2026-09-11,ambiguity_hold_removed_card:q15-b2+q15-k2@2026-09-11;records=q15-k:30000,q15-k2:31000;other=0',
+    'own-states:same',
+    'q15-b=unresolved/ambiguous/0[0..0]/->-@-,q15-b2=unresolved/ambiguous/0[0..0]/->-@-,'
+      || 'q15-k=untracked/removed_card/-30000[-30000..-30000]/->-@destination_removed_card,'
+      || 'q15-k2=untracked/removed_card/-31000[-31000..-31000]/->-@destination_removed_card;'
+      || 'ambiguity_hold_removed_card:q15-b=active,ambiguity_hold_removed_card:q15-b2=active,'
+      || 'destination_removed_card:q15-k=active,destination_removed_card:q15-k2=active',
+    'q15-b=unresolved/ambiguous/0[0..0]/->-@-,q15-k=tracked/auto_pair/0[0..0]/->q15-z@-,q15-z=paired/auto_pair/0[0..0]/->q15-k@-',
+    'q15-b2=unresolved/ambiguous/0[0..0]/->-@-,q15-k2=tracked/auto_pair/0[0..0]/->q15-r2-k2@-,q15-r2-k2=paired/auto_pair/0[0..0]/->q15-k2@-;'
+      || 'ambiguity_hold_removed_card:q15-b=active,ambiguity_hold_removed_card:q15-b2=active,'
+      || 'destination_removed_card:q15-k=active,destination_removed_card:q15-k2=active'),
+  'checkpoints', jsonb_build_array('after-removal', 'new-leg'),
+  'legs', jsonb_build_object(
+    'q15-k', 'tracked/auto_pair',  'q15-z', 'paired/auto_pair',     'q15-b', 'unresolved/ambiguous',
+    'q15-k2', 'tracked/auto_pair', 'q15-r2-k2', 'paired/auto_pair', 'q15-b2', 'unresolved/ambiguous'),
+  'liveDecisions', 4));

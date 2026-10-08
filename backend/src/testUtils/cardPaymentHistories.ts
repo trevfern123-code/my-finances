@@ -3,8 +3,12 @@
 // harness supabase/tests/card_payment_evaluator (which compiles this file with tsc). Test-only: excluded
 // from the production build (tsconfig.build.json excludes src/testUtils). Moved verbatim from the
 // adversarial test; any change to it changes every generated case.
+// 2026-10-06: preserved pairs (pair_counterpart_removed) are ADDED to each generated history from a separate
+// random stream, after everything else: the accounts, rows, carry-overs and every other decision of a seed
+// are exactly what they were before. System ambiguity holds are added the same way, from a third stream.
 import type {
   CardPaymentMatchingInput,
+  CounterpartStatus,
   DecisionLegRef,
   MatchingAccount,
   MatchingCarryover,
@@ -47,6 +51,37 @@ export const mkDecision = (
   accepted: number | null = kind === 'pair' ? 0 : null,
   userId = U
 ): MatchingDecision => ({ id, userId, kind, a, b, acceptedDifferenceCents: accepted, decidedSeq: 1, supersededBy: null });
+/** A user-confirmed pair whose other account was removed: `a` is the surviving leg, `status` what was true of
+ *  the removed side when its account was deleted. The removed leg's own reference is history only. */
+export const mkPreserved = (
+  id: string,
+  a: DecisionLegRef,
+  status: CounterpartStatus,
+  accepted = 0,
+  userId = U
+): MatchingDecision => ({
+  id,
+  userId,
+  kind: 'pair_counterpart_removed',
+  a,
+  b: null,
+  acceptedDifferenceCents: accepted,
+  decidedSeq: 1,
+  supersededBy: null,
+  counterpart: { plaidTransactionId: `${a.plaidTransactionId}-removed-counterpart`, cents: -a.cents, status },
+});
+export type HoldKind = 'ambiguity_hold_removed_card' | 'ambiguity_hold_removed_cash_account';
+/** A system ambiguity hold on one possible pair of two surviving legs (a removal writes the card leg first),
+ *  with the date of the candidate that was removed. `ambiguity_hold_removed_card`: that candidate was a card
+ *  leg and competed for the cash leg; `…_removed_cash_account`: a cash leg, competing for the card leg. */
+export const mkHold = (
+  id: string,
+  kind: HoldKind,
+  a: DecisionLegRef,
+  b: DecisionLegRef,
+  counterpartDate: string,
+  userId = U
+): MatchingDecision => ({ id, userId, kind, a, b, acceptedDifferenceCents: null, decidedSeq: 1, supersededBy: null, counterpartDate });
 
 /** mulberry32 — a small deterministic PRNG, so every generated case is reproducible from its seed. */
 export function rng(seed: number): () => number {
@@ -159,13 +194,90 @@ export function generate(seed: number, withDecisions = true): Generated {
     r() < 0.3 && a.transactions.length > 0
       ? [mkDecision('b-foreign', 'destination_unlinked', ref(a.transactions[0].accountId, a.transactions[0].plaidTransactionId, a.transactions[0].amountCents), null, null, V)]
       : [];
+  // Preserved pairs, from their OWN stream (nothing above depends on it). About half the seeds get none.
+  // They land on any row of the user — cash or credit side, a leg or not, with a clean, waiting or
+  // conflicting lineage — at the recorded amount or one cent off, with every frozen status, sometimes undone.
+  const preserved: MatchingDecision[] = [];
+  if (withDecisions) {
+    const pr = rng((seed ^ 0x51ed270b) >>> 0);
+    const pickP = <T>(xs: T[]): T => xs[Math.floor(pr() * xs.length)];
+    const STATUSES: CounterpartStatus[] = [
+      'valid', 'valid', 'valid', 'valid', 'waiting_to_post', 'waiting_to_post', 'amount_changed', 'amount_changed',
+      'lineage_ambiguous', 'partner_gone', 'role_changed', 'sides_not_opposite', 'direction_mismatch',
+      'difference_not_accepted', 'conflicting_decisions',
+    ];
+    for (const [userId, user, prefix] of [[U, a, 'a'], [V, b, 'b']] as const) {
+      const n = pr() < 0.5 ? 0 : 1 + Math.floor(pr() * 2);
+      for (let k = 0; k < n && user.transactions.length > 0; k++) {
+        const t = pickP(user.transactions);
+        const cents = pr() < 0.85 ? t.amountCents : t.amountCents + 1;
+        const plaid = pr() < 0.3 && t.pendingTransactionId ? t.pendingTransactionId : t.plaidTransactionId;
+        const decision = mkPreserved(`${prefix}k${k}`, ref(t.accountId, plaid, cents), pickP(STATUSES), pickP([0, 0, 0, 200, -200]), userId);
+        preserved.push({ ...decision, decidedSeq: 200 + k, supersededBy: pr() < 0.1 ? 'undone' : null });
+      }
+    }
+  }
+  // Ambiguity holds, from their OWN stream too (nothing above depends on it). About half the seeds get none.
+  // Mostly on a pair that tier 1 could form (opposite sides, opposite cents, within five days), so that the
+  // hold matters; sometimes on any two rows. Either leg order, either kind, a removed-candidate date around
+  // the first leg's (so the pair is sometimes withheld and sometimes not), the recorded cents or one cent
+  // off, a pending id where there is one, sometimes undone, rarely the same hold twice.
+  const holds: MatchingDecision[] = [];
+  if (withDecisions) {
+    const hr = rng((seed ^ 0x2f6a91c5) >>> 0);
+    const pickH = <T>(xs: T[]): T => xs[Math.floor(hr() * xs.length)];
+    for (const [userId, user, prefix] of [[U, a, 'a'], [V, b, 'b']] as const) {
+      const n = hr() < 0.5 ? 0 : 1 + Math.floor(hr() * 3);
+      const isCredit = (t: MatchingTransaction) => user.accounts.find((x) => x.id === t.accountId)!.type === 'credit';
+      const days = (t: MatchingTransaction) => Math.round(Date.parse(`${t.date}T00:00:00Z`) / 86400000);
+      const shaped: Array<[MatchingTransaction, MatchingTransaction]> = [];
+      for (const x of user.transactions) {
+        for (const y of user.transactions) {
+          if (isCredit(x) && !isCredit(y) && y.amountCents === -x.amountCents && Math.abs(days(x) - days(y)) <= 5) shaped.push([x, y]);
+        }
+      }
+      for (let k = 0; k < n && user.transactions.length > 0; k++) {
+        const [x, y] = shaped.length > 0 && hr() < 0.75 ? pickH(shaped) : [pickH(user.transactions), pickH(user.transactions)];
+        const [first, second] = hr() < 0.8 ? [x, y] : [y, x];
+        const refH = (t: MatchingTransaction): DecisionLegRef =>
+          ref(t.accountId, hr() < 0.3 && t.pendingTransactionId ? t.pendingTransactionId : t.plaidTransactionId, hr() < 0.9 ? t.amountCents : t.amountCents + 1);
+        const kind = pickH<HoldKind>(['ambiguity_hold_removed_card', 'ambiguity_hold_removed_card', 'ambiguity_hold_removed_cash_account']);
+        const hold = mkHold(`${prefix}h${k}`, kind, refH(first), refH(second), addDays(first.date, Math.floor(hr() * 13) - 6), userId);
+        holds.push({ ...hold, decidedSeq: 300 + k, supersededBy: hr() < 0.1 ? 'undone' : null });
+        if (hr() < 0.1) holds.push({ ...hold, id: `${prefix}h${k}x`, decidedSeq: 320 + k });
+      }
+    }
+  }
+  // Revision 5 (the independent audit's P2), from a FOURTH stream of its own (nothing above depends on it):
+  // sometimes a user with NO included card has a preserved pair on a cash payment whose amount the bank has
+  // since corrected in the same direction — exactly the shape of the known-effect exception — with ANY frozen
+  // status. The exception may apply only when the frozen status is one an amount explains (valid,
+  // waiting_to_post, amount_changed); under every other one the leg must stay reserved and unresolved.
+  const corrected: MatchingDecision[] = [];
+  if (withDecisions) {
+    const cr = rng((seed ^ 0x7c3b5e19) >>> 0);
+    const pickC = <T>(xs: T[]): T => xs[Math.floor(cr() * xs.length)];
+    const ANY_STATUS: CounterpartStatus[] = [
+      'valid', 'waiting_to_post', 'amount_changed', 'lineage_ambiguous', 'partner_gone', 'role_changed',
+      'sides_not_opposite', 'direction_mismatch', 'difference_not_accepted', 'conflicting_decisions',
+    ];
+    for (const [userId, user, prefix] of [[U, a, 'a'], [V, b, 'b']] as const) {
+      const skip = cr() < 0.35;
+      if (skip || user.accounts.some((x) => x.type === 'credit' && !x.excludeFromCashFlow)) continue;
+      const cashLegs = user.transactions.filter((t) => user.accounts.find((x) => x.id === t.accountId)!.type !== 'credit' && Math.abs(t.amountCents) > 300);
+      if (cashLegs.length === 0) continue;
+      const t = pickC(cashLegs);
+      const recorded = t.amountCents + Math.sign(t.amountCents) * pickC([200, 200, 1]);
+      corrected.push({ ...mkPreserved(`${prefix}c0`, ref(t.accountId, t.plaidTransactionId, recorded), pickC(ANY_STATUS), 0, userId), decidedSeq: 400 });
+    }
+  }
   return {
     input: {
       asOf: ASOF,
       accounts: [...a.accounts, ...b.accounts],
       transactions: [...a.transactions, ...b.transactions],
       carryovers: [...a.carryovers, ...b.carryovers],
-      decisions: [...a.decisions, ...b.decisions, ...foreign],
+      decisions: [...a.decisions, ...b.decisions, ...foreign, ...preserved, ...holds, ...corrected],
     },
   };
 }

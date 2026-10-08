@@ -7,6 +7,9 @@
 >   `80c724d` and earlier.
 > - **Draft PR #9** (head `afa29ee`): slice 2a — `bb4e2d1`, `afa29ee`. CI passed.
 > - **Slice 2b-1**, the decision RPCs, is §9.
+> - **Packet 2b-2b**, the removal conversion that §9–§10 defer and recommend, was built later as
+>   integration slice I3A (2026-10-06, a candidate pending review): `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md`.
+>   The sections below are unchanged and still describe it as not built.
 >
 > Nothing is merged, applied to a hosted database or released. The live app does not consume any of
 > this work.

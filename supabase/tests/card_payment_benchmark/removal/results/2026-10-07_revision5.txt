@@ -1,0 +1,1523 @@
+# supabase/tests/card_payment_benchmark/removal/run.sh   (2026-10-07, revision 5: body 7997a757408fa888aa44bdbc9d85f89d — statement (c) now derives the ambiguity holds from the evaluator's scratch tables (pg_temp.cpe_pool, cpe_txn, cpe_tier1, cpe_dismissed) and also holds a payment that was matched automatically to the removed card against each kept competitor; evaluator 6cb5e299b0383fab0b6517cc2e7522c8; local, synthetic; defaults: 5 samples after 1 warm-up at 1000, 10000 and 50000; two fixture variants, one run each)
+#
+# WHAT THIS IS. Local measurements on synthetic data in throwaway containers, taken on a developer machine that was
+# doing other work the same afternoon. NOT hosted latency, not a pass/fail test, never correctness evidence.
+#
+# THE MACHINE, AND HOW FAR THE NUMBERS CAN BE TRUSTED.
+#   * Docker here reports 8 CPUs (docker 29.8.2); the 2026-10-06 transcripts were taken with 12 (docker 29.7.2), run alone.
+#   * A first pass of the base fixture (14:15-14:34 UTC) ran while 7 to 11 other test containers (access-control and
+#     replay harnesses) were busy. It was badly disturbed — the unchanged previous body alone took 132 / 1982 / 5861 ms,
+#     samples of one phase differing by up to 5x — and every size was repeated. Its timings are at the end, for the record.
+#   * The two runs below (15:02-15:14 UTC) were made after those harnesses had finished: no other container was running at
+#     the start or the end of either. The samples are tight again. They are still about 2x slower than the 2026-10-06
+#     numbers for the SAME code: the unchanged previous body takes 46.9 / 409.1 / 2122.5 ms here against 23.7 / 207.2 /
+#     1037.8 recorded. The cause was not established (fewer CPUs; possibly other processes outside Docker). So the
+#     recorded revision 4 numbers cannot be compared with these directly. To have a like-for-like baseline, the archived
+#     revision 4 tree (its own migrations, its own bench.cjs and run.sh, extracted to a scratch directory) was run on this
+#     machine between the passes (14:50-14:56 UTC, no other container running): the middle column of the first table.
+#   * In the hold_heavy run one sample at size 1000 was off (step 1 max 92.2 against a median of 47.9); that size was
+#     repeated once, with the same medians (shown after that run).
+#
+# WHAT CHANGED IN bench.cjs FOR THIS RUN. The base fixture is unchanged. New: the function checksums are printed; the clock
+# is read between the three preservation statements (steps 2a, 2b, 2c; "step 2: conversion" is still the three together,
+# now with two more clock reads inside it); the plan of the ambiguity-hold statement's SELECT is printed, taken where the
+# statement runs (after the evaluation and after the conversion wrote its records); five more counts, checked against
+# what the fixture variant describes; and a second fixture variant, BENCH_FIXTURE=hold_heavy.
+#
+# COMPARISON 1 — base fixture, medians in ms at 1,000 / 10,000 / 50,000 transactions on the removed institution.
+#
+#                                      revision 4, recorded       revision 4, re-measured    revision 5 (this run)
+#                                      2026-10-06, run alone      here, 2026-10-07           base fixture
+#   previous body (20260926120000)     23.7 /  207.2 / 1037.8     46.0 /  404.8 / 2048.0     46.9 /  409.1 / 2122.5
+#   candidate, whole removal           80.1 /  517.5 / 2490.9    137.1 /  930.8 / 4411.7    134.9 /  904.5 / 4442.4
+#   candidate / previous               3.38 /   2.50 /   2.40     2.98 /   2.30 /   2.15     2.88 /   2.21 /   2.09
+#   step 1: first evaluation           26.4 /  179.6 /  861.0     42.0 /  302.5 / 1437.5     42.1 /  287.0 / 1439.0
+#   step 2: three preservation stmts    8.9 /   15.5 /   42.0     14.1 /   25.0 /   77.0     16.1 /   28.7 /   85.9
+#   step 3: delete                     21.3 /  206.6 / 1036.8     42.3 /  404.3 / 2059.1     41.9 /  402.5 / 2082.7
+#   step 4: final evaluation           16.2 /  103.3 /  506.7     24.8 /  163.8 /  840.7     25.3 /  161.5 /  859.4
+#
+#   Read: against revision 4 on the same machine and day, the whole removal is within 3% at every size (-1.6%, -2.8%,
+#   +0.7%: inside the spread of the samples). The three preservation statements together cost 2.0 / 3.7 / 8.9 ms more
+#   than revision 4's (two extra clock reads included): the new statement (c) plans a 15-relation join (5.9-7.2 ms of
+#   planning, see its plans) where revision 4's read the published states.
+#
+# COMPARISON 2 — this run, base against hold_heavy (medians, ms; 1,000 / 10,000 / 50,000).
+#
+#                                        base                       hold_heavy                 difference
+#   whole removal (candidate)           134.9 /  904.5 / 4442.4    152.4 / 1081.8 / 5642.7    +17.5 / +177.3 / +1200.3  (+13% / +20% / +27%)
+#   previous body (control)              46.9 /  409.1 / 2122.5     47.0 /  415.6 / 1981.4
+#   step 1: first evaluation             42.1 /  287.0 / 1439.0     47.9 /  354.9 / 1764.5     +5.8 /  +67.9 /  +325.5
+#   step 2: three preservation stmts     16.1 /   28.7 /   85.9     17.6 /   38.2 /  133.4     +1.5 /   +9.5 /   +47.5
+#     2a user-pair statement              3.3 /    3.4 /    3.4      3.3 /    3.5 /    3.3
+#     2b automatic-pair statement         5.3 /   16.3 /   67.5      5.7 /   15.3 /   65.4
+#     2c ambiguity-hold statement         6.9 /    9.1 /   13.3      8.6 /   19.2 /   64.5     +1.7 /  +10.1 /   +51.2
+#   step 3: delete                       41.9 /  402.5 / 2082.7     40.2 /  393.9 / 1978.2
+#   step 4: final evaluation             25.3 /  161.5 /  859.4     33.4 /  261.5 / 1636.8     +8.1 / +100.0 /  +777.4
+#   rows written: destination records      10 /    100 /    500       10 /    100 /    500
+#   rows written: ambiguity holds           0 /      0 /      0       10 /    100 /    500
+#   live holds read by final evaluation     0 /      0 /      0       10 /    100 /    500
+#   legs evaluated after the removal       30 /    300 /   1500       40 /    400 /   2000
+#
+#   Read: writing the holds costs about 0.1 ms each (2c: +51.2 ms for 500), as an insert with its triggers and foreign
+#   keys does. The larger differences are in the two evaluations and are mostly NOT the holds: the hold_heavy fixture has
+#   N/100 unresolved kept-card legs before AND after the removal, and the evaluator scans the opposite side of the pool
+#   once per unresolved leg (step 1 pays this too, with no hold anywhere). A per-statement attribution of the final
+#   evaluation at 50,000 is at the end of this file: of about +880 ms there, about 290 ms is that candidate scan, about
+#   170 ms is the evaluator's tier 1 statement choosing a nested loop over its own CTE (an existing plan choice, see
+#   there), and about 40 ms is hold-specific (the decision loop over 500 holds, the statement that withholds their
+#   pairs, their decision states); the rest is 500 more legs and per-statement overhead.
+#   Not measured: revision 4 on the hold_heavy fixture. There revision 4 writes no hold and lets the kept card take the
+#   payment (the behaviour revision 5 corrects), so its final evaluation has no unresolved leg; it would be cheaper.
+#
+# ======================================================================================================================
+# RUN 1 of 2 — base fixture (2026-10-07 15:02-15:08 UTC; no other container running)
+# ======================================================================================================================
+environment: image public.ecr.aws/supabase/postgres:17.6.1.155; server 17.6; docker 29.8.2, 8 CPUs, 8250589184 bytes
+settings: fsync=on max_wal_size=1024 shared_buffers=16384 synchronous_commit=on work_mem=4096
+samples per configuration: 5 measured after 1 warm-up; sizes 1000,10000,50000 (transactions on the removed institution; as many again on the kept one)
+fixture variant: base (no payment to the removed card has a second candidate)
+function bodies measured (md5 of the LF-normalised source)
+                         function                          |             body_md5
+-----------------------------------------------------------+----------------------------------
+ remove_plaid_item_local(uuid,uuid)                        | 7997a757408fa888aa44bdbc9d85f89d
+ evaluate_card_payments(uuid,timestamp with time zone)     | 6cb5e299b0383fab0b6517cc2e7522c8
+ try_evaluate_card_payments(uuid,timestamp with time zone) | fac15fabe5470dd62a79a3a6c8630a89
+ bench.remove_previous(uuid,uuid)                          | a8f567d397b9dae5b777497317985ab7
+(4 rows)
+
+size 1000
+conversion plan at size 1000:
+                                                                                                                      QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort (actual rows=10 loops=1)
+   Sort Key: t.id
+   Sort Method: quicksort  Memory: 26kB
+   ->  Nested Loop Anti Join (actual rows=10 loops=1)
+         Join Filter: ((d.a_account_id = t.account_id) AND (d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+         ->  Nested Loop (actual rows=10 loops=1)
+               Join Filter: (ci.id = ca.item_id)
+               ->  Nested Loop (actual rows=1 loops=1)
+                     ->  Seq Scan on plaid_items ci (actual rows=1 loops=1)
+                           Filter: ((id <> '84791154-2380-4bca-9658-e0033dc15e82'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                           Rows Removed by Filter: 1
+                     ->  Seq Scan on plaid_items pi (actual rows=1 loops=1)
+                           Filter: ((id = '84791154-2380-4bca-9658-e0033dc15e82'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                           Rows Removed by Filter: 1
+               ->  Nested Loop (actual rows=10 loops=1)
+                     ->  Nested Loop (actual rows=10 loops=1)
+                           ->  Hash Join (actual rows=20 loops=1)
+                                 Hash Cond: (pt.id = s.partner_transaction_id)
+                                 ->  Seq Scan on transactions pt (actual rows=2000 loops=1)
+                                 ->  Hash (actual rows=20 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 11kB
+                                       ->  Hash Join (actual rows=20 loops=1)
+                                             Hash Cond: (t.id = s.transaction_id)
+                                             ->  Seq Scan on transactions t (actual rows=2000 loops=1)
+                                             ->  Hash (actual rows=20 loops=1)
+                                                   Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                                                   ->  Seq Scan on card_payment_leg_states s (actual rows=20 loops=1)
+                                                         Filter: ((partner_transaction_id IS NOT NULL) AND (decision_id IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                                         Rows Removed by Filter: 20
+                           ->  Memoize (actual rows=0 loops=20)
+                                 Cache Key: pt.account_id
+                                 Cache Mode: logical
+                                 Hits: 18  Misses: 2  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                                 ->  Index Scan using accounts_pkey on accounts pa (actual rows=0 loops=2)
+                                       Index Cond: (id = pt.account_id)
+                                       Filter: (item_id = '84791154-2380-4bca-9658-e0033dc15e82'::uuid)
+                                       Rows Removed by Filter: 0
+                     ->  Memoize (actual rows=1 loops=10)
+                           Cache Key: t.account_id
+                           Cache Mode: logical
+                           Hits: 9  Misses: 1  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                           ->  Index Scan using accounts_pkey on accounts ca (actual rows=1 loops=1)
+                                 Index Cond: (id = t.account_id)
+         ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=10)
+               Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid) AND (kind = 'destination_removed_card'::text))
+(45 rows)
+
+ambiguity-hold plan at size 1000:
+                                                                                                                                                                                                                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=38.14..38.16 rows=1 width=164) (actual time=0.328..0.333 rows=0 loops=1)
+   Buffers: shared hit=63, local hit=255
+   ->  Sort  (cost=38.14..38.14 rows=1 width=164) (actual time=0.328..0.332 rows=0 loops=1)
+         Sort Key: (CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END), (CASE WHEN o.credit THEN o.account_id ELSE y.account_id END), (CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END), (CASE WHEN o.credit THEN y.account_id ELSE o.account_id END), (CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END), rt.date, (CASE WHEN o.credit THEN o.cents ELSE y.cents END), (CASE WHEN o.credit THEN y.cents ELSE o.cents END)
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=63, local hit=255
+         ->  Nested Loop Anti Join  (cost=21.32..38.13 rows=1 width=164) (actual time=0.320..0.324 rows=0 loops=1)
+               Join Filter: ((d.a_plaid_transaction_id = CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END) AND (d.b_plaid_transaction_id = CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END) AND (d.counterpart_date = rt.date))
+               Buffers: shared hit=63, local hit=255
+               ->  Nested Loop Anti Join  (cost=21.18..37.64 rows=1 width=129) (actual time=0.320..0.324 rows=0 loops=1)
+                     Buffers: shared hit=63, local hit=255
+                     ->  Nested Loop Anti Join  (cost=21.03..35.25 rows=1 width=161) (actual time=0.320..0.324 rows=0 loops=1)
+                           Buffers: shared hit=63, local hit=255
+                           ->  Nested Loop  (cost=20.87..32.85 rows=1 width=177) (actual time=0.320..0.323 rows=0 loops=1)
+                                 Join Filter: (yi.id = ya.item_id)
+                                 Rows Removed by Join Filter: 10
+                                 Buffers: shared hit=63, local hit=255
+                                 ->  Nested Loop  (cost=20.74..32.39 rows=1 width=193) (actual time=0.217..0.299 rows=10 loops=1)
+                                       Buffers: shared hit=43, local hit=255
+                                       ->  Nested Loop  (cost=20.74..31.35 rows=1 width=177) (actual time=0.215..0.281 rows=10 loops=1)
+                                             Buffers: shared hit=33, local hit=255
+                                             ->  Nested Loop  (cost=20.46..27.35 rows=1 width=139) (actual time=0.208..0.262 rows=10 loops=1)
+                                                   Buffers: shared hit=33, local hit=214
+                                                   ->  Nested Loop  (cost=20.46..26.31 rows=1 width=155) (actual time=0.205..0.242 rows=10 loops=1)
+                                                         Buffers: shared hit=23, local hit=214
+                                                         ->  Nested Loop  (cost=20.33..25.64 rows=1 width=155) (actual time=0.198..0.226 rows=10 loops=1)
+                                                               Buffers: shared hit=3, local hit=214
+                                                               ->  Hash Join  (cost=20.05..21.64 rows=1 width=151) (actual time=0.191..0.201 rows=10 loops=1)
+                                                                     Hash Cond: (y.cents = rc.cents)
+                                                                     Join Filter: ((y.id <> o.id) AND (y.credit <> o.credit) AND (abs((o.day - y.day)) <= 5))
+                                                                     Buffers: shared hit=3, local hit=173
+                                                                     ->  Seq Scan on cpe_pool y  (cost=0.00..1.40 rows=40 width=45) (actual time=0.009..0.012 rows=40 loops=1)
+                                                                           Buffers: local hit=1
+                                                                     ->  Hash  (cost=20.02..20.02 rows=2 width=123) (actual time=0.176..0.178 rows=10 loops=1)
+                                                                           Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                                                                           Buffers: shared hit=3, local hit=172
+                                                                           ->  Nested Loop  (cost=4.72..20.02 rows=2 width=123) (actual time=0.076..0.171 rows=10 loops=1)
+                                                                                 Buffers: shared hit=3, local hit=172
+                                                                                 ->  Nested Loop Left Join  (cost=4.44..12.03 rows=2 width=85) (actual time=0.065..0.141 rows=10 loops=1)
+                                                                                       Join Filter: (pa.id = tp.account_id)
+                                                                                       Rows Removed by Join Filter: 50
+                                                                                       Filter: ((t1.partner IS NULL) OR (pa.item_id = '84791154-2380-4bca-9658-e0033dc15e82'::uuid))
+                                                                                       Rows Removed by Filter: 20
+                                                                                       Buffers: shared hit=3, local hit=122
+                                                                                       ->  Nested Loop Left Join  (cost=4.44..10.81 rows=3 width=117) (actual time=0.051..0.113 rows=30 loops=1)
+                                                                                             Buffers: shared hit=2, local hit=122
+                                                                                             ->  Nested Loop Left Join  (cost=4.30..10.31 rows=3 width=101) (actual time=0.047..0.085 rows=30 loops=1)
+                                                                                                   Buffers: shared hit=2, local hit=62
+                                                                                                   ->  Hash Join  (cost=4.14..6.19 rows=3 width=85) (actual time=0.040..0.052 rows=30 loops=1)
+                                                                                                         Hash Cond: (rc.cents = (- o.cents))
+                                                                                                         Join Filter: ((rc.id <> o.id) AND (rc.credit <> o.credit) AND (abs((o.day - rc.day)) <= 5))
+                                                                                                         Buffers: shared hit=2, local hit=2
+                                                                                                         ->  Seq Scan on cpe_pool rc  (cost=0.00..1.40 rows=40 width=45) (actual time=0.002..0.005 rows=40 loops=1)
+                                                                                                               Buffers: local hit=1
+                                                                                                         ->  Hash  (cost=3.90..3.90 rows=20 width=45) (actual time=0.033..0.034 rows=30 loops=1)
+                                                                                                               Buckets: 1024  Batches: 1  Memory Usage: 11kB
+                                                                                                               Buffers: shared hit=2, local hit=1
+                                                                                                               ->  Hash Join  (cost=2.15..3.90 rows=20 width=45) (actual time=0.018..0.028 rows=30 loops=1)
+                                                                                                                     Hash Cond: (o.account_id = oa.id)
+                                                                                                                     Buffers: shared hit=2, local hit=1
+                                                                                                                     ->  Seq Scan on cpe_pool o  (cost=0.00..1.40 rows=40 width=45) (actual time=0.002..0.004 rows=40 loops=1)
+                                                                                                                           Buffers: local hit=1
+                                                                                                                     ->  Hash  (cost=2.12..2.12 rows=2 width=16) (actual time=0.013..0.014 rows=2 loops=1)
+                                                                                                                           Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                                                           Buffers: shared hit=2
+                                                                                                                           ->  Nested Loop  (cost=0.00..2.12 rows=2 width=16) (actual time=0.011..0.012 rows=2 loops=1)
+                                                                                                                                 Join Filter: (oi.id = oa.item_id)
+                                                                                                                                 Rows Removed by Join Filter: 2
+                                                                                                                                 Buffers: shared hit=2
+                                                                                                                                 ->  Seq Scan on plaid_items oi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.006..0.006 rows=1 loops=1)
+                                                                                                                                       Filter: ((id <> '84791154-2380-4bca-9658-e0033dc15e82'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                                                                                                                                       Rows Removed by Filter: 1
+                                                                                                                                       Buffers: shared hit=1
+                                                                                                                                 ->  Seq Scan on accounts oa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.003..0.004 rows=4 loops=1)
+                                                                                                                                       Buffers: shared hit=1
+                                                                                                   ->  Index Scan using cpe_tier1_pkey on cpe_tier1 t1  (cost=0.15..1.37 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=30)
+                                                                                                         Index Cond: (id = o.id)
+                                                                                                         Buffers: local hit=60
+                                                                                             ->  Index Scan using cpe_pool_pkey on cpe_pool tp  (cost=0.14..0.17 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=30)
+                                                                                                   Index Cond: (id = t1.partner)
+                                                                                                   Buffers: local hit=60
+                                                                                       ->  Materialize  (cost=0.00..1.06 rows=4 width=32) (actual time=0.000..0.001 rows=3 loops=30)
+                                                                                             Buffers: shared hit=1
+                                                                                             ->  Seq Scan on accounts pa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.002..0.003 rows=4 loops=1)
+                                                                                                   Buffers: shared hit=1
+                                                                                 ->  Index Scan using cpe_txn_pkey on cpe_txn ot  (cost=0.28..4.00 rows=1 width=54) (actual time=0.003..0.003 rows=1 loops=10)
+                                                                                       Index Cond: (id = o.id)
+                                                                                       Buffers: local hit=50
+                                                               ->  Index Scan using cpe_txn_pkey on cpe_txn rt  (cost=0.28..4.00 rows=1 width=20) (actual time=0.002..0.002 rows=1 loops=10)
+                                                                     Index Cond: (id = rc.id)
+                                                                     Buffers: local hit=41
+                                                         ->  Index Scan using accounts_pkey on accounts ra  (cost=0.13..0.45 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=10)
+                                                               Index Cond: (id = rc.account_id)
+                                                               Filter: (item_id = '84791154-2380-4bca-9658-e0033dc15e82'::uuid)
+                                                               Buffers: shared hit=20
+                                                   ->  Seq Scan on plaid_items ri  (cost=0.00..1.03 rows=1 width=16) (actual time=0.001..0.001 rows=1 loops=10)
+                                                         Filter: ((id = '84791154-2380-4bca-9658-e0033dc15e82'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                                                         Rows Removed by Filter: 1
+                                                         Buffers: shared hit=10
+                                             ->  Index Scan using cpe_txn_pkey on cpe_txn yt  (cost=0.28..4.00 rows=1 width=54) (actual time=0.002..0.002 rows=1 loops=10)
+                                                   Index Cond: (id = y.id)
+                                                   Buffers: local hit=41
+                                       ->  Seq Scan on plaid_items yi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.000..0.001 rows=1 loops=10)
+                                             Filter: ((id <> '84791154-2380-4bca-9658-e0033dc15e82'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                                             Rows Removed by Filter: 1
+                                             Buffers: shared hit=10
+                                 ->  Index Scan using accounts_pkey on accounts ya  (cost=0.13..0.45 rows=1 width=32) (actual time=0.002..0.002 rows=1 loops=10)
+                                       Index Cond: (id = y.account_id)
+                                       Buffers: shared hit=20
+                           ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd  (cost=0.16..1.28 rows=1 width=32) (never executed)
+                                 Index Cond: ((lo = LEAST(o.id, rc.id)) AND (hi = GREATEST(o.id, rc.id)))
+                                 Heap Fetches: 0
+                     ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd_1  (cost=0.16..1.28 rows=1 width=32) (never executed)
+                           Index Cond: ((lo = LEAST(o.id, y.id)) AND (hi = GREATEST(o.id, y.id)))
+                           Heap Fetches: 0
+               ->  Index Scan using card_payment_decisions_b_account_idx on card_payment_decisions d  (cost=0.14..0.47 rows=1 width=148) (never executed)
+                     Index Cond: (b_account_id = CASE WHEN o.credit THEN y.account_id ELSE o.account_id END)
+                     Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid) AND (kind = CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END) AND (a_account_id = CASE WHEN o.credit THEN o.account_id ELSE y.account_id END) AND (a_cents = CASE WHEN o.credit THEN o.cents ELSE y.cents END) AND (b_cents = CASE WHEN o.credit THEN y.cents ELSE o.cents END))
+ Planning:
+   Buffers: shared hit=39, local hit=14
+ Planning Time: 5.893 ms
+ Execution Time: 0.555 ms
+(122 rows)
+
+size 10000
+conversion plan at size 10000:
+                                                                                                                   QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort (actual rows=100 loops=1)
+   Sort Key: t.id
+   Sort Method: quicksort  Memory: 38kB
+   ->  Nested Loop Anti Join (actual rows=100 loops=1)
+         Join Filter: ((d.a_account_id = t.account_id) AND (d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+         ->  Hash Join (actual rows=100 loops=1)
+               Hash Cond: (pt.account_id = pa.id)
+               ->  Hash Join (actual rows=200 loops=1)
+                     Hash Cond: (pt.id = s.partner_transaction_id)
+                     ->  Seq Scan on transactions pt (actual rows=20000 loops=1)
+                     ->  Hash (actual rows=200 loops=1)
+                           Buckets: 1024  Batches: 1  Memory Usage: 33kB
+                           ->  Hash Join (actual rows=200 loops=1)
+                                 Hash Cond: (t.account_id = ca.id)
+                                 ->  Hash Join (actual rows=200 loops=1)
+                                       Hash Cond: (t.id = s.transaction_id)
+                                       ->  Seq Scan on transactions t (actual rows=20000 loops=1)
+                                       ->  Hash (actual rows=200 loops=1)
+                                             Buckets: 1024  Batches: 1  Memory Usage: 23kB
+                                             ->  Seq Scan on card_payment_leg_states s (actual rows=200 loops=1)
+                                                   Filter: ((partner_transaction_id IS NOT NULL) AND (decision_id IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                                   Rows Removed by Filter: 200
+                                 ->  Hash (actual rows=2 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                       ->  Nested Loop (actual rows=2 loops=1)
+                                             Join Filter: (ci.id = ca.item_id)
+                                             Rows Removed by Join Filter: 2
+                                             ->  Seq Scan on plaid_items ci (actual rows=1 loops=1)
+                                                   Filter: ((id <> '59520270-cf37-4906-9bde-2ed547f1b9c8'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                                   Rows Removed by Filter: 1
+                                             ->  Seq Scan on accounts ca (actual rows=4 loops=1)
+               ->  Hash (actual rows=2 loops=1)
+                     Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                     ->  Nested Loop (actual rows=2 loops=1)
+                           ->  Seq Scan on plaid_items pi (actual rows=1 loops=1)
+                                 Filter: ((id = '59520270-cf37-4906-9bde-2ed547f1b9c8'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                 Rows Removed by Filter: 1
+                           ->  Seq Scan on accounts pa (actual rows=2 loops=1)
+                                 Filter: (item_id = '59520270-cf37-4906-9bde-2ed547f1b9c8'::uuid)
+                                 Rows Removed by Filter: 2
+         ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=100)
+               Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid) AND (kind = 'destination_removed_card'::text))
+(42 rows)
+
+ambiguity-hold plan at size 10000:
+                                                                                                                                                                                                                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=151.40..151.43 rows=1 width=164) (actual time=2.840..2.845 rows=0 loops=1)
+   Buffers: shared hit=603, local hit=3315
+   ->  Sort  (cost=151.40..151.41 rows=1 width=164) (actual time=2.840..2.845 rows=0 loops=1)
+         Sort Key: (CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END), (CASE WHEN o.credit THEN o.account_id ELSE y.account_id END), (CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END), (CASE WHEN o.credit THEN y.account_id ELSE o.account_id END), (CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END), rt.date, (CASE WHEN o.credit THEN o.cents ELSE y.cents END), (CASE WHEN o.credit THEN y.cents ELSE o.cents END)
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=603, local hit=3315
+         ->  Nested Loop Anti Join  (cost=129.92..151.39 rows=1 width=164) (actual time=2.832..2.836 rows=0 loops=1)
+               Join Filter: ((d.a_plaid_transaction_id = CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END) AND (d.b_plaid_transaction_id = CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END) AND (d.counterpart_date = rt.date))
+               Buffers: shared hit=603, local hit=3315
+               ->  Nested Loop Anti Join  (cost=129.77..151.15 rows=1 width=131) (actual time=2.831..2.836 rows=0 loops=1)
+                     Buffers: shared hit=603, local hit=3315
+                     ->  Nested Loop Anti Join  (cost=129.62..150.74 rows=1 width=163) (actual time=2.831..2.835 rows=0 loops=1)
+                           Buffers: shared hit=603, local hit=3315
+                           ->  Nested Loop  (cost=129.46..150.32 rows=1 width=179) (actual time=2.831..2.835 rows=0 loops=1)
+                                 Join Filter: (yi.id = ya.item_id)
+                                 Rows Removed by Join Filter: 100
+                                 Buffers: shared hit=603, local hit=3315
+                                 ->  Nested Loop  (cost=129.33..150.13 rows=1 width=195) (actual time=1.637..2.718 rows=100 loops=1)
+                                       Buffers: shared hit=403, local hit=3315
+                                       ->  Nested Loop  (cost=129.33..149.09 rows=1 width=179) (actual time=1.634..2.503 rows=100 loops=1)
+                                             Buffers: shared hit=303, local hit=3315
+                                             ->  Nested Loop  (cost=129.04..145.08 rows=1 width=140) (actual time=1.632..2.262 rows=100 loops=1)
+                                                   Buffers: shared hit=303, local hit=2815
+                                                   ->  Nested Loop  (cost=129.04..144.04 rows=1 width=156) (actual time=1.625..2.079 rows=100 loops=1)
+                                                         Buffers: shared hit=203, local hit=2815
+                                                         ->  Nested Loop  (cost=128.75..140.04 rows=1 width=152) (actual time=1.621..1.818 rows=100 loops=1)
+                                                               Buffers: shared hit=203, local hit=2315
+                                                               ->  Hash Join  (cost=128.62..139.51 rows=3 width=152) (actual time=1.615..1.706 rows=100 loops=1)
+                                                                     Hash Cond: (y.cents = rc.cents)
+                                                                     Join Filter: ((y.id <> o.id) AND (y.credit <> o.credit) AND (abs((o.day - y.day)) <= 5))
+                                                                     Buffers: shared hit=3, local hit=2315
+                                                                     ->  Seq Scan on cpe_pool y  (cost=0.00..9.00 rows=400 width=45) (actual time=0.012..0.039 rows=400 loops=1)
+                                                                           Buffers: local hit=5
+                                                                     ->  Hash  (cost=128.41..128.41 rows=17 width=124) (actual time=1.584..1.587 rows=100 loops=1)
+                                                                           Buckets: 1024  Batches: 1  Memory Usage: 25kB
+                                                                           Buffers: shared hit=3, local hit=2310
+                                                                           ->  Nested Loop  (cost=18.07..128.41 rows=17 width=124) (actual time=0.256..1.560 rows=100 loops=1)
+                                                                                 Buffers: shared hit=3, local hit=2310
+                                                                                 ->  Hash Left Join  (cost=17.79..60.33 rows=17 width=85) (actual time=0.249..1.270 rows=100 loops=1)
+                                                                                       Hash Cond: (tp.account_id = pa.id)
+                                                                                       Filter: ((t1.partner IS NULL) OR (pa.item_id = '59520270-cf37-4906-9bde-2ed547f1b9c8'::uuid))
+                                                                                       Rows Removed by Filter: 200
+                                                                                       Buffers: shared hit=3, local hit=1810
+                                                                                       ->  Nested Loop Left Join  (cost=16.70..59.04 rows=33 width=117) (actual time=0.242..1.172 rows=300 loops=1)
+                                                                                             Buffers: shared hit=2, local hit=1810
+                                                                                             ->  Nested Loop Left Join  (cost=16.42..48.50 rows=33 width=101) (actual time=0.236..0.853 rows=300 loops=1)
+                                                                                                   Buffers: shared hit=2, local hit=910
+                                                                                                   ->  Hash Join  (cost=16.14..34.14 rows=33 width=85) (actual time=0.228..0.468 rows=300 loops=1)
+                                                                                                         Hash Cond: ((- o.cents) = rc.cents)
+                                                                                                         Join Filter: ((rc.id <> o.id) AND (rc.credit <> o.credit) AND (abs((o.day - rc.day)) <= 5))
+                                                                                                         Buffers: shared hit=2, local hit=10
+                                                                                                         ->  Hash Join  (cost=2.15..14.64 rows=200 width=45) (actual time=0.083..0.203 rows=300 loops=1)
+                                                                                                               Hash Cond: (o.account_id = oa.id)
+                                                                                                               Buffers: shared hit=2, local hit=5
+                                                                                                               ->  Seq Scan on cpe_pool o  (cost=0.00..9.00 rows=400 width=45) (actual time=0.003..0.034 rows=400 loops=1)
+                                                                                                                     Buffers: local hit=5
+                                                                                                               ->  Hash  (cost=2.12..2.12 rows=2 width=16) (actual time=0.077..0.077 rows=2 loops=1)
+                                                                                                                     Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                                                     Buffers: shared hit=2
+                                                                                                                     ->  Nested Loop  (cost=0.00..2.12 rows=2 width=16) (actual time=0.073..0.075 rows=2 loops=1)
+                                                                                                                           Join Filter: (oi.id = oa.item_id)
+                                                                                                                           Rows Removed by Join Filter: 2
+                                                                                                                           Buffers: shared hit=2
+                                                                                                                           ->  Seq Scan on plaid_items oi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.066..0.066 rows=1 loops=1)
+                                                                                                                                 Filter: ((id <> '59520270-cf37-4906-9bde-2ed547f1b9c8'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                                                                                                                 Rows Removed by Filter: 1
+                                                                                                                                 Buffers: shared hit=1
+                                                                                                                           ->  Seq Scan on accounts oa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.006..0.007 rows=4 loops=1)
+                                                                                                                                 Buffers: shared hit=1
+                                                                                                         ->  Hash  (cost=9.00..9.00 rows=400 width=45) (actual time=0.130..0.130 rows=400 loops=1)
+                                                                                                               Buckets: 1024  Batches: 1  Memory Usage: 41kB
+                                                                                                               Buffers: local hit=5
+                                                                                                               ->  Seq Scan on cpe_pool rc  (cost=0.00..9.00 rows=400 width=45) (actual time=0.006..0.045 rows=400 loops=1)
+                                                                                                                     Buffers: local hit=5
+                                                                                                   ->  Index Scan using cpe_tier1_pkey on cpe_tier1 t1  (cost=0.28..0.44 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=300)
+                                                                                                         Index Cond: (id = o.id)
+                                                                                                         Buffers: local hit=900
+                                                                                             ->  Index Scan using cpe_pool_pkey on cpe_pool tp  (cost=0.27..0.32 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=300)
+                                                                                                   Index Cond: (id = t1.partner)
+                                                                                                   Buffers: local hit=900
+                                                                                       ->  Hash  (cost=1.04..1.04 rows=4 width=32) (actual time=0.004..0.004 rows=4 loops=1)
+                                                                                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                             Buffers: shared hit=1
+                                                                                             ->  Seq Scan on accounts pa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.002..0.003 rows=4 loops=1)
+                                                                                                   Buffers: shared hit=1
+                                                                                 ->  Index Scan using cpe_txn_pkey on cpe_txn ot  (cost=0.29..4.00 rows=1 width=55) (actual time=0.003..0.003 rows=1 loops=100)
+                                                                                       Index Cond: (id = o.id)
+                                                                                       Buffers: local hit=500
+                                                               ->  Index Scan using accounts_pkey on accounts ra  (cost=0.13..0.18 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=100)
+                                                                     Index Cond: (id = rc.account_id)
+                                                                     Filter: (item_id = '59520270-cf37-4906-9bde-2ed547f1b9c8'::uuid)
+                                                                     Buffers: shared hit=200
+                                                         ->  Index Scan using cpe_txn_pkey on cpe_txn rt  (cost=0.29..4.00 rows=1 width=20) (actual time=0.002..0.002 rows=1 loops=100)
+                                                               Index Cond: (id = rc.id)
+                                                               Buffers: local hit=500
+                                                   ->  Seq Scan on plaid_items ri  (cost=0.00..1.03 rows=1 width=16) (actual time=0.001..0.001 rows=1 loops=100)
+                                                         Filter: ((id = '59520270-cf37-4906-9bde-2ed547f1b9c8'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                                         Rows Removed by Filter: 1
+                                                         Buffers: shared hit=100
+                                             ->  Index Scan using cpe_txn_pkey on cpe_txn yt  (cost=0.29..4.00 rows=1 width=55) (actual time=0.002..0.002 rows=1 loops=100)
+                                                   Index Cond: (id = y.id)
+                                                   Buffers: local hit=500
+                                       ->  Seq Scan on plaid_items yi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.000..0.001 rows=1 loops=100)
+                                             Filter: ((id <> '59520270-cf37-4906-9bde-2ed547f1b9c8'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                             Rows Removed by Filter: 1
+                                             Buffers: shared hit=100
+                                 ->  Index Scan using accounts_pkey on accounts ya  (cost=0.13..0.18 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=100)
+                                       Index Cond: (id = y.account_id)
+                                       Buffers: shared hit=200
+                           ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd  (cost=0.16..0.29 rows=1 width=32) (never executed)
+                                 Index Cond: ((lo = LEAST(o.id, rc.id)) AND (hi = GREATEST(o.id, rc.id)))
+                                 Heap Fetches: 0
+                     ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd_1  (cost=0.16..0.29 rows=1 width=32) (never executed)
+                           Index Cond: ((lo = LEAST(o.id, y.id)) AND (hi = GREATEST(o.id, y.id)))
+                           Heap Fetches: 0
+               ->  Index Scan using card_payment_decisions_b_account_idx on card_payment_decisions d  (cost=0.14..0.22 rows=1 width=148) (never executed)
+                     Index Cond: (b_account_id = CASE WHEN o.credit THEN y.account_id ELSE o.account_id END)
+                     Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid) AND (kind = CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END) AND (a_account_id = CASE WHEN o.credit THEN o.account_id ELSE y.account_id END) AND (a_cents = CASE WHEN o.credit THEN o.cents ELSE y.cents END) AND (b_cents = CASE WHEN o.credit THEN y.cents ELSE o.cents END))
+ Planning:
+   Buffers: shared hit=39, local hit=38
+ Planning Time: 7.112 ms
+ Execution Time: 2.971 ms
+(122 rows)
+
+size 50000
+conversion plan at size 50000:
+                                                                                                                      QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Merge (actual rows=500 loops=1)
+   Workers Planned: 1
+   Workers Launched: 1
+   ->  Sort (actual rows=250 loops=2)
+         Sort Key: t.id
+         Sort Method: quicksort  Memory: 61kB
+         Worker 0:  Sort Method: quicksort  Memory: 58kB
+         ->  Hash Join (actual rows=250 loops=2)
+               Hash Cond: (pt.account_id = pa.id)
+               ->  Nested Loop Anti Join (actual rows=500 loops=2)
+                     Join Filter: ((d.a_account_id = t.account_id) AND (d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+                     ->  Parallel Hash Join (actual rows=500 loops=2)
+                           Hash Cond: (pt.id = s.partner_transaction_id)
+                           ->  Parallel Seq Scan on transactions pt (actual rows=50000 loops=2)
+                           ->  Parallel Hash (actual rows=500 loops=2)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 200kB
+                                 ->  Hash Join (actual rows=500 loops=2)
+                                       Hash Cond: (t.account_id = ca.id)
+                                       ->  Hash Join (actual rows=500 loops=2)
+                                             Hash Cond: (t.id = s.transaction_id)
+                                             ->  Parallel Seq Scan on transactions t (actual rows=50000 loops=2)
+                                             ->  Hash (actual rows=1000 loops=2)
+                                                   Buckets: 2048  Batches: 1  Memory Usage: 87kB
+                                                   ->  Seq Scan on card_payment_leg_states s (actual rows=1000 loops=2)
+                                                         Filter: ((partner_transaction_id IS NOT NULL) AND (decision_id IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                                         Rows Removed by Filter: 1000
+                                       ->  Hash (actual rows=2 loops=2)
+                                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                             ->  Nested Loop (actual rows=2 loops=2)
+                                                   Join Filter: (ci.id = ca.item_id)
+                                                   Rows Removed by Join Filter: 2
+                                                   ->  Nested Loop (actual rows=1 loops=2)
+                                                         ->  Seq Scan on plaid_items ci (actual rows=1 loops=2)
+                                                               Filter: ((id <> '1eb8a398-67fb-46d6-bd78-2ece6d87e2c9'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                               Rows Removed by Filter: 1
+                                                         ->  Seq Scan on plaid_items pi (actual rows=1 loops=2)
+                                                               Filter: ((id = '1eb8a398-67fb-46d6-bd78-2ece6d87e2c9'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                               Rows Removed by Filter: 1
+                                                   ->  Seq Scan on accounts ca (actual rows=4 loops=2)
+                     ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=1000)
+                           Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid) AND (kind = 'destination_removed_card'::text))
+               ->  Hash (actual rows=2 loops=2)
+                     Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                     ->  Seq Scan on accounts pa (actual rows=2 loops=2)
+                           Filter: (item_id = '1eb8a398-67fb-46d6-bd78-2ece6d87e2c9'::uuid)
+                           Rows Removed by Filter: 2
+(46 rows)
+
+ambiguity-hold plan at size 50000:
+                                                                                                                                                                                                                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=698.75..698.79 rows=2 width=164) (actual time=8.357..8.367 rows=0 loops=1)
+   Buffers: shared hit=8, local hit=7202 read=375
+   ->  Sort  (cost=698.75..698.75 rows=2 width=164) (actual time=8.357..8.366 rows=0 loops=1)
+         Sort Key: (CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END), (CASE WHEN o.credit THEN o.account_id ELSE y.account_id END), (CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END), (CASE WHEN o.credit THEN y.account_id ELSE o.account_id END), (CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END), rt.date, (CASE WHEN o.credit THEN o.cents ELSE y.cents END), (CASE WHEN o.credit THEN y.cents ELSE o.cents END)
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=8, local hit=7202 read=375
+         ->  Nested Loop Anti Join  (cost=615.04..698.74 rows=2 width=164) (actual time=8.348..8.358 rows=0 loops=1)
+               Join Filter: ((d.a_plaid_transaction_id = CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END) AND (d.b_plaid_transaction_id = CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END) AND (d.counterpart_date = rt.date))
+               Buffers: shared hit=8, local hit=7202 read=375
+               ->  Nested Loop Anti Join  (cost=614.89..698.23 rows=2 width=133) (actual time=8.348..8.357 rows=0 loops=1)
+                     Buffers: shared hit=8, local hit=7202 read=375
+                     ->  Nested Loop Anti Join  (cost=614.73..697.62 rows=3 width=165) (actual time=8.347..8.356 rows=0 loops=1)
+                           Buffers: shared hit=8, local hit=7202 read=375
+                           ->  Nested Loop  (cost=614.58..696.82 rows=4 width=181) (actual time=8.347..8.356 rows=0 loops=1)
+                                 Buffers: shared hit=8, local hit=7202 read=375
+                                 ->  Nested Loop  (cost=614.16..680.31 rows=4 width=141) (actual time=8.347..8.355 rows=0 loops=1)
+                                       Buffers: shared hit=8, local hit=7202 read=375
+                                       ->  Hash Join  (cost=613.74..663.80 rows=4 width=137) (actual time=8.346..8.354 rows=0 loops=1)
+                                             Hash Cond: (ya.item_id = yi.id)
+                                             Buffers: shared hit=8, local hit=7202 read=375
+                                             ->  Nested Loop  (cost=611.66..661.65 rows=7 width=169) (actual time=7.722..8.234 rows=500 loops=1)
+                                                   Buffers: shared hit=6, local hit=7202 read=375
+                                                   ->  Hash Join  (cost=611.52..660.96 rows=7 width=153) (actual time=7.709..8.051 rows=500 loops=1)
+                                                         Hash Cond: (y.cents = rc.cents)
+                                                         Join Filter: ((y.id <> o.id) AND (y.credit <> o.credit) AND (abs((o.day - y.day)) <= 5))
+                                                         Buffers: shared hit=4, local hit=7202 read=375
+                                                         ->  Seq Scan on cpe_pool y  (cost=0.00..41.00 rows=2000 width=45) (actual time=0.012..0.137 rows=2000 loops=1)
+                                                               Buffers: local hit=18 read=3
+                                                         ->  Hash  (cost=610.99..610.99 rows=42 width=125) (actual time=7.612..7.617 rows=500 loops=1)
+                                                               Buckets: 1024  Batches: 1  Memory Usage: 91kB
+                                                               Buffers: shared hit=4, local hit=7184 read=372
+                                                               ->  Hash Join  (cost=159.09..610.99 rows=42 width=125) (actual time=1.940..7.458 rows=500 loops=1)
+                                                                     Hash Cond: (rc.account_id = ra.id)
+                                                                     Buffers: shared hit=4, local hit=7184 read=372
+                                                                     ->  Nested Loop  (cost=158.02..609.46 rows=84 width=125) (actual time=1.932..7.337 rows=500 loops=1)
+                                                                           Buffers: shared hit=3, local hit=7184 read=372
+                                                                           ->  Hash Left Join  (cost=157.60..262.80 rows=84 width=85) (actual time=1.925..5.187 rows=500 loops=1)
+                                                                                 Hash Cond: (tp.account_id = pa.id)
+                                                                                 Filter: ((t1.partner IS NULL) OR (pa.item_id = '1eb8a398-67fb-46d6-bd78-2ece6d87e2c9'::uuid))
+                                                                                 Rows Removed by Filter: 1000
+                                                                                 Buffers: shared hit=3, local hit=4516 read=41
+                                                                                 ->  Nested Loop Left Join  (cost=156.51..260.70 rows=167 width=117) (actual time=1.903..4.812 rows=1500 loops=1)
+                                                                                       Buffers: shared hit=2, local hit=4516 read=41
+                                                                                       ->  Hash Right Join  (cost=156.23..200.95 rows=167 width=101) (actual time=1.896..2.628 rows=1500 loops=1)
+                                                                                             Hash Cond: (t1.id = o.id)
+                                                                                             Buffers: shared hit=2, local hit=23 read=34
+                                                                                             ->  Seq Scan on cpe_tier1 t1  (cost=0.00..35.40 rows=2040 width=32) (actual time=0.016..0.194 rows=2000 loops=1)
+                                                                                                   Buffers: local read=15
+                                                                                             ->  Hash  (cost=154.15..154.15 rows=167 width=85) (actual time=1.876..1.880 rows=1500 loops=1)
+                                                                                                   Buckets: 2048 (originally 1024)  Batches: 1 (originally 1)  Memory Usage: 204kB
+                                                                                                   Buffers: shared hit=2, local hit=23 read=19
+                                                                                                   ->  Hash Join  (cost=68.15..154.15 rows=167 width=85) (actual time=0.566..1.468 rows=1500 loops=1)
+                                                                                                         Hash Cond: ((- o.cents) = rc.cents)
+                                                                                                         Join Filter: ((rc.id <> o.id) AND (rc.credit <> o.credit) AND (abs((o.day - rc.day)) <= 5))
+                                                                                                         Buffers: shared hit=2, local hit=23 read=19
+                                                                                                         ->  Hash Join  (cost=2.15..60.65 rows=1000 width=45) (actual time=0.014..0.482 rows=1500 loops=1)
+                                                                                                               Hash Cond: (o.account_id = oa.id)
+                                                                                                               Buffers: shared hit=2, local hit=20 read=1
+                                                                                                               ->  Seq Scan on cpe_pool o  (cost=0.00..41.00 rows=2000 width=45) (actual time=0.003..0.133 rows=2000 loops=1)
+                                                                                                                     Buffers: local hit=20 read=1
+                                                                                                               ->  Hash  (cost=2.12..2.12 rows=2 width=16) (actual time=0.008..0.009 rows=2 loops=1)
+                                                                                                                     Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                                                     Buffers: shared hit=2
+                                                                                                                     ->  Nested Loop  (cost=0.00..2.12 rows=2 width=16) (actual time=0.006..0.008 rows=2 loops=1)
+                                                                                                                           Join Filter: (oi.id = oa.item_id)
+                                                                                                                           Rows Removed by Join Filter: 2
+                                                                                                                           Buffers: shared hit=2
+                                                                                                                           ->  Seq Scan on plaid_items oi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.002..0.003 rows=1 loops=1)
+                                                                                                                                 Filter: ((id <> '1eb8a398-67fb-46d6-bd78-2ece6d87e2c9'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                                                                                                 Rows Removed by Filter: 1
+                                                                                                                                 Buffers: shared hit=1
+                                                                                                                           ->  Seq Scan on accounts oa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.003..0.004 rows=4 loops=1)
+                                                                                                                                 Buffers: shared hit=1
+                                                                                                         ->  Hash  (cost=41.00..41.00 rows=2000 width=45) (actual time=0.548..0.549 rows=2000 loops=1)
+                                                                                                               Buckets: 2048  Batches: 1  Memory Usage: 181kB
+                                                                                                               Buffers: local hit=3 read=18
+                                                                                                               ->  Seq Scan on cpe_pool rc  (cost=0.00..41.00 rows=2000 width=45) (actual time=0.003..0.275 rows=2000 loops=1)
+                                                                                                                     Buffers: local hit=3 read=18
+                                                                                       ->  Index Scan using cpe_pool_pkey on cpe_pool tp  (cost=0.28..0.36 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=1500)
+                                                                                             Index Cond: (id = t1.partner)
+                                                                                             Buffers: local hit=4493 read=7
+                                                                                 ->  Hash  (cost=1.04..1.04 rows=4 width=32) (actual time=0.005..0.005 rows=4 loops=1)
+                                                                                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                       Buffers: shared hit=1
+                                                                                       ->  Seq Scan on accounts pa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.003..0.004 rows=4 loops=1)
+                                                                                             Buffers: shared hit=1
+                                                                           ->  Index Scan using cpe_txn_pkey on cpe_txn ot  (cost=0.42..4.13 rows=1 width=56) (actual time=0.004..0.004 rows=1 loops=500)
+                                                                                 Index Cond: (id = o.id)
+                                                                                 Buffers: local hit=2668 read=331
+                                                                     ->  Hash  (cost=1.05..1.05 rows=2 width=32) (actual time=0.005..0.006 rows=2 loops=1)
+                                                                           Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                           Buffers: shared hit=1
+                                                                           ->  Seq Scan on accounts ra  (cost=0.00..1.05 rows=2 width=32) (actual time=0.004..0.004 rows=2 loops=1)
+                                                                                 Filter: (item_id = '1eb8a398-67fb-46d6-bd78-2ece6d87e2c9'::uuid)
+                                                                                 Rows Removed by Filter: 2
+                                                                                 Buffers: shared hit=1
+                                                   ->  Memoize  (cost=0.14..0.16 rows=1 width=32) (actual time=0.000..0.000 rows=1 loops=500)
+                                                         Cache Key: y.account_id
+                                                         Cache Mode: logical
+                                                         Hits: 499  Misses: 1  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                                                         Buffers: shared hit=2
+                                                         ->  Index Scan using accounts_pkey on accounts ya  (cost=0.13..0.15 rows=1 width=32) (actual time=0.008..0.008 rows=1 loops=1)
+                                                               Index Cond: (id = y.account_id)
+                                                               Buffers: shared hit=2
+                                             ->  Hash  (cost=2.07..2.07 rows=1 width=32) (actual time=0.049..0.051 rows=1 loops=1)
+                                                   Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                   Buffers: shared hit=2
+                                                   ->  Nested Loop  (cost=0.00..2.07 rows=1 width=32) (actual time=0.034..0.036 rows=1 loops=1)
+                                                         Buffers: shared hit=2
+                                                         ->  Seq Scan on plaid_items ri  (cost=0.00..1.03 rows=1 width=16) (actual time=0.030..0.031 rows=1 loops=1)
+                                                               Filter: ((id = '1eb8a398-67fb-46d6-bd78-2ece6d87e2c9'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                               Rows Removed by Filter: 1
+                                                               Buffers: shared hit=1
+                                                         ->  Seq Scan on plaid_items yi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.002..0.003 rows=1 loops=1)
+                                                               Filter: ((id <> '1eb8a398-67fb-46d6-bd78-2ece6d87e2c9'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                               Rows Removed by Filter: 1
+                                                               Buffers: shared hit=1
+                                       ->  Index Scan using cpe_txn_pkey on cpe_txn rt  (cost=0.42..4.13 rows=1 width=20) (never executed)
+                                             Index Cond: (id = rc.id)
+                                 ->  Index Scan using cpe_txn_pkey on cpe_txn yt  (cost=0.42..4.13 rows=1 width=56) (never executed)
+                                       Index Cond: (id = y.id)
+                           ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd  (cost=0.16..0.20 rows=1 width=32) (never executed)
+                                 Index Cond: ((lo = LEAST(o.id, rc.id)) AND (hi = GREATEST(o.id, rc.id)))
+                                 Heap Fetches: 0
+                     ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd_1  (cost=0.16..0.20 rows=1 width=32) (never executed)
+                           Index Cond: ((lo = LEAST(o.id, y.id)) AND (hi = GREATEST(o.id, y.id)))
+                           Heap Fetches: 0
+               ->  Index Scan using card_payment_decisions_b_account_idx on card_payment_decisions d  (cost=0.15..0.24 rows=1 width=148) (never executed)
+                     Index Cond: (b_account_id = CASE WHEN o.credit THEN y.account_id ELSE o.account_id END)
+                     Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid) AND (kind = CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END) AND (a_account_id = CASE WHEN o.credit THEN o.account_id ELSE y.account_id END) AND (a_cents = CASE WHEN o.credit THEN o.cents ELSE y.cents END) AND (b_cents = CASE WHEN o.credit THEN y.cents ELSE o.cents END))
+ Planning:
+   Buffers: shared hit=39, local hit=31 read=13
+ Planning Time: 7.156 ms
+ Execution Time: 8.522 ms
+(134 rows)
+
+
+counts (first measured sample of each size)
+ size  |                           what                           |   n
+-------+----------------------------------------------------------+--------
+  1000 | ambiguity holds written by the removal                   |      0
+  1000 | automatic pairs left after the removal                   |     10
+  1000 | leg states read by the conversion (all of the user's)    |     40
+  1000 | live holds applied by the final evaluation               |      0
+  1000 | payments read untracked / removed_card after the removal |     10
+  1000 | records written by the removal                           |     10
+  1000 | surviving legs evaluated after the removal               |     30
+  1000 | transactions of the user                                 |   2000
+  1000 | transactions on the removed institution                  |   1000
+ 10000 | ambiguity holds written by the removal                   |      0
+ 10000 | automatic pairs left after the removal                   |    100
+ 10000 | leg states read by the conversion (all of the user's)    |    400
+ 10000 | live holds applied by the final evaluation               |      0
+ 10000 | payments read untracked / removed_card after the removal |    100
+ 10000 | records written by the removal                           |    100
+ 10000 | surviving legs evaluated after the removal               |    300
+ 10000 | transactions of the user                                 |  20000
+ 10000 | transactions on the removed institution                  |  10000
+ 50000 | ambiguity holds written by the removal                   |      0
+ 50000 | automatic pairs left after the removal                   |    500
+ 50000 | leg states read by the conversion (all of the user's)    |   2000
+ 50000 | live holds applied by the final evaluation               |      0
+ 50000 | payments read untracked / removed_card after the removal |    500
+ 50000 | records written by the removal                           |    500
+ 50000 | surviving legs evaluated after the removal               |   1500
+ 50000 | transactions of the user                                 | 100000
+ 50000 | transactions on the removed institution                  |  50000
+(27 rows)
+
+
+timings (milliseconds)
+ size  |                phase                | n | median_ms | min_ms | max_ms
+-------+-------------------------------------+---+-----------+--------+--------
+  1000 | current                             | 5 |     134.9 |  131.7 |  137.0
+  1000 | previous                            | 5 |      46.9 |   46.1 |   63.2
+  1000 | step 1: first evaluation            | 5 |      42.1 |   40.4 |   59.3
+  1000 | step 2: conversion                  | 5 |      16.1 |   15.1 |   19.2
+  1000 | step 2a: user-pair statement        | 5 |       3.3 |    3.1 |    4.5
+  1000 | step 2b: automatic-pair statement   | 5 |       5.3 |    5.2 |    6.4
+  1000 | step 2c: ambiguity-hold statement   | 5 |       6.9 |    6.7 |    8.6
+  1000 | step 3: delete (cascade + triggers) | 5 |      41.9 |   40.7 |   43.8
+  1000 | step 4: final evaluation            | 5 |      25.3 |   23.9 |   38.2
+ 10000 | current                             | 5 |     904.5 |  888.5 |  991.7
+ 10000 | previous                            | 5 |     409.1 |  389.2 |  429.7
+ 10000 | step 1: first evaluation            | 5 |     287.0 |  281.4 |  308.1
+ 10000 | step 2: conversion                  | 5 |      28.7 |   28.2 |   33.8
+ 10000 | step 2a: user-pair statement        | 5 |       3.4 |    3.3 |    5.4
+ 10000 | step 2b: automatic-pair statement   | 5 |      16.3 |   15.9 |   17.1
+ 10000 | step 2c: ambiguity-hold statement   | 5 |       9.1 |    8.6 |   11.9
+ 10000 | step 3: delete (cascade + triggers) | 5 |     402.5 |  395.5 |  446.4
+ 10000 | step 4: final evaluation            | 5 |     161.5 |  159.8 |  175.6
+ 50000 | current                             | 5 |    4442.4 | 4308.2 | 4497.1
+ 50000 | previous                            | 5 |    2122.5 | 2040.4 | 2155.5
+ 50000 | step 1: first evaluation            | 5 |    1439.0 | 1383.6 | 1476.2
+ 50000 | step 2: conversion                  | 5 |      85.9 |   83.4 |  102.8
+ 50000 | step 2a: user-pair statement        | 5 |       3.4 |    3.3 |    4.6
+ 50000 | step 2b: automatic-pair statement   | 5 |      67.5 |   66.3 |   86.0
+ 50000 | step 2c: ambiguity-hold statement   | 5 |      13.3 |   12.9 |   14.6
+ 50000 | step 3: delete (cascade + triggers) | 5 |    2082.7 | 2047.2 | 2125.9
+ 50000 | step 4: final evaluation            | 5 |     859.4 |  791.1 |  919.3
+(27 rows)
+
+
+added by 20261006120000 (median current - median previous)
+ size  | previous_ms | current_ms | added_ms | added_pct
+-------+-------------+------------+----------+-----------
+  1000 |        46.9 |      134.9 |     88.0 |       188
+ 10000 |       409.1 |      904.5 |    495.4 |       121
+ 50000 |      2122.5 |     4442.4 |   2319.9 |       109
+(3 rows)
+
+
+# ======================================================================================================================
+# RUN 2 of 2 — hold_heavy fixture:  BENCH_FIXTURE=hold_heavy supabase/tests/card_payment_benchmark/removal/run.sh
+# (2026-10-07 15:08-15:14 UTC; no other container running)
+# ======================================================================================================================
+environment: image public.ecr.aws/supabase/postgres:17.6.1.155; server 17.6; docker 29.8.2, 8 CPUs, 8250589184 bytes
+settings: fsync=on max_wal_size=1024 shared_buffers=16384 synchronous_commit=on work_mem=4096
+samples per configuration: 5 measured after 1 warm-up; sizes 1000,10000,50000 (transactions on the removed institution; as many again on the kept one)
+fixture variant: hold_heavy (every payment to the removed card also has a same-amount leg on the kept card, three days later)
+function bodies measured (md5 of the LF-normalised source)
+                         function                          |             body_md5
+-----------------------------------------------------------+----------------------------------
+ remove_plaid_item_local(uuid,uuid)                        | 7997a757408fa888aa44bdbc9d85f89d
+ evaluate_card_payments(uuid,timestamp with time zone)     | 6cb5e299b0383fab0b6517cc2e7522c8
+ try_evaluate_card_payments(uuid,timestamp with time zone) | fac15fabe5470dd62a79a3a6c8630a89
+ bench.remove_previous(uuid,uuid)                          | a8f567d397b9dae5b777497317985ab7
+(4 rows)
+
+size 1000
+conversion plan at size 1000:
+                                                                                                                      QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort (actual rows=10 loops=1)
+   Sort Key: t.id
+   Sort Method: quicksort  Memory: 26kB
+   ->  Nested Loop Anti Join (actual rows=10 loops=1)
+         Join Filter: ((d.a_account_id = t.account_id) AND (d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+         ->  Nested Loop (actual rows=10 loops=1)
+               Join Filter: (ci.id = ca.item_id)
+               ->  Nested Loop (actual rows=1 loops=1)
+                     ->  Seq Scan on plaid_items ci (actual rows=1 loops=1)
+                           Filter: ((id <> '8f2f3a74-65ef-45a0-ba2d-5488bc4b807c'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                           Rows Removed by Filter: 1
+                     ->  Seq Scan on plaid_items pi (actual rows=1 loops=1)
+                           Filter: ((id = '8f2f3a74-65ef-45a0-ba2d-5488bc4b807c'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                           Rows Removed by Filter: 1
+               ->  Nested Loop (actual rows=10 loops=1)
+                     ->  Nested Loop (actual rows=10 loops=1)
+                           ->  Hash Join (actual rows=20 loops=1)
+                                 Hash Cond: (pt.id = s.partner_transaction_id)
+                                 ->  Seq Scan on transactions pt (actual rows=2000 loops=1)
+                                 ->  Hash (actual rows=20 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 11kB
+                                       ->  Hash Join (actual rows=20 loops=1)
+                                             Hash Cond: (t.id = s.transaction_id)
+                                             ->  Seq Scan on transactions t (actual rows=2000 loops=1)
+                                             ->  Hash (actual rows=20 loops=1)
+                                                   Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                                                   ->  Seq Scan on card_payment_leg_states s (actual rows=20 loops=1)
+                                                         Filter: ((partner_transaction_id IS NOT NULL) AND (decision_id IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                                         Rows Removed by Filter: 30
+                           ->  Memoize (actual rows=0 loops=20)
+                                 Cache Key: pt.account_id
+                                 Cache Mode: logical
+                                 Hits: 18  Misses: 2  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                                 ->  Index Scan using accounts_pkey on accounts pa (actual rows=0 loops=2)
+                                       Index Cond: (id = pt.account_id)
+                                       Filter: (item_id = '8f2f3a74-65ef-45a0-ba2d-5488bc4b807c'::uuid)
+                                       Rows Removed by Filter: 0
+                     ->  Memoize (actual rows=1 loops=10)
+                           Cache Key: t.account_id
+                           Cache Mode: logical
+                           Hits: 9  Misses: 1  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                           ->  Index Scan using accounts_pkey on accounts ca (actual rows=1 loops=1)
+                                 Index Cond: (id = t.account_id)
+         ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=10)
+               Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid) AND (kind = 'destination_removed_card'::text))
+(45 rows)
+
+ambiguity-hold plan at size 1000:
+                                                                                                                                                                                                                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=36.50..36.53 rows=1 width=164) (actual time=0.593..0.602 rows=10 loops=1)
+   Buffers: shared hit=193, local hit=713
+   ->  Sort  (cost=36.50..36.51 rows=1 width=164) (actual time=0.593..0.598 rows=10 loops=1)
+         Sort Key: (CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END), (CASE WHEN o.credit THEN o.account_id ELSE y.account_id END), (CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END), (CASE WHEN o.credit THEN y.account_id ELSE o.account_id END), (CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END), rt.date, (CASE WHEN o.credit THEN o.cents ELSE y.cents END), (CASE WHEN o.credit THEN y.cents ELSE o.cents END)
+         Sort Method: quicksort  Memory: 26kB
+         Buffers: shared hit=193, local hit=713
+         ->  Nested Loop Anti Join  (cost=21.47..36.49 rows=1 width=164) (actual time=0.430..0.565 rows=10 loops=1)
+               Join Filter: ((d.a_plaid_transaction_id = CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END) AND (d.b_plaid_transaction_id = CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END) AND (d.counterpart_date = rt.date))
+               Buffers: shared hit=193, local hit=713
+               ->  Nested Loop Anti Join  (cost=21.33..36.07 rows=1 width=129) (actual time=0.426..0.553 rows=10 loops=1)
+                     Buffers: shared hit=183, local hit=713
+                     ->  Nested Loop Anti Join  (cost=21.17..34.11 rows=1 width=161) (actual time=0.424..0.545 rows=10 loops=1)
+                           Buffers: shared hit=183, local hit=693
+                           ->  Nested Loop  (cost=21.01..32.15 rows=1 width=177) (actual time=0.418..0.531 rows=10 loops=1)
+                                 Join Filter: (yi.id = ya.item_id)
+                                 Rows Removed by Join Filter: 10
+                                 Buffers: shared hit=183, local hit=673
+                                 ->  Nested Loop  (cost=20.88..31.75 rows=1 width=193) (actual time=0.287..0.500 rows=20 loops=1)
+                                       Buffers: shared hit=143, local hit=673
+                                       ->  Nested Loop  (cost=20.88..30.71 rows=1 width=177) (actual time=0.285..0.466 rows=20 loops=1)
+                                             Buffers: shared hit=123, local hit=673
+                                             ->  Nested Loop  (cost=20.60..27.13 rows=1 width=139) (actual time=0.282..0.433 rows=20 loops=1)
+                                                   Buffers: shared hit=123, local hit=573
+                                                   ->  Nested Loop  (cost=20.60..26.09 rows=1 width=155) (actual time=0.279..0.395 rows=20 loops=1)
+                                                         Buffers: shared hit=103, local hit=573
+                                                         ->  Nested Loop  (cost=20.47..25.53 rows=1 width=155) (actual time=0.247..0.348 rows=50 loops=1)
+                                                               Buffers: shared hit=3, local hit=573
+                                                               ->  Hash Join  (cost=20.19..21.95 rows=1 width=151) (actual time=0.245..0.268 rows=50 loops=1)
+                                                                     Hash Cond: (y.cents = rc.cents)
+                                                                     Join Filter: ((y.id <> o.id) AND (y.credit <> o.credit) AND (abs((o.day - y.day)) <= 5))
+                                                                     Buffers: shared hit=3, local hit=323
+                                                                     ->  Seq Scan on cpe_pool y  (cost=0.00..1.50 rows=50 width=45) (actual time=0.008..0.012 rows=50 loops=1)
+                                                                           Buffers: local hit=1
+                                                                     ->  Hash  (cost=20.17..20.17 rows=2 width=123) (actual time=0.232..0.235 rows=30 loops=1)
+                                                                           Buckets: 1024  Batches: 1  Memory Usage: 13kB
+                                                                           Buffers: shared hit=3, local hit=322
+                                                                           ->  Nested Loop  (cost=6.06..20.17 rows=2 width=123) (actual time=0.063..0.228 rows=30 loops=1)
+                                                                                 Buffers: shared hit=3, local hit=322
+                                                                                 ->  Hash Left Join  (cost=5.78..13.01 rows=2 width=85) (actual time=0.055..0.167 rows=30 loops=1)
+                                                                                       Hash Cond: (tp.account_id = pa.id)
+                                                                                       Filter: ((t1.partner IS NULL) OR (pa.item_id = '8f2f3a74-65ef-45a0-ba2d-5488bc4b807c'::uuid))
+                                                                                       Rows Removed by Filter: 20
+                                                                                       Buffers: shared hit=3, local hit=172
+                                                                                       ->  Nested Loop Left Join  (cost=4.69..11.90 rows=4 width=117) (actual time=0.048..0.149 rows=50 loops=1)
+                                                                                             Buffers: shared hit=2, local hit=172
+                                                                                             ->  Nested Loop Left Join  (cost=4.55..11.23 rows=4 width=101) (actual time=0.047..0.110 rows=50 loops=1)
+                                                                                                   Buffers: shared hit=2, local hit=92
+                                                                                                   ->  Hash Join  (cost=4.39..6.71 rows=4 width=85) (actual time=0.042..0.062 rows=50 loops=1)
+                                                                                                         Hash Cond: (rc.cents = (- o.cents))
+                                                                                                         Join Filter: ((rc.id <> o.id) AND (rc.credit <> o.credit) AND (abs((o.day - rc.day)) <= 5))
+                                                                                                         Buffers: shared hit=2, local hit=2
+                                                                                                         ->  Seq Scan on cpe_pool rc  (cost=0.00..1.50 rows=50 width=45) (actual time=0.002..0.005 rows=50 loops=1)
+                                                                                                               Buffers: local hit=1
+                                                                                                         ->  Hash  (cost=4.08..4.08 rows=25 width=45) (actual time=0.036..0.037 rows=40 loops=1)
+                                                                                                               Buckets: 1024  Batches: 1  Memory Usage: 12kB
+                                                                                                               Buffers: shared hit=2, local hit=1
+                                                                                                               ->  Hash Join  (cost=2.15..4.08 rows=25 width=45) (actual time=0.018..0.030 rows=40 loops=1)
+                                                                                                                     Hash Cond: (o.account_id = oa.id)
+                                                                                                                     Buffers: shared hit=2, local hit=1
+                                                                                                                     ->  Seq Scan on cpe_pool o  (cost=0.00..1.50 rows=50 width=45) (actual time=0.002..0.005 rows=50 loops=1)
+                                                                                                                           Buffers: local hit=1
+                                                                                                                     ->  Hash  (cost=2.12..2.12 rows=2 width=16) (actual time=0.013..0.014 rows=2 loops=1)
+                                                                                                                           Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                                                           Buffers: shared hit=2
+                                                                                                                           ->  Nested Loop  (cost=0.00..2.12 rows=2 width=16) (actual time=0.010..0.012 rows=2 loops=1)
+                                                                                                                                 Join Filter: (oi.id = oa.item_id)
+                                                                                                                                 Rows Removed by Join Filter: 2
+                                                                                                                                 Buffers: shared hit=2
+                                                                                                                                 ->  Seq Scan on plaid_items oi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.006..0.006 rows=1 loops=1)
+                                                                                                                                       Filter: ((id <> '8f2f3a74-65ef-45a0-ba2d-5488bc4b807c'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                                                                                                                                       Rows Removed by Filter: 1
+                                                                                                                                       Buffers: shared hit=1
+                                                                                                                                 ->  Seq Scan on accounts oa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.003..0.004 rows=4 loops=1)
+                                                                                                                                       Buffers: shared hit=1
+                                                                                                   ->  Index Scan using cpe_tier1_pkey on cpe_tier1 t1  (cost=0.15..1.13 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=50)
+                                                                                                         Index Cond: (id = o.id)
+                                                                                                         Buffers: local hit=90
+                                                                                             ->  Index Scan using cpe_pool_pkey on cpe_pool tp  (cost=0.14..0.17 rows=1 width=32) (actual time=0.000..0.000 rows=1 loops=50)
+                                                                                                   Index Cond: (id = t1.partner)
+                                                                                                   Buffers: local hit=80
+                                                                                       ->  Hash  (cost=1.04..1.04 rows=4 width=32) (actual time=0.004..0.004 rows=4 loops=1)
+                                                                                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                             Buffers: shared hit=1
+                                                                                             ->  Seq Scan on accounts pa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.002..0.003 rows=4 loops=1)
+                                                                                                   Buffers: shared hit=1
+                                                                                 ->  Index Scan using cpe_txn_pkey on cpe_txn ot  (cost=0.28..3.58 rows=1 width=54) (actual time=0.002..0.002 rows=1 loops=30)
+                                                                                       Index Cond: (id = o.id)
+                                                                                       Buffers: local hit=150
+                                                               ->  Index Scan using cpe_txn_pkey on cpe_txn rt  (cost=0.28..3.58 rows=1 width=20) (actual time=0.001..0.001 rows=1 loops=50)
+                                                                     Index Cond: (id = rc.id)
+                                                                     Buffers: local hit=250
+                                                         ->  Index Scan using accounts_pkey on accounts ra  (cost=0.13..0.39 rows=1 width=32) (actual time=0.001..0.001 rows=0 loops=50)
+                                                               Index Cond: (id = rc.account_id)
+                                                               Filter: (item_id = '8f2f3a74-65ef-45a0-ba2d-5488bc4b807c'::uuid)
+                                                               Rows Removed by Filter: 1
+                                                               Buffers: shared hit=100
+                                                   ->  Seq Scan on plaid_items ri  (cost=0.00..1.03 rows=1 width=16) (actual time=0.001..0.001 rows=1 loops=20)
+                                                         Filter: ((id = '8f2f3a74-65ef-45a0-ba2d-5488bc4b807c'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                                                         Rows Removed by Filter: 1
+                                                         Buffers: shared hit=20
+                                             ->  Index Scan using cpe_txn_pkey on cpe_txn yt  (cost=0.28..3.58 rows=1 width=54) (actual time=0.001..0.001 rows=1 loops=20)
+                                                   Index Cond: (id = y.id)
+                                                   Buffers: local hit=100
+                                       ->  Seq Scan on plaid_items yi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.000..0.001 rows=1 loops=20)
+                                             Filter: ((id <> '8f2f3a74-65ef-45a0-ba2d-5488bc4b807c'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid))
+                                             Rows Removed by Filter: 1
+                                             Buffers: shared hit=20
+                                 ->  Index Scan using accounts_pkey on accounts ya  (cost=0.13..0.39 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=20)
+                                       Index Cond: (id = y.account_id)
+                                       Buffers: shared hit=40
+                           ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd  (cost=0.16..1.06 rows=1 width=32) (actual time=0.001..0.001 rows=0 loops=10)
+                                 Index Cond: ((lo = LEAST(o.id, rc.id)) AND (hi = GREATEST(o.id, rc.id)))
+                                 Heap Fetches: 0
+                                 Buffers: local hit=20
+                     ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd_1  (cost=0.16..1.06 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=10)
+                           Index Cond: ((lo = LEAST(o.id, y.id)) AND (hi = GREATEST(o.id, y.id)))
+                           Heap Fetches: 0
+                           Buffers: local hit=20
+               ->  Index Scan using card_payment_decisions_b_account_idx on card_payment_decisions d  (cost=0.14..0.41 rows=1 width=148) (actual time=0.001..0.001 rows=0 loops=10)
+                     Index Cond: (b_account_id = CASE WHEN o.credit THEN y.account_id ELSE o.account_id END)
+                     Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000006'::uuid) AND (kind = CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END) AND (a_account_id = CASE WHEN o.credit THEN o.account_id ELSE y.account_id END) AND (a_cents = CASE WHEN o.credit THEN o.cents ELSE y.cents END) AND (b_cents = CASE WHEN o.credit THEN y.cents ELSE o.cents END))
+                     Buffers: shared hit=10
+ Planning:
+   Buffers: shared hit=39, local hit=32
+ Planning Time: 5.820 ms
+ Execution Time: 0.728 ms
+(126 rows)
+
+size 10000
+conversion plan at size 10000:
+                                                                                                                QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort (actual rows=100 loops=1)
+   Sort Key: t.id
+   Sort Method: quicksort  Memory: 38kB
+   ->  Nested Loop (actual rows=100 loops=1)
+         Join Filter: (ca.id = t.account_id)
+         Rows Removed by Join Filter: 100
+         ->  Nested Loop Anti Join (actual rows=100 loops=1)
+               Join Filter: ((d.a_account_id = t.account_id) AND (d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+               ->  Nested Loop (actual rows=100 loops=1)
+                     ->  Nested Loop (actual rows=100 loops=1)
+                           ->  Hash Join (actual rows=200 loops=1)
+                                 Hash Cond: (pt.id = s.partner_transaction_id)
+                                 ->  Seq Scan on transactions pt (actual rows=20000 loops=1)
+                                 ->  Hash (actual rows=200 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 23kB
+                                       ->  Seq Scan on card_payment_leg_states s (actual rows=200 loops=1)
+                                             Filter: ((partner_transaction_id IS NOT NULL) AND (decision_id IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                             Rows Removed by Filter: 300
+                           ->  Memoize (actual rows=0 loops=200)
+                                 Cache Key: pt.account_id
+                                 Cache Mode: logical
+                                 Hits: 198  Misses: 2  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                                 ->  Index Scan using accounts_pkey on accounts pa (actual rows=0 loops=2)
+                                       Index Cond: (id = pt.account_id)
+                                       Filter: (item_id = '9d8e6014-68a9-417c-bce7-23d1218ae5e4'::uuid)
+                                       Rows Removed by Filter: 0
+                     ->  Index Scan using transactions_pkey on transactions t (actual rows=1 loops=100)
+                           Index Cond: (id = s.transaction_id)
+               ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=100)
+                     Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid) AND (kind = 'destination_removed_card'::text))
+         ->  Materialize (actual rows=2 loops=100)
+               ->  Nested Loop (actual rows=2 loops=1)
+                     Join Filter: (ci.id = ca.item_id)
+                     Rows Removed by Join Filter: 2
+                     ->  Nested Loop (actual rows=1 loops=1)
+                           ->  Seq Scan on plaid_items ci (actual rows=1 loops=1)
+                                 Filter: ((id <> '9d8e6014-68a9-417c-bce7-23d1218ae5e4'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                 Rows Removed by Filter: 1
+                           ->  Seq Scan on plaid_items pi (actual rows=1 loops=1)
+                                 Filter: ((id = '9d8e6014-68a9-417c-bce7-23d1218ae5e4'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                 Rows Removed by Filter: 1
+                     ->  Seq Scan on accounts ca (actual rows=4 loops=1)
+(42 rows)
+
+ambiguity-hold plan at size 10000:
+                                                                                                                                                                                                                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=204.26..204.31 rows=2 width=164) (actual time=3.576..3.602 rows=100 loops=1)
+   Buffers: shared hit=511, local hit=5518
+   ->  Sort  (cost=204.26..204.27 rows=2 width=164) (actual time=3.575..3.584 rows=100 loops=1)
+         Sort Key: (CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END), (CASE WHEN o.credit THEN o.account_id ELSE y.account_id END), (CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END), (CASE WHEN o.credit THEN y.account_id ELSE o.account_id END), (CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END), rt.date, (CASE WHEN o.credit THEN o.cents ELSE y.cents END), (CASE WHEN o.credit THEN y.cents ELSE o.cents END)
+         Sort Method: quicksort  Memory: 44kB
+         Buffers: shared hit=511, local hit=5518
+         ->  Nested Loop Anti Join  (cost=173.51..204.25 rows=2 width=164) (actual time=2.645..3.409 rows=100 loops=1)
+               Join Filter: ((d.a_plaid_transaction_id = CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END) AND (d.b_plaid_transaction_id = CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END) AND (d.counterpart_date = rt.date))
+               Buffers: shared hit=511, local hit=5518
+               ->  Nested Loop Anti Join  (cost=173.37..203.79 rows=2 width=131) (actual time=2.641..3.319 rows=100 loops=1)
+                     Buffers: shared hit=411, local hit=5518
+                     ->  Nested Loop Anti Join  (cost=173.21..203.15 rows=2 width=163) (actual time=2.639..3.255 rows=100 loops=1)
+                           Buffers: shared hit=411, local hit=5318
+                           ->  Nested Loop  (cost=173.05..202.51 rows=2 width=179) (actual time=2.635..3.180 rows=100 loops=1)
+                                 Buffers: shared hit=411, local hit=5118
+                                 ->  Nested Loop  (cost=172.77..195.36 rows=2 width=140) (actual time=2.632..3.014 rows=100 loops=1)
+                                       Buffers: shared hit=411, local hit=4618
+                                       ->  Nested Loop  (cost=172.48..188.21 rows=2 width=136) (actual time=2.629..2.794 rows=100 loops=1)
+                                             Join Filter: (yi.id = ya.item_id)
+                                             Rows Removed by Join Filter: 100
+                                             Buffers: shared hit=411, local hit=4118
+                                             ->  Nested Loop  (cost=0.00..2.07 rows=1 width=32) (actual time=0.014..0.016 rows=1 loops=1)
+                                                   Buffers: shared hit=2
+                                                   ->  Seq Scan on plaid_items ri  (cost=0.00..1.03 rows=1 width=16) (actual time=0.011..0.012 rows=1 loops=1)
+                                                         Filter: ((id = '9d8e6014-68a9-417c-bce7-23d1218ae5e4'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                                         Rows Removed by Filter: 1
+                                                         Buffers: shared hit=1
+                                                   ->  Seq Scan on plaid_items yi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.002..0.003 rows=1 loops=1)
+                                                         Filter: ((id <> '9d8e6014-68a9-417c-bce7-23d1218ae5e4'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                                         Rows Removed by Filter: 1
+                                                         Buffers: shared hit=1
+                                             ->  Nested Loop  (cost=172.48..186.10 rows=3 width=168) (actual time=2.471..2.756 rows=200 loops=1)
+                                                   Buffers: shared hit=409, local hit=4118
+                                                   ->  Hash Join  (cost=172.35..185.61 rows=3 width=152) (actual time=2.468..2.579 rows=200 loops=1)
+                                                         Hash Cond: (y.cents = rc.cents)
+                                                         Join Filter: ((y.id <> o.id) AND (y.credit <> o.credit) AND (abs((o.day - y.day)) <= 5))
+                                                         Buffers: shared hit=9, local hit=4118
+                                                         ->  Seq Scan on cpe_pool y  (cost=0.00..11.00 rows=500 width=45) (actual time=0.005..0.039 rows=500 loops=1)
+                                                               Buffers: local hit=6
+                                                         ->  Hash  (cost=172.20..172.20 rows=12 width=124) (actual time=2.444..2.446 rows=100 loops=1)
+                                                               Buckets: 1024  Batches: 1  Memory Usage: 25kB
+                                                               Buffers: shared hit=9, local hit=4112
+                                                               ->  Nested Loop  (cost=21.46..172.20 rows=12 width=124) (actual time=0.282..2.421 rows=100 loops=1)
+                                                                     Buffers: shared hit=9, local hit=4112
+                                                                     ->  Nested Loop  (cost=21.32..170.94 rows=25 width=124) (actual time=0.268..2.307 rows=300 loops=1)
+                                                                           Buffers: shared hit=3, local hit=4112
+                                                                           ->  Hash Left Join  (cost=21.04..81.52 rows=25 width=85) (actual time=0.261..1.691 rows=300 loops=1)
+                                                                                 Hash Cond: (tp.account_id = pa.id)
+                                                                                 Filter: ((t1.partner IS NULL) OR (pa.item_id = '9d8e6014-68a9-417c-bce7-23d1218ae5e4'::uuid))
+                                                                                 Rows Removed by Filter: 200
+                                                                                 Buffers: shared hit=3, local hit=2612
+                                                                                 ->  Nested Loop Left Join  (cost=19.95..80.13 rows=50 width=117) (actual time=0.252..1.584 rows=500 loops=1)
+                                                                                       Buffers: shared hit=2, local hit=2612
+                                                                                       ->  Nested Loop Left Join  (cost=19.67..64.02 rows=50 width=101) (actual time=0.249..1.086 rows=500 loops=1)
+                                                                                             Buffers: shared hit=2, local hit=1412
+                                                                                             ->  Hash Join  (cost=19.39..43.66 rows=50 width=85) (actual time=0.241..0.524 rows=500 loops=1)
+                                                                                                   Hash Cond: ((- o.cents) = rc.cents)
+                                                                                                   Join Filter: ((rc.id <> o.id) AND (rc.credit <> o.credit) AND (abs((o.day - rc.day)) <= 5))
+                                                                                                   Buffers: shared hit=2, local hit=12
+                                                                                                   ->  Hash Join  (cost=2.15..17.52 rows=250 width=45) (actual time=0.016..0.166 rows=400 loops=1)
+                                                                                                         Hash Cond: (o.account_id = oa.id)
+                                                                                                         Buffers: shared hit=2, local hit=6
+                                                                                                         ->  Seq Scan on cpe_pool o  (cost=0.00..11.00 rows=500 width=45) (actual time=0.003..0.040 rows=500 loops=1)
+                                                                                                               Buffers: local hit=6
+                                                                                                         ->  Hash  (cost=2.12..2.12 rows=2 width=16) (actual time=0.009..0.009 rows=2 loops=1)
+                                                                                                               Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                                               Buffers: shared hit=2
+                                                                                                               ->  Nested Loop  (cost=0.00..2.12 rows=2 width=16) (actual time=0.006..0.007 rows=2 loops=1)
+                                                                                                                     Join Filter: (oi.id = oa.item_id)
+                                                                                                                     Rows Removed by Join Filter: 2
+                                                                                                                     Buffers: shared hit=2
+                                                                                                                     ->  Seq Scan on plaid_items oi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.002..0.002 rows=1 loops=1)
+                                                                                                                           Filter: ((id <> '9d8e6014-68a9-417c-bce7-23d1218ae5e4'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid))
+                                                                                                                           Rows Removed by Filter: 1
+                                                                                                                           Buffers: shared hit=1
+                                                                                                                     ->  Seq Scan on accounts oa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.003..0.004 rows=4 loops=1)
+                                                                                                                           Buffers: shared hit=1
+                                                                                                   ->  Hash  (cost=11.00..11.00 rows=500 width=45) (actual time=0.221..0.221 rows=500 loops=1)
+                                                                                                         Buckets: 1024  Batches: 1  Memory Usage: 50kB
+                                                                                                         Buffers: local hit=6
+                                                                                                         ->  Seq Scan on cpe_pool rc  (cost=0.00..11.00 rows=500 width=45) (actual time=0.003..0.099 rows=500 loops=1)
+                                                                                                               Buffers: local hit=6
+                                                                                             ->  Index Scan using cpe_tier1_pkey on cpe_tier1 t1  (cost=0.28..0.41 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=500)
+                                                                                                   Index Cond: (id = o.id)
+                                                                                                   Buffers: local hit=1400
+                                                                                       ->  Index Scan using cpe_pool_pkey on cpe_pool tp  (cost=0.27..0.32 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=500)
+                                                                                             Index Cond: (id = t1.partner)
+                                                                                             Buffers: local hit=1200
+                                                                                 ->  Hash  (cost=1.04..1.04 rows=4 width=32) (actual time=0.005..0.005 rows=4 loops=1)
+                                                                                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                       Buffers: shared hit=1
+                                                                                       ->  Seq Scan on accounts pa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.004..0.004 rows=4 loops=1)
+                                                                                             Buffers: shared hit=1
+                                                                           ->  Index Scan using cpe_txn_pkey on cpe_txn ot  (cost=0.29..3.58 rows=1 width=55) (actual time=0.002..0.002 rows=1 loops=300)
+                                                                                 Index Cond: (id = o.id)
+                                                                                 Buffers: local hit=1500
+                                                                     ->  Memoize  (cost=0.14..0.18 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=300)
+                                                                           Cache Key: rc.account_id
+                                                                           Cache Mode: logical
+                                                                           Hits: 297  Misses: 3  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                                                                           Buffers: shared hit=6
+                                                                           ->  Index Scan using accounts_pkey on accounts ra  (cost=0.13..0.17 rows=1 width=32) (actual time=0.002..0.002 rows=0 loops=3)
+                                                                                 Index Cond: (id = rc.account_id)
+                                                                                 Filter: (item_id = '9d8e6014-68a9-417c-bce7-23d1218ae5e4'::uuid)
+                                                                                 Rows Removed by Filter: 1
+                                                                                 Buffers: shared hit=6
+                                                   ->  Index Scan using accounts_pkey on accounts ya  (cost=0.13..0.17 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=200)
+                                                         Index Cond: (id = y.account_id)
+                                                         Buffers: shared hit=400
+                                       ->  Index Scan using cpe_txn_pkey on cpe_txn rt  (cost=0.29..3.58 rows=1 width=20) (actual time=0.002..0.002 rows=1 loops=100)
+                                             Index Cond: (id = rc.id)
+                                             Buffers: local hit=500
+                                 ->  Index Scan using cpe_txn_pkey on cpe_txn yt  (cost=0.29..3.58 rows=1 width=55) (actual time=0.001..0.001 rows=1 loops=100)
+                                       Index Cond: (id = y.id)
+                                       Buffers: local hit=500
+                           ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd  (cost=0.16..0.27 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=100)
+                                 Index Cond: ((lo = LEAST(o.id, rc.id)) AND (hi = GREATEST(o.id, rc.id)))
+                                 Heap Fetches: 0
+                                 Buffers: local hit=200
+                     ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd_1  (cost=0.16..0.27 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=100)
+                           Index Cond: ((lo = LEAST(o.id, y.id)) AND (hi = GREATEST(o.id, y.id)))
+                           Heap Fetches: 0
+                           Buffers: local hit=200
+               ->  Index Scan using card_payment_decisions_b_account_idx on card_payment_decisions d  (cost=0.14..0.21 rows=1 width=148) (actual time=0.000..0.000 rows=0 loops=100)
+                     Index Cond: (b_account_id = CASE WHEN o.credit THEN y.account_id ELSE o.account_id END)
+                     Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000024'::uuid) AND (kind = CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END) AND (a_account_id = CASE WHEN o.credit THEN o.account_id ELSE y.account_id END) AND (a_cents = CASE WHEN o.credit THEN o.cents ELSE y.cents END) AND (b_cents = CASE WHEN o.credit THEN y.cents ELSE o.cents END))
+                     Buffers: shared hit=100
+ Planning:
+   Buffers: shared hit=39, local hit=38
+ Planning Time: 6.227 ms
+ Execution Time: 3.748 ms
+(131 rows)
+
+size 50000
+conversion plan at size 50000:
+                                                                                                                      QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Merge (actual rows=500 loops=1)
+   Workers Planned: 1
+   Workers Launched: 1
+   ->  Sort (actual rows=250 loops=2)
+         Sort Key: t.id
+         Sort Method: quicksort  Memory: 68kB
+         Worker 0:  Sort Method: quicksort  Memory: 50kB
+         ->  Merge Anti Join (actual rows=250 loops=2)
+               Merge Cond: (t.account_id = d.a_account_id)
+               Join Filter: ((d.a_plaid_transaction_id = t.plaid_transaction_id) AND (d.a_cents = s.amount_cents))
+               ->  Merge Join (actual rows=250 loops=2)
+                     Merge Cond: (t.account_id = ca.id)
+                     ->  Sort (actual rows=250 loops=2)
+                           Sort Key: t.account_id
+                           Sort Method: quicksort  Memory: 59kB
+                           Worker 0:  Sort Method: quicksort  Memory: 45kB
+                           ->  Nested Loop (actual rows=250 loops=2)
+                                 ->  Hash Join (actual rows=250 loops=2)
+                                       Hash Cond: (pt.account_id = pa.id)
+                                       ->  Hash Join (actual rows=500 loops=2)
+                                             Hash Cond: (pt.id = s.partner_transaction_id)
+                                             ->  Parallel Seq Scan on transactions pt (actual rows=50000 loops=2)
+                                             ->  Hash (actual rows=1000 loops=2)
+                                                   Buckets: 2048  Batches: 1  Memory Usage: 87kB
+                                                   ->  Seq Scan on card_payment_leg_states s (actual rows=1000 loops=2)
+                                                         Filter: ((partner_transaction_id IS NOT NULL) AND (decision_id IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid) AND (computed_at_version = 1) AND (side = 'cash'::text))
+                                                         Rows Removed by Filter: 1500
+                                       ->  Hash (actual rows=2 loops=2)
+                                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                             ->  Seq Scan on accounts pa (actual rows=2 loops=2)
+                                                   Filter: (item_id = '20cc07ab-b1d4-4821-b6cd-b5bf04eb8ee7'::uuid)
+                                                   Rows Removed by Filter: 2
+                                 ->  Index Scan using transactions_pkey on transactions t (actual rows=1 loops=500)
+                                       Index Cond: (id = s.transaction_id)
+                     ->  Sort (actual rows=251 loops=2)
+                           Sort Key: ca.id
+                           Sort Method: quicksort  Memory: 25kB
+                           Worker 0:  Sort Method: quicksort  Memory: 25kB
+                           ->  Nested Loop (actual rows=2 loops=2)
+                                 Join Filter: (ci.id = ca.item_id)
+                                 Rows Removed by Join Filter: 2
+                                 ->  Nested Loop (actual rows=1 loops=2)
+                                       ->  Seq Scan on plaid_items ci (actual rows=1 loops=2)
+                                             Filter: ((id <> '20cc07ab-b1d4-4821-b6cd-b5bf04eb8ee7'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                             Rows Removed by Filter: 1
+                                       ->  Seq Scan on plaid_items pi (actual rows=1 loops=2)
+                                             Filter: ((id = '20cc07ab-b1d4-4821-b6cd-b5bf04eb8ee7'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                             Rows Removed by Filter: 1
+                                 ->  Seq Scan on accounts ca (actual rows=4 loops=2)
+               ->  Sort (actual rows=0 loops=2)
+                     Sort Key: d.a_account_id
+                     Sort Method: quicksort  Memory: 25kB
+                     Worker 0:  Sort Method: quicksort  Memory: 25kB
+                     ->  Seq Scan on card_payment_decisions d (actual rows=0 loops=2)
+                           Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid) AND (kind = 'destination_removed_card'::text))
+(55 rows)
+
+ambiguity-hold plan at size 50000:
+                                                                                                                                                                                                                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Unique  (cost=925.80..925.87 rows=3 width=164) (actual time=16.041..16.152 rows=500 loops=1)
+   Buffers: shared hit=510, local hit=16569 read=550
+   ->  Sort  (cost=925.80..925.81 rows=3 width=164) (actual time=16.040..16.071 rows=500 loops=1)
+         Sort Key: (CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END), (CASE WHEN o.credit THEN o.account_id ELSE y.account_id END), (CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END), (CASE WHEN o.credit THEN y.account_id ELSE o.account_id END), (CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END), rt.date, (CASE WHEN o.credit THEN o.cents ELSE y.cents END), (CASE WHEN o.credit THEN y.cents ELSE o.cents END)
+         Sort Method: quicksort  Memory: 122kB
+         Buffers: shared hit=510, local hit=16569 read=550
+         ->  Nested Loop Anti Join  (cost=816.37..925.78 rows=3 width=164) (actual time=10.494..14.878 rows=500 loops=1)
+               Join Filter: ((d.a_plaid_transaction_id = CASE WHEN o.credit THEN ot.plaid ELSE yt.plaid END) AND (d.b_plaid_transaction_id = CASE WHEN o.credit THEN yt.plaid ELSE ot.plaid END) AND (d.counterpart_date = rt.date))
+               Buffers: shared hit=510, local hit=16569 read=550
+               ->  Nested Loop Anti Join  (cost=816.22..925.04 rows=3 width=133) (actual time=10.486..14.436 rows=500 loops=1)
+                     Buffers: shared hit=10, local hit=16569 read=550
+                     ->  Nested Loop Anti Join  (cost=816.07..924.25 rows=4 width=165) (actual time=10.483..14.103 rows=500 loops=1)
+                           Buffers: shared hit=10, local hit=15569 read=550
+                           ->  Nested Loop  (cost=815.91..923.06 rows=6 width=181) (actual time=10.478..13.751 rows=500 loops=1)
+                                 Buffers: shared hit=10, local hit=14569 read=550
+                                 ->  Nested Loop  (cost=815.49..900.57 rows=6 width=141) (actual time=10.474..12.693 rows=500 loops=1)
+                                       Buffers: shared hit=10, local hit=11569 read=550
+                                       ->  Hash Join  (cost=815.07..878.07 rows=6 width=137) (actual time=10.468..11.169 rows=500 loops=1)
+                                             Hash Cond: (ya.item_id = yi.id)
+                                             Buffers: shared hit=10, local hit=8624 read=495
+                                             ->  Nested Loop  (cost=812.99..875.88 rows=13 width=169) (actual time=9.871..10.956 rows=1000 loops=1)
+                                                   Buffers: shared hit=8, local hit=8624 read=495
+                                                   ->  Hash Join  (cost=812.85..875.03 rows=13 width=153) (actual time=9.857..10.506 rows=1000 loops=1)
+                                                         Hash Cond: (y.cents = rc.cents)
+                                                         Join Filter: ((y.id <> o.id) AND (y.credit <> o.credit) AND (abs((o.day - y.day)) <= 5))
+                                                         Buffers: shared hit=4, local hit=8624 read=495
+                                                         ->  Seq Scan on cpe_pool y  (cost=0.00..51.00 rows=2500 width=45) (actual time=0.021..0.199 rows=2500 loops=1)
+                                                               Buffers: local hit=23 read=3
+                                                         ->  Hash  (cost=812.06..812.06 rows=63 width=125) (actual time=9.746..9.753 rows=500 loops=1)
+                                                               Buckets: 1024  Batches: 1  Memory Usage: 91kB
+                                                               Buffers: shared hit=4, local hit=8601 read=492
+                                                               ->  Hash Join  (cost=230.13..812.06 rows=63 width=125) (actual time=2.618..9.631 rows=500 loops=1)
+                                                                     Hash Cond: (rc.account_id = ra.id)
+                                                                     Buffers: shared hit=4, local hit=8601 read=492
+                                                                     ->  Nested Loop  (cost=229.05..810.30 rows=126 width=125) (actual time=2.605..9.363 rows=1500 loops=1)
+                                                                           Buffers: shared hit=3, local hit=8601 read=492
+                                                                           ->  Hash Join  (cost=228.64..337.98 rows=126 width=85) (actual time=2.583..5.015 rows=1500 loops=1)
+                                                                                 Hash Cond: ((- o.cents) = rc.cents)
+                                                                                 Join Filter: ((rc.id <> o.id) AND (rc.credit <> o.credit) AND (abs((o.day - rc.day)) <= 5))
+                                                                                 Buffers: shared hit=3, local hit=55 read=38
+                                                                                 ->  Hash Left Join  (cost=146.39..233.35 rows=628 width=45) (actual time=1.532..3.445 rows=1000 loops=1)
+                                                                                       Hash Cond: (tp.account_id = pa.id)
+                                                                                       Filter: ((t1.partner IS NULL) OR (pa.item_id = '20cc07ab-b1d4-4821-b6cd-b5bf04eb8ee7'::uuid))
+                                                                                       Rows Removed by Filter: 1000
+                                                                                       Buffers: shared hit=3, local hit=52 read=15
+                                                                                       ->  Hash Left Join  (cost=145.30..224.73 rows=1250 width=77) (actual time=1.523..3.112 rows=2000 loops=1)
+                                                                                             Hash Cond: (t1.partner = tp.id)
+                                                                                             Buffers: shared hit=2, local hit=52 read=15
+                                                                                             ->  Hash Left Join  (cost=63.05..139.20 rows=1250 width=61) (actual time=0.585..1.812 rows=2000 loops=1)
+                                                                                                   Hash Cond: (o.id = t1.id)
+                                                                                                   Buffers: shared hit=2, local hit=26 read=15
+                                                                                                   ->  Hash Join  (cost=2.15..75.02 rows=1250 width=45) (actual time=0.022..0.781 rows=2000 loops=1)
+                                                                                                         Hash Cond: (o.account_id = oa.id)
+                                                                                                         Buffers: shared hit=2, local hit=26
+                                                                                                         ->  Seq Scan on cpe_pool o  (cost=0.00..51.00 rows=2500 width=45) (actual time=0.005..0.210 rows=2500 loops=1)
+                                                                                                               Buffers: local hit=26
+                                                                                                         ->  Hash  (cost=2.12..2.12 rows=2 width=16) (actual time=0.012..0.013 rows=2 loops=1)
+                                                                                                               Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                                               Buffers: shared hit=2
+                                                                                                               ->  Nested Loop  (cost=0.00..2.12 rows=2 width=16) (actual time=0.010..0.011 rows=2 loops=1)
+                                                                                                                     Join Filter: (oi.id = oa.item_id)
+                                                                                                                     Rows Removed by Join Filter: 2
+                                                                                                                     Buffers: shared hit=2
+                                                                                                                     ->  Seq Scan on plaid_items oi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.005..0.005 rows=1 loops=1)
+                                                                                                                           Filter: ((id <> '20cc07ab-b1d4-4821-b6cd-b5bf04eb8ee7'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                                                                                           Rows Removed by Filter: 1
+                                                                                                                           Buffers: shared hit=1
+                                                                                                                     ->  Seq Scan on accounts oa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.003..0.003 rows=4 loops=1)
+                                                                                                                           Buffers: shared hit=1
+                                                                                                   ->  Hash  (cost=35.40..35.40 rows=2040 width=32) (actual time=0.559..0.560 rows=2000 loops=1)
+                                                                                                         Buckets: 2048  Batches: 1  Memory Usage: 141kB
+                                                                                                         Buffers: local read=15
+                                                                                                         ->  Seq Scan on cpe_tier1 t1  (cost=0.00..35.40 rows=2040 width=32) (actual time=0.010..0.267 rows=2000 loops=1)
+                                                                                                               Buffers: local read=15
+                                                                                             ->  Hash  (cost=51.00..51.00 rows=2500 width=32) (actual time=0.933..0.933 rows=2500 loops=1)
+                                                                                                   Buckets: 4096  Batches: 1  Memory Usage: 189kB
+                                                                                                   Buffers: local hit=26
+                                                                                                   ->  Seq Scan on cpe_pool tp  (cost=0.00..51.00 rows=2500 width=32) (actual time=0.005..0.431 rows=2500 loops=1)
+                                                                                                         Buffers: local hit=26
+                                                                                       ->  Hash  (cost=1.04..1.04 rows=4 width=32) (actual time=0.006..0.006 rows=4 loops=1)
+                                                                                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                                             Buffers: shared hit=1
+                                                                                             ->  Seq Scan on accounts pa  (cost=0.00..1.04 rows=4 width=32) (actual time=0.004..0.005 rows=4 loops=1)
+                                                                                                   Buffers: shared hit=1
+                                                                                 ->  Hash  (cost=51.00..51.00 rows=2500 width=45) (actual time=1.044..1.045 rows=2500 loops=1)
+                                                                                       Buckets: 4096  Batches: 1  Memory Usage: 238kB
+                                                                                       Buffers: local hit=3 read=23
+                                                                                       ->  Seq Scan on cpe_pool rc  (cost=0.00..51.00 rows=2500 width=45) (actual time=0.003..0.538 rows=2500 loops=1)
+                                                                                             Buffers: local hit=3 read=23
+                                                                           ->  Index Scan using cpe_txn_pkey on cpe_txn ot  (cost=0.42..3.75 rows=1 width=56) (actual time=0.003..0.003 rows=1 loops=1500)
+                                                                                 Index Cond: (id = o.id)
+                                                                                 Buffers: local hit=8546 read=454
+                                                                     ->  Hash  (cost=1.05..1.05 rows=2 width=32) (actual time=0.006..0.007 rows=2 loops=1)
+                                                                           Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                                           Buffers: shared hit=1
+                                                                           ->  Seq Scan on accounts ra  (cost=0.00..1.05 rows=2 width=32) (actual time=0.005..0.005 rows=2 loops=1)
+                                                                                 Filter: (item_id = '20cc07ab-b1d4-4821-b6cd-b5bf04eb8ee7'::uuid)
+                                                                                 Rows Removed by Filter: 2
+                                                                                 Buffers: shared hit=1
+                                                   ->  Memoize  (cost=0.14..0.16 rows=1 width=32) (actual time=0.000..0.000 rows=1 loops=1000)
+                                                         Cache Key: y.account_id
+                                                         Cache Mode: logical
+                                                         Hits: 998  Misses: 2  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                                                         Buffers: shared hit=4
+                                                         ->  Index Scan using accounts_pkey on accounts ya  (cost=0.13..0.15 rows=1 width=32) (actual time=0.006..0.006 rows=1 loops=2)
+                                                               Index Cond: (id = y.account_id)
+                                                               Buffers: shared hit=4
+                                             ->  Hash  (cost=2.07..2.07 rows=1 width=32) (actual time=0.022..0.023 rows=1 loops=1)
+                                                   Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                                   Buffers: shared hit=2
+                                                   ->  Nested Loop  (cost=0.00..2.07 rows=1 width=32) (actual time=0.019..0.021 rows=1 loops=1)
+                                                         Buffers: shared hit=2
+                                                         ->  Seq Scan on plaid_items ri  (cost=0.00..1.03 rows=1 width=16) (actual time=0.016..0.016 rows=1 loops=1)
+                                                               Filter: ((id = '20cc07ab-b1d4-4821-b6cd-b5bf04eb8ee7'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                               Rows Removed by Filter: 1
+                                                               Buffers: shared hit=1
+                                                         ->  Seq Scan on plaid_items yi  (cost=0.00..1.03 rows=1 width=16) (actual time=0.002..0.003 rows=1 loops=1)
+                                                               Filter: ((id <> '20cc07ab-b1d4-4821-b6cd-b5bf04eb8ee7'::uuid) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid))
+                                                               Rows Removed by Filter: 1
+                                                               Buffers: shared hit=1
+                                       ->  Index Scan using cpe_txn_pkey on cpe_txn rt  (cost=0.42..3.75 rows=1 width=20) (actual time=0.003..0.003 rows=1 loops=500)
+                                             Index Cond: (id = rc.id)
+                                             Buffers: local hit=2945 read=55
+                                 ->  Index Scan using cpe_txn_pkey on cpe_txn yt  (cost=0.42..3.75 rows=1 width=56) (actual time=0.002..0.002 rows=1 loops=500)
+                                       Index Cond: (id = y.id)
+                                       Buffers: local hit=3000
+                           ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd  (cost=0.16..0.20 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=500)
+                                 Index Cond: ((lo = LEAST(o.id, rc.id)) AND (hi = GREATEST(o.id, rc.id)))
+                                 Heap Fetches: 0
+                                 Buffers: local hit=1000
+                     ->  Index Only Scan using cpe_dismissed_pkey on cpe_dismissed dd_1  (cost=0.16..0.20 rows=1 width=32) (actual time=0.000..0.000 rows=0 loops=500)
+                           Index Cond: ((lo = LEAST(o.id, y.id)) AND (hi = GREATEST(o.id, y.id)))
+                           Heap Fetches: 0
+                           Buffers: local hit=1000
+               ->  Index Scan using card_payment_decisions_b_account_idx on card_payment_decisions d  (cost=0.15..0.23 rows=1 width=148) (actual time=0.000..0.000 rows=0 loops=500)
+                     Index Cond: (b_account_id = CASE WHEN o.credit THEN y.account_id ELSE o.account_id END)
+                     Filter: ((superseded_by IS NULL) AND (user_id = '00000000-0000-0000-0000-000000000042'::uuid) AND (kind = CASE WHEN (NOT o.credit) THEN 'ambiguity_hold_removed_card'::text ELSE 'ambiguity_hold_removed_cash_account'::text END) AND (a_account_id = CASE WHEN o.credit THEN o.account_id ELSE y.account_id END) AND (a_cents = CASE WHEN o.credit THEN o.cents ELSE y.cents END) AND (b_cents = CASE WHEN o.credit THEN y.cents ELSE o.cents END))
+                     Buffers: shared hit=500
+ Planning:
+   Buffers: shared hit=39, local hit=31 read=13
+ Planning Time: 7.785 ms
+ Execution Time: 16.320 ms
+(142 rows)
+
+
+counts (first measured sample of each size)
+ size  |                           what                           |   n
+-------+----------------------------------------------------------+--------
+  1000 | ambiguity holds written by the removal                   |     10
+  1000 | automatic pairs left after the removal                   |     10
+  1000 | leg states read by the conversion (all of the user's)    |     50
+  1000 | live holds applied by the final evaluation               |     10
+  1000 | payments read untracked / removed_card after the removal |     10
+  1000 | records written by the removal                           |     10
+  1000 | surviving legs evaluated after the removal               |     40
+  1000 | transactions of the user                                 |   2000
+  1000 | transactions on the removed institution                  |   1000
+ 10000 | ambiguity holds written by the removal                   |    100
+ 10000 | automatic pairs left after the removal                   |    100
+ 10000 | leg states read by the conversion (all of the user's)    |    500
+ 10000 | live holds applied by the final evaluation               |    100
+ 10000 | payments read untracked / removed_card after the removal |    100
+ 10000 | records written by the removal                           |    100
+ 10000 | surviving legs evaluated after the removal               |    400
+ 10000 | transactions of the user                                 |  20000
+ 10000 | transactions on the removed institution                  |  10000
+ 50000 | ambiguity holds written by the removal                   |    500
+ 50000 | automatic pairs left after the removal                   |    500
+ 50000 | leg states read by the conversion (all of the user's)    |   2500
+ 50000 | live holds applied by the final evaluation               |    500
+ 50000 | payments read untracked / removed_card after the removal |    500
+ 50000 | records written by the removal                           |    500
+ 50000 | surviving legs evaluated after the removal               |   2000
+ 50000 | transactions of the user                                 | 100000
+ 50000 | transactions on the removed institution                  |  50000
+(27 rows)
+
+
+timings (milliseconds)
+ size  |                phase                | n | median_ms | min_ms | max_ms
+-------+-------------------------------------+---+-----------+--------+--------
+  1000 | current                             | 5 |     152.4 |  145.2 |  154.7
+  1000 | previous                            | 5 |      47.0 |   43.6 |   49.9
+  1000 | step 1: first evaluation            | 5 |      47.9 |   46.9 |   92.2
+  1000 | step 2: conversion                  | 5 |      17.6 |   16.6 |   34.3
+  1000 | step 2a: user-pair statement        | 5 |       3.3 |    3.1 |    6.9
+  1000 | step 2b: automatic-pair statement   | 5 |       5.7 |    5.1 |   13.3
+  1000 | step 2c: ambiguity-hold statement   | 5 |       8.6 |    8.1 |   14.0
+  1000 | step 3: delete (cascade + triggers) | 5 |      40.2 |   37.4 |   44.3
+  1000 | step 4: final evaluation            | 5 |      33.4 |   30.5 |   34.5
+ 10000 | current                             | 5 |    1081.8 | 1050.7 | 1173.4
+ 10000 | previous                            | 5 |     415.6 |  383.3 |  462.4
+ 10000 | step 1: first evaluation            | 5 |     354.9 |  349.4 |  372.8
+ 10000 | step 2: conversion                  | 5 |      38.2 |   37.1 |   41.7
+ 10000 | step 2a: user-pair statement        | 5 |       3.5 |    3.5 |    3.8
+ 10000 | step 2b: automatic-pair statement   | 5 |      15.3 |   14.7 |   15.7
+ 10000 | step 2c: ambiguity-hold statement   | 5 |      19.2 |   18.9 |   22.8
+ 10000 | step 3: delete (cascade + triggers) | 5 |     393.9 |  386.7 |  427.0
+ 10000 | step 4: final evaluation            | 5 |     261.5 |  254.8 |  273.7
+ 50000 | current                             | 5 |    5642.7 | 5462.3 | 5729.3
+ 50000 | previous                            | 5 |    1981.4 | 1939.2 | 2023.4
+ 50000 | step 1: first evaluation            | 5 |    1764.5 | 1750.5 | 1797.7
+ 50000 | step 2: conversion                  | 5 |     133.4 |  128.1 |  138.9
+ 50000 | step 2a: user-pair statement        | 5 |       3.3 |    3.3 |    4.7
+ 50000 | step 2b: automatic-pair statement   | 5 |      65.4 |   63.1 |   67.6
+ 50000 | step 2c: ambiguity-hold statement   | 5 |      64.5 |   61.7 |   67.4
+ 50000 | step 3: delete (cascade + triggers) | 5 |    1978.2 | 1947.0 | 1984.6
+ 50000 | step 4: final evaluation            | 5 |    1636.8 | 1606.5 | 1680.7
+(27 rows)
+
+
+added by 20261006120000 (median current - median previous)
+ size  | previous_ms | current_ms | added_ms | added_pct
+-------+-------------+------------+----------+-----------
+  1000 |        47.0 |      152.4 |    105.5 |       225
+ 10000 |       415.6 |     1081.8 |    666.3 |       160
+ 50000 |      1981.4 |     5642.7 |   3661.3 |       185
+(3 rows)
+
+
+# ======================================================================================================================
+# REPEAT — hold_heavy, size 1000 only (one sample of run 2 was off):  BENCH_FIXTURE=hold_heavy run.sh 5 1 1000
+# (2026-10-07 15:14-15:15 UTC; timings only, the counts and plans are those of run 2)
+# ======================================================================================================================
+timings (milliseconds)
+ size |                phase                | n | median_ms | min_ms | max_ms
+------+-------------------------------------+---+-----------+--------+--------
+ 1000 | current                             | 5 |     156.1 |  149.7 |  174.7
+ 1000 | previous                            | 5 |      48.8 |   43.4 |   49.7
+ 1000 | step 1: first evaluation            | 5 |      48.7 |   44.2 |   49.2
+ 1000 | step 2: conversion                  | 5 |      17.6 |   16.7 |   21.7
+ 1000 | step 2a: user-pair statement        | 5 |       3.2 |    2.9 |    3.7
+ 1000 | step 2b: automatic-pair statement   | 5 |       5.6 |    5.2 |    5.8
+ 1000 | step 2c: ambiguity-hold statement   | 5 |       8.5 |    8.2 |   12.1
+ 1000 | step 3: delete (cascade + triggers) | 5 |      42.0 |   38.8 |   44.0
+ 1000 | step 4: final evaluation            | 5 |      33.4 |   31.8 |   34.2
+(9 rows)
+
+
+added by 20261006120000 (median current - median previous)
+ size | previous_ms | current_ms | added_ms | added_pct
+------+-------------+------------+----------+-----------
+ 1000 |        48.8 |      156.1 |    107.3 |       220
+(1 row)
+
+
+# ======================================================================================================================
+# BASELINE — revision 4 re-measured on this machine (2026-10-07 14:50-14:56 UTC; no other container running).
+# The archived revision 4 tree (r4_candidate_tree_ac01db6b.lf.tar: body f19b079c87a102ef1f5541f7394fcb82), its own
+# migrations, bench.cjs and run.sh, extracted to a scratch directory outside the repository. Timings only.
+# ======================================================================================================================
+timings (milliseconds)
+ size  |                phase                | n | median_ms | min_ms | max_ms
+-------+-------------------------------------+---+-----------+--------+--------
+  1000 | current                             | 5 |     137.1 |  126.7 |  156.4
+  1000 | previous                            | 5 |      46.0 |   43.1 |   47.6
+  1000 | step 1: first evaluation            | 5 |      42.0 |   39.3 |   48.3
+  1000 | step 2: conversion                  | 5 |      14.1 |   13.4 |   16.7
+  1000 | step 3: delete (cascade + triggers) | 5 |      42.3 |   41.1 |   43.0
+  1000 | step 4: final evaluation            | 5 |      24.8 |   22.8 |   25.0
+ 10000 | current                             | 5 |     930.8 |  877.3 |  977.3
+ 10000 | previous                            | 5 |     404.8 |  384.9 |  436.6
+ 10000 | step 1: first evaluation            | 5 |     302.5 |  279.8 |  307.9
+ 10000 | step 2: conversion                  | 5 |      25.0 |   24.7 |   40.0
+ 10000 | step 3: delete (cascade + triggers) | 5 |     404.3 |  389.7 |  409.1
+ 10000 | step 4: final evaluation            | 5 |     163.8 |  162.4 |  165.1
+ 50000 | current                             | 5 |    4411.7 | 4343.4 | 4452.1
+ 50000 | previous                            | 5 |    2048.0 | 2015.4 | 2089.6
+ 50000 | step 1: first evaluation            | 5 |    1437.5 | 1423.2 | 1453.4
+ 50000 | step 2: conversion                  | 5 |      77.0 |   70.0 |   83.1
+ 50000 | step 3: delete (cascade + triggers) | 5 |    2059.1 | 2040.3 | 2113.1
+ 50000 | step 4: final evaluation            | 5 |     840.7 |  821.3 |  884.0
+(18 rows)
+
+
+added by 20261006120000 (median current - median previous)
+ size  | previous_ms | current_ms | added_ms | added_pct
+-------+-------------+------------+----------+-----------
+  1000 |        46.0 |      137.1 |     91.2 |       198
+ 10000 |       404.8 |      930.8 |    526.0 |       130
+ 50000 |      2048.0 |     4411.7 |   2363.7 |       115
+(3 rows)
+
+
+# ======================================================================================================================
+# FOR THE RECORD — the first pass of the base fixture (2026-10-07 14:15-14:34 UTC), DISTURBED: 7 to 11 other test
+# containers were busy. Not used in any comparison above. (That pass still took the ambiguity-hold plan before the three
+# statements; the script was changed afterwards to take it where the statement runs.)
+# ======================================================================================================================
+timings (milliseconds)
+ size  |                phase                | n | median_ms | min_ms | max_ms
+-------+-------------------------------------+---+-----------+--------+---------
+  1000 | current                             | 5 |     640.3 |  477.8 |   652.8
+  1000 | previous                            | 5 |     132.0 |  117.0 |   201.5
+  1000 | step 1: first evaluation            | 5 |     169.1 |  109.4 |   271.5
+  1000 | step 2: conversion                  | 5 |      48.8 |   37.5 |    50.0
+  1000 | step 2a: user-pair statement        | 5 |      10.3 |    7.3 |    15.7
+  1000 | step 2b: automatic-pair statement   | 5 |      16.5 |   10.1 |    21.6
+  1000 | step 2c: ambiguity-hold statement   | 5 |      18.3 |   16.6 |    20.0
+  1000 | step 3: delete (cascade + triggers) | 5 |     152.9 |  114.5 |   171.9
+  1000 | step 4: final evaluation            | 5 |      91.7 |   76.7 |   107.3
+ 10000 | current                             | 5 |    3620.0 | 2752.8 |  4534.7
+ 10000 | previous                            | 5 |    1982.1 | 1308.1 |  2037.8
+ 10000 | step 1: first evaluation            | 5 |    1197.2 |  831.7 |  1710.2
+ 10000 | step 2: conversion                  | 5 |     142.3 |   67.6 |   152.8
+ 10000 | step 2a: user-pair statement        | 5 |      15.0 |    6.1 |    31.9
+ 10000 | step 2b: automatic-pair statement   | 5 |      63.3 |   38.3 |    95.8
+ 10000 | step 2c: ambiguity-hold statement   | 5 |      40.6 |   23.3 |    64.0
+ 10000 | step 3: delete (cascade + triggers) | 5 |    1734.8 | 1393.3 |  2245.5
+ 10000 | step 4: final evaluation            | 5 |     736.9 |  470.1 |  1074.7
+ 50000 | current                             | 5 |   12685.8 | 4405.2 | 23725.3
+ 50000 | previous                            | 5 |    5860.6 | 2955.2 | 10477.5
+ 50000 | step 1: first evaluation            | 5 |    3642.0 | 1459.9 |  7503.4
+ 50000 | step 2: conversion                  | 5 |     226.3 |   81.7 |   568.0
+ 50000 | step 2a: user-pair statement        | 5 |       7.4 |    3.8 |    19.1
+ 50000 | step 2b: automatic-pair statement   | 5 |     189.5 |   64.4 |   481.1
+ 50000 | step 2c: ambiguity-hold statement   | 5 |      29.4 |   13.6 |    72.5
+ 50000 | step 3: delete (cascade + triggers) | 5 |    5152.3 | 2034.7 |  8838.8
+ 50000 | step 4: final evaluation            | 5 |    2586.7 |  834.9 |  3622.3
+(27 rows)
+
+
+added by 20261006120000 (median current - median previous)
+ size  | previous_ms | current_ms | added_ms | added_pct
+-------+-------------+------------+----------+-----------
+  1000 |       132.0 |      640.3 |    508.3 |       385
+ 10000 |      1982.1 |     3620.0 |   1638.0 |        83
+ 50000 |      5860.6 |    12685.8 |   6825.1 |       116
+(3 rows)
+
+
+# ======================================================================================================================
+# ATTRIBUTION — where the final evaluation's time goes at 50,000, base against hold_heavy.
+# A one-off diagnostic, NOT produced by run.sh: in a container this harness started (KEEP=1, removed afterwards), one
+# fixture of each variant was built with bench.build, removed with public.remove_plaid_item_local, and then evaluated
+# once more with pg_stat_statements.track = 'all' (every statement inside the function is counted; the tracking adds
+# a little to each). That evaluation does the work of the removal's final evaluation: the same rows, the same live
+# decisions. Times in ms. Single runs, no repetition: read them as proportions.
+# ======================================================================================================================
+#
+#   statement inside evaluate_card_payments                          base             hold_heavy
+#                                                                 calls   total      calls   total
+#   whole evaluation                                                  1   846.3          1  1729.5
+#   candidates of each unresolved leg (second pass)                   0       -        500   293.3
+#   tier 1 statement (insert into cpe_tier1 ...)                      1    62.3          1   228.2
+#   copy of the user's rows (insert into cpe_txn ...)                 1   322.7          1   373.5
+#   insert into card_payment_leg_states                            1500    33.7       2000    70.2
+#   decision loop: lineage by Plaid id                              500     3.2       1500     9.4
+#   decision loop: lineage by pending id                            500     2.0       1500     5.3
+#   decision loop: select * from cpe_txn where id = ...             500     1.7       1500     5.4
+#   decision loop: insert into cpe_dec_result                       500     2.8       1000     5.5
+#   withholding the held pairs (delete from cpe_tier1 using cpe_hold)  -       -          1     6.4
+#   insert into card_payment_decision_states                          1     6.2          1    13.1
+#
+#   * The 500 live holds themselves: 1,000 more lineage lookups of each kind, 1,000 more row reads, 500 more result
+#     rows, one set-based delete and 500 more decision states — about 40 ms of statement time in a 1.7 s evaluation.
+#   * The candidate scan is the evaluator's existing cost of an unresolved leg (one pass over the opposite side of the
+#     pool per leg). The same 500 kept-card legs were unresolved BEFORE the removal and cost the same there (314.5 ms in
+#     the evaluation before the removal, hold_heavy). What revision 5 changes is that they stay unresolved after it.
+#   * The tier 1 statement is unchanged since 20260930120000. Its last join (best b1 join best b2) is planned as a
+#     nested loop over two CTE scans whenever "best" is estimated at 1 row, which the planner does here for a pool of
+#     up to roughly 2,400 legs with distinct amounts; it then compares every pair of legs that have a best candidate:
+#         pool 2,000 legs, 2,000 with a best candidate: Nested Loop, Rows Removed by Join Filter: 3998000, 266.6 ms
+#         pool 1,500 legs, 1,000 with a best candidate: Nested Loop, Rows Removed by Join Filter:  999000,  70.3 ms
+#         pool 2,500 legs (estimated 2 rows):           Hash Join,                                            8.9 ms
+#     (EXPLAIN ANALYZE of the statement's SELECT on the pool each evaluation left.) The same choice is in revision 4's
+#     numbers and in the base fixture's first evaluation (229.9 ms of 1429.7 there). It is why hold_heavy's FIRST
+#     evaluation is only 23% above base's although it has the 500 candidate scans: its pool of 2,500 legs gets the
+#     hash join. Not a revision 5 matter; reported separately.

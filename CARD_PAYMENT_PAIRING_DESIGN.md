@@ -22,6 +22,36 @@ PRs, nothing merged or released.**
   - **Credit-side `unresolved` legs** are published as "unresolved card credits"
     (`card_payments_unresolved_credit`), never as externally funded; their effect stays 0 (D5).
   - Retry-on-read, the removal integration, the frontend and the backfill are still not built.
+- **Since (2026-10-06, integration slice I3A — an implementation candidate under independent review,
+  nothing merged or released):** the removal integration of §4.7 (T9, acceptance test 18) exists in
+  migration `20261006120000`, which replaces the body of `remove_plaid_item_local`. See
+  `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md`. Trevor's decisions of 2026-10-06 settle what the first
+  review left open. All are implemented in the candidate:
+  - **Evaluation failures (§3.7).** The evaluation *before* the delete is strict: if it fails, nothing is
+    removed. The evaluation *after* the delete is best-effort, like every other RPC's closing
+    evaluation: if it fails, the removal still commits and the user is stale.
+  - **Explicit user confirmations (§3.2, §3.5, §4.7).** A user-confirmed pair with an account that is
+    removed survives as the user's own decision on the leg that is left — a new, additive decision kind,
+    `pair_counterpart_removed` (migration `20261006110000`) — and keeps holding that leg, active or
+    inactive, on either side. The system record `destination_removed_card` is unchanged and is used
+    for automatic pairs only. A confirmation whose removed side was invalid for a reason other than an
+    amount stays invalid whatever the surviving leg's amount later does.
+  - **Lock order (§3.7).** The removal locks the removed institution's account rows before it takes the
+    version row, as the released removal did.
+  - **A tie the removal would break (§3.2, §3.5, §4.7).** An unresolved leg does not become resolved
+    because one of its candidates was deleted: removal is not evidence. For a leg whose candidates were
+    on both sides of the removal, the removal records a **system ambiguity hold** on the pair that is
+    left — two additive decision kinds and one date column, also in migration `20261006110000`. A hold
+    publishes no effect, is not a user decision and has no user-strength precedence. It ends by itself
+    when the evidence changes, or when the user decides. The rule is about the matching evidence, not
+    about what a reader is shown: a leg on an account excluded from cash flow is covered like any other.
+  - **An automatic match the removal would switch (§3.2, §4.7; "Option B").** A payment that was
+    automatically matched to a card of the removed institution keeps its recorded destination. It does
+    not switch automatically to another card that was already there, solely because the original
+    destination disappeared: the same hold, on that pair, withholds it. No new kind, column or evaluator
+    rule was needed.
+  - Retry-on-read, background recovery, evaluation after other user actions and the backfill are still
+    not built.
 
 *Original status line (rev 3, 2026-09-29), kept for history:* proposal for review — nothing
 implemented. There is no migration, endpoint or live-calculation change.
@@ -148,19 +178,23 @@ assumes an answer (§6).
 | `untracked` | `partner_excluded` | payment −, return + | Tier 1 or user pair with a leg on an **excluded** card |
 | `untracked` | `no_included_card` | payment −, return + | The user has no included credit account at all, so no leg can be tracked |
 | `untracked` | `user_confirmed_unlinked` | payment −, return + | The user said "this went to a card I haven't linked" — for this transaction |
-| `untracked` | `removed_card` | payment −, return + | Its pair's card was removed through LIM; converted in the removal transaction (§4.7, T9) |
+| `untracked` | `removed_card` | payment −, return + | Its pair's card was removed through LIM; preserved in the removal transaction (§4.7, T9): by the system record for an automatic pair, by the user's own preserved decision (`pair_counterpart_removed`) for a pair the user confirmed |
 | `unresolved` | `no_candidate` | one of the two | No candidate within the suggestion limits. The text varies with the leg's age and sync status |
 | `unresolved` | `possible_match` | one of the two | An exact-amount candidate the automatic rule cannot use |
 | `unresolved` | `amount_differs` | one of the two | A near-amount candidate |
-| `unresolved` | `ambiguous` | one of the two | An exact candidate within 5 days, but a tie or not reciprocal |
+| `unresolved` | `ambiguous` | one of the two | An exact candidate within 5 days, but a tie or not reciprocal — or the one pair that is left is withheld by a system ambiguity hold, because another candidate was removed with its institution (§4.7) |
 | `unresolved` | `matched_leg_not_posted` | one of the two | A user decision whose other leg is still waiting to post (§3.6) |
 | `unresolved` | `decision_invalidated` | one of the two | A user decision whose leg changed amount or role (§3.6) |
 | `unresolved` | `ambiguous_replacement` | one of the two | More than one posted row on the same account names this leg's pending id (§3.6, approved rule of 2026-09-30). Applies ahead of every precedence step below |
 
 Rules that apply throughout:
 - **Precedence**, when several apply to one leg:
-  1. an active **user** decision (a pair, or a confirmed unlinked destination);
-  2. then a **tier 1** pair;
+  1. an active **user** decision (a pair, a confirmed unlinked destination, or a pair preserved after
+     its other account was removed — `pair_counterpart_removed`, §4.7);
+  2. then a **tier 1** pair — unless a system ambiguity hold withholds exactly that pair (§4.7). A hold
+     is not a step of its own: it gives a leg no state and no effect. It only keeps a removal from
+     turning an old tie into a match, or from switching an automatically matched payment to a card that
+     was already there — that payment then falls to step 3 and reads its record;
   3. then `destination_removed_card` (system-written by a removal, §4.7);
   4. then `no_included_card`;
   5. otherwise unresolved.
@@ -245,15 +279,30 @@ All new tables:
 **`card_payment_decisions`** — what the user decided. It has **no foreign key to `transactions`.**
 - Columns:
   - `id`, `user_id`;
-  - `kind`: `pair` | `not_this_pair` | `destination_unlinked` | `destination_removed_card`;
+  - `kind`: `pair` | `not_this_pair` | `destination_unlinked` | `destination_removed_card` |
+    `pair_counterpart_removed` *(added 2026-10-06, §4.7: a USER decision — the user's pair after the
+    account of one of its legs was removed; written only by the removal)* |
+    `ambiguity_hold_removed_card` | `ambiguity_hold_removed_cash_account` *(added 2026-10-06, §4.7: SYSTEM
+    ambiguity holds on one possible pair of two legs that both survive; written only by the removal)*;
   - leg A: `a_account_id`, `a_plaid_transaction_id`, `a_cents`;
-  - leg B (null for single-leg kinds): the same three columns;
+  - leg B (null for single-leg kinds): the same three columns. For `pair_counterpart_removed`, leg A is
+    the leg that **survived** and leg B keeps only the **removed** leg's Plaid id and cents: `b_account_id`
+    is null, because that account no longer exists and nothing may reference it. For an ambiguity hold,
+    leg A is the card-side leg and leg B the cash-side leg of the possible pair, both on accounts that
+    exist;
+  - `counterpart_status` (`pair_counterpart_removed` only): what was true of the removed side when its
+    account was deleted, frozen — `valid`, `waiting_to_post`, or the reason the confirmation was invalid
+    on that side. A reason other than `amount_changed` is read before the surviving leg's own amount
+    and role (§4.7);
+  - `counterpart_date` (the two ambiguity holds only): the date of the candidate that was removed. Nothing
+    else of that candidate is kept;
   - `difference_cents` (pairs only; `|a_cents| − |b_cents|`, signed by which side is larger);
   - `created_at`, `decided_seq`, and `superseded_by` (for undo history).
 - Leg references use the **Plaid id at decision time**. §3.6 maps them onto the current row.
 - `*_account_id` references `accounts(id) on delete cascade`. That is safe: relinking an institution
   creates new accounts and new Plaid ids, so no replacement ever comes through a deleted account.
-  The LIM removal RPC converts pairs *before* the delete (§4.7).
+  The LIM removal RPC preserves what the pairs said *before* the delete (§4.7): a pair row itself still
+  goes with its account.
 - A foreign key to `transactions` would **not** be safe. Posting replaces the pending row on the
   same account, and a cascade would erase the confirmation the replacement needs.
 - **Purge:** only when every referenced lineage has been `gone` (§3.6) for more than 30 days — the
@@ -493,8 +542,55 @@ holds, while that writer waits on L2 for its own bump. That is a cycle.
       that is the only retry for now: the "retries after commit" of the bullet below is not built for it
       (retry-on-read is later work).
     - **Unchanged:** the decision RPCs still evaluate in-RPC.
-    - **Still open:** institution removal (packet 2b-2b); retry-on-read and evaluation after other user
-      actions (later slices).
+    - **Still open:** retry-on-read and evaluation after other user actions (later slices). Institution
+      removal (formerly "packet 2b-2b") is the I3A candidate described in the next bullet.
+  - **The removal path (integration slice I3A; failure contract approved by Trevor, 2026-10-06).**
+    `remove_plaid_item_local` evaluates **twice in its own transaction**:
+    - **before its deletes, strictly** (`evaluate_card_payments`), because the conversion of §4.7 must
+      be computed from the rows as they are now — never from stored states, which may be stale or
+      missing. If this evaluation or the conversion fails, the call raises: the whole removal rolls
+      back and stays retryable. A removal that cannot learn, or cannot preserve, what is known does not
+      happen. This is the one place where an evaluation failure blocks a write;
+    - **as its last statement, best-effort** (`try_evaluate_card_payments`), so a removal normally
+      commits fresh states for the rows that are left. If this evaluation fails, only it rolls back:
+      the removal commits, `evaluated_version` stays behind `input_version`, `last_error_code` records
+      the SQLSTATE, and no state is readable until a later evaluation succeeds. That is the "On
+      failure" rule below, unchanged.
+
+    **What "a failure rolls back the whole removal" means (acceptance test 18).** It refers to a
+    failure of the preservation-and-removal transaction itself: its checks, the first evaluation, the
+    conversion, the version bumps, the deletes. A failure of the final derived-state evaluation, after
+    the evidence and the removal are safely established, leaves the committed user stale. It does not
+    undo the removal.
+
+    **Recovery from that stale state is not built for the removal path.** The next sync's evaluation
+    (flag on) or a standalone evaluation recovers the user. A replay of a cleaned removal evaluates
+    nothing, and the decision RPCs refuse a stale user.
+
+    The freshness rule is unchanged. The first evaluation's lock on the version row (L2) is held to the
+    end of the transaction, so no other writer's input change can commit between the preservation, the
+    delete and the final publication.
+
+    **Lock order of the removal (approved 2026-10-06).** L1 first. Then, before the first evaluation
+    takes L2, the removal locks the removed institution's **account rows**, in id order, with the lock
+    their delete takes (`FOR UPDATE`). The released removal reached those rows — its cascade's delete —
+    before its first version bump; taking L2 earlier without this would have turned a wait into a
+    deadlock for a lock-free writer that holds one of them (the account-settings update, or an insert
+    that references the account). A lock-free writer that holds a **transaction** row of the removed
+    institution is unchanged: the same PostgreSQL-detected, retryable deadlock as under the released
+    removal, which also held L2 before it deleted any transaction. The global lock hierarchy is not
+    redesigned.
+
+    **Surviving accounts.** The preservation's inserts take the foreign-key lock (`KEY SHARE`) on the
+    surviving accounts they name, while L2 is held — also on the kept account of a card that a hold
+    names. A lock-free account-settings update on such an account holds its row `FOR NO KEY UPDATE`,
+    which does not conflict: the removal does not wait for it, and the writer's later version bump
+    leaves the user stale, never falsely fresh (concurrency `c36`).
+
+    **The removal reads the evaluator's scratch tables.** The statement that writes the ambiguity holds
+    of §4.7 reads the complete matching pool as the strict evaluation leaves it in the same transaction
+    (`pg_temp.cpe_pool`, `cpe_txn`, `cpe_tier1`, `cpe_dismissed`). A later change that replaces
+    `evaluate_card_payments` must replace, or guard on, `remove_plaid_item_local` with it.
 - **On failure** only the evaluation rolls back. The write commits, `evaluated_version` stays behind
   `input_version`, `last_error_code` records a sanitized code, and the backend retries after commit
   and on the next sync. **A failed evaluation never blocks the sync and never leaves a stale state
@@ -630,15 +726,26 @@ C +250 to a card Z that was never linked:
   labelled "funded from an excluded account" (0).
 
 ### 4.7 Removal, relinking, stale institutions
-- **LIM removal of the card's institution** *(T9)*. In the same transaction as the removal, and
-  **before** its deletes, the RPC converts every tier 1 or user pair between a removed card leg and a
-  surviving cash leg into a `destination_removed_card` decision on the surviving leg. The removed
-  leg's pair was the evidence of the destination, and that card is now outside the tracked set.
+- **LIM removal of the card's institution** *(T9; amended 2026-10-06)*. In the same transaction as the
+  removal, and **before** its deletes, the RPC preserves every pair between a removed card leg and a
+  surviving cash leg, on the surviving leg: a **tier 1** pair as a `destination_removed_card` decision
+  (the system record); a **user-confirmed** pair as the user's own decision, `pair_counterpart_removed`
+  (below). The removed leg's pair was the evidence of the destination, and that card is now outside the
+  tracked set. *(Before the amendment a user pair became the system record too. That downgraded an
+  explicit confirmation to a record that reserves nothing.)*
   - Those cash legs become `untracked / removed_card` → past months change from 0 to −amount.
   - This is correct under D5, because the tracked set shrank.
   - The removal confirmation says so: "Payments from your other accounts to this card will count as
     money leaving your tracked accounts."
-  - Cash legs that were already unresolved stay unresolved.
+  - Legs that were already unresolved **stay unresolved** *(approved 2026-10-06)*. Removal is not
+    evidence: such a leg gets no destination. And deleting one of its candidates is not evidence for
+    another one: a leg does not become resolved merely because the removal deleted a candidate. Where
+    that could happen, the removal records a system ambiguity hold (below). A later evaluation resolves
+    such a leg when genuinely new or changed evidence supports it under the ordinary rules, or when the
+    user decides.
+  - A payment that was **automatically matched** to the removed card **is not switched** to another
+    card that was already there *(approved 2026-10-06, below)*. The disappearance of a destination is
+    not evidence for another one. The payment keeps reading its record.
 - **Relinking** creates new accounts and Plaid ids. A `destination_removed_card` decision ranks below
   a tier 1 pair (§3.2 precedence). When the relinked card's history re-imports the matching legs, the
   cash legs become `tracked` again automatically, and the decision stays as dormant history.
@@ -654,6 +761,235 @@ C +250 to a card Z that was never linked:
   reserve the leg.
 - **A card item that is not syncing** changes wording only: "Reconnect Sapphire to finish matching 2
   payments". It is never evidence.
+
+**How the removal rule is implemented (integration slice I3A, 2026-10-06 — a candidate under
+independent review; `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md`).** Where the rule's wording leaves a case
+open, the candidate does this:
+- **Which pairs.** The cash-side legs that an evaluation made inside the removal gives a partner on an
+  account of the removed institution: tier 1 pairs and *active* user pairs, with an included **or an
+  excluded** card. A pair with an excluded card already counted −amount; it keeps that effect, as
+  `removed_card` instead of `partner_excluded`.
+- **Which leg.** Only a cash leg on an account of **another** institution survives and is converted. A
+  cash leg on the removed institution is deleted with it. A surviving card leg whose cash leg is removed
+  gets no destination record: a credit-side leg never moves cash flow (§2). Where a kept cash leg also
+  fitted it, it gets a hold (below).
+- **A leg on an excluded cash account** is converted too. It stays not counted; if the account is
+  included later, the preserved destination applies.
+- **The record's key** is the surviving leg's own lineage key at that moment: its account, its own Plaid
+  id (the pending id while it is pending) and its cents. A leg that already has a live record with
+  exactly that key gets no second one.
+- **A pair with a difference** (§4.3) becomes the whole cash leg: −80, not −2. The card is outside the
+  tracked set now, as with an excluded card.
+- **The warning** ("Payments from your other accounts to this card will count as money leaving your
+  tracked accounts") is **not** shown yet. The removal preview already lists the institution's accounts
+  with their types, so the confirmation can show it without an API change; that copy change is left for
+  the frontend packet.
+
+**Explicit user confirmations through a removal — approved (Trevor, 2026-10-06) and implemented in the
+I3A candidate.** A permanent removal must not erase explicit user-confirmed evidence merely because the
+confirmation is temporarily inactive. It must not release the surviving leg for automatic reuse because
+the other account is being deleted. User-confirmed evidence is distinguished from automatic (tier 1)
+evidence:
+- **Active.** An active user pair is preserved at user strength too. It is not downgraded to the
+  system record. While the surviving leg's amount, direction and lineage stay valid, it gives the
+  removed-destination effect, and it stays stronger than later tier 1 evidence until the user undoes or
+  replaces it.
+- **Waiting to post** (lineage unambiguous; amount and direction not invalidated). The confirmation is
+  preserved, stays stronger than automatic matching and keeps its reservation. Once the surviving
+  lineage is determinable, the removed destination gives the removed-card effect.
+- **Amount changed.** The decision, its history and its reservation are preserved. The old amount is
+  not proof: the leg stays unresolved unless current independent evidence already establishes the
+  effect under the existing rules. A removal never makes an invalid confirmation valid again.
+  - That independent evidence is the "no included card" rule, and it applies only where an **amount**
+    is the only thing wrong — the surviving leg's, the removed leg's, or both. A confirmation whose
+    removed side was invalid for any other reason stays unresolved whatever the surviving leg's amount
+    later does: a correction of the leg that survived resolves nothing about the side that is gone.
+- **Conflicting replacement lineage.** Preserved and reserved; unresolved. No replacement is chosen and
+  no removed-card effect is published. If later data resolves the ambiguity, the existing rules
+  re-evaluate.
+- **Automatic (tier 1) evidence** keeps the system record described above: non-reserving, below every
+  user decision, dormant after a relink, never proof once invalidated.
+- **Relinking.** Preserved user intent keeps its precedence: tier 1 evidence from the relinked card is
+  listed as a suggestion and never applied by itself. An invalidated or ambiguous confirmation does not
+  become a valid effect because a relink occurs. The "no included card" rule can still establish an
+  effect by itself; that is not a reactivation of the old confirmation.
+- **The mirror case.** When the **cash** account is the one removed and the card leg survives, the
+  confirmation is preserved on the card leg in the same way. The card leg must not become free to pair
+  with another cash leg. No cash-flow effect is invented for it: a credit-side leg's effect is 0; the
+  leg reads `funded_from_excluded` (reason `removed_cash_account`) — its funding is outside the tracked
+  set.
+- **Passive invalidation is not a newer user action.** History and reservation are kept across passive
+  data or lifecycle changes: waiting to post, an amount change, conflicting lineage, a row the classifier
+  re-classified, a row the bank withdrew. But **a newer explicit user action supersedes an older
+  confirmation**, which is then neither carried forward nor allowed to keep reserving: an undo, a
+  replacement by another decision, or the user re-classifying one of the two legs away from card payment.
+
+**How it is represented (the smallest additive form; migration `20261006110000`).** The existing
+decision model could not hold it: the only removed-card kind is the non-reserving system one; the only
+reserving single-leg kind means "unlinked" and cannot stay invalid for a reason on the removed side; and
+a pair cannot outlive its account. So:
+- one new decision kind, `pair_counterpart_removed`, a **user** decision on the surviving leg, keyed
+  exactly as the pair recorded that leg;
+- the removed leg's Plaid id and cents stay in leg B **without an account** (no dangling reference, no
+  foreign key weakened), with the pair's accepted difference;
+- one new column, `counterpart_status`, freezes what was true of the removed side: `valid` and
+  `waiting_to_post` invalidate nothing; any other value keeps the decision inactive for good.
+
+The evaluator reads it as a user decision: it claims its row, active or not. Active → `untracked /
+removed_card` on the cash side, `funded_from_excluded / removed_cash_account` (0) on the credit side.
+Inactive → reserved and unresolved. `link_card_payment` and `mark_card_payment_destination` supersede
+it like any other user decision; undo releases it.
+
+The order in which the frozen status is read, after the surviving reference's own lineage (the SQL
+evaluator and the TypeScript reference, the same rule):
+1. a frozen status other than `valid`, `waiting_to_post` and `amount_changed` is the decision's
+   inactive reason, whatever the surviving leg's amount or role is now;
+2. then the surviving leg's amount (`amount_changed`), then its role (`role_changed`);
+3. then a frozen `amount_changed`;
+4. otherwise the decision is active.
+
+So the "no included card" exception, which accepts only `amount_changed`, is never reached by another
+frozen reason. *(An earlier candidate read the surviving leg's amount first: a frozen
+`lineage_ambiguous` with a corrected surviving amount read `amount_changed` and, with no included
+card, published an effect.)*
+
+Tests: `a20_lim_removal_user_confirmations.sql` (nine cases, each with a competing leg; it was written
+before the behaviour existed and failed against the earlier candidate), `a21_lim_removal_user_intent.sql`
+(passive invalidation against newer explicit user actions), `a24_lim_removal_frozen_invalidity.sql`
+(a frozen invalidity is never masked by a surviving amount correction: through the real removal, and
+for all ten frozen statuses, each also with its surviving payment re-classified afterwards), sequences
+Q11 and Q14 and scenarios S32–S50 and S77–S82 of the evaluator-equivalence harness, and the reference
+evaluator's own tests and invariants I11 and I12.
+
+**A tie the removal would break: the system ambiguity hold — approved (Trevor, 2026-10-06) and
+implemented in the I3A candidate.** If a leg is unresolved before a removal because of a genuine tie or
+ambiguity between an account being removed and one or more accounts that remain, the removal must not
+resolve it. Deleting one candidate is not new evidence that another was the true destination.
+- **What is held.** A surviving leg with no automatic match whose tier 1 candidates include at least
+  one leg of the removed institution **and** at least one leg that survives. Either side: a payment that
+  a removed card and a kept card both fitted, or a card leg that a removed cash leg and a kept cash leg
+  both fitted.
+- **Judged on the matching evidence, not on what a reader is shown.** The removal reads this from the
+  evaluator's complete pool — the scratch tables its own strict evaluation leaves in the transaction —
+  and not from the published states. A leg on an account that is excluded from cash flow takes part in
+  tier 1 like any other, but is published `not_counted`, with no candidates. A payment that the "no
+  included card" rule or an earlier removal's record decides is published `untracked`. Each of them can
+  have candidates on both sides of a removal, and is then held like a leg that reads unresolved. *(An
+  earlier candidate read the published states and missed them: a kept payment was paired with the leg
+  of a kept excluded card as soon as a removed payment that fitted that leg equally well was deleted.)*
+- **What is not held.** A leg whose candidates were all on one side of the removal: there is no
+  ambiguity for the removal to resolve, and the ordinary rules go on applying to it. Nor a leg whose
+  automatic match stays, or one that a user decision holds. Unresolved payments are not frozen in
+  general.
+- **No effect.** The hold publishes nothing: no removed-card effect and no tracked pair. The leg reads
+  what it read before the removal — unresolved, with its range; not counted, on an excluded account —
+  and its candidates, where a reader is shown any, are still listed. One reading changes through the
+  removal itself: if it took the user's last included card, an included cash leg that was unresolved
+  reads `untracked / no_included_card`. A leg that was matched automatically to the removed
+  institution (the second case, below) no longer reads that match: a cash leg reads its system record —
+  `untracked / removed_card`, a definite figure — and a card leg reads unresolved; on an excluded
+  account either still reads not counted.
+- **System strength.** The hold is not a user decision. It claims no leg, is never the decision named
+  on a leg, and ranks below every user decision, a preserved one included. It does not say that either
+  destination was confirmed.
+- **Not permanent.** A later evaluation resolves the leg when genuinely new or changed evidence
+  supports it under the ordinary rules:
+  - a **new transaction**, or the re-imported leg of a **relinked** card, is not the hold's concern: it
+    pairs, or ties, by the ordinary rules. It does not release the hold's own pair, which stays judged
+    against the removed candidate's stored date — after a relink too, whatever date the re-imported leg
+    has (recorded as open: `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3, question 7);
+  - a **changed amount** on either leg ends the hold;
+  - a **date change** releases the pair when it brings the kept candidate strictly closer than the
+    removed one was, and not otherwise;
+  - a leg that **posts** with the same amount is the same leg, not new evidence; if it posts on another
+    date, that is judged like any date change;
+  - an **explicit user decision** — a match, "a card I haven't linked", a dismissal — works as if no hold
+    existed, and decides the legs it names. If the user later undoes it, the pair is withheld again. A
+    decision about another leg does not release the hold's own pair.
+- **Precedence.** A newer explicit user action, then a preserved explicit user confirmation, then
+  current automatic evidence subject to the hold, then ordinary system history.
+
+**How it is represented (the smallest additive form; migration `20261006110000`).** A hold is a record
+on **one possible pair**: the two surviving legs that would otherwise be matched.
+- two decision kinds, `ambiguity_hold_removed_card` and `ambiguity_hold_removed_cash_account`, both
+  system-written. Leg A is the card-side leg and leg B the cash-side leg, with their accounts — the
+  ordinary references, so the record goes with either account;
+- one new column, `counterpart_date`: the removed candidate's date;
+- the **kind** says which of the two legs the removed candidate competed for: the cash leg when a card
+  leg was removed, the card leg when a cash leg was.
+
+Why each part is needed:
+- *The pair, not just the leg.* The hold must stop the old candidate from being proven by the deletion,
+  and must leave a new one alone. A record on the leg alone would also stand in the way of the relinked
+  card's re-imported leg.
+- *The date.* Whether a later date change breaks the old tie depends on where the removed candidate
+  was, and no existing column holds a date.
+- *Two kinds rather than the order of the legs.* The card leg is written first on purpose. An evaluator
+  that does not know these kinds (after the migration's rollback) then reads the record as an inactive
+  decision that holds both legs — not as a confirmed pair, while the card leg's account is a credit
+  account. That reading is not harmless once a hold stands on a payment with a known figure: see the
+  rollback notes in `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §7.
+
+The evaluator computes tier 1 exactly as before. Then it withholds the automatic pair of a hold's own
+two legs while the hold applies — both legs current card legs, on opposite sides, with the recorded
+cents — and the removed candidate would still be at least as close to the leg it competed for as that
+leg's partner is, on the dates as they are now. Nothing else changes: both legs stay in the pool, no
+other pair is formed in the withheld pair's place, and a pair with any other leg is evaluated as always.
+The user cannot undo a hold (`undo_card_payment_decision` refuses it, as it refuses the system record);
+no other RPC reads one.
+
+Tests: `a22_lim_removal_ambiguity_hold.sql` (the contract's own test: the two-way tie, three candidates,
+later evidence of each kind, the user's decision, a relink, a second removal, a candidate the user had
+dismissed — removed or kept — and a removed leg outside the five days, the mirror case, ownership),
+`a23_lim_removal_excluded_accounts.sql` (the same contract where an excluded account is involved, on
+either side; a payment the "no included card" rule decides, as the hold's other leg and as the owner of
+the tie; and four shapes with no ambiguity, where nothing is written), `a21` case T, sequences Q12 and
+Q13 and scenarios S51–S76 and S83–S86 of the evaluator-equivalence harness, and the reference
+evaluator's own tests and invariant I13.
+
+**A payment that was automatically matched to the removed card — approved (Trevor, 2026-10-06,
+"Option B") and implemented in the I3A candidate.** A payment that was automatically matched to a card
+of the removed institution must not automatically switch to another card that was already there, solely
+because the original destination disappeared. Institution removal is not new financial evidence.
+*(Before this decision such a payment kept only the system record, which ranks below tier 1: a kept
+card's fitting leg within five days then paired automatically, and the record went dormant.)*
+- **Two cases stay distinct.** A payment that was *resolved* by automatic matching to the removed card
+  keeps its known removed destination and its treatment: the system record, `untracked / removed_card`,
+  −amount. A payment that was genuinely *unresolved* — a tie — stays unresolved and gets no
+  destination. Known removed-destination evidence is not collapsed into an ambiguity.
+- **Pair-specific, system strength.** The protection claims no leg and publishes nothing. It is on the
+  pair of the payment and the competitor that was already there, and on nothing else. New evidence (a
+  new, strictly closer leg), changed evidence (an amount; a date that brings the competitor strictly
+  closer than the removed candidate was), the re-imported leg of a relinked card and the user's decision
+  are evaluated as always. One limit after a relink is recorded as open (the slice document's §9.3,
+  question 7): the hold keeps judging its pair against the stored date of the leg that was removed.
+- **Nothing is written where there is nothing to protect against:** no competitor, an automatic match
+  that stays, or a kept leg outside the five-day window.
+- **The mirror.** When the **cash** institution is removed, a kept card leg that was matched
+  automatically to a removed cash leg is held against the kept cash legs that also fitted it. There is no
+  destination record for a card leg. It reads unresolved (effect 0), and the kept cash leg is not read
+  as a tracked payment.
+
+**How it is implemented (migration `20261006120000`).** No new kind, column or evaluator rule, and
+`destination_removed_card` is not promoted above tier 1:
+- the removal still writes the system record on the payment;
+- the statement that writes the holds also takes as an *owner* a pool leg whose tier 1 partner is on
+  the removed institution, and writes the existing ambiguity hold on the pair of that owner and each
+  kept tier 1 candidate, dated by each removed tier 1 candidate;
+- after the removal tier 1 forms the pair with the kept competitor, the hold withholds it, and the
+  payment falls to the next step of §3.2: it reads its record;
+- an owner gets a hold for **every** removed tier 1 candidate, not only for its partner. The evaluator
+  judges a hold on the dates as they then are, and the owner itself can be re-dated when it posts.
+
+Tests: `a25_lim_removal_automatic_destination.sql` (the approved example; no competitor; a tie; several
+competitors; new, changed and unchanged evidence of each kind, an unchanged posting of the payment and
+of the kept card's leg included; a relink and a second removal; the user's confirmation and later
+decisions; excluded accounts; the mirror; ownership), `a21` case E-undo (which pinned the opposite
+before this decision), concurrency `c36`, and sequence Q15 and scenarios S87–S94 of the
+evaluator-equivalence harness.
+
+**Left for a decision.** Seven questions that revision 5 of the I3A candidate records and does not
+decide are in `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3.
 
 ### 4.8 Pending → posted — every order
 
@@ -992,10 +1328,39 @@ future review path that does not make the user guess; it is not built.
     - the pairs are converted before the deletes, in the same transaction;
     - cash legs become `removed_card`;
     - the version is bumped;
-    - a failure rolls back the whole removal;
+    - a failure rolls back the whole removal — a failure of the preservation-and-removal transaction
+      itself. A failure of the final, best-effort evaluation commits the removal and leaves the user
+      stale; a later evaluation recovers (§3.7; Trevor, 2026-10-06);
     - after relinking, re-imported matching legs re-track via tier 1 (precedence, §3.2);
     - an active user decision is never overridden by a later tier 1 pair; the pair is shown as a
-      suggestion instead.
+      suggestion instead;
+    - an explicit user confirmation that names a removed account survives the removal with its
+      reservation, active or inactive, on either side, and its leg never pairs automatically with a
+      competitor; a confirmation the user has since superseded is not carried forward (§4.7; Trevor,
+      2026-10-06);
+    - an unresolved leg whose candidates were on both sides of the removal is not resolved by it: it
+      does not pair with the candidate that is left, publishes no effect, and resolves later only on new
+      or changed evidence or by the user's decision (§4.7; Trevor, 2026-10-06);
+    - the same where an account excluded from cash flow is involved, on either side, and for a payment
+      the "no included card" rule decides: the ambiguity is judged on the complete matching pool, not on
+      the published states; where there is none, nothing is written (§4.7);
+    - a preserved confirmation whose removed side was invalid for a reason other than an amount stays
+      reserved and unresolved whatever the surviving leg's amount later does; the "no included card"
+      exception applies only where an amount is the only thing wrong (§4.7);
+    - a payment that was automatically matched to the removed card keeps its recorded destination and
+      is not switched to a card that was already there; a tie stays a distinct, unresolved case; new or
+      changed evidence, a relinked card and the user's decision are evaluated as always (§4.7; Trevor,
+      2026-10-06);
+    - a lock-free writer holding an account row of the removed institution makes the removal wait; it
+      does not deadlock (§3.7; Trevor, 2026-10-06). One holding the row of a surviving account that a
+      hold names does not make the removal wait, and ends stale, never falsely fresh (§3.7).
+
+    *(I3A candidate: `supabase/tests/access_control/sql/a18_lim_removal_card_payments.sql`,
+    `a19_lim_removal_card_payments_atomicity.sql`, `a20_lim_removal_user_confirmations.sql`,
+    `a21_lim_removal_user_intent.sql`, `a22_lim_removal_ambiguity_hold.sql`,
+    `a23_lim_removal_excluded_accounts.sql`, `a24_lim_removal_frozen_invalidity.sql`,
+    `a25_lim_removal_automatic_destination.sql`, concurrency `c26`–`c36`, and sequences Q9–Q15 of
+    `supabase/tests/card_payment_evaluator/rpc_sequences.sql`.)*
 19. **Role override away / to** card payment: decisions are invalidated, or the row joins the pool,
     in the same RPC. The evaluation runs before commit.
 20. **Same-user ownership:**
@@ -1014,7 +1379,9 @@ future review path that does not make the user guess; it is not built.
     - link vs role override on the same leg;
     - an account inclusion toggle vs evaluation;
     - a lock-free direct update during evaluation: the user ends stale, never falsely fresh;
-    - a LIM removal vs a link on a leg of that card.
+    - a LIM removal vs a link on a leg of that card. *(I3A candidate: `concurrency/c26`–`c33` — both
+      orders of removal vs link, vs a standalone evaluation and vs the posting of the surviving leg; a
+      lock-free writer after the removal's publication; and the removal's L1-before-L2 order.)*
 22. **Grants:** no `anon` / `authenticated` privilege on the new tables. RPCs are service-role only,
     SECURITY INVOKER, with an empty `search_path`. The trigger functions are executable by no role.
 23. **Audit:** `supabase/tests/card_payment_audit/run.sh` passes (R1–R7 included).

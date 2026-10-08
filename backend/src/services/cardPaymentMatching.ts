@@ -23,6 +23,24 @@
  * Precedence (§3.2): an active user decision; else (a leg claimed by an inactive user decision stays
  * unresolved — §3.6); else a tier 1 pair; else a removed-card decision; else no included card; else
  * unresolved with the reason from the candidates. Nothing else ever makes a leg untracked (§3.4).
+ * User decisions are `pair`, `destination_unlinked` and `pair_counterpart_removed` (a pair whose other
+ * account was permanently removed; it keeps holding the leg that survived). `destination_removed_card`
+ * is system-written, ranks below tier 1 and holds nothing.
+ * A preserved pair's frozen counterpart status is read in this order (revision 5, 2026-10-07): a frozen
+ * status other than valid / waiting_to_post / amount_changed is the decision's reason whatever the
+ * surviving leg's amount or role is now; then the surviving leg's amount, then its role; then a frozen
+ * amount change. So a later amount correction of the surviving leg never hides what was wrong with the
+ * side that is gone, and the known-effect exception sees `amount_changed` only for an amount.
+ *
+ * Ambiguity holds (APPROVED by Trevor, 2026-10-06): institution removal is not evidence. The two
+ * `ambiguity_hold_*` kinds are system-written on ONE possible pair of two surviving legs that a removed
+ * candidate stood in the way of. Tier 1 is computed as always; then the automatic pair of exactly those
+ * two legs is withheld while the removed candidate would still be at least as close to the leg it
+ * competed for as that leg's partner is. A hold claims nothing, publishes no effect, is never a leg's
+ * decision, and does not touch a pair with any other leg. The removal writes one where the leg had no
+ * automatic match (a tie, whatever the leg is shown as) AND where the leg was matched automatically to
+ * the removed institution while a leg that stays also fitted it ("Option B"): with that pair withheld,
+ * a cash leg reads its `destination_removed_card` record instead of switching to the other card.
  *
  * Conflicting replacements (APPROVED by Trevor, 2026-09-30): when more than one posted row on the same
  * user/account names the same pending id, the matching of every such row stays unresolved
@@ -86,21 +104,65 @@ export interface DecisionLegRef {
   cents: number;
 }
 
-export type DecisionKind = 'pair' | 'not_this_pair' | 'destination_unlinked' | 'destination_removed_card';
+export type DecisionKind =
+  | 'pair'
+  | 'not_this_pair'
+  | 'destination_unlinked'
+  | 'destination_removed_card'
+  /** A user-confirmed `pair` whose OTHER account was permanently removed (§4.7; Trevor, 2026-10-06).
+   *  USER strength: it holds the surviving leg like any user decision. Leg `a` is the surviving leg,
+   *  exactly as the pair recorded it; the removed leg is `counterpart`. */
+  | 'pair_counterpart_removed'
+  /** SYSTEM ambiguity holds, written by institution removal (§4.7; Trevor, 2026-10-06) on one possible
+   *  pair of two legs that both survive: `a` and `b`, on opposite sides. A candidate on the removed
+   *  institution, dated `counterpartDate`, stood in the way of that pair; removing it is not evidence
+   *  for the pair. The kind says which leg the removed candidate competed for: the cash-side leg when
+   *  a CARD leg was removed, the card-side leg when a CASH leg was. Not a user decision. */
+  | 'ambiguity_hold_removed_card'
+  | 'ambiguity_hold_removed_cash_account';
+
+/** What was true of a preserved pair's REMOVED side when its account was deleted. Frozen: that side
+ *  can never change again. `valid` and `waiting_to_post` invalidate nothing; every other value is the
+ *  reason the confirmation was invalid on that side, and keeps the decision inactive. */
+export type CounterpartStatus =
+  | 'valid'
+  | 'waiting_to_post'
+  | 'amount_changed'
+  | 'lineage_ambiguous'
+  | 'partner_gone'
+  | 'role_changed'
+  | 'sides_not_opposite'
+  | 'direction_mismatch'
+  | 'difference_not_accepted'
+  | 'conflicting_decisions';
+
+/** The removed leg of a `pair_counterpart_removed` decision: its reference as the pair recorded it
+ *  (history; no account — the account is gone) and its frozen status. */
+export interface RemovedCounterpart {
+  plaidTransactionId: string;
+  cents: number;
+  status: CounterpartStatus;
+}
 
 export interface MatchingDecision {
   id: string;
   userId: string;
   kind: DecisionKind;
   a: DecisionLegRef;
-  /** Required for `pair` and `not_this_pair`; null for the single-leg kinds. */
+  /** Required for `pair`, `not_this_pair` and the two ambiguity holds; null for the single-leg kinds. */
   b: DecisionLegRef | null;
-  /** `pair` only: |cash cents| − |credit cents| that the user explicitly accepted (0 for an exact
-   *  pair). Must equal the recorded legs' actual difference (§4.3, T6). Null for other kinds. */
+  /** `pair` and `pair_counterpart_removed`: |cash cents| − |credit cents| that the user explicitly
+   *  accepted (0 for an exact pair). For a `pair` it must equal the recorded legs' actual difference
+   *  (§4.3, T6). Null for other kinds. */
   acceptedDifferenceCents: number | null;
   decidedSeq: number;
   /** Set when the user undid or replaced it; a superseded decision is ignored. */
   supersededBy: string | null;
+  /** Required for `pair_counterpart_removed`; absent or null for every other kind. */
+  counterpart?: RemovedCounterpart | null;
+  /** Required for the two ambiguity holds (YYYY-MM-DD: the removed candidate's date); absent or null
+   *  for every other kind. */
+  counterpartDate?: string | null;
 }
 
 export interface CardPaymentMatchingInput {
@@ -133,6 +195,9 @@ export type CardLegReason =
   | 'no_included_card'
   | 'user_confirmed_unlinked'
   | 'removed_card'
+  /** Credit side only: the user-confirmed cash leg was on an account that was removed (the mirror of
+   *  `removed_card`). The card leg is funded from outside the tracked set; its effect is 0 as always. */
+  | 'removed_cash_account'
   | 'no_candidate'
   | 'possible_match'
   | 'amount_differs'
@@ -265,6 +330,25 @@ const DECISION_KINDS: ReadonlySet<string> = new Set<DecisionKind>([
   'not_this_pair',
   'destination_unlinked',
   'destination_removed_card',
+  'pair_counterpart_removed',
+  'ambiguity_hold_removed_card',
+  'ambiguity_hold_removed_cash_account',
+]);
+
+const isAmbiguityHold = (kind: DecisionKind): boolean =>
+  kind === 'ambiguity_hold_removed_card' || kind === 'ambiguity_hold_removed_cash_account';
+
+const COUNTERPART_STATUSES: ReadonlySet<string> = new Set<CounterpartStatus>([
+  'valid',
+  'waiting_to_post',
+  'amount_changed',
+  'lineage_ambiguous',
+  'partner_gone',
+  'role_changed',
+  'sides_not_opposite',
+  'direction_mismatch',
+  'difference_not_accepted',
+  'conflicting_decisions',
 ]);
 
 interface Leg {
@@ -332,19 +416,34 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
     if (decisionIds.has(d.id)) throw new CardPaymentMatchingIntegrityError(`duplicate decision id '${d.id}'`);
     decisionIds.add(d.id);
     if (!DECISION_KINDS.has(d.kind)) throw new CardPaymentMatchingIntegrityError(`decision '${d.id}' has unknown kind`);
-    const twoLeg = d.kind === 'pair' || d.kind === 'not_this_pair';
+    const twoLeg = d.kind === 'pair' || d.kind === 'not_this_pair' || isAmbiguityHold(d.kind);
     if (twoLeg !== (d.b !== null)) {
       throw new CardPaymentMatchingIntegrityError(`decision '${d.id}' (${d.kind}) has the wrong number of legs`);
     }
     for (const ref of d.b === null ? [d.a] : [d.a, d.b]) assertCents(ref.cents, `decision '${d.id}' leg cents`);
-    if (d.kind === 'pair') {
+    if (d.kind === 'pair' || d.kind === 'pair_counterpart_removed') {
       if (d.acceptedDifferenceCents === null) {
-        throw new CardPaymentMatchingIntegrityError(`pair decision '${d.id}' must record its accepted difference`);
+        throw new CardPaymentMatchingIntegrityError(`${d.kind} decision '${d.id}' must record its accepted difference`);
       }
       assertCents(d.acceptedDifferenceCents, `decision '${d.id}' acceptedDifferenceCents`);
     } else if (d.acceptedDifferenceCents !== null) {
       throw new CardPaymentMatchingIntegrityError(`decision '${d.id}' (${d.kind}) cannot carry an accepted difference`);
     }
+    const counterpart = d.counterpart ?? null;
+    if ((d.kind === 'pair_counterpart_removed') !== (counterpart !== null)) {
+      throw new CardPaymentMatchingIntegrityError(`decision '${d.id}' (${d.kind}) has the wrong removed-counterpart record`);
+    }
+    if (counterpart !== null) {
+      assertCents(counterpart.cents, `decision '${d.id}' counterpart cents`);
+      if (!COUNTERPART_STATUSES.has(counterpart.status)) {
+        throw new CardPaymentMatchingIntegrityError(`decision '${d.id}' has an unknown counterpart status`);
+      }
+    }
+    const counterpartDate = d.counterpartDate ?? null;
+    if (isAmbiguityHold(d.kind) !== (counterpartDate !== null)) {
+      throw new CardPaymentMatchingIntegrityError(`decision '${d.id}' (${d.kind}) has the wrong removed-candidate date`);
+    }
+    if (counterpartDate !== null) dayNumber(counterpartDate, `decision '${d.id}' counterpartDate`);
     if (!Number.isSafeInteger(d.decidedSeq)) throw new CardPaymentMatchingIntegrityError(`decision '${d.id}' decidedSeq`);
   }
 
@@ -414,6 +513,9 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
   const dismissed = new Set<string>();
   const userDecisions: UserDecisionView[] = [];
   const removedCard = new Map<string, MatchingDecision>();
+  /** Applicable ambiguity holds: the leg the removed candidate competed for, the other leg of the
+   *  possible pair, and the removed candidate's day. */
+  const holds: Array<{ ownerId: string; otherId: string; day: number }> = [];
   /** Held (conflicting) row id → ids of the decisions whose lineage names it (reporting only). */
   const namedBy = new Map<string, string[]>();
   const noteHeld = (d: MatchingDecision, lineages: Lineage[]) => {
@@ -451,6 +553,30 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
       continue;
     }
 
+    if (isAmbiguityHold(d.kind)) {
+      // A system ambiguity hold (§4.7) on one possible pair of two surviving legs. Not a user decision:
+      // it claims nothing and is never named on a leg. It applies while both references resolve to
+      // current card legs on opposite sides with the recorded cents; anything else is new evidence, and
+      // the ordinary rules decide alone.
+      let detail: InactiveDetail | null = lineageDetail(lineages);
+      if (detail === null) {
+        const [ra, rb] = rows as MatchingTransaction[];
+        if (ra.amountCents !== d.a.cents || rb.amountCents !== d.b!.cents) detail = 'amount_changed';
+        else if (!isCardRow(ra) || !isCardRow(rb)) detail = 'role_changed';
+        else if (sideOf(ra.accountId) === sideOf(rb.accountId)) detail = 'sides_not_opposite';
+        else {
+          // The owner is the leg the removed candidate competed for: the cash-side leg when a card leg
+          // was removed, the card-side leg when a cash leg was.
+          const ownerSide: LegSide = d.kind === 'ambiguity_hold_removed_card' ? 'cash' : 'credit';
+          const owner = sideOf(ra.accountId) === ownerSide ? ra : rb;
+          const other = owner === ra ? rb : ra;
+          holds.push({ ownerId: owner.id, otherId: other.id, day: dayNumber(d.counterpartDate!, 'counterpartDate') });
+        }
+      }
+      decisionResults.set(d.id, { decisionId: d.id, kind: d.kind, status: detail === null ? 'active' : 'inactive', detail });
+      continue;
+    }
+
     let inactive: InactiveDetail | null = lineageDetail(lineages);
     if (inactive === null) {
       inactive = shapeDetail(d, rows as MatchingTransaction[]);
@@ -471,10 +597,24 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
 
   function shapeDetail(d: MatchingDecision, rows: MatchingTransaction[]): InactiveDetail | null {
     const refs = d.b === null ? [d.a] : [d.a, d.b];
+    if (d.kind === 'pair_counterpart_removed') {
+      // A preserved pair whose REMOVED side was invalid for a reason other than its amount. That is
+      // frozen in the decision, and it is the decision's reason whatever the amount or role of the leg
+      // that survived is now: a later correction of the surviving leg resolves nothing about the side
+      // that is gone. Checked BEFORE the amount, so that it can never be reported as `amount_changed`
+      // — the one inactive reason the known-effect exception accepts.
+      const status = d.counterpart!.status;
+      if (status !== 'valid' && status !== 'waiting_to_post' && status !== 'amount_changed') return status;
+    }
     // Amount first: a row whose amount became 0 is no longer a card leg, but what changed is the
     // amount, not the role.
     if (rows.some((r, i) => r.amountCents !== refs[i].cents)) return 'amount_changed';
     if (rows.some((r) => !isCardRow(r))) return 'role_changed';
+    if (d.kind === 'pair_counterpart_removed') {
+      // A preserved pair holds the leg that survived, on either side, and that leg is valid. Of the
+      // frozen statuses only the removed side's own amount change is left to keep it inactive.
+      return d.counterpart!.status === 'amount_changed' ? 'amount_changed' : null;
+    }
     if (d.kind !== 'pair') return sideOf(rows[0].accountId) === 'cash' ? null : 'not_cash_side';
     const sides = rows.map((r) => sideOf(r.accountId));
     if (sides[0] === sides[1]) return 'sides_not_opposite';
@@ -527,6 +667,20 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
     Math.abs(x.day - y.day) <= AUTO_PAIR_WINDOW_DAYS &&
     !dismissed.has(edgeKey(x.txn.id, y.txn.id));
   const tier1 = pairReciprocally(pool, tier1Edge);
+  // Ambiguity holds (§4.7): institution removal is not evidence. The automatic pair of a hold's own two
+  // legs is withheld while the candidate that was removed would still be at least as close to the leg it
+  // competed for (the owner) as that leg's partner is, on the dates as they are now. Only that pair:
+  // both legs stay in the pool as candidates, no other pair is formed in its place, and a pair with any
+  // other leg is untouched.
+  for (const hold of holds) {
+    const owner = legs.get(hold.ownerId)!;
+    const other = legs.get(hold.otherId)!;
+    if (tier1.get(owner.txn.id)?.txn.id !== other.txn.id) continue;
+    if (Math.abs(hold.day - owner.day) <= Math.abs(owner.day - other.day)) {
+      tier1.delete(owner.txn.id);
+      tier1.delete(other.txn.id);
+    }
+  }
 
   const includedCreditExists = userAccounts.some((a) => a.type === 'credit' && !a.excludeFromCashFlow);
 
@@ -633,6 +787,11 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
       draft.contradictions = true;
       if (claim.decision.kind === 'destination_unlinked') {
         setResolved(draft, 'untracked', 'user_confirmed_unlinked', -leg.txn.amountCents);
+      } else if (claim.decision.kind === 'pair_counterpart_removed') {
+        // A user-confirmed pair whose other account was removed (§4.7): the confirmed counterpart is
+        // outside the tracked set. A cash leg counts in full; a card leg is funded from outside.
+        if (leg.side === 'credit') setResolved(draft, 'funded_from_excluded', 'removed_cash_account', 0);
+        else setResolved(draft, 'untracked', 'removed_card', -leg.txn.amountCents);
       } else {
         const partnerRow = claim.rows.find((r) => r !== null && r.id !== leg.txn.id)!;
         const partner = legs.get(partnerRow.id)!;
@@ -650,8 +809,13 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
         // known independently of the (inactive) confirmation — no included card can hold it — so it
         // is published; the confirmation stays inactive and the leg stays reserved. Nothing else
         // qualifies: not conflicting decisions, changed roles, pairs, or an included card.
+        // Extended (Trevor, 2026-10-06) to a preserved pair whose counterpart account was removed:
+        // the same rule on the surviving cash leg, whichever side's amount had changed. It is the
+        // "no included card" evidence that establishes the effect, not the old confirmation. The
+        // decision's reason must be an amount change: any other frozen status of the removed side
+        // is reported as itself by shapeDetail, never as `amount_changed`, so it never gets here.
         claim.inactive === 'amount_changed' &&
-        claim.decision.kind === 'destination_unlinked' &&
+        (claim.decision.kind === 'destination_unlinked' || claim.decision.kind === 'pair_counterpart_removed') &&
         leg.side === 'cash' &&
         !includedCreditExists &&
         Math.sign(leg.txn.amountCents) === Math.sign(claim.decision.a.cents)

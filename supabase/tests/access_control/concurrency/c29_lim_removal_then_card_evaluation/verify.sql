@@ -1,0 +1,7 @@
+set role service_role;
+select th.assert((select outcome from public.th_c29_outcome where who = 'holder') = 'removed' and (select outcome from public.th_c29_outcome where who = 'contender') = 'evaluated:true', 'both committed');
+select th.assert((select input_version::text = (select outcome from public.th_c29_outcome where who = 'holder-version') and evaluated_version::text = (select outcome from public.th_c29_outcome where who = 'holder-version')
+                  from public.card_payment_eval_versions where user_id = '00000000-0000-0000-0000-0000000000aa'),
+  'the later evaluation changed no input: the version is still the one the removal published');
+select th.assert((public.get_card_payment_states('00000000-0000-0000-0000-0000000000aa')->>'fresh')::boolean, 'fresh');
+select th.assert((select coalesce(array_agg(a_plaid_transaction_id order by a_plaid_transaction_id), '{}') from public.card_payment_decisions where kind = 'destination_removed_card' and superseded_by is null) = array['c29-q'] and (select (l->>'state') || '/' || (l->>'reason') || '/' || coalesce(l->>'effectCents', 'null') from (select l from jsonb_array_elements(public.get_card_payment_states('00000000-0000-0000-0000-0000000000aa')->'legs') l where (l->>'transactionId')::uuid = (select id from public.transactions where plaid_transaction_id = 'c29-q')) x(l)) = 'untracked/removed_card/-6000', 'and the removal''s result is unchanged');
