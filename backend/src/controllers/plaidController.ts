@@ -17,6 +17,8 @@ import { isSyncableItemStatus } from '../services/itemStatus';
 import { ItemRemovalIncompleteError, runItemRemoval, toRemovalView } from '../services/itemRemoval';
 import { env } from '../config/env';
 import { respondTransactionGone } from './transactionGone';
+import * as semanticReadPath from '../services/semanticReadPath';
+import { alignMonths, cashFlowFields, clientWantsSemanticFields, monthlyBreakdownSemanticFields, semanticStatusOf } from './semanticResponse';
 
 /** Date-Range Customization v1: `range_id` (one of the 5 reporting-range presets) takes
  *  precedence when present and valid; falls back to the legacy `months` count (default 6,
@@ -52,39 +54,67 @@ export async function getSpendingSummary(req: Request, res: Response, next: Next
     const accounts = await dataService.getAccountBalancesForUser(userId);
     const { assets, liabilities } = netWorthService.aggregateAssetsAndLiabilities(accounts);
 
-    const transactions = await dataService.getTransactionsSince(userId, sinceDate, untilDate);
-
-    const byMonth = new Map<string, { spent: number; income: number }>();
-    for (const t of transactions) {
-      const month = t.date.slice(0, 7);
-      const bucket = byMonth.get(month) ?? { spent: 0, income: 0 };
-      if (t.amount >= 0) bucket.spent += t.amount;
-      else bucket.income += -t.amount;
-      byMonth.set(month, bucket);
-    }
-
-    const monthlySpending = Array.from(byMonth.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([month, totals]) => ({ month, ...totals }));
-
     // Current-period operational metrics (Cash Flow Pace, Income & Savings' Savings Rate) mean
     // "how am I doing this month" intrinsically — that must stay true no matter what historical
     // reporting range the user has selected, so this is always its own explicit current-month
-    // query rather than reused from whatever `monthly_spending` happens to contain (which, for
+    // read rather than reused from whatever `monthly_spending` happens to contain (which, for
     // the 'last_month' preset, deliberately excludes the current month entirely).
     const currentRange = getCurrentMonthRange();
-    const currentMonthTransactions = await dataService.getTransactionsSince(
-      userId,
-      currentRange.start,
-      currentRange.end
-    );
 
+    // Every field built here is FROZEN at its sign-based meaning (Phase B design §6.4). It is all a
+    // client below API level 2 receives — exactly today's response.
+    const frozenOf = (transactions: { amount: number; date: string }[], currentMonthTransactions: { amount: number; date: string }[]) => {
+      const byMonth = new Map<string, { spent: number; income: number }>();
+      for (const t of transactions) {
+        const month = t.date.slice(0, 7);
+        const bucket = byMonth.get(month) ?? { spent: 0, income: 0 };
+        if (t.amount >= 0) bucket.spent += t.amount;
+        else bucket.income += -t.amount;
+        byMonth.set(month, bucket);
+      }
+      return {
+        net_worth: assets - liabilities,
+        total_assets: assets,
+        total_liabilities: liabilities,
+        monthly_spending: Array.from(byMonth.entries())
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([month, totals]) => ({ month, ...totals })),
+        current_month: sumIncomeAndSpent(currentMonthTransactions),
+      };
+    };
+    const readFrozen = async () =>
+      frozenOf(
+        await dataService.getTransactionsSince(userId, sinceDate, untilDate),
+        await dataService.getTransactionsSince(userId, currentRange.start, currentRange.end)
+      );
+
+    if (!clientWantsSemanticFields(req)) {
+      res.json(await readFrozen());
+      return;
+    }
+
+    // Phase B (design §5 C1–C4), level-2 clients only: ONE snapshot supplies the rows for the frozen
+    // fields and for the role-aware ones, so both describe the same database state.
+    const read = await semanticReadPath.readSummary(userId, {
+      range: { start: sinceDate, end: untilDate },
+      currentMonth: currentRange,
+    });
+    if (read.status === 'unavailable') {
+      // The snapshot could not be read: the frozen fields come from the frozen reads, and no
+      // role-aware field is present.
+      res.json({ ...(await readFrozen()), semantic_status: semanticStatusOf(read) });
+      return;
+    }
+    const frozen = frozenOf(read.frozen.range, read.frozen.currentMonth);
+    if (read.status === 'updating') {
+      res.json({ ...frozen, semantic_status: semanticStatusOf(read) });
+      return;
+    }
     res.json({
-      net_worth: assets - liabilities,
-      total_assets: assets,
-      total_liabilities: liabilities,
-      monthly_spending: monthlySpending,
-      current_month: sumIncomeAndSpent(currentMonthTransactions),
+      ...frozen,
+      monthly_spending: alignMonths(frozen.monthly_spending, read.value.monthly).map(([entry, month]) => ({ ...entry, ...cashFlowFields(month) })),
+      current_month: { ...frozen.current_month, ...cashFlowFields(read.value.currentMonth) },
+      semantic_status: semanticStatusOf(read),
     });
   } catch (err) {
     next(err);
@@ -96,9 +126,32 @@ export async function getMonthlyBreakdown(req: Request, res: Response, next: Nex
     const userId = req.user!.id;
     const { sinceDate, untilDate } = resolveRangeFromQuery(req.query);
 
-    const transactions = await dataService.getCategorizedTransactionsSince(userId, sinceDate, untilDate);
+    // `total_spent`, `total_income` and `by_category` are FROZEN at their sign-based meaning (design
+    // §6.4) and are all a client below API level 2 receives — exactly today's response.
+    const readFrozen = async () => aggregateByMonth(await dataService.getCategorizedTransactionsSince(userId, sinceDate, untilDate));
 
-    res.json({ months: aggregateByMonth(transactions) });
+    if (!clientWantsSemanticFields(req)) {
+      res.json({ months: await readFrozen() });
+      return;
+    }
+
+    // Phase B (design §5 C5), level-2 clients only: each month gains a `semantic` block, computed from
+    // the same snapshot rows as the frozen fields beside it. Its excluded lines depend on the
+    // card-payment states, so the whole block is withheld while those are stale or unreadable.
+    const read = await semanticReadPath.readMonthlyBreakdown(userId, { start: sinceDate, end: untilDate });
+    if (read.status === 'unavailable') {
+      res.json({ months: await readFrozen(), semantic_status: semanticStatusOf(read) });
+      return;
+    }
+    const months = aggregateByMonth(read.frozen);
+    if (read.status === 'updating') {
+      res.json({ months, semantic_status: semanticStatusOf(read) });
+      return;
+    }
+    res.json({
+      months: alignMonths(months, read.value).map(([entry, month]) => ({ ...entry, semantic: monthlyBreakdownSemanticFields(month) })),
+      semantic_status: semanticStatusOf(read),
+    });
   } catch (err) {
     next(err);
   }
@@ -992,6 +1045,126 @@ export async function listTransactions(req: Request, res: Response, next: NextFu
     const transactions = await dataService.getRecentTransactionsForUser(userId, limit, start, end);
     res.json({ transactions });
   } catch (err) {
+    next(err);
+  }
+}
+
+const POSITIVE_INTEGER = /^[1-9][0-9]{0,5}$/;
+const EFFECTS_DEFAULT_LIMIT = 50;
+const EFFECTS_MAX_LIMIT = 200;
+
+function badEffectQuery(res: Response, message: string): void {
+  res.status(400).json({ error: message, code: 'invalid_effect_query' });
+}
+
+/**
+ * Financial Semantics Phase B (design §6.1, §7.3): the drill-down. Returns EFFECT rows — not
+ * transaction rows — for one bucket of [start, end), produced by the same module and the same
+ * complete row set as the totals, so the rows of every page sum to `total_amount`.
+ *
+ * Level-2 clients only: a client below API level 2 gets 404, like a route that does not exist.
+ *
+ * Query: `start`, `end` (YYYY-MM-DD, end exclusive); `measure` (default `spending`); for `spending`
+ * optionally one of `budget_category_id` (a category id, or `unassigned`) or `plaid_category`
+ * (`LOAN_INTEREST` allowed) — without either, every spending effect of the period; `cursor`;
+ * `limit` (default 50, max 200; a page may exceed it to keep one transaction's effects together).
+ *
+ * Continuation: the cursor carries a fingerprint of the complete result the first page described. If
+ * the result differs when a later page is requested, the answer is 409 `effects_restart_required`
+ * with no rows, total or cursor, and the client restarts from page 1.
+ *
+ * A measure that depends on card-payment matching answers 200 `{ status: 'updating' | 'unavailable', … }`
+ * with no rows and no total while the stored states cannot be used.
+ */
+export async function listTransactionEffects(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (!clientWantsSemanticFields(req)) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    const userId = req.user!.id;
+    // A parameter sent twice (or as a structure) arrives as an array or object: refuse it rather than
+    // pick one, and never let it fall through to a default.
+    const param = (name: string): string | undefined | null => {
+      const value = req.query[name];
+      if (value === undefined) return undefined;
+      return typeof value === 'string' ? value : null;
+    };
+    const start = param('start');
+    const end = param('end');
+    if (!start || !end || !semanticReadPath.isCalendarDate(start) || !semanticReadPath.isCalendarDate(end) || start >= end) {
+      badEffectQuery(res, 'start and end must be YYYY-MM-DD dates with start before end');
+      return;
+    }
+
+    const measureParam = param('measure');
+    if (measureParam === null) {
+      badEffectQuery(res, 'measure must be sent once');
+      return;
+    }
+    const measure = measureParam ?? 'spending';
+    if (!(semanticReadPath.EFFECT_MEASURES as readonly string[]).includes(measure)) {
+      badEffectQuery(res, 'measure is not one of the published totals');
+      return;
+    }
+
+    const budgetCategoryId = param('budget_category_id');
+    const plaidCategory = param('plaid_category');
+    let bucket: semanticReadPath.EffectBucket | undefined;
+    if (budgetCategoryId !== undefined && plaidCategory !== undefined) {
+      badEffectQuery(res, 'Send budget_category_id or plaid_category, not both');
+      return;
+    }
+    if (budgetCategoryId !== undefined) {
+      if (budgetCategoryId === null || (budgetCategoryId !== 'unassigned' && !UUID_PATTERN.test(budgetCategoryId))) {
+        badEffectQuery(res, 'budget_category_id must be a category id or "unassigned"');
+        return;
+      }
+      bucket = { kind: 'budget_category', id: budgetCategoryId === 'unassigned' ? null : budgetCategoryId.toLowerCase() };
+    } else if (plaidCategory !== undefined) {
+      if (plaidCategory === null || plaidCategory === '' || plaidCategory.length > 100) {
+        badEffectQuery(res, 'plaid_category must be a category name');
+        return;
+      }
+      bucket = { kind: 'plaid_category', category: plaidCategory };
+    }
+
+    const limitParam = param('limit');
+    if (limitParam === null || (limitParam !== undefined && !POSITIVE_INTEGER.test(limitParam))) {
+      badEffectQuery(res, 'limit must be a positive integer');
+      return;
+    }
+    const limit = Math.min(limitParam === undefined ? EFFECTS_DEFAULT_LIMIT : Number(limitParam), EFFECTS_MAX_LIMIT);
+
+    const cursor = param('cursor');
+    if (cursor === null) {
+      res.status(400).json({ error: 'The cursor is not valid', code: 'invalid_cursor' });
+      return;
+    }
+
+    const result = await semanticReadPath.readEffectRows(userId, {
+      start,
+      end,
+      measure: measure as semanticReadPath.EffectMeasure,
+      bucket,
+      cursor: cursor ?? null,
+      limit,
+    });
+    if (result.status !== 'ok') {
+      res.json(semanticStatusOf(result));
+      return;
+    }
+    res.json({ status: 'ok', ...result.value });
+  } catch (err) {
+    if (err instanceof semanticReadPath.InvalidEffectQueryError) {
+      res.status(400).json({ error: err.message, code: err.code });
+      return;
+    }
+    if (err instanceof semanticReadPath.EffectsRestartRequiredError) {
+      // No rows, no total, no cursor: the pages already returned no longer describe one result.
+      res.status(409).json({ error: err.message, code: err.code, reason: err.reason });
+      return;
+    }
     next(err);
   }
 }

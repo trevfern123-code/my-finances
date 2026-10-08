@@ -1,23 +1,18 @@
 import { useState } from 'react';
 import { useUpdateGuard } from '../hooks/useAppUpdate';
-import type { BudgetCategory, TransactionItem } from '../lib/api';
-import { getCurrentMonthCategoryItems } from '../lib/budgetDrilldown';
+import type { BudgetCategory } from '../lib/api';
+import { currentMonthRange } from '../lib/budgetDrilldown';
 import { computeReorder } from '../lib/reorder';
 import { formatCurrency } from '../lib/currency';
+import type { BudgetView } from '../lib/semanticModel';
+import { formatSpending } from '../lib/semanticPresentation';
+import { EffectsDrilldown } from './EffectsDrilldown';
+import { SemanticNotice } from './SemanticNotice';
 import { EmojiPicker } from './EmojiPicker';
 import { ColorPicker, ColorDot } from './ColorPicker';
 
 function currentMonthLabel() {
   return new Date().toLocaleDateString('en-US', { month: 'long' });
-}
-
-function formatDrilldownDate(date: string) {
-  const [year, month, day] = date.split('-').map(Number);
-  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    timeZone: 'UTC',
-  });
 }
 
 /** Traffic-light tiers so a glance at the bar's color says as much as the numbers do. */
@@ -93,48 +88,15 @@ function AddCategoryForm({
   );
 }
 
-function CategoryDrilldown({
-  categoryId,
-  transactions,
-  totalSpent,
-}: {
-  categoryId: string;
-  transactions: TransactionItem[];
-  totalSpent: number;
-}) {
-  const items = getCurrentMonthCategoryItems(transactions, categoryId);
-  const shownTotal = items.reduce((sum, item) => sum + item.amount, 0);
-  const missing = totalSpent - shownTotal;
-
-  return (
-    <div className="category-drilldown">
-      {items.length === 0 ? (
-        <p className="hint">No transactions this month.</p>
-      ) : (
-        items.map((item, i) => (
-          <div key={i} className="drilldown-row">
-            <span className="drilldown-date">{formatDrilldownDate(item.date)}</span>
-            <span className="drilldown-name">
-              {item.name}
-              {item.isSplit && <span className="split-badge">split</span>}
-            </span>
-            <span className="drilldown-amount">{formatCurrency(item.amount)}</span>
-          </div>
-        ))
-      )}
-      {missing > 0.01 && (
-        <p className="hint drilldown-mismatch">
-          Showing {formatCurrency(shownTotal)} of {formatCurrency(totalSpent)} — older transactions may not be
-          loaded.
-        </p>
-      )}
-    </div>
-  );
-}
-
+/**
+ * Budget categories (design §5 C6). The category list, names and budgeted amounts are the user's own
+ * settings. Each category's spending and recent average are the server's role-aware figures: signed
+ * (a negative amount is net refunds) and never clamped. When those figures are withheld the list
+ * stays, with a dash in place of every figure.
+ */
 export function BudgetCategories({
   categories,
-  transactions,
+  semantics,
   recentAvgMonths,
   onCreate,
   onUpdate,
@@ -143,10 +105,12 @@ export function BudgetCategories({
   onReorder,
   onArchive,
   onUnarchive,
+  onRetry,
 }: {
   categories: BudgetCategory[];
-  transactions: TransactionItem[];
-  /** Window (Settings → Financial preferences) the server used to compute recent_avg_spent —
+  /** The role-aware spending per category, or the state in which no figure is shown. */
+  semantics: BudgetView;
+  /** Window (Settings → Financial preferences) the server used to compute the recent average —
    *  purely for labeling here, since the number itself already reflects it. */
   recentAvgMonths: number;
   onCreate: (name: string, budgetAmount: number, emoji: string | null, color: string | null) => void;
@@ -156,6 +120,8 @@ export function BudgetCategories({
   onReorder: (id: string, sortOrder: number) => void;
   onArchive: (id: string) => void;
   onUnarchive: (id: string) => void;
+  /** Reloads the categories and their figures. */
+  onRetry?: () => void;
 }) {
   const [editing, setEditing] = useState<Record<string, string>>({});
   const [showAddForm, setShowAddForm] = useState(false);
@@ -192,16 +158,22 @@ export function BudgetCategories({
             <button onClick={() => setShowAddForm(true)}>Add category</button>
           </div>
         </div>
+        {semantics.kind !== 'ok' && sorted.length > 0 && <SemanticNotice state={semantics} onRetry={onRetry} />}
         {sorted.length === 0 ? (
           <p className="hint">No budget categories yet.</p>
         ) : (
           <div className="budget-categories">
             {sorted.map((c, index) => {
-              const pct = c.budget_amount > 0 ? Math.min((c.spent / c.budget_amount) * 100, 100) : 0;
-              const tier = progressTier(c.spent, c.budget_amount);
+              // No figure for this category means no figure on screen: never the frozen `spent`.
+              const figures = semantics.kind === 'ok' ? (semantics.byCategoryId.get(c.id) ?? null) : null;
+              const spending = figures?.spending ?? null;
+              const recentAvg = figures?.recent_avg_spending ?? null;
+              // The bar is a picture of the figure: it cannot go below empty or above full.
+              const pct = spending !== null && c.budget_amount > 0 ? Math.min(Math.max((spending / c.budget_amount) * 100, 0), 100) : 0;
+              const tier = spending !== null ? progressTier(spending, c.budget_amount) : 'good';
               const recentAvgPct =
-                c.budget_amount > 0 ? Math.min((c.recent_avg_spent / c.budget_amount) * 100, 100) : 0;
-              const overRecentAvg = c.recent_avg_spent > c.budget_amount;
+                recentAvg !== null && c.budget_amount > 0 ? Math.min(Math.max((recentAvg / c.budget_amount) * 100, 0), 100) : 0;
+              const overRecentAvg = recentAvg !== null && recentAvg > c.budget_amount;
               return (
                 <div key={c.id} className="budget-category-row">
                   <div className="budget-category-header">
@@ -256,37 +228,53 @@ export function BudgetCategories({
                   </div>
                   <div className="progress-track">
                     <div className={`progress-fill progress-${tier}`} style={{ width: `${pct}%` }} />
-                    {c.recent_avg_spent > 0 && (
+                    {recentAvg !== null && recentAvg > 0 && (
                       <div
                         className={overRecentAvg ? 'recent-avg-marker over' : 'recent-avg-marker'}
                         style={{ left: `${recentAvgPct}%` }}
-                        title={`Recent average (last ${recentAvgMonths} mo${recentAvgMonths === 1 ? '' : 's'}): ${formatCurrency(c.recent_avg_spent)}/mo`}
+                        title={`Recent average (last ${recentAvgMonths} mo${recentAvgMonths === 1 ? '' : 's'}): ${formatCurrency(recentAvg)}/mo`}
                       />
                     )}
                   </div>
                   <div className="budget-category-footer">
-                    <span className={`budget-category-summary budget-category-summary-${tier}`}>
-                      {formatCurrency(c.spent)} of {formatCurrency(c.budget_amount)} spent
-                    </span>
-                    {c.recent_avg_spent > 0 && (
+                    {spending !== null ? (
+                      <span className={`budget-category-summary budget-category-summary-${tier}`}>
+                        {formatSpending(spending)} of {formatCurrency(c.budget_amount)} spent
+                      </span>
+                    ) : (
+                      <span className="budget-category-summary">— of {formatCurrency(c.budget_amount)} spent</span>
+                    )}
+                    {recentAvg !== null && recentAvg !== 0 && (
                       <span className={overRecentAvg ? 'recent-avg-text over' : 'recent-avg-text'}>
-                        Recent avg (last {recentAvgMonths} mo{recentAvgMonths === 1 ? '' : 's'}): {formatCurrency(c.recent_avg_spent)}/mo
+                        Recent avg (last {recentAvgMonths} mo{recentAvgMonths === 1 ? '' : 's'}): {formatSpending(recentAvg)}/mo
                       </span>
                     )}
-                    <button
-                      type="button"
-                      className="link-button drilldown-toggle"
-                      onClick={() => setExpandedId(expandedId === c.id ? null : c.id)}
-                    >
-                      {expandedId === c.id ? 'Hide transactions ▴' : 'Show transactions ▾'}
-                    </button>
+                    {spending !== null && (
+                      <button
+                        type="button"
+                        className="link-button drilldown-toggle"
+                        aria-expanded={expandedId === c.id}
+                        aria-label={`${expandedId === c.id ? 'Hide' : 'Show'} transactions for ${c.name}`}
+                        onClick={() => setExpandedId(expandedId === c.id ? null : c.id)}
+                      >
+                        {expandedId === c.id ? 'Hide transactions ▴' : 'Show transactions ▾'}
+                      </button>
+                    )}
                   </div>
-                  {expandedId === c.id && <CategoryDrilldown categoryId={c.id} transactions={transactions} totalSpent={c.spent} />}
+                  {expandedId === c.id && spending !== null && (
+                    <EffectsDrilldown
+                      query={{ ...currentMonthRange(), measure: 'spending', bucket: { kind: 'budget_category', id: c.id } }}
+                      parentAmount={spending}
+                      onRefreshParent={onRetry}
+                      emptyText="No transactions this month."
+                    />
+                  )}
                 </div>
               );
             })}
           </div>
         )}
+        {sorted.length > 0 && <p className="hint">Spending excludes transfers, card payments and debt payments.</p>}
       </div>
 
       {archived.length > 0 && (

@@ -1,6 +1,9 @@
 import type { AssetGroup, NetWorthPoint } from '../lib/api';
 import { computeLiquidCash } from '../lib/assets';
 import { formatCurrencyWhole as formatCurrency } from '../lib/currency';
+import type { SummaryView } from '../lib/semanticModel';
+import { unresolvedCardPaymentsNote } from '../lib/semanticPresentation';
+import { WithheldFigure } from './SemanticNotice';
 
 /** Most recent snapshot from a calendar month strictly before the latest snapshot's month —
  *  the "last month" comparison point for the Net Worth delta. Null if there isn't one yet
@@ -43,20 +46,24 @@ export function OverviewStats({
   netWorth,
   netWorthHistory,
   assetGroups,
-  monthlySpending,
+  semantics,
 }: {
   netWorth: number;
   netWorthHistory: NetWorthPoint[];
   assetGroups: AssetGroup[];
-  monthlySpending: { month: string; spent: number; income: number }[];
+  /** The role-aware figures of the summary, or the state in which none is shown. Net worth and
+   *  liquid cash are balance-based and do not depend on it. */
+  semantics: SummaryView;
 }) {
   const lastMonthSnapshot = findLastMonthSnapshot(netWorthHistory);
   const liquidCash = computeLiquidCash(assetGroups);
 
-  const currentMonth = monthlySpending[monthlySpending.length - 1] ?? null;
-  const previousMonth = monthlySpending.length > 1 ? monthlySpending[monthlySpending.length - 2] : null;
-  const cashFlow = currentMonth ? currentMonth.income - currentMonth.spent : null;
-  const previousCashFlow = previousMonth ? previousMonth.income - previousMonth.spent : null;
+  // Cash flow is the server's figure for the latest month of the range. It is never rebuilt here
+  // from income and spending.
+  const months = semantics.kind === 'ok' ? semantics.months : [];
+  const currentMonth = months[months.length - 1] ?? null;
+  const previousMonth = months.length > 1 ? months[months.length - 2] : null;
+  const cashFlow = currentMonth?.cash_flow ?? null;
 
   return (
     <div className="overview-stats">
@@ -72,11 +79,23 @@ export function OverviewStats({
       </div>
       <div className="stat-card">
         <span className="stat-label">Monthly cash flow</span>
-        <span className={cashFlow !== null && cashFlow < 0 ? 'stat-value negative' : 'stat-value'}>
-          {cashFlow !== null ? formatCurrency(cashFlow) : '—'}
-        </span>
-        {cashFlow !== null && (
-          <StatDelta current={cashFlow} previous={previousCashFlow} favorableWhenUp />
+        {semantics.kind !== 'ok' ? (
+          <WithheldFigure state={semantics} />
+        ) : currentMonth === null ? (
+          <span className="stat-value">—</span>
+        ) : cashFlow !== null ? (
+          <>
+            <span className={cashFlow < 0 ? 'stat-value negative' : 'stat-value'}>{formatCurrency(cashFlow)}</span>
+            {/* A change is shown only between two months that are each a single figure. */}
+            <StatDelta current={cashFlow} previous={previousMonth?.cash_flow ?? null} favorableWhenUp />
+          </>
+        ) : (
+          <>
+            <span className="stat-value">
+              {formatCurrency(currentMonth.cash_flow_range.low)} – {formatCurrency(currentMonth.cash_flow_range.high)}
+            </span>
+            <span className="stat-delta">{unresolvedCardPaymentsNote(currentMonth.card_payments_unresolved.count)}</span>
+          </>
         )}
       </div>
     </div>

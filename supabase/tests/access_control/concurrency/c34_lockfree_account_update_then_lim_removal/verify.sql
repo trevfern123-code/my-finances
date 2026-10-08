@@ -1,0 +1,10 @@
+set role service_role;
+select th.assert((select outcome from public.th_c34_outcome where who = 'probe') = 'l2_free',
+  'while it waited for the account row, the removal held no lock on the version row (the account rows come before L2)');
+select th.assert((select outcome from public.th_c34_outcome where who = 'holder') = 'updated' and (select outcome from public.th_c34_outcome where who = 'contender') = 'removed',
+  'both completed: the lock-free writer first, then the removal — a wait, not a deadlock');
+select th.assert(not exists (select 1 from public.plaid_items where id = '00000000-0000-0000-0000-000000000001') and (select status from public.plaid_item_removals where item_id = '00000000-0000-0000-0000-000000000001') = 'cleaned', 'the institution is removed and the operation cleaned');
+select th.assert(not exists (select 1 from public.accounts where id = '00000000-0000-0000-0000-000000034c02'), 'the account the writer changed went with its institution');
+select th.assert((public.get_card_payment_states('00000000-0000-0000-0000-0000000000aa')->>'fresh')::boolean and (select evaluated_version = input_version from public.card_payment_eval_versions where user_id = '00000000-0000-0000-0000-0000000000aa'), 'fresh: the removal ran after the writer committed and was the last writer');
+select th.assert((select coalesce(array_agg(a_plaid_transaction_id order by a_plaid_transaction_id), '{}') from public.card_payment_decisions where kind = 'destination_removed_card' and superseded_by is null) = array['c34-q'], 'and it preserved the known destination from the rows as the writer left them');
+select th.assert((select (l->>'state') || '/' || (l->>'reason') || '/' || coalesce(l->>'effectCents', 'null') from (select l from jsonb_array_elements(public.get_card_payment_states('00000000-0000-0000-0000-0000000000aa')->'legs') l where (l->>'transactionId')::uuid = (select id from public.transactions where plaid_transaction_id = 'c34-q')) x(l)) = 'untracked/removed_card/-6000', 'the payment counts as leaving the tracked accounts');

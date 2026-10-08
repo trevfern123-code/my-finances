@@ -62,7 +62,8 @@ const serverError = () => ({
 const updateRequired409 = () => ({
   ok: false,
   status: 409,
-  headers: new Headers({ 'X-Api-Level': '2', 'X-Min-Client-Api-Level': '2' }),
+  // A server whose minimum is above this client's level (2).
+  headers: new Headers({ 'X-Api-Level': '3', 'X-Min-Client-Api-Level': '3' }),
   json: () => Promise.resolve({ error: 'This version of the app is out of date.', code: 'client_update_required' }),
 });
 /** Lets every pending promise hop (session lookup, fetch, json, the trackers' own .then) run. */

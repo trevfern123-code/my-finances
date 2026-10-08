@@ -23,7 +23,14 @@ export function currentMonthRange(now: Date = todayUtc()): { start: string; end:
 /** Mirrors the backend's getCategorySpendRows two-source combine: a split transaction
  *  contributes its split line items (not its own row) toward whichever budget category each
  *  split targets; an unsplit transaction contributes its own row as-is. Scoped to the current
- *  calendar month and positive (spend) amounts only, matching what BudgetCategory.spent counts. */
+ *  calendar month and positive (spend) amounts only, matching what BudgetCategory.spent counts.
+ *
+ *  NOT USED BY THE UI since Financial Semantics Phase B (integration slice I2): the Budget
+ *  drill-down lists the server's effect rows (components/EffectsDrilldown.tsx). This sign-based
+ *  filter explains only the frozen `spent`, which this client no longer shows; it must not be used
+ *  for a role-aware figure. Kept, with its tests, until the frozen fields are retired.
+ *  (`currentMonthRange` above is still used: it is the period the Budget and Cash Flow drill-downs
+ *  ask the server for.) */
 export function getCurrentMonthCategoryItems(
   transactions: TransactionItem[],
   budgetCategoryId: string,
