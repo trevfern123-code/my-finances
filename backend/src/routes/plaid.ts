@@ -23,6 +23,9 @@ plaidRouter.patch('/accounts/:accountId/savings-goal', plaidController.updateAcc
 plaidRouter.patch('/accounts/:accountId/customization', plaidController.updateAccountCustomization);
 plaidRouter.post('/transactions/sync', plaidController.syncTransactions);
 plaidRouter.get('/transactions', plaidController.listTransactions);
+// Financial Semantics Phase B: effect rows for drill-downs (reconcile to the published totals).
+// Level-2 clients only: a client below API level 2 gets 404.
+plaidRouter.get('/transactions/effects', plaidController.listTransactionEffects);
 plaidRouter.patch('/transactions/:transactionId/category', plaidController.setTransactionCategory);
 plaidRouter.patch('/transactions/:transactionId/approve', plaidController.approveTransaction);
 plaidRouter.put('/transactions/:transactionId/splits', plaidController.setTransactionSplits);

@@ -1,0 +1,245 @@
+# supabase/tests/lim_removal_lock_comparison/run.sh   (2026-10-09, I3A-R packet 1: THREE bodies of remove_plaid_item_local, each installed by its own file on top of its predecessors and measured before the next file is applied — 20260926120000 a8f567d397b9dae5b777497317985ab7, 20261006120000 7997a757408fa888aa44bdbc9d85f89d, 20261008120000 cc12b7a12c6510924781b93c658ee854; evaluator 6cb5e299b0383fab0b6517cc2e7522c8; one throwaway local database; 17 cases and 3 extent probes)
+#
+# THE BYTES. supabase/migrations/20261008120000_card_payment_removal_provenance.sql md5 f840ef9e6bbb97cfb94df1c756a4760f (the
+# same at the start and at the end of the run). The three checksums above are computed by the harness from the installed
+# function; it holds no literal of any of them. Run 2026-10-09 02:24:41-02:26:41 UTC and again 04:25:52-04:27:45 UTC, while one
+# to three other test containers were busy on the same machine: every RESULT, PROVENANCE and EXTENT line identical. The
+# verdicts do not depend on timing: every overlap is established by the writer's barrier, not by a sleep.
+# The transcript below is of a THIRD run, 2026-10-09T14:31:48Z to 2026-10-09T14:33:43Z, on the same migration bytes, after two texts
+# of the harness changed that change no lock, no count and none of the 17 expectations: card X's Plaid account id in
+# fixture.sql is now lc-x-card (it was lc-x, the same as its leg's Plaid transaction id, so the identity assertion could
+# not tell the two apart), and verify.sql's provenance assertion no longer says "or was refused" (no case here refuses a
+# removal; refusals are a26's and a19's). Against the first run's transcript only that account id, the container name
+# and PostgreSQL's process and transaction numbers in the deadlock details differ.
+#
+# WHAT CHANGED IN THE HARNESS SINCE 2026-10-07.
+#   * Until now it compared "previous" (the body before 20261006120000) with "candidate", and installed the candidate by
+#     applying 20261006120000 AND EVERYTHING AFTER IT. With 20261008120000 in the history that would have measured the new
+#     body under 20261006120000's name and never measured 20261006120000. A body is now named by the timestamp of the file
+#     that installs it, the history is applied in pieces, and the run stops if a file between two bodies replaces the
+#     function or if a body's file installs nothing new. The first two bodies are measured WITHOUT the provenance tables
+#     (verify.sql asserts that they do not exist yet).
+#   * The eleven cases of the first two bodies and their expectations are the ones recorded on 2026-10-07, under their new
+#     labels (previous -> 20260926120000, candidate -> 20261006120000). All eleven read as they did then.
+#   * Six cases for 20261008120000: the five scenarios, and S1 once more with deadlock detection left to the writer.
+#   * verify.sql, for 20261008120000: a removal that lost the deadlock left NO generation row and NO source
+#     row — asserted before the retry, and printed (PROVENANCE after the removal lost: generations=0 sources=0); and at the
+#     end, whichever side lost, the user has exactly one generation (this removal's ledger row, recorded, ordinal 1: the
+#     lost attempt left no gap in the order) and the one decision the removal wrote has its one source, checked by identity:
+#     the removed leg lc-x (-60.00, 2026-09-04, not pending, USD) on card X (Plaid account lc-x-card, type credit), as the
+#     automatic partner of the surviving payment lc-k (S1, S4, S5: a destination_removed_card record) or as the counterpart
+#     the user confirmed (S2, S3: a pair_counterpart_removed decision). The fixture has no kept card leg: no hold anywhere.
+#   * New: an EXTENT probe, once per body (extent_fixture.sql, extent_removal.sql, extent_probe.sql). See below.
+#
+# WHAT WAS EXPECTED OF 20261008120000, AND WHY (its header, LOCKS: no new lock class and no new order).
+#   Its new statements — the markers, the generation, the plan table, the plan, the decisions, the provenance rows — are
+#   all where 20261006120000's three inserts were: after L1, after the item's account rows (FOR UPDATE, in id order) and
+#   after L2 (the first evaluation). They take only the KEY SHARE locks of foreign-key checks, on rows this transaction
+#   wrote or already holds FOR UPDATE, on the user's auth.users row, and on the ledger rows of earlier cleaned removals
+#   that get a marker. No writer of S1-S5 holds or asks for one of those rows. So: a held TRANSACTION row is the same
+#   detected deadlock (the removal holds L2 and asks for the row inside its delete; the writer holds the row and asks for
+#   L2), a held ACCOUNT row is the same plain wait, and with detection left to the writer the writer is the victim — every
+#   case as under 20261006120000. That is what happened, six times out of six.
+#     Where a removal lost (S1-S3), it lost inside "delete from plaid_items", AFTER the preservation block had written its
+#     generation, its decision and its source row. PostgreSQL rolled the whole call back: nothing of them was left, the
+#     removal stayed plaid_removed, and the retry wrote them once.
+#
+# THE EXTENT PROBE: WHICH OTHER ROWS A REMOVAL LOCKS. A user with NO card-payment leg (the removal writes no decision and no
+# matching state) and one EARLIER cleaned removal that has no generation row. While the removal's transaction is open and
+# its function has returned, a second session asks for four rows FOR UPDATE NOWAIT (the lock a delete takes; it conflicts
+# with KEY SHARE). Two are controls: this removal's own ledger row is locked and another user's row is free under every body.
+#
+#     body             the user's auth.users row    the earlier removal's ledger row
+#     20260926120000   free                         free
+#     20261006120000   LOCKED                       free
+#     20261008120000   LOCKED                       LOCKED
+#
+#   * The earlier removal's ledger row: as 20261008120000's header says. Only this body touches it — the marker it writes
+#     references it (KEY SHARE). Nothing updates that row's key, and a replay of that removal takes L1 first.
+#   * The user's row: NOT as 20261008120000's header says. Its LOCKS section calls this the "one difference in extent":
+#     every removal now takes KEY SHARE on the user's row, "where 20261006120000 took it only when it wrote a decision or a
+#     state". This removal writes neither, and under 20261006120000 the row is locked all the same. The cause was isolated
+#     in a one-off diagnostic (history up to 20261006120000; its script is kept under
+#     review-exports/2026-10-08_phase_b_i3a_r_provenance_p1/logs/perf/diag_extent_user_row/, and its output, run again at
+#     04:41 UTC for this file, in .../logs/perf/2026-10-09/diag_extent_user_row_rerun.txt):
+#         after ONE update of the user's card_payment_eval_versions row (no key changed)         the user's row is free
+#         after a SECOND update of that row in the same transaction                              locked
+#         after evaluate_card_payments (it updates the version row once)                         free
+#         after delete from plaid_items (its trigger bumps the version row: the second update)   locked
+#     PostgreSQL re-checks a foreign key on UPDATE when the row version being replaced was written by the same transaction,
+#     whether or not the key changed (RI_FKey_fk_upd_check_required). 20261006120000 evaluates before it deletes, so the
+#     delete's bump is always the second update of the version row, and its re-check takes KEY SHARE on auth.users — on
+#     EVERY removal, since 20261006120000. So 20261008120000 does not add this lock. What it changes is WHEN it is taken
+#     for a user who has no card-payment leg: at the generation insert, before the delete, instead of at the delete's first
+#     bump — in both cases after L1, the account rows and L2. (A user who has a leg took it in the first evaluation under
+#     both bodies: every state row references the user.) The difference in extent is against 20260926120000, which
+#     updates the version row once and leaves the user's row alone. A concurrent deletion of the user is therefore the
+#     detected-deadlock case for every removal since 20261006120000, not only since this file.
+#     The header's sentence is in a file this harness does not own; it is reported, not changed.
+#
+# The WAIT lines differ from the 2026-10-07 transcript only in what the 20 ms sampler happened to catch (in two cases the
+# removal's wait was recorded only at the barrier).
+#
+# Raw transcripts, each with the md5 of every harness file: review-exports/2026-10-08_phase_b_i3a_r_provenance_p1/logs/perf/2026-10-09/
+# lock_comparison_run1.log and lock_comparison_run2.log; the per-case session logs are beside them (lock_comparison_run1_sessions/,
+# lock_comparison_run2_sessions/).
+
+image: public.ecr.aws/supabase/postgres:17.6.1.155   container: lim-lock-comparison-123816
+server: 17.6
+
+remove_plaid_item_local body: a8f567d397b9dae5b777497317985ab7 (20260926120000_linked_institution_management.sql)
+
+CASE  body=20260926120000  scenario=S1  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 567 waits for ShareLock on transaction 1023; blocked by process 566. | Process 566 waits for ShareLock on transaction 1025; blocked by process 567.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=stale-unreadable loan=1000
+  -> as-documented
+
+CASE  body=20260926120000  scenario=S2  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 621 waits for ShareLock on transaction 1063; blocked by process 622. | Process 622 waits for ShareLock on transaction 1065; blocked by process 621.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=stale-unreadable loan=1000
+  -> as-documented
+
+CASE  body=20260926120000  scenario=S3  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 680 waits for ShareLock on transaction 1116; blocked by process 679. | Process 679 waits for ShareLock on transaction 1118; blocked by process 680.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=stale-unreadable loan=1000
+  -> as-documented
+
+CASE  body=20260926120000  scenario=S4  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=stale-unreadable loan=1000
+  -> as-documented
+
+CASE  body=20260926120000  scenario=S5  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=stale-unreadable loan=1000
+  -> as-documented
+
+EXTENT  body=20260926120000  a user with no card-payment leg and an earlier cleaned removal
+  EXTENT user_row=free earlier_removal=free this_removal=locked another_user=free
+  -> as-documented
+
+remove_plaid_item_local body: 7997a757408fa888aa44bdbc9d85f89d (20261006120000_lim_removal_card_payment_matching.sql)
+
+CASE  body=20261006120000  scenario=S1  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 905 waits for ShareLock on transaction 1255; blocked by process 904. | Process 904 waits for ShareLock on transaction 1256; blocked by process 905.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261006120000  scenario=S2  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 969 waits for ShareLock on transaction 1300; blocked by process 968. | Process 968 waits for ShareLock on transaction 1301; blocked by process 969.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261006120000  scenario=S3  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 1026 waits for ShareLock on transaction 1346; blocked by process 1027. | Process 1027 waits for ShareLock on transaction 1347; blocked by process 1026.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261006120000  scenario=S4  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261006120000  scenario=S5  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid at the barrier)
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261006120000  scenario=S1  deadlock_timeout: removal=60s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL writer saw: Process 1188 waits for ShareLock on transaction 1486; blocked by process 1187. | Process 1187 waits for ShareLock on transaction 1485; blocked by process 1188.
+  RESULT removal=removed writer=error(40P01) deadlock=yes victim=writer removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+EXTENT  body=20261006120000  a user with no card-payment leg and an earlier cleaned removal
+  EXTENT user_row=locked earlier_removal=free this_removal=locked another_user=free
+  -> as-documented
+
+remove_plaid_item_local body: cc12b7a12c6510924781b93c658ee854 (20261008120000_card_payment_removal_provenance.sql)
+
+CASE  body=20261008120000  scenario=S1  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 1314 waits for ShareLock on transaction 1555; blocked by process 1312. | Process 1312 waits for ShareLock on transaction 1556; blocked by process 1314.
+  PROVENANCE after the removal lost: generations=0 sources=0; at the end: generation 1 (recorded); destination_removed_card(lc-k)<=lc-x-card:lc-x[automatic_partner]
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261008120000  scenario=S2  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 1370 waits for ShareLock on transaction 1601; blocked by process 1369. | Process 1369 waits for ShareLock on transaction 1602; blocked by process 1370.
+  PROVENANCE after the removal lost: generations=0 sources=0; at the end: generation 1 (recorded); pair_counterpart_removed(lc-k)<=lc-x-card:lc-x[confirmed_counterpart]
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261008120000  scenario=S3  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 1426 waits for ShareLock on transaction 1648; blocked by process 1424. | Process 1424 waits for ShareLock on transaction 1649; blocked by process 1426.
+  PROVENANCE after the removal lost: generations=0 sources=0; at the end: generation 1 (recorded); pair_counterpart_removed(lc-k)<=lc-x-card:lc-x[confirmed_counterpart]
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261008120000  scenario=S4  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  PROVENANCE at the end: generation 1 (recorded); destination_removed_card(lc-k)<=lc-x-card:lc-x[automatic_partner]
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261008120000  scenario=S5  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  PROVENANCE at the end: generation 1 (recorded); destination_removed_card(lc-k)<=lc-x-card:lc-x[automatic_partner]
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+CASE  body=20261008120000  scenario=S1  deadlock_timeout: removal=60s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL writer saw: Process 1596 waits for ShareLock on transaction 1778; blocked by process 1594. | Process 1594 waits for ShareLock on transaction 1777; blocked by process 1596.
+  PROVENANCE at the end: generation 1 (recorded); destination_removed_card(lc-k)<=lc-x-card:lc-x[automatic_partner]
+  RESULT removal=removed writer=error(40P01) deadlock=yes victim=writer removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+EXTENT  body=20261008120000  a user with no card-payment leg and an earlier cleaned removal
+  EXTENT user_row=locked earlier_removal=locked this_removal=locked another_user=free
+  -> as-documented
+
+BODY            SCENARIO  TIMEOUT rem/wr  DEADLOCK  VICTIM   FINAL             VERDICT
+20260926120000  S1        1s/1s           yes       removal  stale-unreadable  as-documented
+20260926120000  S2        1s/1s           yes       removal  stale-unreadable  as-documented
+20260926120000  S3        1s/1s           yes       removal  stale-unreadable  as-documented
+20260926120000  S4        1s/1s           no        none     stale-unreadable  as-documented
+20260926120000  S5        1s/1s           no        none     stale-unreadable  as-documented
+20261006120000  S1        1s/1s           yes       removal  fresh             as-documented
+20261006120000  S2        1s/1s           yes       removal  fresh             as-documented
+20261006120000  S3        1s/1s           yes       removal  fresh             as-documented
+20261006120000  S4        1s/1s           no        none     fresh             as-documented
+20261006120000  S5        1s/1s           no        none     fresh             as-documented
+20261006120000  S1        60s/1s          yes       writer   fresh             as-documented
+20261008120000  S1        1s/1s           yes       removal  fresh             as-documented
+20261008120000  S2        1s/1s           yes       removal  fresh             as-documented
+20261008120000  S3        1s/1s           yes       removal  fresh             as-documented
+20261008120000  S4        1s/1s           no        none     fresh             as-documented
+20261008120000  S5        1s/1s           no        none     fresh             as-documented
+20261008120000  S1        60s/1s          yes       writer   fresh             as-documented
+
+BODY            USER'S ROW   EARLIER REMOVAL'S ROW   VERDICT
+20260926120000  free         free                    as-documented
+20261006120000  locked       free                    as-documented
+20261008120000  locked       locked                  as-documented
+
+all 17 cases and 3 extent probes as documented

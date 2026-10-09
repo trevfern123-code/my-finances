@@ -5,6 +5,8 @@ import type { BudgetCategory } from './api';
  *  like the synthetic "Uncategorized" bucket. */
 export function formatPlaidCategoryLabel(category: string) {
   if (category === 'Uncategorized') return category;
+  // The server's synthetic category for the interest part of a manual-loan payment (Phase B §5 C5).
+  if (category === 'LOAN_INTEREST') return 'Loan interest';
   return category
     .toLowerCase()
     .split('_')

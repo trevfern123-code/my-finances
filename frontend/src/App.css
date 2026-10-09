@@ -2583,3 +2583,84 @@ button:disabled {
     justify-content: space-between;
   }
 }
+
+/* Financial Semantics Phase B: role-aware figures, their states and their drill-downs. */
+.semantic-notice {
+  margin: 0.5rem 0;
+}
+
+.cash-flow-result {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 0.9rem;
+}
+
+.cash-flow-details {
+  margin: 0.5rem 0 0.75rem;
+  font-size: 0.85rem;
+}
+
+.cash-flow-details > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.cash-flow-details-group {
+  margin-top: 0.6rem;
+}
+
+.cash-flow-details-title {
+  margin: 0 0 0.2rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.cash-flow-details-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.35rem 0;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  font-weight: normal;
+  color: inherit;
+  cursor: pointer;
+}
+
+.cash-flow-details-line:hover {
+  filter: none;
+  background: rgba(var(--accent-rgb), 0.08);
+}
+
+.cash-flow-details-amount {
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.cash-flow-details-note {
+  margin: 0.15rem 0 0.25rem;
+  font-size: 0.75rem;
+}
+
+.drilldown-footer {
+  margin: 0.3rem 0 0;
+  font-size: 0.75rem;
+}
+
+.drilldown-error {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.month-excluded {
+  margin: 0.6rem 0 0;
+  font-size: 0.78rem;
+}

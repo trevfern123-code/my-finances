@@ -257,12 +257,12 @@ function postTo(root: string, path: string, body: unknown, headers: Record<strin
   });
 }
 
-describe('Client API level contract — production policy (level 1, minimum 0)', () => {
+describe('Client API level contract — production policy (level 2, minimum 0)', () => {
   it('a legacy request with no X-Client-Api-Level is still served, and carries the compatibility headers', async () => {
     const res = await post('/api/manual-loans/idempotent', { name: 'Legacy', current_balance: 100 }, { 'Idempotency-Key': 'k-legacy' });
 
     expect(res.status).toBe(201);
-    expectCompatHeaders(res, '1', '0');
+    expectCompatHeaders(res, '2', '0');
     expect((await readJson(res)).loan).toMatchObject({ name: 'Legacy' });
   });
 
@@ -274,7 +274,7 @@ describe('Client API level contract — production policy (level 1, minimum 0)',
     });
 
     expect(levelled.status).toBe(201);
-    expectCompatHeaders(levelled, '1', '0');
+    expectCompatHeaders(levelled, '2', '0');
     const body = await readJson(levelled);
     expect(Object.keys(body).sort()).toEqual(Object.keys(legacy).sort());
     expect(Object.keys(body.loan).sort()).toEqual(Object.keys(legacy.loan).sort());
@@ -287,8 +287,8 @@ describe('Client API level contract — production policy (level 1, minimum 0)',
     const withLevel = await get(base, '/api/manual-loans', { 'X-Client-Api-Level': '1' });
 
     expect([without.status, withLevel.status]).toEqual([200, 200]);
-    expectCompatHeaders(without, '1', '0');
-    expectCompatHeaders(withLevel, '1', '0');
+    expectCompatHeaders(without, '2', '0');
+    expectCompatHeaders(withLevel, '2', '0');
     expect(await withLevel.json()).toEqual(await without.json());
   });
 
@@ -301,7 +301,7 @@ describe('Client API level contract — production policy (level 1, minimum 0)',
       });
 
       expect(res.status).toBe(400);
-      expectCompatHeaders(res, '1', '0');
+      expectCompatHeaders(res, '2', '0');
       expect(await res.json()).toEqual({ error: 'Invalid X-Client-Api-Level header', code: 'invalid_client_api_level' });
       expect(store.keysSeen).toHaveLength(0);
     }
@@ -314,13 +314,13 @@ describe('Client API level contract — production policy (level 1, minimum 0)',
     });
 
     expect(res.status).toBe(500);
-    expectCompatHeaders(res, '1', '0');
+    expectCompatHeaders(res, '2', '0');
   });
 
   it('an unknown path under a covered prefix still carries the headers', async () => {
     const res = await get(base, '/api/manual-loans/nope/also-nope', { 'X-Client-Api-Level': '1' });
     expect(res.status).toBe(404);
-    expectCompatHeaders(res, '1', '0');
+    expectCompatHeaders(res, '2', '0');
   });
 
   it('CORS preflight allows X-Client-Api-Level with the existing headers, and needs no client header itself', async () => {
@@ -522,7 +522,7 @@ describe('Client API level runs before body parsing, and body-parser failures ar
     });
 
     expect(res.status).toBe(400);
-    expectCompatHeaders(res, '1', '0');
+    expectCompatHeaders(res, '2', '0');
     expect(((await res.json()) as { code: unknown }).code).toBe('invalid_client_api_level');
   });
 
@@ -536,7 +536,7 @@ describe('Client API level runs before body parsing, and body-parser failures ar
     });
 
     expect(res.status).toBe(400);
-    expectCompatHeaders(res, '1', '0');
+    expectCompatHeaders(res, '2', '0');
     const body = (await res.json()) as { error: string; code: string };
     expect(body).toEqual({ error: 'The request body is not valid JSON', code: 'malformed_json' });
     expect(store.keysSeen).toHaveLength(0);
@@ -549,7 +549,7 @@ describe('Client API level runs before body parsing, and body-parser failures ar
     });
 
     expect(res.status).toBe(413);
-    expectCompatHeaders(res, '1', '0');
+    expectCompatHeaders(res, '2', '0');
     expect(await res.json()).toEqual({ error: 'The request body is too large', code: 'payload_too_large' });
     expect(store.keysSeen).toHaveLength(0);
   });

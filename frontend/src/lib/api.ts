@@ -3,6 +3,7 @@ import { supabase } from './supabaseClient';
 import type { ReportingRangeId } from './reportingRange';
 import type { OwnershipCheck } from './sessionOwnership';
 import { appUpdate, CLIENT_API_LEVEL, parseLevelHeader } from './appUpdate';
+import { readEffectsResponse, type EffectMeasure, type EffectsResponse } from './semanticModel';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
@@ -120,10 +121,13 @@ async function authedFetch(
       // A machine-readable `code`, when the server sends one, lets a caller act on a specific outcome
       // without parsing the human-readable message (see isManualLoanCreationResolvedError). A
       // `transaction_superseded` refusal also carries the posted row that replaced the pending one
-      // the caller tried to edit, so the feed can re-target (pending → posted continuity).
+      // the caller tried to edit, so the feed can re-target (pending → posted continuity). `status`
+      // and `reason` let a caller tell a refusal apart from a failure (the drill-down's restart).
       throw Object.assign(
         new Error(message),
+        { status: response.status },
         typeof body.code === 'string' ? { code: body.code } : {},
+        typeof body.reason === 'string' ? { reason: body.reason } : {},
         body.superseded_by ? { superseded_by: body.superseded_by as TransactionItem } : {}
       );
     }
@@ -296,10 +300,18 @@ export interface BudgetCategory {
    *  excluded from active budgeting/selection flows but stays attached to its historical
    *  transactions, splits, and spend totals unchanged. */
   archived_at: string | null;
-  /** Sum of positive-amount categorized transactions in the current calendar month — only present on GET /api/budget-categories. */
+  /** Sum of positive-amount categorized transactions in the current calendar month — only present on GET /api/budget-categories.
+   *  @deprecated frozen sign-based figure (design §6.4); the role-aware one comes from `readBudgetSemantics`. */
   spent: number;
-  /** Average monthly spend over the most recent full months, excluding the in-progress current month — only present on GET /api/budget-categories. */
+  /** Average monthly spend over the most recent full months, excluding the in-progress current month — only present on GET /api/budget-categories.
+   *  @deprecated frozen sign-based figure (design §6.4); the role-aware one comes from `readBudgetSemantics`. */
   recent_avg_spent: number;
+}
+
+export interface BudgetCategoriesResponse {
+  categories: BudgetCategory[];
+  /** Validated by `readBudgetSemantics`; never read directly. */
+  semantic_status?: unknown;
 }
 
 /** A server-owned Plaid Hosted Link attempt (Wave 1). The Plaid link token stays on the server; this
@@ -409,17 +421,33 @@ export function updateAccountCustomization(
   }, false, verifyOwnership);
 }
 
+/**
+ * Financial Semantics Phase B: this client speaks API level 2, so each of the three aggregate
+ * responses below also carries role-aware fields and a top-level `semantic_status`
+ * (PHASE_B_I1_BACKEND_READ_PATH.md §3). Those are deliberately NOT typed here. They are read and
+ * validated by lib/semanticModel.ts, which yields either the figures or a state with no figure, so
+ * no component can pick up a half-present field.
+ *
+ * The fields that ARE typed here as `spent`, `income`, `total_spent`, `total_income`,
+ * `by_category` and `recent_avg_spent` are FROZEN at their sign-based meaning (design §6.4) for
+ * bundles released before level 2. This client does not display them.
+ */
 export interface SpendingSummary {
   net_worth: number;
   total_assets: number;
   total_liabilities: number;
-  /** Follows the reporting-range preference (Date-Range Customization v1). */
+  /** Follows the reporting-range preference (Date-Range Customization v1).
+   *  @deprecated `spent` / `income` are frozen sign-based figures; read
+   *  `readSummarySemantics(summary)` instead. */
   monthly_spending: { month: string; spent: number; income: number }[];
   /** Always the real current calendar month, regardless of the reporting-range preference —
    *  Cash Flow Pace and the Savings Rate card are current-period-intrinsic ("how am I doing this
    *  month") and must never silently follow a historical filter like 'last_month', which would
-   *  otherwise exclude the current month from `monthly_spending` entirely. */
+   *  otherwise exclude the current month from `monthly_spending` entirely.
+   *  @deprecated frozen sign-based figures; read `readSummarySemantics(summary)` instead. */
   current_month: { income: number; spent: number };
+  /** Validated by `readSummarySemantics`; never read directly. */
+  semantic_status?: unknown;
 }
 
 export function getSpendingSummary(rangeId?: ReportingRangeId): Promise<SpendingSummary> {
@@ -442,6 +470,8 @@ export interface CategoryAmount {
   amount: number;
 }
 
+/** @deprecated The frozen sign-based month (design §6.4). This client renders the role-aware
+ *  `semantic` block of each month, through `readMonthlyBreakdownSemantics`. */
 export interface MonthBreakdown {
   month: string;
   total_spent: number;
@@ -449,7 +479,13 @@ export interface MonthBreakdown {
   by_category: CategoryAmount[];
 }
 
-export function getMonthlyBreakdown(rangeId?: ReportingRangeId): Promise<{ months: MonthBreakdown[] }> {
+export interface MonthlyBreakdownResponse {
+  months: MonthBreakdown[];
+  /** Validated by `readMonthlyBreakdownSemantics`; never read directly. */
+  semantic_status?: unknown;
+}
+
+export function getMonthlyBreakdown(rangeId?: ReportingRangeId): Promise<MonthlyBreakdownResponse> {
   return authedFetch(`/api/plaid/monthly-breakdown${rangeId ? `?range_id=${rangeId}` : ''}`);
 }
 
@@ -767,8 +803,44 @@ export function clearTransactionSplits(transactionId: string, verifyOwnership: O
   return authedFetch(`/api/plaid/transactions/${transactionId}/splits`, { method: 'DELETE' }, false, verifyOwnership);
 }
 
-export function getBudgetCategories(): Promise<{ categories: BudgetCategory[] }> {
+export function getBudgetCategories(): Promise<BudgetCategoriesResponse> {
   return authedFetch('/api/budget-categories');
+}
+
+/** The bucket a `spending` drill-down is limited to; without one, every spending effect of the period. */
+export type EffectBucket =
+  /** A budget category, or `null` for spending with no budget category ("unassigned"). */
+  | { kind: 'budget_category'; id: string | null }
+  /** Plaid's primary category; `LOAN_INTEREST` for manual-loan interest. */
+  | { kind: 'plaid_category'; category: string };
+
+/** One drill-down: a period `[start, end)` and the published amount it explains. Only `spending` can
+ *  be narrowed to a bucket (the server refuses a bucket with any other measure). */
+export type EffectsQuery = { start: string; end: string } & (
+  | { measure: 'spending'; bucket?: EffectBucket }
+  | { measure: Exclude<EffectMeasure, 'spending'> }
+);
+
+export const EFFECTS_RESTART_REQUIRED = 'effects_restart_required';
+
+/**
+ * `GET /api/plaid/transactions/effects` (level 2 only): the effect rows behind one published amount,
+ * with the complete `total_amount` / `total_count` on every page. A continuation whose result changed
+ * is refused with HTTP 409 `effects_restart_required`, thrown here as an error carrying that `code`;
+ * the caller discards what it has and starts again from page 1 (lib/effectsDrilldown.ts).
+ */
+export async function getTransactionEffects(
+  query: EffectsQuery,
+  page: { cursor: string | null; limit: number },
+  signal?: AbortSignal
+): Promise<EffectsResponse> {
+  const params = new URLSearchParams({ start: query.start, end: query.end, measure: query.measure, limit: String(page.limit) });
+  if (query.measure === 'spending' && query.bucket) {
+    if (query.bucket.kind === 'budget_category') params.set('budget_category_id', query.bucket.id ?? 'unassigned');
+    else params.set('plaid_category', query.bucket.category);
+  }
+  if (page.cursor !== null) params.set('cursor', page.cursor);
+  return readEffectsResponse(await authedFetch(`/api/plaid/transactions/effects?${params.toString()}`, { signal }));
 }
 
 // The create/update endpoints return the bare row from Supabase, not the enriched shape —
