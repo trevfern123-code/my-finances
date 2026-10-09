@@ -16,6 +16,10 @@
 -- Q13, Q14 and Q15 (revision 5) do it for: a hold whose owner is a leg on an EXCLUDED account (the audit's
 -- finding P1); a preserved pair's frozen invalidity under a later amount correction (P2); and a payment that
 -- was matched automatically to the removed card while a kept card's leg also fitted (Option B).
+-- Q16–Q19 (20261008120000: the removal writes one system row per source) do it for what a removal now leaves
+-- routinely: two holds on one pair with one date, written by two removals (Q16) or by one removal for two
+-- identical removed transactions (Q17); two records on one payment after a relink and a second removal (Q18);
+-- and a user pair whose removed leg was waiting to post (Q19).
 \set ON_ERROR_STOP 1
 set client_min_messages = warning;
 
@@ -701,3 +705,339 @@ select pg_temp.dump('Q15', jsonb_build_object(
     'q15-k', 'tracked/auto_pair',  'q15-z', 'paired/auto_pair',     'q15-b', 'unresolved/ambiguous',
     'q15-k2', 'tracked/auto_pair', 'q15-r2-k2', 'paired/auto_pair', 'q15-b2', 'unresolved/ambiguous'),
   'liveDecisions', 4));
+
+-- ---- One system row per source (20261008120000): Q16–Q19 ----------------------------------------------------
+-- The removal writes one hold for each removed candidate and one record for each removed partner, and never
+-- reuses a row that an earlier removal wrote. Rows that differ in nothing but their id are then routine, and
+-- nothing a reader is shown may change with their number. Each sequence runs the real removal(s) and states by
+-- hand, in its S lines: what a reader must see at every stage; every row the removals left, with the removed
+-- transaction its provenance row names (which removal, which removed account, which transaction); and the
+-- removals in the user's order. At every checkpoint and at the end compare_rpc.cjs requires the reference
+-- evaluator, run on exactly those rows, to equal the SQL states — and, where the E line says how many rows
+-- share a key (`sameKeyRows`), that every one of them reached it.
+create function pg_temp.item_r2() returns uuid language sql as $$ select '00000000-0000-4000-8000-00000000a003'::uuid $$;
+create function pg_temp.card_r2() returns uuid language sql as $$ select '00000000-0000-4000-8000-0000000a0c0a'::uuid $$;
+create function pg_temp.item_s() returns uuid language sql as $$ select '00000000-0000-4000-8000-00000000a004'::uuid $$;
+create function pg_temp.card_s() returns uuid language sql as $$ select '00000000-0000-4000-8000-0000000a0c0c'::uuid $$;
+-- Card R linked again: a new institution, a new account and new Plaid ids.
+create function pg_temp.relink_card_r() returns void language sql as $$
+  insert into public.plaid_items (id, user_id, plaid_item_id, access_token) values (pg_temp.item_r2(), pg_temp.aa(), 'rpc-item-a3', 'placeholder');
+  insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+    (pg_temp.card_r2(), pg_temp.item_r2(), 'rpc-r2', 'Card R (relinked)', 'credit', false);
+$$;
+-- Another institution of aa holding only card S.
+create function pg_temp.add_card_s() returns void language sql as $$
+  insert into public.plaid_items (id, user_id, plaid_item_id, access_token) values (pg_temp.item_s(), pg_temp.aa(), 'rpc-item-a4', 'placeholder');
+  insert into public.accounts (id, item_id, plaid_account_id, name, type, exclude_from_cash_flow) values
+    (pg_temp.card_s(), pg_temp.item_s(), 'rpc-s', 'Card S', 'credit', false);
+$$;
+-- A card leg on an account given by its id.
+create function pg_temp.txa(p_account uuid, p_plaid text, p_amount numeric, p_date date, p_pending boolean default false) returns void language sql as $$
+  insert into public.transactions (account_id, plaid_transaction_id, amount, date, pending, user_role_override)
+  values (p_account, p_plaid, p_amount, p_date, p_pending, 'credit_card_payment') $$;
+-- The removal of one of aa's items through its state machine, as one step line (remove_r, for any item).
+create function pg_temp.remove_item(p_scenario text, p_name text, p_item uuid) returns text language plpgsql as $$
+declare
+  v jsonb;
+begin
+  perform public.begin_plaid_item_removal(pg_temp.aa(), p_item, public.plaid_item_removal_digest(pg_temp.aa(), p_item));
+  perform public.record_plaid_item_removal_attempt(pg_temp.aa(), p_item, 'removed', null);
+  v := public.remove_plaid_item_local(pg_temp.aa(), p_item);
+  return 'S|' || p_scenario || '|' || p_name || '|' || case when (v->>'replayed')::boolean then 'replayed' else 'removed' end
+         || case when coalesce((public.get_card_payment_states(pg_temp.aa())->>'fresh')::boolean, false) then ':fresh' else ':stale' end;
+end $$;
+-- A standalone evaluation of the inputs a removal left, at the fixed time: it must equal what that removal
+-- published (kept in pg_temp.own under p_key), the time-dependent label aside.
+create function pg_temp.own_states(p_scenario text, p_name text, p_key text) returns text language plpgsql as $$
+begin
+  perform public.evaluate_card_payments(pg_temp.aa(), '2026-11-15T00:00:00Z');
+  return 'S|' || p_scenario || '|' || p_name || '|own-states:'
+         || case when pg_temp.timeless((select s from pg_temp.own where scenario = p_key)) = pg_temp.timeless(public.get_card_payment_states(pg_temp.aa()))
+                 then 'same' else 'DIFFERENT' end;
+end $$;
+-- A question about the provenance tables, answered as text. Where they do not exist — a run with
+-- EXCLUDE=20261008120000_card_payment_removal_provenance.sql, against the removal that merges — the answer is
+-- NO PROVENANCE TABLES, so that such a run reaches its verdict and shows what else differs there.
+create function pg_temp.pv(p_sql text) returns text language plpgsql as $$
+declare
+  v text;
+begin
+  if to_regclass('public.card_payment_removal_sources') is null or to_regclass('public.card_payment_removal_generations') is null then
+    return 'NO PROVENANCE TABLES';
+  end if;
+  execute p_sql into v;
+  return v;
+end $$;
+-- aa's live decisions that a removal wrote, each with the source its provenance row names, sorted:
+--   <kind>:<leg a's Plaid id>[+<leg b's>][@<removed candidate's date>]<=<removed item's Plaid id>:<removed account's
+--   Plaid id>:<removed transaction's Plaid id>[<relation>/<resolution>]
+-- (hold_… for ambiguity_hold_…, record for destination_removed_card; "-" for the transaction when the source had
+-- no single row; NO SOURCE when the decision has no provenance row). Rows that differ in nothing but their id
+-- and their source are separate entries.
+create function pg_temp.src() returns text language sql as $$
+  select pg_temp.pv($q$
+    select coalesce(string_agg(q.x, ',' order by q.x collate "C"), 'none')
+    from (select replace(replace(d.kind, 'ambiguity_hold_', 'hold_'), 'destination_removed_card', 'record') || ':' || d.a_plaid_transaction_id
+                 || case when d.b_account_id is not null then '+' || d.b_plaid_transaction_id else '' end
+                 || coalesce('@' || d.counterpart_date, '') || '<='
+                 || coalesce(r.plaid_item_id || ':' || s.source_plaid_account_id || ':' || coalesce(s.source_plaid_transaction_id, '-')
+                             || '[' || s.source_relation || '/' || s.source_resolution || ']', 'NO SOURCE') as x
+          from public.card_payment_decisions d
+          left join public.card_payment_removal_sources s on s.decision_id = d.id
+          left join public.plaid_item_removals r on r.id = s.removal_id
+          where d.user_id = pg_temp.aa() and d.superseded_by is null
+            and d.kind in ('pair_counterpart_removed', 'destination_removed_card', 'ambiguity_hold_removed_card', 'ambiguity_hold_removed_cash_account')) q $q$) $$;
+-- aa's removals as the provenance knows them, in the user's order: <ordinal>:<removed item's Plaid id>:<recorded|marker>.
+create function pg_temp.gens() returns text language sql as $$
+  select pg_temp.pv($q$
+    select coalesce(string_agg(g.ordinal || ':' || r.plaid_item_id || ':' || case when g.sources_recorded then 'recorded' else 'marker' end, ',' order by g.ordinal), 'none')
+    from public.card_payment_removal_generations g join public.plaid_item_removals r on r.id = g.removal_id
+    where g.user_id = pg_temp.aa() $q$) $$;
+-- Which of the live records on a payment's own Plaid id its state names: "least-of-<n>" when it is the one with
+-- the least id of the n. (The ids are random: which removal wrote the least one differs from run to run.)
+create function pg_temp.named_record(p_plaid text) returns text language sql as $$
+  select coalesce((
+    select case when (l->>'decisionId')::uuid = (select d.id from public.card_payment_decisions d
+                                               where d.user_id = pg_temp.aa() and d.kind = 'destination_removed_card' and d.superseded_by is null
+                                                 and d.a_plaid_transaction_id = p_plaid
+                                               order by d.id limit 1)
+                then 'least' else 'NOT-THE-LEAST' end
+    from jsonb_array_elements(public.get_card_payment_states(pg_temp.aa())->'legs') l
+    join public.transactions t on t.id = (l->>'transactionId')::uuid
+    where t.plaid_transaction_id = p_plaid), 'NO-LEG')
+    || '-of-' || (select count(*) from public.card_payment_decisions d
+                  where d.user_id = pg_temp.aa() and d.kind = 'destination_removed_card' and d.superseded_by is null and d.a_plaid_transaction_id = p_plaid) $$;
+
+-- ==== Q16: TWO REMOVALS, one pair, one date. A payment (C, 09-10) that three cards' legs fit equally, all dated
+--      09-11: card R (the institution removed first), card S (another institution, removed second) and the kept
+--      card Y. A three-way tie: unresolved before, and after each removal. The first removal writes a hold on each
+--      of the two pairs that are left, (S's leg, the payment) and (Y's leg, the payment), both because of R's leg.
+--      The second deletes the first of them with card S and writes its OWN hold on (Y's leg, the payment), because
+--      of S's leg — although a live hold with that pair and that date exists. The pair then has two live holds
+--      that differ in nothing but their id, each naming its own removal's leg. They withhold as one: the payment
+--      is unresolved, a range, with the kept card's leg as its candidate.
+select pg_temp.reset();
+select pg_temp.add_card_r();
+select pg_temp.add_card_s();
+select pg_temp.tx('C', 'q16-k', 500, '2026-09-10'), pg_temp.txr('q16-r', -500, '2026-09-11'),
+       pg_temp.txa(pg_temp.card_s(), 'q16-s', -500, '2026-09-11'), pg_temp.tx('Y', 'q16-y', -500, '2026-09-11');
+select pg_temp.evaluate();
+select 'S|Q16|1-before|' || pg_temp.srx(array['q16-k', 'q16-r', 'q16-s', 'q16-y']);
+set role service_role;
+select pg_temp.remove_item('Q16', '2-remove-r', pg_temp.item_r());
+insert into pg_temp.own values ('Q16/r', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q16|3-rows|' || pg_temp.src() || ';removals=' || pg_temp.gens();
+select pg_temp.own_states('Q16', '4-own', 'Q16/r');
+select 'S|Q16|5-after-r|' || pg_temp.srx(array['q16-k', 'q16-s', 'q16-y']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q16', 'after-first-removal');
+set role service_role;
+select pg_temp.remove_item('Q16', '6-remove-s', pg_temp.item_s());
+insert into pg_temp.own values ('Q16/s', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q16|7-rows|' || pg_temp.src() || ';removals=' || pg_temp.gens();
+select pg_temp.own_states('Q16', '8-own', 'Q16/s');
+select 'S|Q16|9-after-s|' || pg_temp.srx(array['q16-k', 'q16-y']) || ';' || pg_temp.dst();
+select pg_temp.dump('Q16', jsonb_build_object(
+  'steps', jsonb_build_array(
+    'q16-k=unresolved/ambiguous/null[-50000..0]/->-@-,q16-r=unresolved/ambiguous/0[0..0]/->-@-,'
+      || 'q16-s=unresolved/ambiguous/0[0..0]/->-@-,q16-y=unresolved/ambiguous/0[0..0]/->-@-',
+    'removed:fresh',
+    'hold_removed_card:q16-s+q16-k@2026-09-11<=rpc-item-a2:rpc-r:q16-r[removed_candidate/row],'
+      || 'hold_removed_card:q16-y+q16-k@2026-09-11<=rpc-item-a2:rpc-r:q16-r[removed_candidate/row];removals=1:rpc-item-a2:recorded',
+    'own-states:same',
+    'q16-k=unresolved/ambiguous/null[-50000..0]/->-@-,q16-s=unresolved/ambiguous/0[0..0]/->-@-,q16-y=unresolved/ambiguous/0[0..0]/->-@-;'
+      || 'ambiguity_hold_removed_card:q16-s=active,ambiguity_hold_removed_card:q16-y=active',
+    'removed:fresh',
+    'hold_removed_card:q16-y+q16-k@2026-09-11<=rpc-item-a2:rpc-r:q16-r[removed_candidate/row],'
+      || 'hold_removed_card:q16-y+q16-k@2026-09-11<=rpc-item-a4:rpc-s:q16-s[removed_candidate/row];'
+      || 'removals=1:rpc-item-a2:recorded,2:rpc-item-a4:recorded',
+    'own-states:same',
+    'q16-k=unresolved/ambiguous/null[-50000..0]/->-@-,q16-y=unresolved/ambiguous/0[0..0]/->-@-;'
+      || 'ambiguity_hold_removed_card:q16-y=active,ambiguity_hold_removed_card:q16-y=active'),
+  'checkpoints', jsonb_build_array('after-first-removal'),
+  'legs', jsonb_build_object('q16-k', 'unresolved/ambiguous', 'q16-y', 'unresolved/ambiguous'),
+  'liveDecisions', 2,
+  'sameKeyRows', jsonb_build_object('ambiguity_hold_removed_card:q16-y+q16-k@2026-09-11', 2)));
+
+-- ==== Q17: TWO IDENTICAL REMOVED TRANSACTIONS in one removal. Two legs on the removed card with one amount and one
+--      date (09-11), a payment (C, 09-10) that both fit, and the kept card's leg (Y, 09-12), which fits less well.
+--      The two tie: the payment is unresolved before. The removal writes TWO holds on (Y's leg, the payment) dated
+--      09-11, one for each removed leg, each naming its own transaction — the same account, amount and date.
+--      They withhold as one (1 day against 2). Then the kept card's leg is re-dated to the payment's own day:
+--      strictly closer than either removed leg was, so neither hold withholds and the pair forms. Re-dated back,
+--      it is withheld again, by both.
+select pg_temp.reset();
+select pg_temp.add_card_r();
+select pg_temp.tx('C', 'q17-k', 510, '2026-09-10'), pg_temp.txr('q17-r1', -510, '2026-09-11'), pg_temp.txr('q17-r2', -510, '2026-09-11'),
+       pg_temp.tx('Y', 'q17-y', -510, '2026-09-12');
+select pg_temp.evaluate();
+select 'S|Q17|1-before|' || pg_temp.srx(array['q17-k', 'q17-r1', 'q17-r2', 'q17-y']);
+set role service_role;
+select pg_temp.remove_item('Q17', '2-remove', pg_temp.item_r());
+insert into pg_temp.own values ('Q17', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q17|3-rows|' || pg_temp.src() || ';removals=' || pg_temp.gens();
+select pg_temp.own_states('Q17', '4-own', 'Q17');
+select 'S|Q17|5-after|' || pg_temp.srx(array['q17-k', 'q17-y']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q17', 'after-removal');
+update public.transactions set date = '2026-09-10' where plaid_transaction_id = 'q17-y';
+select pg_temp.evaluate();
+select 'S|Q17|6-closer|' || pg_temp.srx(array['q17-k', 'q17-y']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q17', 'closer');
+update public.transactions set date = '2026-09-12' where plaid_transaction_id = 'q17-y';
+select pg_temp.evaluate();
+select 'S|Q17|7-back|' || pg_temp.srx(array['q17-k', 'q17-y']) || ';' || pg_temp.dst();
+select pg_temp.dump('Q17', jsonb_build_object(
+  'steps', jsonb_build_array(
+    'q17-k=unresolved/ambiguous/null[-51000..0]/->-@-,q17-r1=unresolved/ambiguous/0[0..0]/->-@-,'
+      || 'q17-r2=unresolved/ambiguous/0[0..0]/->-@-,q17-y=unresolved/ambiguous/0[0..0]/->-@-',
+    'removed:fresh',
+    'hold_removed_card:q17-y+q17-k@2026-09-11<=rpc-item-a2:rpc-r:q17-r1[removed_candidate/row],'
+      || 'hold_removed_card:q17-y+q17-k@2026-09-11<=rpc-item-a2:rpc-r:q17-r2[removed_candidate/row];removals=1:rpc-item-a2:recorded',
+    'own-states:same',
+    'q17-k=unresolved/ambiguous/null[-51000..0]/->-@-,q17-y=unresolved/ambiguous/0[0..0]/->-@-;'
+      || 'ambiguity_hold_removed_card:q17-y=active,ambiguity_hold_removed_card:q17-y=active',
+    'q17-k=tracked/auto_pair/0[0..0]/->q17-y@-,q17-y=paired/auto_pair/0[0..0]/->q17-k@-;'
+      || 'ambiguity_hold_removed_card:q17-y=active,ambiguity_hold_removed_card:q17-y=active',
+    'q17-k=unresolved/ambiguous/null[-51000..0]/->-@-,q17-y=unresolved/ambiguous/0[0..0]/->-@-;'
+      || 'ambiguity_hold_removed_card:q17-y=active,ambiguity_hold_removed_card:q17-y=active'),
+  'checkpoints', jsonb_build_array('after-removal', 'closer'),
+  'legs', jsonb_build_object('q17-k', 'unresolved/ambiguous', 'q17-y', 'unresolved/ambiguous'),
+  'liveDecisions', 2,
+  'sameKeyRows', jsonb_build_object('ambiguity_hold_removed_card:q17-y+q17-k@2026-09-11', 2)));
+
+-- ==== Q18: A SECOND REMOVAL AFTER A RELINK. A payment (C, 09-10) matched automatically to the removed card's leg
+--      (09-11), while the kept card's leg (Y, 09-13) also fitted. The first removal keeps the known destination
+--      (a record on the payment) and writes a hold on (Y's leg, the payment), both because of that leg. The card
+--      is linked again with new ids and re-imports the leg: the payment matches it again, and the rows of the
+--      first removal lie dormant. That institution is removed too: it writes its OWN record and its OWN hold,
+--      because of the re-imported leg — although a live record with that key and a live hold with that pair and
+--      date exist. Two records and two holds, each pair alike but for the id. They read as one: the payment is
+--      untracked / removed_card, a figure, and names the record with the lesser id; the kept card does not take
+--      it. Then the bank corrects the payment: all four rows are inactive alike, and none of them is proof.
+select pg_temp.reset();
+select pg_temp.add_card_r();
+select pg_temp.tx('C', 'q18-k', 520, '2026-09-10'), pg_temp.txr('q18-r', -520, '2026-09-11'), pg_temp.tx('Y', 'q18-b', -520, '2026-09-13');
+select pg_temp.evaluate();
+select 'S|Q18|1-before|' || pg_temp.srx(array['q18-b', 'q18-k', 'q18-r']);
+set role service_role;
+select pg_temp.remove_item('Q18', '2-remove-r', pg_temp.item_r());
+insert into pg_temp.own values ('Q18/r', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q18|3-rows|' || pg_temp.src() || ';removals=' || pg_temp.gens();
+select pg_temp.own_states('Q18', '4-own', 'Q18/r');
+select 'S|Q18|5-after-r|' || pg_temp.srx(array['q18-b', 'q18-k']) || ';named=' || pg_temp.named_record('q18-k') || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q18', 'after-first-removal');
+select pg_temp.relink_card_r();
+select pg_temp.txa(pg_temp.card_r2(), 'q18-r2', -520, '2026-09-11');
+select pg_temp.evaluate();
+select 'S|Q18|6-relinked|' || pg_temp.srx(array['q18-b', 'q18-k', 'q18-r2']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q18', 'relinked');
+set role service_role;
+select pg_temp.remove_item('Q18', '7-remove-r2', pg_temp.item_r2());
+insert into pg_temp.own values ('Q18/r2', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q18|8-rows|' || pg_temp.src() || ';removals=' || pg_temp.gens();
+select pg_temp.own_states('Q18', '9-own', 'Q18/r2');
+select 'S|Q18|10-after-r2|' || pg_temp.srx(array['q18-b', 'q18-k']) || ';named=' || pg_temp.named_record('q18-k') || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q18', 'after-second-removal');
+update public.transactions set amount = 518 where plaid_transaction_id = 'q18-k';
+select pg_temp.evaluate();
+select 'S|Q18|11-corrected|' || pg_temp.srx(array['q18-b', 'q18-k']) || ';' || pg_temp.dst();
+select pg_temp.dump('Q18', jsonb_build_object(
+  'steps', jsonb_build_array(
+    'q18-b=unresolved/ambiguous/0[0..0]/->-@-,q18-k=tracked/auto_pair/0[0..0]/->q18-r@-,q18-r=paired/auto_pair/0[0..0]/->q18-k@-',
+    'removed:fresh',
+    'hold_removed_card:q18-b+q18-k@2026-09-11<=rpc-item-a2:rpc-r:q18-r[automatic_partner/row],'
+      || 'record:q18-k<=rpc-item-a2:rpc-r:q18-r[automatic_partner/row];removals=1:rpc-item-a2:recorded',
+    'own-states:same',
+    'q18-b=unresolved/ambiguous/0[0..0]/->-@-,q18-k=untracked/removed_card/-52000[-52000..-52000]/->-@destination_removed_card;'
+      || 'named=least-of-1;ambiguity_hold_removed_card:q18-b=active,destination_removed_card:q18-k=active',
+    'q18-b=unresolved/ambiguous/0[0..0]/->-@-,q18-k=tracked/auto_pair/0[0..0]/->q18-r2@-,q18-r2=paired/auto_pair/0[0..0]/->q18-k@-;'
+      || 'ambiguity_hold_removed_card:q18-b=active,destination_removed_card:q18-k=active',
+    'removed:fresh',
+    'hold_removed_card:q18-b+q18-k@2026-09-11<=rpc-item-a2:rpc-r:q18-r[automatic_partner/row],'
+      || 'hold_removed_card:q18-b+q18-k@2026-09-11<=rpc-item-a3:rpc-r2:q18-r2[automatic_partner/row],'
+      || 'record:q18-k<=rpc-item-a2:rpc-r:q18-r[automatic_partner/row],'
+      || 'record:q18-k<=rpc-item-a3:rpc-r2:q18-r2[automatic_partner/row];removals=1:rpc-item-a2:recorded,2:rpc-item-a3:recorded',
+    'own-states:same',
+    'q18-b=unresolved/ambiguous/0[0..0]/->-@-,q18-k=untracked/removed_card/-52000[-52000..-52000]/->-@destination_removed_card;'
+      || 'named=least-of-2;ambiguity_hold_removed_card:q18-b=active,ambiguity_hold_removed_card:q18-b=active,'
+      || 'destination_removed_card:q18-k=active,destination_removed_card:q18-k=active',
+    'q18-b=unresolved/amount_differs/0[0..0]/->-@-,q18-k=unresolved/amount_differs/null[-51800..0]/->-@-;'
+      || 'ambiguity_hold_removed_card:q18-b=inactive/amount_changed,ambiguity_hold_removed_card:q18-b=inactive/amount_changed,'
+      || 'destination_removed_card:q18-k=inactive/amount_changed,destination_removed_card:q18-k=inactive/amount_changed'),
+  'checkpoints', jsonb_build_array('after-first-removal', 'relinked', 'after-second-removal'),
+  'legs', jsonb_build_object('q18-k', 'unresolved/amount_differs', 'q18-b', 'unresolved/amount_differs'),
+  'liveDecisions', 4,
+  'sameKeyRows', jsonb_build_object('destination_removed_card:q18-k', 2, 'ambiguity_hold_removed_card:q18-b+q18-k@2026-09-11', 2)));
+
+-- ==== Q19: A USER PAIR WHOSE REMOVED LEG IS WAITING TO POST. The user confirms a payment (C, 09-10) with the removed
+--      card's PENDING leg (09-11); the kept card's leg (Y, 09-12) also fits. A sync withdraws the pending leg, and
+--      its carry-over waits for the posted row: the confirmation is inactive (waiting to post) and holds the
+--      payment. The removal keeps it as the USER's decision on the payment, frozen as waiting to post — which
+--      invalidates nothing — and its provenance row records what was there: no row, the carry-over's date and
+--      amount. It writes no system row. The payment reads untracked / removed_card by the user's decision; the
+--      kept card's leg is not matched to it. Then the card is linked again and re-imports the leg, posted: a
+--      suggestion at most, never applied. That institution is removed too: it writes nothing for the payment —
+--      a user's decision is never written a second time, and never becomes a system row.
+select pg_temp.reset();
+select pg_temp.add_card_r();
+select pg_temp.tx('C', 'q19-k', 530, '2026-09-10'), pg_temp.txa(pg_temp.card_r(), 'q19-r', -530, '2026-09-11', true),
+       pg_temp.tx('Y', 'q19-y', -530, '2026-09-12');
+select pg_temp.evaluate();
+set role service_role;
+select pg_temp.step('Q19', '1-link-pending', pg_temp.link('q19-k', 'q19-r', 0));
+select public.apply_synced_transaction_batch_v2(pg_temp.aa(), '[]'::jsonb, '[]'::jsonb, array['q19-r']) is not null as withdrawn;
+reset role;
+select pg_temp.evaluate();
+select 'S|Q19|2-waiting|' || pg_temp.srx(array['q19-k', 'q19-y']) || ';' || pg_temp.dst();
+set role service_role;
+select pg_temp.remove_item('Q19', '3-remove-r', pg_temp.item_r());
+insert into pg_temp.own values ('Q19', public.get_card_payment_states(pg_temp.aa()));
+reset role;
+select 'S|Q19|4-rows|' || pg_temp.src()
+       || ';kept=' || (select string_agg(d.a_plaid_transaction_id || '/' || d.b_plaid_transaction_id || ':' || d.b_cents || '=' || d.counterpart_status, ',')
+                       from public.card_payment_decisions d where d.kind = 'pair_counterpart_removed')
+       || ';observed=' || pg_temp.pv($q$ select string_agg(coalesce(s.source_plaid_transaction_id, 'no-row') || '@' || coalesce(s.source_date::text, 'no-date') || ':'
+                                                           || coalesce(s.source_cents::text, 'no-amount'), ',')
+                                         from public.card_payment_removal_sources s $q$)
+       || ';carry-overs=' || (select count(*) from public.transaction_carryovers)
+       || ';decisions=' || (select count(*) from public.card_payment_decisions)
+       || ';removals=' || pg_temp.gens();
+select pg_temp.own_states('Q19', '5-own', 'Q19');
+select 'S|Q19|6-after|' || pg_temp.srx(array['q19-k', 'q19-y']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q19', 'after-removal');
+select pg_temp.relink_card_r();
+select pg_temp.txa(pg_temp.card_r2(), 'q19-r2', -530, '2026-09-11');
+select pg_temp.evaluate();
+select 'S|Q19|7-relinked|' || pg_temp.srx(array['q19-k', 'q19-r2', 'q19-y']) || ';' || pg_temp.dst();
+select pg_temp.checkpoint('Q19', 'relinked');
+set role service_role;
+select pg_temp.remove_item('Q19', '8-remove-r2', pg_temp.item_r2());
+reset role;
+select 'S|Q19|9-rows|' || pg_temp.src() || ';decisions=' || (select count(*) from public.card_payment_decisions)
+       || ';sources=' || pg_temp.pv($q$ select count(*)::text from public.card_payment_removal_sources $q$) || ';removals=' || pg_temp.gens();
+select 'S|Q19|10-after-r2|' || pg_temp.srx(array['q19-k', 'q19-y']) || ';' || pg_temp.dst();
+select pg_temp.dump('Q19', jsonb_build_object(
+  'steps', jsonb_build_array(
+    'saved:fresh',
+    'q19-k=unresolved/matched_leg_not_posted/null[-53000..0]/waiting_to_post>-@pair,q19-y=unresolved/no_candidate/0[0..0]/->-@-;'
+      || 'pair:q19-k=inactive/waiting_to_post',
+    'removed:fresh',
+    'pair_counterpart_removed:q19-k<=rpc-item-a2:rpc-r:-[confirmed_counterpart/waiting_to_post];kept=q19-k/q19-r:-53000=waiting_to_post;'
+      || 'observed=no-row@2026-09-11:-53000;carry-overs=0;decisions=1;removals=1:rpc-item-a2:recorded',
+    'own-states:same',
+    'q19-k=untracked/removed_card/-53000[-53000..-53000]/->-@pair_counterpart_removed,q19-y=unresolved/no_candidate/0[0..0]/->-@-;'
+      || 'pair_counterpart_removed:q19-k=active',
+    'q19-k=untracked/removed_card/-53000[-53000..-53000]/->-@pair_counterpart_removed,q19-r2=unresolved/no_candidate/0[0..0]/->-@-,'
+      || 'q19-y=unresolved/no_candidate/0[0..0]/->-@-;pair_counterpart_removed:q19-k=active',
+    'removed:fresh',
+    'pair_counterpart_removed:q19-k<=rpc-item-a2:rpc-r:-[confirmed_counterpart/waiting_to_post];decisions=1;sources=1;'
+      || 'removals=1:rpc-item-a2:recorded,2:rpc-item-a3:recorded',
+    'q19-k=untracked/removed_card/-53000[-53000..-53000]/->-@pair_counterpart_removed,q19-y=unresolved/no_candidate/0[0..0]/->-@-;'
+      || 'pair_counterpart_removed:q19-k=active'),
+  'checkpoints', jsonb_build_array('after-removal', 'relinked'),
+  'legs', jsonb_build_object('q19-k', 'untracked/removed_card', 'q19-y', 'unresolved/no_candidate'),
+  'liveDecisions', 1));

@@ -57,6 +57,13 @@
 --   OQ7-dis k-q7d +380 C 10    x-q7d −380 X 11 (d1)          y-q7d −380 Y 12 (d2)      later: relinked (the 11th); the user dismisses it
 -- User bb (N). Item 2 (card BX) is REMOVED; item 5 survives (checking BC, card BY). The amounts and dates of aa's A:
 --           b-k  +100 BC 10    bx-k −100 BX 11               by-k −100 BY 13
+--
+-- The second removal (H, O2, O3) is read against 20261008120000_card_payment_removal_provenance.sql (one system row
+-- per source): a removal writes a record for the automatic match it deletes and a hold for each candidate it
+-- deletes, and merges neither into a row an earlier removal wrote; each row has a provenance row naming the leg
+-- its own removal deleted; and the payment reads as with one record and one hold. Against 20261006120000 alone
+-- (EXCLUDE=20261008120000_card_payment_removal_provenance.sql) the file runs to its verdict and H, O2 and O3 are
+-- violated: that body wrote no second record and no second hold with the same date, and it has no provenance.
 set role service_role;
 
 create function pg_temp.aa() returns uuid language sql as $$ select '00000000-0000-0000-0000-0000000000aa'::uuid $$;
@@ -95,17 +102,50 @@ create function pg_temp.holds(p_plaid text) returns text language sql as $$
                              order by d.kind, d.a_plaid_transaction_id collate "C", d.b_plaid_transaction_id collate "C", d.counterpart_date), 'none')
   from public.card_payment_decisions d
   where d.kind like 'ambiguity_hold_%' and d.superseded_by is null and p_plaid in (d.a_plaid_transaction_id, d.b_plaid_transaction_id) $$;
+-- One of them: the first by card leg and date, and among holds that differ only in their source the least id.
 create function pg_temp.hold_id(p_plaid text) returns uuid language sql as $$
   select d.id from public.card_payment_decisions d
   where d.kind like 'ambiguity_hold_%' and d.superseded_by is null and p_plaid in (d.a_plaid_transaction_id, d.b_plaid_transaction_id)
-  order by d.a_plaid_transaction_id collate "C", d.counterpart_date limit 1 $$;
--- The live system destination records on a cash leg's own Plaid id, and the one record's id.
+  order by d.a_plaid_transaction_id collate "C", d.counterpart_date, d.id limit 1 $$;
+-- The live system destination records on a cash leg's own Plaid id, and one record's id: with several (a second
+-- removal writes its own), the least — the one a leg names while they all apply.
 create function pg_temp.records(p_plaid text) returns bigint language sql as $$
   select count(*) from public.card_payment_decisions d
   where d.kind = 'destination_removed_card' and d.superseded_by is null and d.a_plaid_transaction_id = p_plaid $$;
 create function pg_temp.record_id(p_plaid text) returns uuid language sql as $$
   select d.id from public.card_payment_decisions d
-  where d.kind = 'destination_removed_card' and d.superseded_by is null and d.a_plaid_transaction_id = p_plaid $$;
+  where d.kind = 'destination_removed_card' and d.superseded_by is null and d.a_plaid_transaction_id = p_plaid
+  order by d.id limit 1 $$;
+-- ---- Provenance (20261008120000), read so that this file also RUNS where its tables do not exist ----------
+create function pg_temp.has_provenance() returns boolean language sql as $$
+  select to_regclass('public.card_payment_removal_sources') is not null
+         and to_regclass('public.card_payment_removal_generations') is not null $$;
+-- The live decisions a removal wrote that name a Plaid id as either leg, each with its source, sorted:
+--   kind(card-or-surviving leg[/other leg][@removed date])<=removed item:removed account:removed transaction[relation]
+-- ("-" for the transaction when the source had no single row; the relation is confirmed, partner or candidate;
+-- "NO SOURCE" for a decision without a provenance row). "NO PROVENANCE TABLES" where the tables do not exist.
+create function pg_temp.deps(p_plaid text, p_user uuid default pg_temp.aa()) returns text language plpgsql as $$
+declare
+  v text;
+begin
+  if not pg_temp.has_provenance() then return 'NO PROVENANCE TABLES'; end if;
+  execute $q$
+    select coalesce(string_agg(q.x, ' ; ' order by q.x collate "C"), 'none')
+    from (select replace(replace(d.kind, 'ambiguity_hold_', 'hold_'), 'destination_removed_card', 'record')
+                 || '(' || d.a_plaid_transaction_id || coalesce('/' || d.b_plaid_transaction_id, '') || coalesce('@' || d.counterpart_date, '') || ')<='
+                 || coalesce(r.plaid_item_id || ':' || s.source_plaid_account_id || ':' || coalesce(s.source_plaid_transaction_id, '-')
+                             || '[' || replace(replace(replace(s.source_relation, 'confirmed_counterpart', 'confirmed'),
+                                                       'automatic_partner', 'partner'), 'removed_candidate', 'candidate') || ']',
+                             'NO SOURCE') as x
+          from public.card_payment_decisions d
+          left join public.card_payment_removal_sources s on s.decision_id = d.id
+          left join public.plaid_item_removals r on r.id = s.removal_id
+          where d.user_id = $2 and d.superseded_by is null
+            and d.kind in ('pair_counterpart_removed', 'destination_removed_card', 'ambiguity_hold_removed_card', 'ambiguity_hold_removed_cash_account')
+            and $1 in (d.a_plaid_transaction_id, d.b_plaid_transaction_id)) q $q$
+  into v using p_plaid, p_user;
+  return v;
+end $$;
 -- The kind of the live decision a leg's state names ("none" when it names none).
 create function pg_temp.holder_kind(p_plaid text, p_user uuid default pg_temp.aa()) returns text language sql as $$
   select coalesce((select d.kind from public.card_payment_decisions d where d.id = (l->>'decisionId')::uuid and d.superseded_by is null), 'none')
@@ -467,13 +507,31 @@ select pg_temp.req('H', 'after a relink the re-imported leg — closer than the 
 select pg_temp.req('O2', 'after a relink the payment matches the re-imported leg (one day; the competitor is three)', pg_temp.srep('k-o2') = 'tracked/auto_pair/0 partner=x2-o2');
 select pg_temp.remove(pg_temp.aa(), '00000000-0000-0000-0000-000000000007');
 select pg_temp.observe('after the relink and the second removal', array['k-h', 'y-h', 'k-o2', 'y-o2']);
-select pg_temp.req('H', 'a second removal with the same evidence writes no second record and no second hold, and the payment reads its removed destination again',
-  pg_temp.records('k-h') = 1 and pg_temp.holds('k-h') = 'removed_card:y-h/k-h@2026-09-11' and pg_temp.removed_destination('k-h', 22000) and pg_temp.unmatched('y-h'));
-select pg_temp.req('O2', 'competing system history: still ONE destination record for the payment; a second hold on the same pair with the second removed leg''s date; the payment is not switched',
-  pg_temp.records('k-o2') = 1 and pg_temp.holds('k-o2') = 'removed_card:y-o2/k-o2@2026-09-10,removed_card:y-o2/k-o2@2026-09-11'
-  and pg_temp.removed_destination('k-o2', 32000) and pg_temp.unmatched('y-o2'));
-select pg_temp.req('O3', 'the second removal deletes one of the two tied candidates; the tie is held although the payment was never published unresolved: one hold on the kept leg, still ONE record, and the payment is not switched to the card that is left',
+-- Each removal records what IT removed (20261008120000): a record for the automatic match it deletes, a hold for
+-- each candidate it deletes, and neither merged into a row an earlier removal wrote. Rows that differ only in
+-- their source read as one: nothing a reader is shown changes.
+select pg_temp.req('H', 'a second removal with the same evidence writes its OWN record and its OWN hold: two live records on the payment, and two live holds on the one pair with the one date',
+  pg_temp.records('k-h') = 2 and pg_temp.holds('k-h') = 'removed_card:y-h/k-h@2026-09-11,removed_card:y-h/k-h@2026-09-11');
+select pg_temp.req('H', 'each of the four names the leg its own removal deleted, the payment''s automatic match both times: Card Bank''s, and the relinked card''s',
+  pg_temp.deps('k-h') = 'hold_removed_card(y-h/k-h@2026-09-11)<=harness-item-a7:a25-x2:x2-h[partner] ; hold_removed_card(y-h/k-h@2026-09-11)<=harness-item-a:a25-x:x-h[partner] ; '
+                        || 'record(k-h)<=harness-item-a7:a25-x2:x2-h[partner] ; record(k-h)<=harness-item-a:a25-x:x-h[partner]');
+select pg_temp.req('H', 'the payment reads its removed destination again, as with one record and one hold; the competitor is unmatched',
+  pg_temp.removed_destination('k-h', 22000) and pg_temp.unmatched('y-h'));
+select pg_temp.req('H', 'the record the payment NAMES is the one of its two with the lesser id — a name, not an attribution: both are its dependencies',
+  pg_temp.records('k-h') = 2 and (pg_temp.leg('k-h')->>'decisionId')::uuid = pg_temp.record_id('k-h'));
+select pg_temp.req('O2', 'competing system history: the second removal writes its own record — two live records on the payment — and its own hold on the same pair, with the second removed leg''s date',
+  pg_temp.records('k-o2') = 2 and pg_temp.holds('k-o2') = 'removed_card:y-o2/k-o2@2026-09-10,removed_card:y-o2/k-o2@2026-09-11');
+select pg_temp.req('O2', 'each record and each hold names the leg its own removal deleted, the payment''s automatic match both times: Card Bank''s on the 10th, and the relinked card''s on the 11th',
+  pg_temp.deps('k-o2') = 'hold_removed_card(y-o2/k-o2@2026-09-10)<=harness-item-a:a25-x:x-o2[partner] ; hold_removed_card(y-o2/k-o2@2026-09-11)<=harness-item-a7:a25-x2:x2-o2[partner] ; '
+                         || 'record(k-o2)<=harness-item-a7:a25-x2:x2-o2[partner] ; record(k-o2)<=harness-item-a:a25-x:x-o2[partner]');
+select pg_temp.req('O2', 'the payment is not switched: it reads its removed destination, as with one record; the competitor is unmatched',
+  pg_temp.removed_destination('k-o2', 32000) and pg_temp.unmatched('y-o2'));
+select pg_temp.req('O2', 'the record the payment NAMES is the one of its two with the lesser id',
+  pg_temp.records('k-o2') = 2 and (pg_temp.leg('k-o2')->>'decisionId')::uuid = pg_temp.record_id('k-o2'));
+select pg_temp.req('O3', 'the second removal deletes one of the two tied candidates; the tie is held although the payment was never published unresolved: one hold on the kept leg, still ONE record (the payment had no automatic match for this removal to record), and the payment is not switched to the card that is left',
   pg_temp.holds('k-o3') = 'removed_card:y-o3/k-o3@2026-09-12' and pg_temp.records('k-o3') = 1 and pg_temp.removed_destination('k-o3', 35000) and pg_temp.unmatched('y-o3'));
+select pg_temp.req('O3', 'the record is the first removal''s, from the automatic match it deleted; the hold is the second removal''s, from the tied candidate it deleted, which was no match',
+  pg_temp.deps('k-o3') = 'hold_removed_card(y-o3/k-o3@2026-09-12)<=harness-item-a7:a25-x2:x2-o3[candidate] ; record(k-o3)<=harness-item-a:a25-x:x-o3[partner]');
 select pg_temp.observe('at the end', array['k-a', 'k-c', 'k-d', 'k-e', 'k-fd', 'k-g-posted', 'k-gt-posted', 'k-h', 'k-jl', 'kc-kc', 'k-l', 'k-o', 'k-o2']);
 
 -- ---- The verdict ------------------------------------------------------------------------------------
@@ -486,6 +544,7 @@ select 'OBSERVED', 'system records and holds at the end', d.kind,
        || case when d.superseded_by is null then '' else ' (superseded)' end
 from public.card_payment_decisions d where d.kind like 'ambiguity_hold_%' or d.kind = 'destination_removed_card'
 order by d.user_id, d.kind, d.a_plaid_transaction_id collate "C", d.b_plaid_transaction_id collate "C", d.counterpart_date;
+select 'OBSERVED', 'sources at the end', p, pg_temp.deps(p) from unnest(array['k-h', 'k-o2', 'k-o3']) with ordinality as u(p, n) order by n;
 select 'OPEN QUESTION 7 (not a contract) ' || case when today then 'as recorded' else 'CHANGED    ' end, what from open_question_7 order by seq;
 select 'CONTRACT ' || case when ok then 'ok      ' else 'VIOLATED' end, kase, requirement from contract order by seq;
 select 'CONTRACT SUMMARY', count(*) filter (where ok) || ' of ' || count(*) || ' requirements hold',

@@ -15,6 +15,11 @@
 #
 # Requires: docker, bash, GNU timeout (coreutils), node, and backend dependencies installed (for tsc).
 #   PG_IMAGE=<image>   default public.ecr.aws/supabase/postgres:17.6.1.155
+#   EXCLUDE=<file>...  skip migrations by basename (several: separated by spaces or commas), as
+#                      supabase/tests/access_control/run.sh does. With
+#                      EXCLUDE=20261008120000_card_payment_removal_provenance.sql the removal is the one that
+#                      merges: Q16–Q19 of rpc_sequences.sql then fail on the rows it writes, and everything else
+#                      here — which is about the evaluators, not the removal — must still pass.
 #   KEEP=1             leave the container and the scratch directory
 #   STARTUP_TIMEOUT=s  fail if the database does not accept connections within s seconds (default 180)
 #   PSQL_TIMEOUT=s     fail any single psql run that exceeds s seconds (default 600)
@@ -66,7 +71,18 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 sleep 3
+EXCLUDED="${EXCLUDE:-}"
+EXCLUDED="${EXCLUDED//,/ }"
+excluded() {
+  local name="$1" e
+  for e in $EXCLUDED; do [ "$name" = "$e" ] && return 0; done
+  return 1
+}
+for e in $EXCLUDED; do
+  [ -f "$ROOT/supabase/migrations/$e" ] || { echo "FAILED: EXCLUDE names no migration: $e"; exit 1; }
+done
 for f in "$ROOT"/supabase/migrations/*.sql; do
+  if excluded "$(basename "$f")"; then echo "skipping $(basename "$f") (EXCLUDE)"; continue; fi
   bounded docker exec -i "$CONTAINER" psql -X -q -1 -v ON_ERROR_STOP=1 -U postgres -d postgres < "$f" >"$WORK/migrate.log" 2>&1 \
     || { echo "FAILED to apply migration $(basename "$f")"; tail -20 "$WORK/migrate.log"; exit 1; }
 done

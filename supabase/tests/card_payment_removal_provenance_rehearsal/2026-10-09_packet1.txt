@@ -1,0 +1,141 @@
+# supabase/tests/card_payment_removal_provenance_rehearsal/run.sh   (2026-10-09, I3A-R packet 1: 20261008120000_card_payment_removal_provenance.sql and its rollback script, on top of 20261006120000 (Revision 5); one throwaway local container holding the rehearsed database and its twin, which stays on Revision 5; 33 steps, sixteen snapshots and the twin's two. The three bodies of remove_plaid_item_local are named by the checksums the harness reads from the migration and rollback files; it prints them on the second line of its output)
+# Run twice in a row, 2026-10-09T02:39:44Z to 02:40:59Z and 02:41:01Z to 02:42:14Z (the evening of 2026-10-08 local time), while two or three other harness containers were busy on the same machine: 33 PASS, 0 FAIL and exit 0 both times. The two transcripts are identical apart from the container name and the two generated decision ids that R5 prints. Nothing here depends on timing: the sessions run one after another, never two at once. Every expected value was derived by hand from the fixture and the migration's contract before the harness was first run against it; none was changed to match an observed one. Below: the first run, as printed.
+
+image: public.ecr.aws/supabase/postgres:17.6.1.155   container: card-payment-removal-provenance-rehearsal-9617
+remove_plaid_item_local: 20260926120000 a8f567d397b9dae5b777497317985ab7   20261006120000 (Revision 5) 7997a757408fa888aa44bdbc9d85f89d   20261008120000 cc12b7a12c6510924781b93c658ee854
+PASS  R0  baseline: every migration before 20261006120000
+PASS  R0  helpers and seed
+PASS  R1  (by ordering) 20261008120000 before 20261006120000: refused by its guard
+      | ERROR:  remove_plaid_item_local is not the 20261006120000 definition; refusing to replace it
+PASS  R1  (by ordering) and it left nothing: the 20260926120000 body, no provenance table, no trigger function
+PASS  R0  baseline: 20261006120000 (Revision 5) applied
+PASS  R0  baseline populated under Revision 5: a kept institution and six card institutions, two of them already removed — two holds and a record without provenance; a second user
+      | body 7997a757408fa888aa44bdbc9d85f89d (20261006120000); aa: 29 legs, linked: Card Bank 3, Card Bank 4, Card Bank 5, Card Bank 6, Kept Bank; removed by Revision 5: Card Bank 1, Card Bank 2; bb: 3 legs
+      | rows without provenance: ambiguity_hold_removed_card(x3-a/k-a@2026-09-11)
+      | rows without provenance: ambiguity_hold_removed_card(y-a/k-a@2026-09-11)
+      | rows without provenance: destination_removed_card(k-b)
+PASS  R0  the twin: the baseline database copied into a second database, row for row and definition for definition; it stays on Revision 5
+PASS  R1  upgrade: 20261008120000 applied on Revision 5
+PASS  R1  upgraded: no row changed; both new tables exist, empty; of every existing definition only the removal function changed, in its body; the body is the one the postcondition names
+      | body cc12b7a12c6510924781b93c658ee854 (20261008120000); rows: public.card_payment_removal_generations added (0 rows); public.card_payment_removal_sources added (0 rows)
+      | definitions: function public.remove_plaid_item_local(p_user_id uuid, p_item_id uuid) changed
+      | definitions added: column x21, constraint x14, function x2, index x7, table x2, trigger x2
+PASS  R1  upgrade again: refused by the guard — the body is no longer Revision 5's
+      | ERROR:  remove_plaid_item_local is not the 20261006120000 definition; refusing to replace it
+PASS  R2  the twin (Revision 5): the three removals; every published reading as derived by hand
+PASS  R2  the twin (Revision 5) wrote eight rows for the first institution — it merged two removed candidates with one date, and into a live hold and a live record of the earlier removals — and one for the second
+      | twin (Revision 5, body 7997a757408fa888aa44bdbc9d85f89d): aa 9 rows written, 11 live; bb 2 written and live
+PASS  R2  new body: the same three removals; every published reading as derived by hand — the same expectations
+PASS  R2  the twin's readings copied into the rehearsed database
+PASS  R2  new body: two markers and then the generation, third in the user's order, and the second removal's, fourth; eleven rows for the first institution, one per source, each with exactly one provenance row and exact identities; DIFFERENTIAL — both users read exactly what they read under Revision 5
+      | generations aa: 1:harness-item-a:marker(null), 2:rp-card-bank-2:marker(null), 3:rp-card-bank-3:recorded(ins_card3), 4:rp-card-bank-6:recorded(ins_card6); bb: 1:harness-item-b:recorded(ins_bbcard)
+      | aa ambiguity_hold_removed_card(x4-m/k-m@2026-09-11) <= rp-card-bank-3:rp-x3:x3-m[removed_candidate]
+      | aa ambiguity_hold_removed_card(x5-m/k-m@2026-09-11) <= rp-card-bank-3:rp-x3:x3-m[removed_candidate]
+      | aa ambiguity_hold_removed_card(y-a/k-a@2026-09-11) <= NO SOURCE
+      | aa ambiguity_hold_removed_card(y-a/k-a@2026-09-11) <= rp-card-bank-3:rp-x3:x3-a[removed_candidate]
+      | aa ambiguity_hold_removed_card(y-d/k-d@2026-09-11) <= rp-card-bank-3:rp-x3:x3-D2[removed_candidate]
+      | aa ambiguity_hold_removed_card(y-d/k-d@2026-09-11) <= rp-card-bank-3:rp-x3:x3-d1[removed_candidate]
+      | aa ambiguity_hold_removed_card(y-e/k-e@2026-09-10) <= rp-card-bank-3:rp-x3:x3-e[automatic_partner]
+      | aa ambiguity_hold_removed_card(y-m/k-m@2026-09-11) <= rp-card-bank-3:rp-x3:x3-m[removed_candidate]
+      | aa ambiguity_hold_removed_cash_account(y-g/k-g@2026-09-11) <= rp-card-bank-3:rp-r3:r3-g[automatic_partner]
+      | aa destination_removed_card(k-b) <= NO SOURCE
+      | aa destination_removed_card(k-b) <= rp-card-bank-3:rp-x3:x3-b[automatic_partner]
+      | aa destination_removed_card(k-e) <= rp-card-bank-3:rp-x3:x3-e[automatic_partner]
+      | aa destination_removed_card(k-t) <= rp-card-bank-6:rp-x6:x6-t[automatic_partner]
+      | aa pair_counterpart_removed(k-j/x3-j) <= rp-card-bank-3:rp-x3:x3-j[confirmed_counterpart]
+      | bb ambiguity_hold_removed_card(by-k/b-k@2026-09-11) <= harness-item-b:rp-bx:bx-k[automatic_partner]
+      | bb destination_removed_card(b-k) <= harness-item-b:rp-bx:bx-k[automatic_partner]
+      | aa the two holds on (y-d, k-d), in the order they were written (decided_seq): x3-D2, then x3-d1
+      | differential, aa, as the last removal published it (asOf aside): EQUAL to the twin — inputVersion 8 here, 8 in the twin; 20 legs; decisions listed: 14 here, 11 in the twin, 11 distinct in both
+      | differential, aa, evaluated as of one instant (asOf included): EQUAL to the twin — inputVersion 8 here, 8 in the twin; 20 legs; decisions listed: 14 here, 11 in the twin, 11 distinct in both
+      | differential, bb, as the last removal published it (asOf aside): EQUAL to the twin — inputVersion 3 here, 3 in the twin; 2 legs; decisions listed: 2 here, 2 in the twin, 2 distinct in both
+      | differential, bb, evaluated as of one instant (asOf included): EQUAL to the twin — inputVersion 3 here, 3 in the twin; 2 legs; decisions listed: 2 here, 2 in the twin, 2 distinct in both
+PASS  R3  rollback of 20261006120000 while the new body is installed: refused by its guard
+      | ERROR:  remove_plaid_item_local is not the 20261006120000 definition; refusing to roll back
+PASS  R3  rollback of 20261006110000 while the new body is installed: refused by its guard
+      | ERROR:  remove_plaid_item_local is not the 20260926120000 definition: roll back 20261006120000 first
+PASS  R3  rollback of 20261006110000, acknowledged: refused all the same
+      | ERROR:  remove_plaid_item_local is not the 20260926120000 definition: roll back 20261006120000 first
+PASS  R3  the three refusals changed nothing: no row, no definition, the new body
+PASS  R4  rollback: 20261008120000 rolled back; its NOTICE counts thirteen live system rows that keep their provenance
+      | NOTICE:  remove_plaid_item_local is the 20261006120000 definition again. 13 live system row(s) keep their provenance. Removals made until 20261008120000 is applied again record none, and may merge into those rows; they are marked when it is applied again.
+PASS  R4  rolled back: Revision 5's body, byte for byte; no row changed — both provenance tables and every row in them kept; every other definition kept; every reading unchanged
+      | body 7997a757408fa888aa44bdbc9d85f89d (20261006120000); rows: no difference; generations 5, provenance rows 14
+PASS  R4  rollback again: refused by the guard
+      | ERROR:  remove_plaid_item_local is not the 20261008120000 definition; refusing to roll back
+PASS  R5  a removal while rolled back (Revision 5): no generation, no provenance row; THE HAZARD — its candidate has the pair and date of two live attributed holds of R2, and it writes no hold of its own (by row id; the counterfactual writes both)
+      | body 7997a757408fa888aa44bdbc9d85f89d (20261006120000); the removal of rp-card-bank-4: status cleaned, generation rows 0, provenance rows 0
+      | written: destination_removed_card(k-q); gone with the removed account: ambiguity_hold_removed_card(x4-m/k-m@2026-09-11)
+      | merged into 3b1790b2-e634-45f0-a1a7-7eabb5397ebf ambiguity_hold_removed_card(x5-m/k-m@2026-09-11) <= rp-card-bank-3:rp-x3:x3-m (the row R2 wrote: true)
+      | merged into ab9ddaba-4aad-424a-b7fb-2cf724bb37c4 ambiguity_hold_removed_card(y-m/k-m@2026-09-11) <= rp-card-bank-3:rp-x3:x3-m (the row R2 wrote: true)
+PASS  R6  re-apply: the migration file's SQL run again; its only notices are its repeatable statements finding their objects
+      | NOTICE:  relation "card_payment_removal_generations" already exists, skipping
+      | NOTICE:  relation "card_payment_removal_generations_user_idx" already exists, skipping
+      | NOTICE:  relation "card_payment_removal_sources" already exists, skipping
+      | NOTICE:  relation "card_payment_removal_sources_source_idx" already exists, skipping
+      | NOTICE:  relation "card_payment_removal_sources_user_idx" already exists, skipping
+PASS  R6  re-applied: the new body; no row changed; every definition exactly as after the first application; before the next removal THE RULE excludes every attributed system row of the user (a cleaned removal without a generation row)
+      | body cc12b7a12c6510924781b93c658ee854 (20261008120000); rows: no difference; definitions against the first application: no difference
+      | the rule, before the next removal: aa G3 ambiguity_hold_removed_card(x5-m/k-m@2026-09-11) <= rp-card-bank-3:rp-x3:x3-m[removed_candidate] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G3 ambiguity_hold_removed_card(y-a/k-a@2026-09-11) <= rp-card-bank-3:rp-x3:x3-a[removed_candidate] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G3 ambiguity_hold_removed_card(y-d/k-d@2026-09-11) <= rp-card-bank-3:rp-x3:x3-D2[removed_candidate] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G3 ambiguity_hold_removed_card(y-d/k-d@2026-09-11) <= rp-card-bank-3:rp-x3:x3-d1[removed_candidate] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G3 ambiguity_hold_removed_card(y-e/k-e@2026-09-10) <= rp-card-bank-3:rp-x3:x3-e[automatic_partner] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G3 ambiguity_hold_removed_card(y-m/k-m@2026-09-11) <= rp-card-bank-3:rp-x3:x3-m[removed_candidate] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G3 ambiguity_hold_removed_cash_account(y-g/k-g@2026-09-11) <= rp-card-bank-3:rp-r3:r3-g[automatic_partner] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G3 destination_removed_card(k-b) <= rp-card-bank-3:rp-x3:x3-b[automatic_partner] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G3 destination_removed_card(k-e) <= rp-card-bank-3:rp-x3:x3-e[automatic_partner] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: aa G4 destination_removed_card(k-t) <= rp-card-bank-6:rp-x6:x6-t[automatic_partner] -> NOT alone: a cleaned removal without a generation row
+      | the rule, before the next removal: bb G1 ambiguity_hold_removed_card(by-k/b-k@2026-09-11) <= harness-item-b:rp-bx:bx-k[automatic_partner] -> its source alone
+      | the rule, before the next removal: bb G1 destination_removed_card(b-k) <= harness-item-b:rp-bx:bx-k[automatic_partner] -> its source alone
+PASS  R6  the next removal under the new body: a MARKER for the interval's removal, ordinal 5, after R2's generations (3, 4) and before its own (6); THE RULE, row by row, excludes exactly the rows of generations 3 and 4 and none written after the marker
+      | generations aa: 1:harness-item-a:marker(null), 2:rp-card-bank-2:marker(null), 3:rp-card-bank-3:recorded(ins_card3), 4:rp-card-bank-6:recorded(ins_card6), 5:rp-card-bank-4:marker(null), 6:rp-card-bank-5:recorded(ins_card5); bb: 1:harness-item-b:recorded(ins_bbcard)
+      | the rule: aa G3 ambiguity_hold_removed_card(y-a/k-a@2026-09-11) <= rp-card-bank-3:rp-x3:x3-a[removed_candidate] -> NOT alone: a later marker
+      | the rule: aa G3 ambiguity_hold_removed_card(y-d/k-d@2026-09-11) <= rp-card-bank-3:rp-x3:x3-D2[removed_candidate] -> NOT alone: a later marker
+      | the rule: aa G3 ambiguity_hold_removed_card(y-d/k-d@2026-09-11) <= rp-card-bank-3:rp-x3:x3-d1[removed_candidate] -> NOT alone: a later marker
+      | the rule: aa G3 ambiguity_hold_removed_card(y-e/k-e@2026-09-10) <= rp-card-bank-3:rp-x3:x3-e[automatic_partner] -> NOT alone: a later marker
+      | the rule: aa G3 ambiguity_hold_removed_card(y-m/k-m@2026-09-11) <= rp-card-bank-3:rp-x3:x3-m[removed_candidate] -> NOT alone: a later marker
+      | the rule: aa G3 ambiguity_hold_removed_cash_account(y-g/k-g@2026-09-11) <= rp-card-bank-3:rp-r3:r3-g[automatic_partner] -> NOT alone: a later marker
+      | the rule: aa G3 destination_removed_card(k-b) <= rp-card-bank-3:rp-x3:x3-b[automatic_partner] -> NOT alone: a later marker
+      | the rule: aa G3 destination_removed_card(k-e) <= rp-card-bank-3:rp-x3:x3-e[automatic_partner] -> NOT alone: a later marker
+      | the rule: aa G4 destination_removed_card(k-t) <= rp-card-bank-6:rp-x6:x6-t[automatic_partner] -> NOT alone: a later marker
+      | the rule: aa G6 ambiguity_hold_removed_card(y-m/k-m@2026-09-11) <= rp-card-bank-5:rp-x5:x5-m[removed_candidate] -> its source alone
+      | the rule: aa G6 ambiguity_hold_removed_card(y-s/k-s@2026-09-11) <= rp-card-bank-5:rp-x5:x5-s[automatic_partner] -> its source alone
+      | the rule: aa G6 destination_removed_card(k-s) <= rp-card-bank-5:rp-x5:x5-s[automatic_partner] -> its source alone
+      | the rule: bb G1 ambiguity_hold_removed_card(by-k/b-k@2026-09-11) <= harness-item-b:rp-bx:bx-k[automatic_partner] -> its source alone
+      | the rule: bb G1 destination_removed_card(b-k) <= harness-item-b:rp-bx:bx-k[automatic_partner] -> its source alone
+      | no provenance: ambiguity_hold_removed_card(y-a/k-a@2026-09-11) <= NO SOURCE
+      | no provenance: destination_removed_card(k-b) <= NO SOURCE
+      | no provenance: destination_removed_card(k-q) <= NO SOURCE
+PASS  R7  chain 1/3: rollback of 20261008120000 from the re-applied state; its NOTICE counts fourteen live system rows
+      | NOTICE:  remove_plaid_item_local is the 20261006120000 definition again. 14 live system row(s) keep their provenance. Removals made until 20261008120000 is applied again record none, and may merge into those rows; they are marked when it is applied again.
+PASS  R7  chain 1/3: Revision 5's body; no row changed; the provenance tables whole
+      | body 7997a757408fa888aa44bdbc9d85f89d; rows: no difference; generations 7, provenance rows 15
+PASS  R7  chain 2/3: rollback of 20261006120000 — accepted now
+PASS  R7  chain 2/3: the 20260926120000 body; no row changed; the provenance tables whole
+      | body a8f567d397b9dae5b777497317985ab7; rows: no difference; generations 7, provenance rows 15
+PASS  R7  chain 3/3: rollback of 20261006110000, acknowledged in the same session; it warns about ten live holds and one live preserved pair
+      | WARNING:  rolling back 20261006110000 over 10 live ambiguity hold(s) and 1 live pair_counterpart_removed decision(s): the previous evaluator and RPCs do not know these kinds (this file's header says what they do with them) until the migration is applied again
+PASS  R7  the whole chain changed no row; both provenance tables survive it with every row and every definition. OBSERVED under the previous evaluator: two identical live holds on one pair read conflicting_decisions, one hold reads not_cash_side, and an undo must be repeated per hold
+      | previous evaluator, k-d: unresolved/decision_invalidated/null partner=- range=-12000..0 decision=ambiguity_hold_removed_card(y-d/k-d@2026-09-11) detail=conflicting_decisions candidates=-
+      | previous evaluator, y-d: unresolved/decision_invalidated/0 partner=- range=0..0 decision=ambiguity_hold_removed_card(y-d/k-d@2026-09-11) detail=conflicting_decisions candidates=-
+      | previous evaluator, k-a: unresolved/decision_invalidated/null partner=- range=-10000..0 decision=ambiguity_hold_removed_card(y-a/k-a@2026-09-11) detail=conflicting_decisions candidates=-
+      | previous evaluator, k-m: unresolved/decision_invalidated/null partner=- range=-17000..0 decision=ambiguity_hold_removed_card(y-m/k-m@2026-09-11) detail=conflicting_decisions candidates=-
+      | previous evaluator, k-e: unresolved/decision_invalidated/null partner=- range=-13000..0 decision=ambiguity_hold_removed_card(y-e/k-e@2026-09-10) detail=not_cash_side candidates=-
+      | previous evaluator, k-g: unresolved/decision_invalidated/null partner=- range=-15000..0 decision=ambiguity_hold_removed_cash_account(y-g/k-g@2026-09-11) detail=not_cash_side candidates=-
+      | previous evaluator, k-s: unresolved/decision_invalidated/null partner=- range=-19000..0 decision=ambiguity_hold_removed_card(y-s/k-s@2026-09-11) detail=not_cash_side candidates=-
+      | previous evaluator, k-b: untracked/removed_card/-11000 partner=- range=-11000..-11000 decision=destination_removed_card(k-b) detail=- candidates=-
+      | previous evaluator, k-q: untracked/removed_card/-18000 partner=- range=-18000..-18000 decision=destination_removed_card(k-q) detail=- candidates=-
+      | previous evaluator, k-j: unresolved/no_candidate/null partner=- range=-16000..0 decision=pair_counterpart_removed(k-j/x3-j) detail=- candidates=-
+      | previous evaluator, decisions list: ambiguity_hold_removed_card(y-a/k-a@2026-09-11): inactive/conflicting_decisions
+      | previous evaluator, decisions list: ambiguity_hold_removed_card(y-a/k-a@2026-09-11): inactive/conflicting_decisions
+      | previous evaluator, decisions list: ambiguity_hold_removed_card(y-d/k-d@2026-09-11): inactive/conflicting_decisions
+      | previous evaluator, decisions list: ambiguity_hold_removed_card(y-d/k-d@2026-09-11): inactive/conflicting_decisions
+      | previous evaluator, decisions list: ambiguity_hold_removed_card(y-e/k-e@2026-09-10): inactive/not_cash_side
+      | previous evaluator, decisions list: ambiguity_hold_removed_card(y-m/k-m@2026-09-11): inactive/conflicting_decisions
+      | previous evaluator, decisions list: ambiguity_hold_removed_card(y-m/k-m@2026-09-11): inactive/conflicting_decisions
+      | previous evaluator, decisions list: ambiguity_hold_removed_card(y-s/k-s@2026-09-11): inactive/not_cash_side
+      | previous evaluator, decisions list: ambiguity_hold_removed_cash_account(y-g/k-g@2026-09-11): inactive/not_cash_side
+PASS  evidence: all sixteen snapshots taken, and the twin's two
+
+rehearsal passed

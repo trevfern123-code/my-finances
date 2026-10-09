@@ -52,6 +52,36 @@ PRs, nothing merged or released.**
     rule was needed.
   - Retry-on-read, background recovery, evaluation after other user actions and the backfill are still
     not built.
+- **Since (2026-10-08, I3A-R packet 1 — an implementation candidate awaiting independent review,
+  nothing merged or released):** migration `20261008120000` replaces the body of
+  `remove_plaid_item_local` again and adds two tables. See `PHASE_B_I3A_R_P1_REMOVAL_PROVENANCE.md`.
+  - **One system row for each removed transaction it depends on (§4.7).** A removal no longer merges a
+    record or a hold into one that is already live, nor two holds with one date into one.
+  - **Provenance (§3.5).** Every decision a removal writes gets one row that names the removal and the
+    removed account and transaction it depends on. Nothing reads it.
+  - No published reading changes, and nothing is settled: no hold is ended, no record is retired, and
+    what §4.7 leaves for a decision is as open as it was.
+- **Policy amendment (2026-10-09, I3A-R; recorded following the independent audit of I3A-R packet 1).**
+  The policy had already been approved before that audit and was supplied in the original audit
+  request. This amendment records that existing approval; it does not create a new one. 2026-10-09 is
+  the date of this amendment, not of the approval. It governs what §4.7 leaves for a decision about a
+  removed institution that is linked again, and anything in this document that conflicts with it.
+  - **P-Y.** Permanent release of a historical matching protection requires explicit user
+    authorization, scoped to the relevant source or dependencies.
+  - **P-D.** Retirement of removed-destination evidence requires separately identifiable
+    authorization. P-Y does not implicitly authorize P-D. A single, clearly explained review workflow
+    may collect both permissions, but their meanings and the recorded authorization stay distinct.
+  - Reliable account/event correspondence is evidence, not consent. Similar institution, mask, amount and date—even an exact descriptive match—do not establish reliable correspondence by themselves.
+  - **Before production activation** a narrowly scoped review safeguard for affected
+    relinked-transaction matching, and a reachable user-assisted recovery workflow, are required.
+  - **I3A-R packet 1 implements provenance capture only.** No settlement, no user recovery, no review
+    safeguard, no production activation.
+  - Current implementation examples include system ambiguity holds for P-Y and `destination_removed_card` records for P-D. These are nonexclusive examples, not definitions limiting policy scope. P-Y requires explicit authorization for permanent release of the named historical matching protections and their source dependencies. P-D requires separately identifiable authorization to retire removed-destination evidence. Neither permission grants the other. User-confirmed decisions and reservations retain their separate precedence and undo/supersession rules.
+  - *Historical:* the older text recorded the question as unresolved; that text is kept, and marked.
+    *Superseded where it conflicts:* any route by which a historical matching protection is permanently
+    released, or removed-destination evidence retired, without the user's authorization, including the
+    automatic "exact return" route of the I3A-R roadmap. The places this touches are marked
+    "amended 2026-10-09, I3A-R policy".
 
 *Original status line (rev 3, 2026-09-29), kept for history:* proposal for review — nothing
 implemented. There is no migration, endpoint or live-calculation change.
@@ -287,15 +317,17 @@ All new tables:
   - leg A: `a_account_id`, `a_plaid_transaction_id`, `a_cents`;
   - leg B (null for single-leg kinds): the same three columns. For `pair_counterpart_removed`, leg A is
     the leg that **survived** and leg B keeps only the **removed** leg's Plaid id and cents: `b_account_id`
-    is null, because that account no longer exists and nothing may reference it. For an ambiguity hold,
-    leg A is the card-side leg and leg B the cash-side leg of the possible pair, both on accounts that
-    exist;
+    is null, because that account no longer exists and nothing may reference it
+    *(amended 2026-10-08, I3A-R packet 1: that is the decision row. More of the removed leg and of its
+    account is kept beside it, in `card_payment_removal_sources`, below)*. For an ambiguity hold, leg A
+    is the card-side leg and leg B the cash-side leg of the possible pair, both on accounts that exist;
   - `counterpart_status` (`pair_counterpart_removed` only): what was true of the removed side when its
     account was deleted, frozen — `valid`, `waiting_to_post`, or the reason the confirmation was invalid
     on that side. A reason other than `amount_changed` is read before the surviving leg's own amount
     and role (§4.7);
   - `counterpart_date` (the two ambiguity holds only): the date of the candidate that was removed. Nothing
-    else of that candidate is kept;
+    else of that candidate is kept on the hold *(amended 2026-10-08, I3A-R packet 1: the hold's row in
+    `card_payment_removal_sources`, below, keeps more of it)*;
   - `difference_cents` (pairs only; `|a_cents| − |b_cents|`, signed by which side is larger);
   - `created_at`, `decided_seq`, and `superseded_by` (for undo history).
 - Leg references use the **Plaid id at decision time**. §3.6 maps them onto the current row.
@@ -307,6 +339,26 @@ All new tables:
   same account, and a cascade would erase the confirmation the replacement needs.
 - **Purge:** only when every referenced lineage has been `gone` (§3.6) for more than 30 days — the
   continuity retention, C2 — or by the user's own undo.
+
+**`card_payment_removal_generations`** and **`card_payment_removal_sources`** *(added 2026-10-08,
+I3A-R packet 1, migration `20261008120000` — a candidate awaiting review)* — which removed transaction each
+decision that a removal wrote depends on. Written only by the removal, in its own transaction and
+before its deletes; never backfilled. The service role may select and insert, nothing else.
+- **One generation row per removal:** the removal's row in `plaid_item_removals`, the user, the removed
+  item's institution id, and the removal's place in the user's order. A removal that finished without
+  provenance gets a marker row from the next removal of that user.
+- **One source row per decision a removal writes** — a preserved pair, a system record, a hold: the
+  decision; the removal; what the removed transaction was to the surviving leg (the counterpart the
+  user confirmed, its automatic partner, or a competing candidate); the removed account's Plaid id,
+  type, subtype and mask; and the removed transaction's Plaid id, pending id, pending flag, date, cents
+  and currency. For a preserved pair whose reference had no single current row, of the transaction
+  only what was there instead: a carry-over's date and amount, or nothing.
+- A source row is kept for as long as its decision row exists and is deleted with it; a generation row
+  goes with the removal's row. No account name, balance or token is kept, and neither table references
+  an account, an item or a transaction: the rows outlive the delete they describe.
+- The Plaid ids are historical. A relink issues new ones, so these rows can show that two decisions
+  share a source, never that a source has returned.
+- Neither table is an input of §3.7, and nothing reads them.
 
 **Derived tables** (recomputable at any time from inputs + decisions). They are written only by the
 evaluator and carry **no foreign key** to `transactions` or `accounts` (only `user_id`). An FK
@@ -777,7 +829,9 @@ open, the candidate does this:
   included later, the preserved destination applies.
 - **The record's key** is the surviving leg's own lineage key at that moment: its account, its own Plaid
   id (the pending id while it is pending) and its cents. A leg that already has a live record with
-  exactly that key gets no second one.
+  exactly that key gets another one all the same *(amended 2026-10-08, I3A-R packet 1: each removal
+  writes a record for the removed partner it deletes and reuses none; until then such a leg got no
+  second one)*. Several live records on one leg read as one.
 - **A pair with a difference** (§4.3) becomes the whole cash leg: −80, not −2. The card is outside the
   tracked set now, as with an excluded card.
 - **The warning** ("Payments from your other accounts to this card will count as money leaving your
@@ -897,7 +951,9 @@ resolve it. Deleting one candidate is not new evidence that another was the true
   - a **new transaction**, or the re-imported leg of a **relinked** card, is not the hold's concern: it
     pairs, or ties, by the ordinary rules. It does not release the hold's own pair, which stays judged
     against the removed candidate's stored date — after a relink too, whatever date the re-imported leg
-    has (recorded as open: `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3, question 7);
+    has (recorded as open: `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3, question 7; *amended 2026-10-09,
+    I3A-R policy: the policy that governs it is recorded in the status above; nothing of it is
+    implemented*);
   - a **changed amount** on either leg ends the hold;
   - a **date change** releases the pair when it brings the kept candidate strictly closer than the
     removed one was, and not otherwise;
@@ -963,6 +1019,8 @@ card's fitting leg within five days then paired automatically, and the record we
   closer than the removed candidate was), the re-imported leg of a relinked card and the user's decision
   are evaluated as always. One limit after a relink is recorded as open (the slice document's §9.3,
   question 7): the hold keeps judging its pair against the stored date of the leg that was removed.
+  *(amended 2026-10-09, I3A-R policy: open as behaviour. The policy that governs it is recorded in the
+  status above: permanent release requires the user's explicit authorization, P-Y.)*
 - **Nothing is written where there is nothing to protect against:** no competitor, an automatic match
   that stays, or a kept leg outside the five-day window.
 - **The mirror.** When the **cash** institution is removed, a kept card leg that was matched
@@ -989,7 +1047,9 @@ before this decision), concurrency `c36`, and sequence Q15 and scenarios S87–S
 evaluator-equivalence harness.
 
 **Left for a decision.** Seven questions that revision 5 of the I3A candidate records and does not
-decide are in `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3.
+decide are in `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3. *(amended 2026-10-09, I3A-R policy: for the one
+about a hold after the removed institution is linked again, question 7 there, the governing policy —
+P-Y and P-D — is recorded in the status above. It is not implemented. The others are as they were.)*
 
 ### 4.8 Pending → posted — every order
 
@@ -1361,6 +1421,10 @@ future review path that does not make the user guess; it is not built.
     `a23_lim_removal_excluded_accounts.sql`, `a24_lim_removal_frozen_invalidity.sql`,
     `a25_lim_removal_automatic_destination.sql`, concurrency `c26`–`c36`, and sequences Q9–Q15 of
     `supabase/tests/card_payment_evaluator/rpc_sequences.sql`.)*
+
+    *(I3A-R packet 1, 2026-10-08: `a26_lim_removal_provenance.sql`, `a27_lim_removal_provenance_access.sql`,
+    concurrency `c37`, and the harnesses that `PHASE_B_I3A_R_P1_REMOVAL_PROVENANCE.md` §10 lists. That packet
+    also changes what `a18`, `a22` and `a25` require after a second removal.)*
 19. **Role override away / to** card payment: decisions are invalidated, or the row joins the pool,
     in the same RPC. The evaluation runs before commit.
 20. **Same-user ownership:**

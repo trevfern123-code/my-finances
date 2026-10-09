@@ -24,11 +24,14 @@
 // NOTHING IS LEFT UNSTATED: an omitted key asserts "none" (an omitted range, that both bounds equal the
 // effect; an unresolved effect must state its range), and the legs and decisions listed must be ALL of that
 // user's — a user who is not listed must have none.
+// S98 on are not written here: they are SEVERAL_ROW_SCENARIOS of backend/src/testUtils/cardPaymentHistories.ts,
+// histories and expectations, which the vitest suite runs against the reference evaluator from the same
+// definition. A scenario may ask for its decisions to be written last first (`insertDecisionsLastFirst`).
 const fs = require('node:fs');
 const path = require('node:path');
 
 const [compiled, out] = process.argv.slice(2);
-const { generate, acct, tx, ref, mkDecision, mkPreserved, mkHold, U, V } = require(path.join(compiled, 'testUtils', 'cardPaymentHistories.js'));
+const { generate, acct, tx, ref, mkDecision, mkPreserved, mkHold, SEVERAL_ROW_SCENARIOS, U, V } = require(path.join(compiled, 'testUtils', 'cardPaymentHistories.js'));
 const { evaluateCardPayments } = require(path.join(compiled, 'services', 'cardPaymentMatching.js'));
 
 const SEEDS = Array.from({ length: 300 }, (_, i) => 1000 + i);
@@ -191,8 +194,10 @@ function emit(seed, input) {
     );
   }
   // Kept foreign decisions first, while their accounts are the deciding user's; then those accounts move to
-  // their owner; then every other decision.
-  for (const d of [...decisions.filter((x) => foreignIds.has(x.id)), null, ...decisions.filter((x) => !foreignIds.has(x.id))]) {
+  // their owner; then every other decision — in the order listed, which is the order of their ids, or (a
+  // scenario may ask) in reverse, so that the row with the least id is the one written last.
+  const own = decisions.filter((x) => !foreignIds.has(x.id));
+  for (const d of [...decisions.filter((x) => foreignIds.has(x.id)), null, ...(input.insertDecisionsLastFirst ? own.reverse() : own)]) {
     if (d === null) {
       for (const a of accounts.filter((x) => lentTo.has(x.id))) sql.push(`update public.accounts set item_id = ${q(ITEMS[userKeyOf[a.userId]])} where id = ${q(a.id)};`);
       continue;
@@ -517,8 +522,13 @@ const SCENARIOS = {
     expect: A({ y: 'unresolved/no_candidate/0' }, { k: 'inactive/waiting_to_post' }),
   },
 };
+// One system row per source (20261008120000): several identical holds on a pair, several records on a leg.
+for (const [name, parts] of Object.entries(SEVERAL_ROW_SCENARIOS)) {
+  if (name in SCENARIOS) throw new Error(`${name}: defined both here and in SEVERAL_ROW_SCENARIOS`);
+  SCENARIOS[name] = parts;
+}
 for (const [name, parts] of Object.entries(SCENARIOS)) {
-  if (Number(name.slice(1, 3)) >= 77 && !parts.expect) throw new Error(`${name}: every scenario from S77 on must carry its hand-derived expectation`);
+  if (Number(name.slice(1, name.indexOf('-'))) >= 77 && !parts.expect) throw new Error(`${name}: every scenario from S77 on must carry its hand-derived expectation`);
   if (parts.expect && !Object.keys(parts.expect).every((k) => k in USERS)) throw new Error(`${name}: the expectation names an unknown user`);
   emit(name, {
     asOf: AS_OF,
@@ -528,6 +538,7 @@ for (const [name, parts] of Object.entries(SCENARIOS)) {
     decisions: parts.decisions ?? [],
     expect: parts.expect,
     keepForeign: parts.keepForeign ?? false,
+    insertDecisionsLastFirst: parts.insertDecisionsLastFirst ?? false,
   });
 }
 

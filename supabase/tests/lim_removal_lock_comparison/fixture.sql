@@ -22,7 +22,7 @@ insert into public.plaid_items (id, user_id, plaid_item_id, access_token, instit
 insert into public.accounts (id, item_id, plaid_account_id, name, type) values
   ('00000000-0000-0000-0000-0000000c1001', '00000000-0000-0000-0000-000000000001', 'lc-r', 'Removed Checking', 'depository');
 insert into public.accounts (id, item_id, plaid_account_id, name, type) values
-  ('00000000-0000-0000-0000-0000000c1002', '00000000-0000-0000-0000-000000000001', 'lc-x', 'Card X', 'credit');
+  ('00000000-0000-0000-0000-0000000c1002', '00000000-0000-0000-0000-000000000001', 'lc-x-card', 'Card X', 'credit');
 \if :second_card
 insert into public.accounts (id, item_id, plaid_account_id, name, type) values
   ('00000000-0000-0000-0000-0000000c1003', '00000000-0000-0000-0000-000000000001', 'lc-xb', 'Card XB', 'credit');

@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Institution removal with card-payment conversion (20261006120000) — performance measurements on synthetic
-# data in a THROWAWAY database only. Nothing here touches any real database. Not a pass/fail test and not
-# run in CI: it prints counts and timings to report. See bench.cjs for what is measured and how.
+# Institution removal with card-payment conversion and its provenance (20261006120000, 20261008120000) —
+# performance measurements on synthetic data in a THROWAWAY database only. Nothing here touches any real
+# database. Not a pass/fail test and not run in CI: it prints counts and timings to report. See bench.cjs for
+# what is measured and how.
 #
 #   supabase/tests/card_payment_benchmark/removal/run.sh [samples] [warmups] [sizes]
-#                                                        (defaults 5, 1 and "1000,10000,50000")
+#                                                        (defaults 5, 1 and the fixture variant's sizes)
+#   BENCH_FIXTURE=<variant>   base (default) | hold_heavy | provenance_heavy | same_date | dense | cycles
+#                             (what a size means, and BENCH_KEPT, BENCH_CLUSTERS, BENCH_ROWS, BENCH_PAIRS,
+#                             BENCH_BODIES, BENCH_PLANS and BENCH_BACKGROUND: see bench.cjs)
 #
 # Requires: docker, bash, GNU timeout (coreutils), node.
 #   PG_IMAGE=<image>   default public.ecr.aws/supabase/postgres:17.6.1.155
@@ -43,7 +47,7 @@ wait_for_database() {
   done
 }
 
-node "$HERE/bench.cjs" "${1:-5}" "${2:-1}" "${3:-1000,10000,50000}" >"$WORK/bench.sql" || { echo "FAILED to generate the benchmark script"; exit 1; }
+node "$HERE/bench.cjs" "${1:-5}" "${2:-1}" "${3:-}" >"$WORK/bench.sql" || { echo "FAILED to generate the benchmark script"; exit 1; }
 docker run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=harness "$IMAGE" >/dev/null || { echo "FAILED: could not start the database container"; exit 1; }
 wait_for_database
 for _ in $(seq 1 60); do
@@ -57,6 +61,6 @@ for f in "$ROOT"/supabase/migrations/*.sql; do
 done
 echo "environment: image $IMAGE; server $(docker exec "$CONTAINER" psql -U supabase_admin -d postgres -Atc 'show server_version'); docker $(docker info --format '{{.ServerVersion}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes' 2>/dev/null)"
 echo "settings: $(docker exec "$CONTAINER" psql -U supabase_admin -d postgres -Atc "select string_agg(name || '=' || setting, ' ') from pg_settings where name in ('shared_buffers','synchronous_commit','fsync','work_mem','max_wal_size')")"
-echo "samples per configuration: ${1:-5} measured after ${2:-1} warm-up; sizes ${3:-1000,10000,50000} (transactions on the removed institution; as many again on the kept one)"
+echo "samples per configuration: ${1:-5} measured after ${2:-1} warm-up"
 bounded docker exec -i "$CONTAINER" psql -X -q -v ON_ERROR_STOP=1 -v bench_disposable=1 -U supabase_admin -d postgres < "$WORK/bench.sql" 2>"$WORK/psql.err" \
   || { echo "FAILED while benchmarking:"; tail -20 "$WORK/psql.err"; exit 1; }

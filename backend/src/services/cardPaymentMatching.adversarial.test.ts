@@ -12,7 +12,7 @@ import {
   type MatchingDecision,
   type MatchingTransaction,
 } from './cardPaymentMatching';
-import { acct, generate, mkDecision, mkHold, mkPreserved, ref, rng, shuffle, tx, U, V } from '../testUtils/cardPaymentHistories';
+import { acct, generate, mkDecision, mkHold, mkPreserved, ref, rng, SEVERAL_ROW_SCENARIOS, shuffle, tx, U, V } from '../testUtils/cardPaymentHistories';
 
 // Stage 2 — adversarial tests for the card-payment matching reference evaluator.
 //
@@ -1143,6 +1143,114 @@ describe('APPROVED (Trevor, 2026-10-06): institution removal is not evidence —
   });
 });
 
+describe('institution removal writes one system row per source (20261008120000): several identical holds on a pair, several records on a leg', () => {
+  // Institution removal no longer merges what it writes. Two removed candidates with one date, or a second
+  // removal, leave identical ambiguity holds on one pair; a card that is removed, linked again and removed
+  // again leaves two records on one payment. The evaluator is not changed. These tests pin the two readings
+  // that migration relies on: N identical live holds withhold exactly as one, and several live records on a
+  // leg read as one record, the leg naming the LEAST decision id.
+  // The scenarios and their hand-derived outcomes are SEVERAL_ROW_SCENARIOS (testUtils/cardPaymentHistories.ts);
+  // the SQL harness runs the same definitions against the SQL evaluator (supabase/tests/card_payment_evaluator).
+  // "Ended" is a row whose supersededBy is set. Nothing ends a system row yet: the evaluator has always
+  // ignored a superseded decision, and that is all these tests use.
+
+  // An evaluation as SEVERAL_ROW_SCENARIOS writes one: a line per leg and a line per decision.
+  const written = (ev: CardPaymentEvaluation) => ({
+    legs: Object.fromEntries(
+      ev.legs.map((l) => [
+        l.transactionId,
+        `${l.state}/${l.reason}/${l.effectCents}` +
+          (l.detail === null ? '' : ` detail=${l.detail}`) +
+          (l.partnerTransactionId === null ? '' : ` partner=${l.partnerTransactionId}`) +
+          (l.decisionId === null ? '' : ` decision=${l.decisionId}`) +
+          (l.lowCents === l.effectCents && l.highCents === l.effectCents ? '' : ` range=${l.lowCents}..${l.highCents}`) +
+          (l.candidates.length === 0 ? '' : ` cands=${l.candidates.map((c) => `${c.transactionId}:${c.kind}`).sort().join(',')}`),
+      ])
+    ),
+    decisions: Object.fromEntries(ev.decisions.map((d) => [d.decisionId, `${d.status}${d.detail === null ? '' : `/${d.detail}`}`])),
+  });
+  const inputOf = (name: string, userId = U): CardPaymentMatchingInput => {
+    const s = SEVERAL_ROW_SCENARIOS[name];
+    return { userId, asOf: ASOF, accounts: s.accounts, transactions: s.transactions, carryovers: s.carryovers ?? [], decisions: s.decisions };
+  };
+  const orders = <T,>(xs: T[]): T[][] => (xs.length <= 1 ? [xs] : xs.flatMap((x, i) => orders([...xs.slice(0, i), ...xs.slice(i + 1)]).map((p) => [x, ...p])));
+  const end = (d: MatchingDecision): MatchingDecision => ({ ...d, supersededBy: 'ended' });
+
+  it.each(Object.keys(SEVERAL_ROW_SCENARIOS))('%s: each user reads what was derived by hand, in whatever order the decisions are listed', (name) => {
+    const scenario = SEVERAL_ROW_SCENARIOS[name];
+    // The SQL harness numbers decisions in the order listed; listed ascending, "the least id" is the same decision there.
+    const ids = scenario.decisions.map((d) => d.id);
+    expect(ids).toEqual([...ids].sort());
+    for (const userId of [U, V]) {
+      const input = inputOf(name, userId);
+      const ev = evaluateCardPayments(input);
+      expect(written(ev)).toEqual(scenario.expect[userId] ?? { legs: {}, decisions: {} });
+      checkInvariants(input, ev);
+      for (const decisions of orders(scenario.decisions)) expect(evaluateCardPayments({ ...input, decisions })).toEqual(ev);
+    }
+  });
+
+  it('N identical live holds withhold exactly as one: any number of them, whichever is left, whichever is ended', () => {
+    // What the two legs read once nothing withholds their pair (S101's record is then outranked by tier 1).
+    const released: Record<string, Record<string, string>> = {
+      'S101-three-identical-holds-and-a-record': { b: 'paired/auto_pair', k: 'tracked/auto_pair' },
+      'S102-two-identical-holds-withhold-as-one': { c: 'tracked/auto_pair', y: 'paired/auto_pair' },
+    };
+    for (const name of Object.keys(released)) {
+      const input = inputOf(name);
+      const isHold = (d: MatchingDecision) => d.kind === 'ambiguity_hold_removed_card';
+      const holds = input.decisions.filter(isHold);
+      const rest = input.decisions.filter((d) => !isHold(d));
+      const legsWith = (decisions: MatchingDecision[]) => evaluateCardPayments({ ...input, decisions }).legs;
+      const all = legsWith(input.decisions);
+      // Every way of ending some of them or of never having had them: while one is live the legs read the same.
+      for (let live = 1; live < 2 ** holds.length; live++) {
+        const isLive = (i: number) => ((live >> i) & 1) === 1;
+        expect(legsWith([...rest, ...holds.filter((_, i) => isLive(i))])).toEqual(all);
+        expect(legsWith([...rest, ...holds.map((h, i) => (isLive(i) ? h : end(h)))])).toEqual(all);
+      }
+      // Ten more copies change nothing.
+      expect(legsWith([...input.decisions, ...Array.from({ length: 10 }, (_, i) => ({ ...holds[0], id: `more-${i}` }))])).toEqual(all);
+      // With none, or with every one ended, the pair forms: it was the holds that withheld it.
+      expect(reasons(evaluateCardPayments({ ...input, decisions: rest }))).toEqual(released[name]);
+      expect(reasons(evaluateCardPayments({ ...input, decisions: [...rest, ...holds.map(end)] }))).toEqual(released[name]);
+    }
+  });
+
+  it('several live records on one leg read as one record, and the leg names the least id — of the live and valid ones, in any order', () => {
+    const base = inputOf('S98-two-live-records-on-one-leg-read-as-one');
+    const [r1] = base.decisions;
+    const read = (decisions: MatchingDecision[]) => byId(evaluateCardPayments({ ...base, decisions })).get('c')!;
+    const one = read([r1]);
+    expect(one).toMatchObject({ state: 'untracked', reason: 'removed_card', effectCents: -10000, lowCents: -10000, highCents: -10000, detail: null, decisionId: 'r1', partnerTransactionId: null, candidates: [] });
+    // Two, three or twelve records: the leg reads exactly what it reads with one.
+    for (const n of [2, 3, 12]) {
+      const copies = Array.from({ length: n }, (_, i) => ({ ...r1, id: `r${String(i + 1).padStart(2, '0')}` }));
+      for (const decisions of [copies, [...copies].reverse()]) expect(read(decisions)).toEqual({ ...one, decisionId: 'r01' });
+    }
+    // The least LIVE one: with the lesser ones ended the leg names the next, and reads the same.
+    const three = ['ra', 'rb', 'rc'].map((id) => ({ ...r1, id }));
+    for (const order of orders(three)) {
+      expect(read(order)).toEqual({ ...one, decisionId: 'ra' });
+      expect(read(order.map((d) => (d.id === 'ra' ? end(d) : d)))).toEqual({ ...one, decisionId: 'rb' });
+      expect(read(order.map((d) => (d.id === 'rc' ? d : end(d))))).toEqual({ ...one, decisionId: 'rc' });
+    }
+    // The least VALID one: a record at other cents is no copy. It is inactive, and never the one named.
+    const stale = { ...r1, id: 'r0', a: { ...r1.a, cents: 9900 } };
+    for (const decisions of [[stale, r1], [r1, stale]]) {
+      expect(read(decisions)).toEqual(one);
+      expect(evaluateCardPayments({ ...base, decisions }).decisions).toEqual([
+        { decisionId: 'r0', kind: 'destination_removed_card', status: 'inactive', detail: 'amount_changed' },
+        { decisionId: 'r1', kind: 'destination_removed_card', status: 'active', detail: null },
+      ]);
+    }
+    // Ids are ordered as the database orders uuids — byte by byte, which for their lowercase text is
+    // character by character: a digit before a letter.
+    const uuids = ['a0000000-0000-4000-8000-000000000001', '0b000000-0000-4000-8000-000000000003', '9fffffff-ffff-4fff-8fff-ffffffffffff'];
+    for (const order of orders(uuids)) expect(read(order.map((id) => ({ ...r1, id })))).toEqual({ ...one, decisionId: '0b000000-0000-4000-8000-000000000003' });
+  });
+});
+
 // ---- Generated histories and invariants -----------------------------------------------------------
 
 
@@ -1472,6 +1580,41 @@ function checkInvariants(input: CardPaymentMatchingInput, ev: CardPaymentEvaluat
   // …and the decisions that are not holds come out exactly as they do without holds.
   expect(ev.decisions.filter((d) => !isHold(d as unknown as MatchingDecision))).toEqual(without.decisions);
 
+  // I14 (20261008120000): institution removal writes one destination_removed_card record per removed partner,
+  // so a leg can have several live records. Restated from the input. A live record is active exactly when its
+  // reference resolves to a current cash-side card leg at the recorded cents, whatever else is recorded on
+  // that leg. And a leg that no user decision claims, no conflicting replacement holds and tier 1 does not
+  // pair reads its records as ONE: untracked / removed_card (not counted on an excluded account), naming the
+  // LEAST id among the active ones — never an ended one, never an invalid one.
+  const recordsOn = new Map<string, string[]>();
+  for (const d of input.decisions) {
+    if (d.kind !== 'destination_removed_card' || d.userId !== input.userId) continue;
+    const result = decisions.get(d.id)!;
+    expect(result.kind).toBe('destination_removed_card');
+    if (accounts.get(d.a.accountId)?.userId !== input.userId) {
+      expect(result).toMatchObject({ status: 'rejected', detail: 'foreign_account' });
+      continue;
+    }
+    if (d.supersededBy !== null) {
+      expect(result.status).toBe('superseded');
+      continue;
+    }
+    const row = currentRow(d.a);
+    const applies = row !== undefined && row.amountCents === d.a.cents && legs.get(row.id)?.side === 'cash';
+    expect(result.status).toBe(applies ? 'active' : 'inactive');
+    if (applies) recordsOn.set(row.id, [...(recordsOn.get(row.id) ?? []), d.id]);
+  }
+  for (const leg of ev.legs) {
+    if (conflicting.has(leg.transactionId)) continue;
+    const least = [...(recordsOn.get(leg.transactionId) ?? [])].sort()[0];
+    const namesRecord = leg.decisionId !== null && decisions.get(leg.decisionId)!.kind === 'destination_removed_card';
+    if (namesRecord) expect(leg.decisionId).toBe(least);
+    if (least === undefined || leg.partnerTransactionId !== null || !(leg.decisionId === null || namesRecord)) continue;
+    expect(leg.decisionId).toBe(least);
+    if (leg.accountIncluded) expect(leg).toMatchObject({ state: 'untracked', reason: 'removed_card', effectCents: -leg.amountCents, detail: null, candidates: [] });
+    else expect(leg.state).toBe('not_counted');
+  }
+
   // Decisions of another user are never applied.
   for (const d of input.decisions) {
     if (d.userId !== input.userId) expect(decisions.get(d.id)?.status ?? 'rejected').toBe('rejected');
@@ -1499,7 +1642,7 @@ function checkInvariants(input: CardPaymentMatchingInput, ev: CardPaymentEvaluat
 }
 
 describe('invariants over 300 generated two-user histories (seeds 1000–1299)', () => {
-  it('every evaluation satisfies the approved rules (I1–I13)', () => {
+  it('every evaluation satisfies the approved rules (I1–I14)', () => {
     for (const seed of SEEDS) {
       const { input } = generate(seed);
       for (const userId of [U, V]) {
@@ -1507,6 +1650,45 @@ describe('invariants over 300 generated two-user histories (seeds 1000–1299)',
         checkInvariants(full, evaluateCardPayments(full));
       }
     }
+  });
+
+  it('system rows that differ only in their id read as one: ending all but one of them changes nothing a reader is shown', () => {
+    // 20261008120000: a removal writes one hold and one record per source, so identical rows are routine.
+    // For every user that has live holds or live records identical in every field the evaluator reads but
+    // the id: end all of them but one — the least id, then the greatest — and evaluate again. Every leg reads
+    // the same; a leg that named a record names one that is still live; the ended rows are reported
+    // superseded and no other decision changes. Ending one never ends another.
+    const isSystemRow = (d: MatchingDecision) => d.kind === 'destination_removed_card' || d.kind.startsWith('ambiguity_hold_');
+    let checked = 0;
+    for (const seed of SEEDS) {
+      const { input } = generate(seed);
+      for (const userId of [U, V]) {
+        const groups = new Map<string, string[]>();
+        for (const d of input.decisions) {
+          if (d.userId !== userId || d.supersededBy !== null || !isSystemRow(d)) continue;
+          const key = JSON.stringify([d.kind, d.a, d.b, d.counterpartDate ?? null]);
+          groups.set(key, [...(groups.get(key) ?? []), d.id]);
+        }
+        const several = [...groups.values()].filter((g) => g.length > 1).map((g) => [...g].sort());
+        if (several.length === 0) continue;
+        checked += 1;
+        const full = { ...input, userId };
+        const ev = evaluateCardPayments(full);
+        const kindOf = new Map(ev.decisions.map((d) => [d.decisionId, d.kind]));
+        // Which record a leg names is not compared: it is the least one left (I14).
+        const namedRecord = new Set(ev.legs.filter((l) => l.decisionId !== null && kindOf.get(l.decisionId) === 'destination_removed_card').map((l) => l.transactionId));
+        const unnamed = (legs: CardLegResult[]) => legs.map((l) => (namedRecord.has(l.transactionId) ? { ...l, decisionId: null } : l));
+        for (const kept of [several.map((g) => g[0]), several.map((g) => g[g.length - 1])]) {
+          const ended = new Set(several.flat().filter((id) => !kept.includes(id)));
+          const one = evaluateCardPayments({ ...full, decisions: full.decisions.map((d) => (ended.has(d.id) ? { ...d, supersededBy: 'ended' } : d)) });
+          expect(unnamed(one.legs)).toEqual(unnamed(ev.legs));
+          for (const l of one.legs) expect(l.decisionId !== null && ended.has(l.decisionId)).toBe(false);
+          expect(one.decisions).toEqual(ev.decisions.map((d) => (ended.has(d.decisionId) ? { ...d, status: 'superseded', detail: null } : d)));
+        }
+      }
+    }
+    // Not vacuous: the generator makes such rows for a good part of the users.
+    expect(checked).toBeGreaterThan(100);
   });
 
   it('reordering every input array yields the same result (determinism)', () => {
@@ -1640,6 +1822,35 @@ describe('invariants over 300 generated two-user histories (seeds 1000–1299)',
         const rowOf = (r: DecisionLegRef) => input.transactions.find((t) => t.accountId === r.accountId && (t.pendingTransactionId === r.plaidTransactionId || t.plaidTransactionId === r.plaidTransactionId && !input.transactions.some((o) => o.accountId === t.accountId && o.pendingTransactionId === t.plaidTransactionId)));
         const [ra, rb] = [rowOf(d.a), rowOf(d.b!)];
         if (ra !== undefined && rb !== undefined && partnerNow.get(ra.id) === rb.id) seen.add('hold:the-pair-stands');
+        // The same hold more than once (20261008120000: one hold per removed candidate), live and withholding.
+        const copies = input.decisions.filter((x) => x.kind === d.kind && x.userId === U && x.supersededBy === null && JSON.stringify([x.a, x.b, x.counterpartDate]) === JSON.stringify([d.a, d.b, d.counterpartDate]));
+        if (copies.length > 1 && ra !== undefined && rb !== undefined && partnerWithout.get(ra.id) === rb.id && partnerNow.get(ra.id) === null) seen.add('holds:identical:withholding');
+      }
+      // Several live records on one leg (20261008120000: one record per removed partner): read as one, by
+      // themselves or because a hold withholds the pair; dormant behind a tier 1 pair or under a user
+      // decision; with the lesser one ended; and listed with the least id NOT first, so that an evaluator
+      // that kept the first one it met would show.
+      const txnOf = new Map(input.transactions.map((t) => [t.id, t]));
+      const recordsOf = (t: MatchingTransaction, how: (r: DecisionLegRef) => boolean) =>
+        input.decisions.filter((x) => x.kind === 'destination_removed_card' && x.userId === U && x.a.accountId === t.accountId && how(x.a));
+      for (const leg of ev.legs) {
+        const t = txnOf.get(leg.transactionId)!;
+        const named = leg.decisionId === null ? undefined : kindOf.get(leg.decisionId);
+        if (leg.reason === 'ambiguous_replacement') {
+          const namers = recordsOf(t, (r) => r.plaidTransactionId === t.pendingTransactionId || r.plaidTransactionId === t.plaidTransactionId).filter((x) => x.supersededBy === null);
+          if (named?.kind === 'destination_removed_card' && namers.length > 1) seen.add('records:several:conflicting-replacements');
+          continue;
+        }
+        const onLeg = recordsOf(t, (r) => r.cents === t.amountCents && (r.plaidTransactionId === t.plaidTransactionId || r.plaidTransactionId === t.pendingTransactionId));
+        const live = onLeg.filter((x) => kindOf.get(x.id)!.status === 'active').map((x) => x.id);
+        if (live.length === 1 && leg.decisionId === live[0] && onLeg.some((x) => x.supersededBy !== null && x.id < live[0])) seen.add('records:the-lesser-ended:the-greater-named');
+        if (live.length < 2) continue;
+        if (named?.kind === 'destination_removed_card') {
+          seen.add(`records:several:read:${leg.state}/${leg.reason}`);
+          if (live[0] !== [...live].sort()[0]) seen.add('records:several:read:the-least-is-not-listed-first');
+          if (partnerWithout.get(leg.transactionId) != null) seen.add('records:several:read:behind-a-withheld-pair');
+        } else if (named === undefined && leg.partnerTransactionId !== null) seen.add('records:several:dormant:tier1-pair');
+        else if (named !== undefined) seen.add(`records:several:dormant:user-decision:${named.status}`);
       }
     }
     for (const needed of [
@@ -1681,6 +1892,18 @@ describe('invariants over 300 generated two-user histories (seeds 1000–1299)',
       'hold:ambiguity_hold_removed_card:inactive:amount_changed',
       'hold:ambiguity_hold_removed_card:inactive:sides_not_opposite',
       'hold:ambiguity_hold_removed_card:superseded',
+      // one system row per source (20261008120000): identical holds that withhold; several records on a leg
+      'holds:identical:withholding',
+      'hold:withheld:cash:untracked/removed_card',
+      'records:several:read:untracked/removed_card',
+      'records:several:read:not_counted/excluded_account',
+      'records:several:read:the-least-is-not-listed-first',
+      'records:several:read:behind-a-withheld-pair',
+      'records:several:dormant:tier1-pair',
+      'records:several:dormant:user-decision:active',
+      'records:several:dormant:user-decision:inactive',
+      'records:the-lesser-ended:the-greater-named',
+      'records:several:conflicting-replacements',
     ]) {
       expect(seen, needed).toContain(needed);
     }

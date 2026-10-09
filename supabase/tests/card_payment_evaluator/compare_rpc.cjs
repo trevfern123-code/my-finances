@@ -9,6 +9,11 @@
 // A sequence may also print checkpoints (CI / CR lines: the inputs and the SQL states at a named stage inside
 // it): the reference evaluator must equal the SQL states at each, and the stages must be exactly the ones the
 // E line lists (`checkpoints`; none when it lists none).
+// Since 20261008120000 an institution removal writes one system row per source, so decisions that differ in
+// nothing but their id are routine. An E line may state them (`sameKeyRows`: "<kind>:<leg a's Plaid id>[+<leg
+// b's>][@<removed candidate's date>]" → how many live decisions of user aa have that key at the end of the
+// sequence): every one of them must have reached the reference evaluator under its own id, the same in
+// every other field it reads, and come out of it with one status.
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert');
@@ -69,13 +74,31 @@ for (const [name, sc] of scenarios) {
   const byPlaid = new Map();
   const oracleLegs = new Map();
   let live = 0;
+  // aa's live decisions by kind, leg references and removed-candidate date, each with the reference evaluator's result.
+  const sameKey = new Map();
   for (const [user, input] of Object.entries(sc.inputs)) {
     const want = evaluateCardPayments(input);
     if (!sameAsReference(`${name} user ${user}`, sc.states[user], want)) continue;
     for (const t of input.transactions) byPlaid.set(t.plaidTransactionId, t.id);
     for (const l of want.legs) oracleLegs.set(l.transactionId, l);
+    if (user !== AA) continue;
     // Only user aa calls the RPCs; count aa's live (non-superseded) decisions.
-    if (user === AA) live = input.decisions.filter((d) => d.userId === AA && d.supersededBy === null).length;
+    const liveDecisions = input.decisions.filter((d) => d.userId === AA && d.supersededBy === null);
+    live = liveDecisions.length;
+    for (const d of liveDecisions) {
+      const key = `${d.kind}:${d.a.plaidTransactionId}${d.b ? `+${d.b.plaidTransactionId}` : ''}${d.counterpartDate ? `@${d.counterpartDate}` : ''}`;
+      const result = want.decisions.find((r) => r.decisionId === d.id);
+      sameKey.set(key, [...(sameKey.get(key) ?? []), { d, status: result ? `${result.status}${result.detail === null ? '' : `/${result.detail}`}` : '(not reported)' }]);
+    }
+  }
+  for (const [key, n] of Object.entries(sc.expect.sameKeyRows ?? {})) {
+    const rows = sameKey.get(key) ?? [];
+    const ids = new Set(rows.map((r) => r.d.id));
+    const contents = new Set(rows.map((r) => JSON.stringify({ ...r.d, id: null, decidedSeq: null })));
+    const statuses = new Set(rows.map((r) => r.status));
+    if (rows.length !== n || ids.size !== n) fail(`${name}: ${rows.length} live decisions (${ids.size} ids) reached the reference evaluator as ${key}, expected ${n}`);
+    else if (contents.size !== 1) fail(`${name}: the ${n} decisions ${key} differ in more than their id`);
+    else if (statuses.size !== 1 || statuses.has('(not reported)')) fail(`${name}: the ${n} decisions ${key} come out of the reference evaluator as ${[...statuses].join(', ')}`);
   }
   // Checkpoints inside the sequence: exactly the stages the E line lists, each with both users' inputs and states.
   for (const [stage, cp] of sc.checkpoints) {

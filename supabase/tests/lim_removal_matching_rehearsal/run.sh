@@ -2,6 +2,8 @@
 # Upgrade / rollback / re-apply rehearsal, on a POPULATED database, for the two I3A migrations:
 #   20261006110000_card_payment_pair_counterpart_removed.sql  (the decision kinds, the evaluator, three RPCs)
 #   20261006120000_lim_removal_card_payment_matching.sql      (institution removal)
+# 20261008120000_card_payment_removal_provenance.sql builds on the second and is never applied here: this
+# rehearsal ends before it (its own is supabase/tests/card_payment_removal_provenance_rehearsal).
 # Nothing here touches any real database: one throwaway container of Supabase's PostgreSQL 17 image. Not run
 # in CI.
 #
@@ -63,6 +65,7 @@ SCHEMA_MIGRATION="$ROOT/supabase/migrations/20261006110000_card_payment_pair_cou
 SCHEMA_ROLLBACK="$ROOT/supabase/rollback/20261006110000_card_payment_pair_counterpart_removed_rollback.sql"
 MIGRATION="$ROOT/supabase/migrations/20261006120000_lim_removal_card_payment_matching.sql"
 ROLLBACK="$ROOT/supabase/rollback/20261006120000_lim_removal_card_payment_matching_rollback.sql"
+LATER_MIGRATION="$ROOT/supabase/migrations/20261008120000_card_payment_removal_provenance.sql"
 LOGS="$(mktemp -d)"
 cleanup() { if [ "${KEEP:-0}" != 1 ]; then docker rm -f "$CONTAINER" >/dev/null 2>&1; fi; rm -rf "$LOGS"; }
 trap cleanup EXIT
@@ -90,6 +93,7 @@ apply_baseline() {
   for f in "$ROOT"/supabase/migrations/*.sql; do
     [ "$f" = "$MIGRATION" ] && continue
     [ "$f" = "$SCHEMA_MIGRATION" ] && continue
+    [ "$f" = "$LATER_MIGRATION" ] && continue
     bounded docker exec -i "$CONTAINER" psql -X -q -1 -v ON_ERROR_STOP=1 -U postgres -d postgres < "$f" || { echo "migration $(basename "$f") failed"; return 1; }
   done
 }

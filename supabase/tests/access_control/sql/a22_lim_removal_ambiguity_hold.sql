@@ -35,6 +35,12 @@
 --   M (mirror) card leg y-m −800 09-20 on Y; removed CASH leg r-m +800 09-23 on R; kept cash leg k-m +800 09-23
 -- User bb (F, ownership). Item 2 (card BX) is REMOVED; item 5 survives (checking BC, card BY):
 --             b-k  +700 09-10      bx-k −700 09-11      by-k −700 09-11          the same amounts as aa's case A
+--
+-- G is read against 20261008120000_card_payment_removal_provenance.sql (one system row per source): the second
+-- removal writes a hold of its own on the pair the first removal already holds, with the same date; each of the
+-- two has a provenance row naming the candidate its own removal deleted; and the payment reads as with one.
+-- Against 20261006120000 alone (EXCLUDE=20261008120000_card_payment_removal_provenance.sql) the file runs to its
+-- verdict and G is violated twice: that body wrote no second hold, and it has no provenance.
 set role service_role;
 
 create function pg_temp.aa() returns uuid language sql as $$ select '00000000-0000-0000-0000-0000000000aa'::uuid $$;
@@ -73,10 +79,41 @@ create function pg_temp.holds(p_cash_plaid text) returns text language sql as $$
                              order by d.a_plaid_transaction_id collate "C", d.counterpart_date), 'none')
   from public.card_payment_decisions d
   where d.kind like 'ambiguity_hold_%' and d.superseded_by is null and d.b_plaid_transaction_id = p_cash_plaid $$;
+-- One of them: the first by card leg and date, and among holds that differ only in their source the least id.
 create function pg_temp.hold_id(p_cash_plaid text) returns uuid language sql as $$
   select d.id from public.card_payment_decisions d
   where d.kind like 'ambiguity_hold_%' and d.superseded_by is null and d.b_plaid_transaction_id = p_cash_plaid
-  order by d.a_plaid_transaction_id collate "C" limit 1 $$;
+  order by d.a_plaid_transaction_id collate "C", d.counterpart_date, d.id limit 1 $$;
+-- ---- Provenance (20261008120000), read so that this file also RUNS where its tables do not exist ----------
+create function pg_temp.has_provenance() returns boolean language sql as $$
+  select to_regclass('public.card_payment_removal_sources') is not null
+         and to_regclass('public.card_payment_removal_generations') is not null $$;
+-- The live decisions a removal wrote that name a Plaid id as either leg, each with its source, sorted:
+--   kind(card-or-surviving leg[/other leg][@removed date])<=removed item:removed account:removed transaction[relation]
+-- ("-" for the transaction when the source had no single row; the relation is confirmed, partner or candidate;
+-- "NO SOURCE" for a decision without a provenance row). "NO PROVENANCE TABLES" where the tables do not exist.
+create function pg_temp.deps(p_plaid text, p_user uuid default pg_temp.aa()) returns text language plpgsql as $$
+declare
+  v text;
+begin
+  if not pg_temp.has_provenance() then return 'NO PROVENANCE TABLES'; end if;
+  execute $q$
+    select coalesce(string_agg(q.x, ' ; ' order by q.x collate "C"), 'none')
+    from (select replace(replace(d.kind, 'ambiguity_hold_', 'hold_'), 'destination_removed_card', 'record')
+                 || '(' || d.a_plaid_transaction_id || coalesce('/' || d.b_plaid_transaction_id, '') || coalesce('@' || d.counterpart_date, '') || ')<='
+                 || coalesce(r.plaid_item_id || ':' || s.source_plaid_account_id || ':' || coalesce(s.source_plaid_transaction_id, '-')
+                             || '[' || replace(replace(replace(s.source_relation, 'confirmed_counterpart', 'confirmed'),
+                                                       'automatic_partner', 'partner'), 'removed_candidate', 'candidate') || ']',
+                             'NO SOURCE') as x
+          from public.card_payment_decisions d
+          left join public.card_payment_removal_sources s on s.decision_id = d.id
+          left join public.plaid_item_removals r on r.id = s.removal_id
+          where d.user_id = $2 and d.superseded_by is null
+            and d.kind in ('pair_counterpart_removed', 'destination_removed_card', 'ambiguity_hold_removed_card', 'ambiguity_hold_removed_cash_account')
+            and $1 in (d.a_plaid_transaction_id, d.b_plaid_transaction_id)) q $q$
+  into v using p_plaid, p_user;
+  return v;
+end $$;
 create function pg_temp.cardleg(p_plaid text, p_account text, p_amount numeric, p_date date, p_pending boolean default false,
                                 p_pending_of text default null) returns void language sql as $$
   insert into public.transactions (account_id, plaid_transaction_id, amount, date, name, pending, pending_transaction_id, user_role_override)
@@ -347,11 +384,17 @@ select pg_temp.req('E', 'when the kept card''s leg is then withdrawn, the paymen
 select pg_temp.observe('after the relink', array['k-e', 'k-g']);
 
 -- ---- G. A second removal with the same ambiguity ----------------------------------------------------
+-- Each removal records what IT removed (20261008120000): the second writes a hold of its own on the pair the
+-- first already holds, with the same date. The two rows differ only in their source, and withhold as one.
 select pg_temp.req('G', 'before the second removal the tie is back: the kept card''s leg and the re-imported one', pg_temp.unresolved_range('k-g', 81000) and pg_temp.competitors('k-g') = 'x2-g,y-g');
 select pg_temp.remove(pg_temp.aa(), '00000000-0000-0000-0000-000000000007');
-select pg_temp.req('G', 'the second removal writes no second hold for the same ambiguity, and the payment is still unresolved',
-  (select count(*) = 1 from public.card_payment_decisions d where d.b_plaid_transaction_id = 'k-g') and pg_temp.holds('k-g') = 'removed_card:y-g@2026-09-11'
-  and pg_temp.unresolved_range('k-g', 81000));
+select pg_temp.req('G', 'the second removal writes its OWN hold for the same ambiguity: two live holds on the one pair, with the one date, and both apply',
+  (select count(*) = 2 and bool_and(pg_temp.dstatus(d.id) = 'active') from public.card_payment_decisions d where d.b_plaid_transaction_id = 'k-g')
+  and pg_temp.holds('k-g') = 'removed_card:y-g@2026-09-11,removed_card:y-g@2026-09-11');
+select pg_temp.req('G', 'each of the two holds names the candidate its own removal deleted — Card Bank''s leg, and the relinked card''s — neither of which was a match',
+  pg_temp.deps('k-g') = 'hold_removed_card(y-g/k-g@2026-09-11)<=harness-item-a7:a22-x2:x2-g[candidate] ; hold_removed_card(y-g/k-g@2026-09-11)<=harness-item-a:a22-x:x-g[candidate]');
+select pg_temp.req('G', 'two identical holds withhold as one: the payment is still unresolved, a range, with the kept card''s leg as its one candidate',
+  pg_temp.unresolved_range('k-g', 81000) and pg_temp.competitors('k-g') = 'y-g');
 select pg_temp.observe('at the end', array['k-a', 'k-b', 'k-d1', 'k-e', 'k-g']);
 
 -- ---- The verdict ------------------------------------------------------------------------------------
@@ -362,6 +405,7 @@ select 'OBSERVED', moment, leg, what from observed order by seq;
 select 'OBSERVED', 'ambiguity holds at the end', d.kind, d.a_plaid_transaction_id || ' / ' || d.b_plaid_transaction_id || ' @ ' || d.counterpart_date
        || case when d.superseded_by is null then '' else ' (superseded)' end
 from public.card_payment_decisions d where d.kind like 'ambiguity_hold_%' order by d.user_id, d.b_plaid_transaction_id collate "C", d.a_plaid_transaction_id collate "C";
+select 'OBSERVED', 'sources at the end', 'k-g', pg_temp.deps('k-g');
 select 'CONTRACT ' || case when ok then 'ok      ' else 'VIOLATED' end, kase, requirement from contract order by seq;
 select 'CONTRACT SUMMARY', count(*) filter (where ok) || ' of ' || count(*) || ' requirements hold',
        coalesce('violated in: ' || string_agg(distinct kase, ', ' order by kase) filter (where not ok), 'none violated') from contract;

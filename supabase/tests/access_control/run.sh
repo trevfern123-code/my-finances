@@ -16,8 +16,9 @@
 #
 # Requires: docker, bash, GNU timeout (coreutils).
 #   PG_IMAGE=<image>   override the image (default public.ecr.aws/supabase/postgres:17.6.1.155)
-#   EXCLUDE=<file>     skip one migration by basename — e.g. the one under test, to watch its tests
-#                      fail against the schema it was written to fix
+#   EXCLUDE=<file>...  skip migrations by basename (several: separated by spaces or commas) — e.g. the one
+#                      under test, to watch its tests fail against the schema it was written to fix. A
+#                      migration that builds on an excluded one must be excluded too: its guard refuses.
 #   KEEP=1             leave the container running afterwards
 #   VERBOSE=1          print every test's transcript, not just failing ones
 #   STARTUP_TIMEOUT=s  fail if the database does not accept connections within s seconds (default 180)
@@ -88,8 +89,18 @@ done
 sleep 3
 echo "server: $(psql_db -At -c 'show server_version' </dev/null)"
 
+EXCLUDED="${EXCLUDE:-}"
+EXCLUDED="${EXCLUDED//,/ }"
+excluded() {
+  local name="$1" e
+  for e in $EXCLUDED; do [ "$name" = "$e" ] && return 0; done
+  return 1
+}
+for e in $EXCLUDED; do
+  [ -f "$ROOT/supabase/migrations/$e" ] || { echo "FAILED: EXCLUDE names no migration: $e"; exit 1; }
+done
 for f in "$ROOT"/supabase/migrations/*.sql; do  # glob order is sorted, and safe with spaces in paths
-  if [ -n "${EXCLUDE:-}" ] && [ "$(basename "$f")" = "$EXCLUDE" ]; then echo "skipping $EXCLUDE (EXCLUDE)"; continue; fi
+  if excluded "$(basename "$f")"; then echo "skipping $(basename "$f") (EXCLUDE)"; continue; fi
   if ! bounded docker exec -i "$CONTAINER" psql -X -q -1 -v ON_ERROR_STOP=1 -U postgres -d postgres < "$f" >>"$LOGS/history.log" 2>&1; then
     echo "FAILED to apply migration $(basename "$f"):"; tail -20 "$LOGS/history.log"; exit 1
   fi
