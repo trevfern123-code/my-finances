@@ -81,10 +81,11 @@ jobs:
     # failed, so one run reports all four.
     runs-on: ubuntu-latest
     env:
-      # Supabase's official Docker Hub mirror avoids ECR Public's anonymous-download quota.
-      # Version 17.6.1.155: this index digest matches ECR exactly (verified 2026-09-30).
-      # Only the history/access-control steps opt in; scaffold keeps its postgres:17 image.
-      SUPABASE_TEST_PG_IMAGE: docker.io/supabase/postgres@sha256:3866d94d8426927e8db3f1c5d790752292bfbe27b5f1f46e199ae1b7d3c1710b
+      # Supabase's PostgreSQL 17.6.1.155 from ECR Public, after Docker Hub rejected CI pulls (pull limit).
+      # The SAME index digest as before: no database-image change. An earlier revision had moved to Docker
+      # Hub because of ECR Public's anonymous-download quota, so this is an alternative, not a guarantee.
+      # History, access-control and evaluator suites use this image; scaffold keeps standard PostgreSQL.
+      SUPABASE_TEST_PG_IMAGE: public.ecr.aws/supabase/postgres@sha256:3866d94d8426927e8db3f1c5d790752292bfbe27b5f1f46e199ae1b7d3c1710b
     steps:
       - uses: actions/checkout@v5
 
@@ -98,6 +99,11 @@ jobs:
 
       - name: Phase A (scaffold)
         run: bash supabase/tests/phase_a/run.sh
+        env:
+          # Standard PostgreSQL 17 (the Docker Official Image) from its ECR Public mirror, not the Supabase
+          # image. Pinned to the index that postgres:17 named on 2026-10-09, byte-identical on Docker Hub
+          # and on ECR Public. Until then this step pulled the moving tag postgres:17 from Docker Hub.
+          PG_IMAGE: public.ecr.aws/docker/library/postgres@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
 
       - name: Phase A (history)
         if: ${{ !cancelled() }}
