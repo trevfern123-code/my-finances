@@ -3,16 +3,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 const mockGetTransactionEffects = vi.hoisted(() => vi.fn());
+// The payment review's requests (I3A-R packet 2-A). Only the last block of this file uses them: every other
+// test lists a measure that has no review entry, and must make none of these calls.
+const recoveryApi = vi.hoisted(() => ({
+  getRecoveryReviews: vi.fn(),
+  applyRecoveryAction: vi.fn(),
+  getRecoveryAction: vi.fn(),
+  requestRecoveryRefresh: vi.fn(),
+  getCurrentSessionOwner: vi.fn(),
+}));
 vi.mock('../lib/api', () => ({
   getTransactionEffects: mockGetTransactionEffects,
   EFFECTS_RESTART_REQUIRED: 'effects_restart_required',
+  ...recoveryApi,
 }));
 
 import { EffectsDrilldown } from './EffectsDrilldown';
+import { TransactionsFeed } from './TransactionsFeed';
 import { useEffectsDrilldown } from '../hooks/useEffectsDrilldown';
 import type { EffectsQuery } from '../lib/api';
 import { EFFECTS_MAX_RESTARTS, EFFECTS_PAGE_LIMIT } from '../lib/effectsDrilldown';
-import { readEffectsResponse, type EffectsResponse } from '../lib/semanticModel';
+import { readEffectsResponse, readRecoveryLookup, readRecoveryReviews, type EffectsResponse } from '../lib/semanticModel';
 import { effectRowWire, effectsPageWire } from '../testUtils/semanticFixtures';
 
 // Financial Semantics Phase B, integration slice I2 — the drill-down as the user sees it (design
@@ -45,9 +56,59 @@ const rowAmounts = () => Array.from(document.querySelectorAll('.drilldown-amount
 const footer = () => document.querySelector('.drilldown-footer')?.textContent ?? null;
 
 beforeEach(() => {
+  localStorage.clear();
   mockGetTransactionEffects.mockReset();
+  for (const mock of Object.values(recoveryApi)) mock.mockReset();
+  recoveryApi.getCurrentSessionOwner.mockResolvedValue({ userId: 'user-a', sessionId: 'login-1' });
 });
 afterEach(cleanup);
+
+/**
+ * A stand-in for the browser's Web Locks API, which jsdom does not have: one holder per lock name, the others
+ * wait in turn, and a waiting request ends when its signal aborts. It lets these tests run the coordinated code.
+ * It is NOT evidence of what a browser guarantees.
+ */
+function installWebLocks() {
+  const held = new Set<string>();
+  const queues = new Map<string, Array<() => void>>();
+  const request = vi.fn(
+    (name: string, options: { mode?: string; signal?: AbortSignal }, callback: (lock: { name: string; mode: string }) => unknown) =>
+      new Promise<unknown>((resolve, reject) => {
+        const run = () => {
+          Promise.resolve()
+            .then(() => callback({ name, mode: options.mode ?? 'exclusive' }))
+            .then(resolve, reject)
+            .finally(() => {
+              const next = queues.get(name)?.shift();
+              if (next) next();
+              else held.delete(name);
+            });
+        };
+        if (!held.has(name)) {
+          held.add(name);
+          run();
+          return;
+        }
+        const queue = queues.get(name) ?? [];
+        queues.set(name, queue);
+        queue.push(run);
+        options.signal?.addEventListener('abort', () => {
+          const at = queue.indexOf(run);
+          if (at < 0) return;
+          queue.splice(at, 1);
+          reject(new DOMException('The request was aborted.', 'AbortError'));
+        });
+      })
+  );
+  Object.defineProperty(globalThis.navigator, 'locks', { configurable: true, value: { request } });
+  return request;
+}
+beforeEach(() => {
+  installWebLocks();
+});
+afterEach(() => {
+  Reflect.deleteProperty(globalThis.navigator, 'locks');
+});
 
 describe('loading and listing', () => {
   it('requests page 1 for exactly the query it was given, and announces loading', async () => {
@@ -418,5 +479,66 @@ describe('automatic refetch after an updating answer', () => {
     expect(vi.getTimerCount()).toBe(0);
     await advance(600_000);
     expect(mockGetTransactionEffects).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---- The payment review: an operation left unresolved elsewhere is recovered HERE -------------------------
+describe('an unresolved operation is recovered through the Effects Drilldown', () => {
+  const K = '22222222-2222-4222-8222-222222222222';
+  const CARD_PAYMENTS: EffectsQuery = { start: '2026-09-01', end: '2026-10-01', measure: 'card_payments_unresolved_payments' };
+  const freshness = { fresh: true, input_version: 7, evaluated_version: 7, review_revision: 3, last_error_code: null, refresh: { queued: false, needs_attention: false, attempts: 0 } };
+  const reviewOf = (transactionId: string) => ({
+    transaction_id: transactionId, account_id: '66666666-6666-4666-8666-666666666666', date: '2026-09-10', amount_cents: 37000, pending: false, side: 'cash',
+    direction: 'payment', account_included: true, state: 'untracked', reason: 'removed_card', detail: null, effect_cents: -37000, low_cents: -37000, high_cents: -37000,
+    partner_transaction_id: null, guard_withheld: false, withheld_partner_transaction_id: null, coverage_gap: false, deferred: false, controlling_decision: null,
+    obligations: [], candidates: [],
+  });
+  const reviews = () => readRecoveryReviews({ fresh: true, freshness, actions_enabled: true, affected_payment_count: 1, next_cursor: null, reviews: [reviewOf(K)] });
+  const receipt = { operation_id: '11111111-1111-4111-8111-111111111111', action: 'defer', outcome: 'saved', reason: null, decision_id: null, superseded_decision_ids: [], retained_obligation_ids: [], permanent_retirement: false, committed_at: '2026-10-09T12:00:00+00:00' };
+  const unknown = () => Object.assign(new Error('The outcome of this request is not known.'), { status: 504, code: 'outcome_unknown' });
+  const shownOperationId = () => screen.queryByTestId('unknown-outcome')?.getAttribute('data-operation-id') ?? null;
+  const feedProps = { budgetCategories: [], syncing: false, onSync: () => {}, onCategorize: () => {}, onApprove: () => {}, onSaveSplits: async () => {}, onClearSplits: async () => {} };
+  const feedItem = { id: K, amount: 370, iso_currency_code: 'USD', date: '2026-09-10', name: 'Card payment', merchant_name: null, category: 'LOAN_PAYMENTS', plaid_category: null, pending: false, budget_category_id: null, needs_review: false, splits: [], accounts: { name: 'Checking', nickname: null, plaid_items: { institution_name: 'Bank' } } } as never;
+
+  it('sent from Transactions, left with no answer, Transactions left: the Effects Drilldown offers the entry, shows the SAME operation, blocks other changes, and reconciles it through the same id', async () => {
+    recoveryApi.getRecoveryReviews.mockResolvedValue(reviews());
+    recoveryApi.applyRecoveryAction.mockRejectedValueOnce(unknown());
+    // In Transactions: a change is sent and no answer comes back.
+    const feed = render(<TransactionsFeed {...feedProps} transactions={[feedItem]} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Review payment' })).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Review payment' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Decide later' }).hasAttribute('disabled')).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'Decide later' }));
+    await waitFor(() => expect(shownOperationId()).not.toBeNull());
+    const sent = recoveryApi.applyRecoveryAction.mock.calls[0][0];
+    // The user navigates away: Transactions is gone.
+    feed.unmount();
+    expect(screen.queryByTestId('unknown-outcome')).toBeNull();
+
+    // In the Effects Drilldown, on a list of card payments.
+    mockGetTransactionEffects.mockResolvedValue(ok([row('Card payment', 370, {}, { id: K })], { total_amount: 370, total_count: 1 }));
+    render(<EffectsDrilldown query={CARD_PAYMENTS} />);
+    await waitFor(() => expect(screen.getByText(/1 payment to review · 1 change to check\./)).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Open the review' }));
+    await waitFor(() => expect(shownOperationId()).toBe(sent.operationId));
+    // Opened as a whole, each payment's block starts closed: open it, and its actions are there — and blocked.
+    fireEvent.click(screen.getByRole('button', { name: /Card payment of \$370\.00/ }));
+    expect(screen.getByRole('button', { name: 'Decide later' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Decide later' }));
+    expect(recoveryApi.applyRecoveryAction).toHaveBeenCalledTimes(1);
+    // The original committed in the meantime: the same id finds it. Nothing is sent a second time.
+    recoveryApi.getRecoveryAction.mockResolvedValueOnce(readRecoveryLookup({ found: true, receipt, freshness }));
+    fireEvent.click(screen.getByRole('button', { name: 'Check whether it was saved' }));
+    await waitFor(() => expect(shownOperationId()).toBeNull());
+    expect(recoveryApi.getRecoveryAction.mock.calls[0][0]).toBe(sent.operationId);
+    expect(recoveryApi.applyRecoveryAction).toHaveBeenCalledTimes(1);
+  });
+
+  it('a list that has no review entry stays as it was while a change is unresolved: no entry, no review request', async () => {
+    mockGetTransactionEffects.mockResolvedValue(ok([row('Coffee', 4.5)], { total_amount: 4.5, total_count: 1 }));
+    render(<EffectsDrilldown query={QUERY} />);
+    await waitFor(() => expect(rowNames()).toEqual(['Coffee']));
+    expect(recoveryApi.getRecoveryReviews).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /review/i })).toBeNull();
   });
 });

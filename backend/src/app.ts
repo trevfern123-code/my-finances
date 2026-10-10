@@ -7,6 +7,7 @@ import { budgetCategoriesRouter } from './routes/budgetCategories';
 import { categoryMappingsRouter } from './routes/categoryMappings';
 import { manualLoansRouter } from './routes/manualLoans';
 import { userPreferencesRouter } from './routes/userPreferences';
+import { cardPaymentRecoveryRouter } from './routes/cardPaymentRecovery';
 import { webhooksRouter } from './routes/webhooks';
 import { errorHandler } from './middleware/errorHandler';
 import {
@@ -49,6 +50,7 @@ export const CLIENT_API_ROUTES = [
   '/api/category-mappings',
   '/api/manual-loans',
   '/api/user-preferences',
+  '/api/card-payment-recovery',
 ];
 
 /**
@@ -104,6 +106,7 @@ export function createApp(options: {
   app.use('/api/category-mappings', categoryMappingsRouter);
   app.use('/api/manual-loans', manualLoansRouter);
   app.use('/api/user-preferences', userPreferencesRouter);
+  app.use('/api/card-payment-recovery', cardPaymentRecoveryRouter);
   app.use('/api/webhooks', webhooksRouter);
 
   app.use(errorHandler);

@@ -82,6 +82,33 @@ PRs, nothing merged or released.**
     released, or removed-destination evidence retired, without the user's authorization, including the
     automatic "exact return" route of the I3A-R roadmap. The places this touches are marked
     "amended 2026-10-09, I3A-R policy".
+- **Since (2026-10-09, I3A-R packet 2-A — a local implementation candidate awaiting independent
+  review, nothing committed, merged or released):** migration `20261009120000` replaces the bodies of
+  `evaluate_card_payments`, `remove_plaid_item_local` and `get_card_payment_states` and adds nine
+  tables. See `PHASE_B_I3A_R_PACKET_2A_REVIEW.md`. It implements the review safeguard and the
+  user-assisted recovery workflow that the policy amendment above requires before activation, on
+  Trevor's approval of 2026-10-09.
+  - **The review safeguard (§4.7).** A surviving payment that had an eligible candidate on the removed
+    institution is an *affected payment* — read from the evaluator's complete pool before the delete,
+    whether or not the removal wrote a hold or a record about it (a payment whose candidates were all
+    removed gets neither, and is affected all the same) — and so is the surviving leg of a preserved
+    user confirmation. After tier 1 and the holds, an automatic pair with an affected leg stays only if every
+    review obligation on either leg lists that pair as one that survived the removal. Otherwise it is
+    withheld in both directions and nothing is selected in its place. A new transaction and the
+    re-imported leg of a relinked card are never listed.
+  - **Publication.** A withheld leg is published before the record `destination_removed_card`, which
+    stays stored: an included cash leg reads `unresolved / relink_review_required`, a range from
+    min(0, −cents) to max(0, −cents), where an included card exists, and `untracked /
+    no_included_card` where none does; an included card leg reads `unresolved /
+    relink_review_required`, 0; a leg on an excluded account reads `not_counted / excluded_account`.
+  - **Nothing is retired.** No hold is ended, no record is retired and no obligation is discharged.
+    P-Y and P-D are not implemented. The user decides the current payment with the decisions that
+    already existed (§3.5); those RPCs are unchanged.
+  - *Superseded where it conflicts:* every statement of this document that a new transaction or a
+    re-imported leg pairs "by the ordinary rules" with an affected payment. The places this touches
+    are marked "amended 2026-10-09, I3A-R packet 2-A". Acceptance tests whose stated expectation
+    this changes are listed in that document, §14; their files were updated in the correction pass
+    of the same date.
 
 *Original status line (rev 3, 2026-09-29), kept for history:* proposal for review — nothing
 implemented. There is no migration, endpoint or live-calculation change.
@@ -953,7 +980,9 @@ resolve it. Deleting one candidate is not new evidence that another was the true
     against the removed candidate's stored date — after a relink too, whatever date the re-imported leg
     has (recorded as open: `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3, question 7; *amended 2026-10-09,
     I3A-R policy: the policy that governs it is recorded in the status above; nothing of it is
-    implemented*);
+    implemented*; *amended 2026-10-09, I3A-R packet 2-A: with migration `20261009120000` such a pair is withheld
+    for an affected payment (one that had an eligible candidate on the removed institution), unless
+    that removal knew the pair; the hold and the record stay as they are*);
   - a **changed amount** on either leg ends the hold;
   - a **date change** releases the pair when it brings the kept candidate strictly closer than the
     removed one was, and not otherwise;
@@ -1021,6 +1050,9 @@ card's fitting leg within five days then paired automatically, and the record we
   question 7): the hold keeps judging its pair against the stored date of the leg that was removed.
   *(amended 2026-10-09, I3A-R policy: open as behaviour. The policy that governs it is recorded in the
   status above: permanent release requires the user's explicit authorization, P-Y.)*
+  *(amended 2026-10-09, I3A-R packet 2-A: "evaluated as always" no longer holds for a new or
+  re-imported leg and an affected payment. Such a pair is withheld until the user decides the
+  payment; the status above states the rule.)*
 - **Nothing is written where there is nothing to protect against:** no competitor, an automatic match
   that stays, or a kept leg outside the five-day window.
 - **The mirror.** When the **cash** institution is removed, a kept card leg that was matched
@@ -1049,7 +1081,8 @@ evaluator-equivalence harness.
 **Left for a decision.** Seven questions that revision 5 of the I3A candidate records and does not
 decide are in `PHASE_B_I3A_LIM_REMOVAL_MATCHING.md` §9.3. *(amended 2026-10-09, I3A-R policy: for the one
 about a hold after the removed institution is linked again, question 7 there, the governing policy —
-P-Y and P-D — is recorded in the status above. It is not implemented. The others are as they were.)*
+P-Y and P-D — is recorded in the status above. It is not implemented. The others are as they were.)* *(amended 2026-10-09, I3A-R packet 2-A: the review safeguard and the user-assisted
+recovery of that policy are implemented as a local candidate; P-Y and P-D themselves are not.)*
 
 ### 4.8 Pending → posted — every order
 

@@ -197,6 +197,9 @@ function readUnresolved(value: unknown): UnresolvedCardPayments | null {
   const byReason: Record<string, number> = {};
   for (const [reason, count] of Object.entries(value.by_reason)) {
     if (!isCount(count)) return null;
+    // A reason this build does not know (packet 2-A): the server applies a rule this build cannot explain, so
+    // the summary is not usable — its figures are withheld, never shown as if nothing were open.
+    if (!KNOWN_UNRESOLVED_REASONS.has(reason)) return null;
     byReason[reason] = count;
   }
   return { count: value.count, payments_amount: value.payments_amount, returns_amount: value.returns_amount, by_reason: byReason };
@@ -520,4 +523,355 @@ export function readEffectsResponse(body: unknown): EffectsResponse {
     rows.push(row);
   }
   return { kind: 'ok', rows, total_amount: body.total_amount, total_count: body.total_count, next_cursor: body.next_cursor };
+}
+
+// ---- Card-payment recovery review (I3A-R packet 2-A) --------------------------------------------
+// What `GET /api/card-payment-recovery/reviews`, `POST …/actions`, `GET …/actions/:id` and
+// `POST …/refresh-retries` return, validated field by field. A body that is not exactly the documented
+// shape — an unknown state or reason, a figure where none may be, a candidate not marked as a suggestion —
+// is `invalid`: the review is then shown as unavailable ("update the app"), never as a figure or as zero.
+
+/** The reasons an unresolved card payment can carry. A reason this build does not know means the server
+ *  applies a rule this build cannot explain: the figures that depend on it are withheld. */
+export const KNOWN_UNRESOLVED_REASONS: ReadonlySet<string> = new Set([
+  'no_candidate',
+  'possible_match',
+  'amount_differs',
+  'ambiguous',
+  'matched_leg_not_posted',
+  'decision_invalidated',
+  'ambiguous_replacement',
+  'relink_review_required',
+]);
+
+/** Every (state, reason) a leg under review can read. Anything else is not shown. */
+const KNOWN_REVIEW_READINGS: ReadonlySet<string> = new Set([
+  ...[...KNOWN_UNRESOLVED_REASONS].map((reason) => `unresolved/${reason}`),
+  'tracked/auto_pair',
+  'tracked/user_pair',
+  'untracked/partner_excluded',
+  'untracked/no_included_card',
+  'untracked/user_confirmed_unlinked',
+  'untracked/removed_card',
+  'paired/auto_pair',
+  'paired/user_pair',
+  'funded_from_excluded/auto_pair',
+  'funded_from_excluded/user_pair',
+  'funded_from_excluded/removed_cash_account',
+  'not_counted/excluded_account',
+]);
+
+const RECOVERY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const RECOVERY_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const isId = (value: unknown): value is string => typeof value === 'string' && RECOVERY_UUID.test(value);
+const isIdOrNull = (value: unknown): value is string | null => value === null || isId(value);
+const isCentsValue = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value);
+const isTextOrNull = (value: unknown): value is string | null => value === null || typeof value === 'string';
+const isDay = (value: unknown): value is string => typeof value === 'string' && RECOVERY_DATE.test(value);
+
+export interface RecoveryFreshness {
+  fresh: boolean;
+  input_version: number | null;
+  evaluated_version: number | null;
+  review_revision: number;
+  last_error_code: string | null;
+  refresh: { queued: boolean; needs_attention: boolean; attempts: number };
+}
+
+export type RecoveryActionType = 'pair_current' | 'confirm_unlinked' | 'dismiss_candidate' | 'undo_decision' | 'reject_suggestion' | 'defer';
+
+export interface RecoveryReceipt {
+  operation_id: string;
+  action: RecoveryActionType | 'refresh_retry';
+  outcome: 'saved' | 'unchanged' | 'undone' | 'queued';
+  reason: string | null;
+  decision_id: string | null;
+  superseded_decision_ids: string[];
+  retained_obligation_ids: string[];
+  committed_at: string;
+}
+
+export interface RecoveryCandidate {
+  transaction_id: string;
+  account_id: string;
+  date: string;
+  amount_cents: number;
+  pending: boolean;
+  account_included: boolean;
+  kind: string;
+  distance_days: number;
+  /** |the payment| − |this candidate|, in cents: what pairing them would leave unexplained. */
+  difference_cents: number;
+  withheld_by_guard: boolean;
+  rejected: boolean;
+}
+
+export interface RecoverySource {
+  /** graph_source: a removed candidate no decision was written for; its decision_id is null. */
+  evidence_kind: 'ambiguity_hold' | 'removed_destination' | 'preserved_confirmation' | 'graph_source';
+  decision_id: string | null;
+  decision_status: string | null;
+  source_relation: string | null;
+  source_date: string | null;
+  source_cents: number | null;
+  source_known: boolean;
+}
+
+export interface RecoveryObligation {
+  obligation_id: string;
+  origin: 'captured' | 'seeded' | 'gap';
+  gap_reason: 'unattributed_decision' | 'unrecorded_removal' | null;
+  institution_name: string | null;
+  removed_on: string | null;
+  known_surviving_edge_count: number;
+  sources: RecoverySource[];
+}
+
+export interface RecoveryReview {
+  transaction_id: string;
+  account_id: string;
+  date: string;
+  amount_cents: number;
+  pending: boolean;
+  side: 'cash' | 'credit';
+  direction: 'payment' | 'return';
+  account_included: boolean;
+  state: string;
+  reason: string;
+  detail: string | null;
+  effect_cents: number | null;
+  low_cents: number;
+  high_cents: number;
+  guard_withheld: boolean;
+  withheld_partner_transaction_id: string | null;
+  coverage_gap: boolean;
+  deferred: boolean;
+  controlling_decision: { decision_id: string; kind: string; status: string; user_decision: boolean } | null;
+  obligations: RecoveryObligation[];
+  candidates: RecoveryCandidate[];
+}
+
+export type RecoveryReviewsResponse =
+  | {
+      kind: 'ok';
+      fresh: boolean;
+      freshness: RecoveryFreshness;
+      actions_enabled: boolean;
+      affected_payment_count: number;
+      next_cursor: string | null;
+      /** Empty unless `fresh`. */
+      reviews: RecoveryReview[];
+    }
+  | { kind: 'invalid' };
+
+export type RecoveryAnswer =
+  | { kind: 'ok'; status: 'committed_fresh' | 'committed_pending' | 'replayed' | 'queued'; receipt: RecoveryReceipt; freshness: RecoveryFreshness }
+  | { kind: 'invalid' };
+
+export type RecoveryLookup = { kind: 'ok'; found: boolean; receipt: RecoveryReceipt | null; freshness: RecoveryFreshness } | { kind: 'invalid' };
+
+function readFreshness(value: unknown): RecoveryFreshness | null {
+  if (!isObject(value) || typeof value.fresh !== 'boolean' || !isCount(value.review_revision)) return null;
+  const { input_version: input, evaluated_version: evaluated, last_error_code: code, refresh } = value;
+  if (!(input === null || isCount(input)) || !(evaluated === null || isCount(evaluated)) || !isTextOrNull(code)) return null;
+  if (!isObject(refresh) || typeof refresh.queued !== 'boolean' || typeof refresh.needs_attention !== 'boolean' || !isCount(refresh.attempts)) return null;
+  // "Fresh" is believed only with equal versions.
+  if (value.fresh && (input === null || input !== evaluated)) return null;
+  return {
+    fresh: value.fresh,
+    input_version: input,
+    evaluated_version: evaluated,
+    review_revision: value.review_revision,
+    last_error_code: code,
+    refresh: { queued: refresh.queued, needs_attention: refresh.needs_attention, attempts: refresh.attempts },
+  };
+}
+
+const RECEIPT_ACTIONS: ReadonlySet<string> = new Set(['pair_current', 'confirm_unlinked', 'dismiss_candidate', 'undo_decision', 'reject_suggestion', 'defer', 'refresh_retry']);
+const RECEIPT_OUTCOMES: ReadonlySet<string> = new Set(['saved', 'unchanged', 'undone', 'queued']);
+const idList = (value: unknown): string[] | null => (Array.isArray(value) && value.every(isId) ? (value as string[]) : null);
+
+function readReceipt(value: unknown): RecoveryReceipt | null {
+  if (!isObject(value) || !isId(value.operation_id) || typeof value.committed_at !== 'string') return null;
+  if (typeof value.action !== 'string' || !RECEIPT_ACTIONS.has(value.action)) return null;
+  if (typeof value.outcome !== 'string' || !RECEIPT_OUTCOMES.has(value.outcome)) return null;
+  // This build knows no action that retires anything. A receipt saying otherwise is not one it can explain.
+  if (value.permanent_retirement !== false) return null;
+  const superseded = idList(value.superseded_decision_ids);
+  const retained = idList(value.retained_obligation_ids);
+  if (superseded === null || retained === null || !isTextOrNull(value.reason) || !isIdOrNull(value.decision_id)) return null;
+  return {
+    operation_id: value.operation_id,
+    action: value.action as RecoveryReceipt['action'],
+    outcome: value.outcome as RecoveryReceipt['outcome'],
+    reason: value.reason,
+    decision_id: value.decision_id,
+    superseded_decision_ids: superseded,
+    retained_obligation_ids: retained,
+    committed_at: value.committed_at,
+  };
+}
+
+function readList<T>(value: unknown, read: (item: unknown) => T | null): T[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: T[] = [];
+  for (const item of value) {
+    const parsed = read(item);
+    if (parsed === null) return null;
+    out.push(parsed);
+  }
+  return out;
+}
+
+const EVIDENCE_KINDS: ReadonlySet<string> = new Set(['ambiguity_hold', 'removed_destination', 'preserved_confirmation', 'graph_source']);
+
+function readSource(value: unknown): RecoverySource | null {
+  if (!isObject(value) || typeof value.evidence_kind !== 'string' || !EVIDENCE_KINDS.has(value.evidence_kind)) return null;
+  if (typeof value.source_known !== 'boolean') return null;
+  // A graph-observed source names no decision; every other kind must name one.
+  if (value.evidence_kind === 'graph_source' ? value.decision_id !== null : !isId(value.decision_id)) return null;
+  if (!isTextOrNull(value.decision_status) || !isTextOrNull(value.source_relation)) return null;
+  if (!(value.source_date === null || isDay(value.source_date)) || !(value.source_cents === null || isCentsValue(value.source_cents))) return null;
+  return {
+    evidence_kind: value.evidence_kind as RecoverySource['evidence_kind'],
+    decision_id: value.decision_id as string | null,
+    decision_status: value.decision_status,
+    source_relation: value.source_relation,
+    source_date: value.source_date,
+    source_cents: value.source_cents,
+    source_known: value.source_known,
+  };
+}
+
+function readObligation(value: unknown): RecoveryObligation | null {
+  if (!isObject(value) || !isId(value.obligation_id) || !isCount(value.known_surviving_edge_count)) return null;
+  if (value.origin !== 'captured' && value.origin !== 'seeded' && value.origin !== 'gap') return null;
+  const gap = value.gap_reason;
+  if (!(gap === null || gap === 'unattributed_decision' || gap === 'unrecorded_removal')) return null;
+  if ((value.origin === 'gap') !== (gap !== null)) return null;
+  if (!isTextOrNull(value.institution_name) || !(value.removed_on === null || isDay(value.removed_on))) return null;
+  const sources = readList(value.sources, readSource);
+  if (sources === null) return null;
+  return {
+    obligation_id: value.obligation_id,
+    origin: value.origin,
+    gap_reason: gap,
+    institution_name: value.institution_name,
+    removed_on: value.removed_on,
+    known_surviving_edge_count: value.known_surviving_edge_count,
+    sources,
+  };
+}
+
+function readCandidate(value: unknown): RecoveryCandidate | null {
+  if (!isObject(value) || !isId(value.transaction_id) || !isId(value.account_id) || !isDay(value.date)) return null;
+  if (!isCentsValue(value.amount_cents) || !isCount(value.distance_days) || !isCentsValue(value.difference_cents)) return null;
+  if (typeof value.pending !== 'boolean' || typeof value.account_included !== 'boolean' || typeof value.kind !== 'string') return null;
+  if (typeof value.withheld_by_guard !== 'boolean' || typeof value.rejected !== 'boolean') return null;
+  // Never shown as anything but a suggestion.
+  if (value.suggestion_only !== true) return null;
+  return {
+    transaction_id: value.transaction_id,
+    account_id: value.account_id,
+    date: value.date,
+    amount_cents: value.amount_cents,
+    pending: value.pending,
+    account_included: value.account_included,
+    kind: value.kind,
+    distance_days: value.distance_days,
+    difference_cents: value.difference_cents,
+    withheld_by_guard: value.withheld_by_guard,
+    rejected: value.rejected,
+  };
+}
+
+function readReview(value: unknown): RecoveryReview | null {
+  if (!isObject(value) || !isId(value.transaction_id) || !isId(value.account_id) || !isDay(value.date)) return null;
+  if (!isCentsValue(value.amount_cents) || typeof value.pending !== 'boolean' || typeof value.account_included !== 'boolean') return null;
+  if (value.side !== 'cash' && value.side !== 'credit') return null;
+  if (value.direction !== 'payment' && value.direction !== 'return') return null;
+  if (typeof value.state !== 'string' || typeof value.reason !== 'string' || !isTextOrNull(value.detail)) return null;
+  // A reading this build does not know is not shown — not as a range, not as a figure, not as zero.
+  if (!KNOWN_REVIEW_READINGS.has(`${value.state}/${value.reason}`)) return null;
+  const { effect_cents: effect, low_cents: low, high_cents: high } = value;
+  if (!(effect === null || isCentsValue(effect)) || !isCentsValue(low) || !isCentsValue(high) || low > high) return null;
+  if (effect !== null && (effect !== low || effect !== high)) return null;
+  // Unresolved means: no definite effect on an included cash leg. A definite one there would be a figure.
+  if (value.state === 'unresolved' && value.side === 'cash' && value.account_included && effect !== null) return null;
+  if (typeof value.guard_withheld !== 'boolean' || typeof value.coverage_gap !== 'boolean' || typeof value.deferred !== 'boolean') return null;
+  if (!isIdOrNull(value.withheld_partner_transaction_id) || value.guard_withheld !== (value.withheld_partner_transaction_id !== null)) return null;
+  let controlling: RecoveryReview['controlling_decision'] = null;
+  if (value.controlling_decision !== null) {
+    const d = value.controlling_decision;
+    if (!isObject(d) || !isId(d.decision_id) || typeof d.kind !== 'string' || typeof d.status !== 'string' || typeof d.user_decision !== 'boolean') return null;
+    controlling = { decision_id: d.decision_id, kind: d.kind, status: d.status, user_decision: d.user_decision };
+  }
+  const obligations = readList(value.obligations, readObligation);
+  const candidates = readList(value.candidates, readCandidate);
+  if (obligations === null || candidates === null) return null;
+  return {
+    transaction_id: value.transaction_id,
+    account_id: value.account_id,
+    date: value.date,
+    amount_cents: value.amount_cents,
+    pending: value.pending,
+    side: value.side,
+    direction: value.direction,
+    account_included: value.account_included,
+    state: value.state,
+    reason: value.reason,
+    detail: value.detail,
+    effect_cents: effect,
+    low_cents: low,
+    high_cents: high,
+    guard_withheld: value.guard_withheld,
+    withheld_partner_transaction_id: value.withheld_partner_transaction_id,
+    coverage_gap: value.coverage_gap,
+    deferred: value.deferred,
+    controlling_decision: controlling,
+    obligations,
+    candidates,
+  };
+}
+
+/** A 200 body of `GET /api/card-payment-recovery/reviews`. */
+export function readRecoveryReviews(body: unknown): RecoveryReviewsResponse {
+  if (!isObject(body) || typeof body.fresh !== 'boolean' || typeof body.actions_enabled !== 'boolean' || !isCount(body.affected_payment_count)) return { kind: 'invalid' };
+  const freshness = readFreshness(body.freshness);
+  const reviews = readList(body.reviews, readReview);
+  if (freshness === null || reviews === null || body.fresh !== freshness.fresh) return { kind: 'invalid' };
+  if (!(body.next_cursor === null || (typeof body.next_cursor === 'string' && body.next_cursor !== ''))) return { kind: 'invalid' };
+  // A list that is not current carries no review: a review is never shown with figures that are not current.
+  if (!body.fresh && (reviews.length > 0 || body.next_cursor !== null)) return { kind: 'invalid' };
+  return {
+    kind: 'ok',
+    fresh: body.fresh,
+    freshness,
+    actions_enabled: body.actions_enabled,
+    affected_payment_count: body.affected_payment_count,
+    next_cursor: body.next_cursor,
+    reviews,
+  };
+}
+
+/** A 200 body of `POST …/actions` or `POST …/refresh-retries`. */
+export function readRecoveryAnswer(body: unknown): RecoveryAnswer {
+  if (!isObject(body)) return { kind: 'invalid' };
+  const { status } = body;
+  if (status !== 'committed_fresh' && status !== 'committed_pending' && status !== 'replayed' && status !== 'queued') return { kind: 'invalid' };
+  const receipt = readReceipt(body.receipt);
+  const freshness = readFreshness(body.freshness);
+  if (receipt === null || freshness === null) return { kind: 'invalid' };
+  if (status === 'committed_fresh' && !freshness.fresh) return { kind: 'invalid' };
+  return { kind: 'ok', status, receipt, freshness };
+}
+
+/** A 200 body of `GET …/actions/:operationId`. */
+export function readRecoveryLookup(body: unknown): RecoveryLookup {
+  if (!isObject(body) || typeof body.found !== 'boolean') return { kind: 'invalid' };
+  const freshness = readFreshness(body.freshness);
+  if (freshness === null) return { kind: 'invalid' };
+  if (!body.found) return body.receipt === null ? { kind: 'ok', found: false, receipt: null, freshness } : { kind: 'invalid' };
+  const receipt = readReceipt(body.receipt);
+  return receipt === null ? { kind: 'invalid' } : { kind: 'ok', found: true, receipt, freshness };
 }

@@ -287,8 +287,15 @@ select pg_temp.observe('after the user undid the confirmation (bb)', array['b-k'
 select pg_temp.req('L-amount', 'once the USER undoes it, the leg is free and current evidence decides alone: no card is left, so the payment counts — attached to no decision',
   pg_temp.srep('k-la') = 'untracked/no_included_card/-10000/- partner=-' and pg_temp.holder_kind('k-la') = 'none'
   and (select superseded_by = id from public.card_payment_decisions where a_plaid_transaction_id = 'k-la' and kind = 'pair_counterpart_removed'));
-select pg_temp.req('C-amount', 'once the USER undoes it, the corrected payment pairs with the kept card''s leg by the ordinary rule',
-  pg_temp.srep('b-k', pg_temp.bb()) = 'tracked/auto_pair/0/- partner=by-k');
+-- 20261009120000 (guarded manual recovery). b-k was held by the user's confirmation at the removal, and by-k
+-- (−298) did not even fit it then (b-k was +300): the removal knew no surviving edge of b-k. Once the user undoes
+-- the confirmation and the bank corrects b-k to +298, the pair b-k / by-k is selected by the ordinary rule — and
+-- withheld: the range {−298, 0}, no partner, no decision; the kept card's leg unresolved, 0.
+select pg_temp.req('C-amount', 'once the USER undoes it, the corrected payment''s pair with the kept card''s leg is selected by the ordinary rule and WITHHELD for review: the range {−298, 0}, no partner, attached to no decision',
+  pg_temp.srep('b-k', pg_temp.bb()) = 'unresolved/relink_review_required/null/- partner=-' and pg_temp.holder_kind('b-k', pg_temp.bb()) = 'none'
+  and (pg_temp.leg('b-k', pg_temp.bb())->>'lowCents')::bigint = -29800 and (pg_temp.leg('b-k', pg_temp.bb())->>'highCents')::bigint = 0
+  and pg_temp.srep('by-k', pg_temp.bb()) = 'unresolved/relink_review_required/0/- partner=-'
+  and (pg_temp.leg('by-k', pg_temp.bb())->>'lowCents')::bigint = 0 and (pg_temp.leg('by-k', pg_temp.bb())->>'highCents')::bigint = 0);
 
 -- ---- The verdict ------------------------------------------------------------------------------------
 \pset format unaligned

@@ -618,8 +618,15 @@ insert into public.accounts (id, item_id, plaid_account_id, name, type, subtype,
   ('00000000-0000-0000-0000-0000000026e1', '00000000-0000-0000-0000-000000000007', 'a26-xa-again', 'A Card', 'credit', 'credit card', '1111');
 select pg_temp.cardleg('xr2', '00000000-0000-0000-0000-0000000026e1', -260, '2026-09-11');
 select pg_temp.evaluate();
-select pg_temp.req('R', 'unchanged', 'after the relink the payment matches the re-imported leg again; the record is dormant, and nothing was ended or retired',
-  pg_temp.srep('k-r') = 'tracked/auto_pair/0 partner=xr2' and pg_temp.records('k-r') = 1
+-- 20261009120000 (guarded manual recovery): the re-imported leg is the payment's clear tier 1 match again, and the
+-- pair is WITHHELD — the first removal's review obligation on k-r knows no surviving edge. The payment reads the
+-- range {−260, 0}; the re-imported leg unresolved, 0. The record stays; nothing was ended or retired.
+select pg_temp.req('R', 'unchanged', 'after the relink the re-imported leg is selected again and WITHHELD for review: the range {−260, 0}, no partner, no decision; the re-imported leg unresolved, 0; the one record stays, and nothing was ended or retired',
+  pg_temp.srep('k-r') = 'unresolved/relink_review_required/null partner=-'
+  and (pg_temp.leg('k-r')->>'lowCents')::bigint = -26000 and (pg_temp.leg('k-r')->>'highCents')::bigint = 0 and pg_temp.leg('k-r')->>'decisionId' is null
+  and pg_temp.srep('xr2') = 'unresolved/relink_review_required/0 partner=-'
+  and (pg_temp.leg('xr2')->>'lowCents')::bigint = 0 and (pg_temp.leg('xr2')->>'highCents')::bigint = 0
+  and pg_temp.records('k-r') = 1
   and not exists (select 1 from public.card_payment_decisions d where d.superseded_by is not null and d.kind <> 'pair'));
 
 -- ---- The removal of Bank B (item 4): A, second half -------------------------------------------------------
@@ -642,15 +649,34 @@ select pg_temp.req('N', 'unchanged', 'legs Bank B''s removal did not concern rea
 -- ---- The second removal of Bank A (item 7): R, second half ------------------------------------------------
 select pg_temp.remove(pg_temp.aa(), '00000000-0000-0000-0000-000000000007');
 select pg_temp.observe('after Bank A is removed a second time', array['k-r']);
-select pg_temp.req('R', 'rows', 'a second removal after a relink writes its OWN record for the payment — two live records, not one', pg_temp.records('k-r') = 2);
-select pg_temp.req('R', 'provenance', 'each record names the leg of its own removal: the first Bank A item''s, and the relinked one''s',
-  pg_temp.deps('k-r') = 'record(k-r)<=harness-item-a7:a26-xa-again:xr2[partner] ; record(k-r)<=harness-item-a:a26-xa:xa-r[partner]');
-select pg_temp.req('R', 'unchanged', 'two live records read as one: a removed-card payment, −260', pg_temp.removed_destination('k-r', 26000));
-select pg_temp.req('R', 'rows', 'the decision the payment NAMES is one of its two records (the one with the lesser id) — not an attribution: both are its dependencies',
+-- Since 20261009120000 the re-imported leg was withheld, not matched: when Bank A is removed the second time the
+-- payment has NO automatic match, so the removal has no destination to record and writes no second record (and no
+-- hold: nothing of another institution competes). The ONE original record and its ONE source are as they were.
+select pg_temp.req('R', 'rows', 'a second removal after a relink writes NO second record for the payment — its return was withheld, so no automatic match existed to preserve: one live record', pg_temp.records('k-r') = 1);
+select pg_temp.req('R', 'provenance', 'the one record still names the leg the FIRST removal deleted, on the first Bank A item; no provenance row names the relinked leg',
+  pg_temp.deps('k-r') = 'record(k-r)<=harness-item-a:a26-xa:xa-r[partner]'
+  and pg_temp.pq($q$ select not exists (select 1 from public.card_payment_removal_sources s where s.source_plaid_transaction_id = 'xr2') $q$));
+select pg_temp.req('R', 'unchanged', 'the one live record applies again: a removed-card payment, −260', pg_temp.removed_destination('k-r', 26000));
+select pg_temp.req('R', 'rows', 'the decision the payment NAMES is its one record',
   (select (pg_temp.leg('k-r')->>'decisionId')::uuid = (select d.id from public.card_payment_decisions d
                                                      where d.kind = 'destination_removed_card' and d.superseded_by is null and d.a_plaid_transaction_id = 'k-r'
                                                      order by d.id limit 1))
-  and pg_temp.records('k-r') = 2);
+  and pg_temp.records('k-r') = 1);
+-- What the second removal knew is NOT lost with the record it did not write (20261009120000, capture from the
+-- eligible graph): the re-imported leg xr2 was an eligible candidate of k-r when its institution was removed. That
+-- removal keeps its OWN review obligation on k-r, of its own generation, with xr2 as a graph-observed source — a
+-- source that names no decision, because none was written. The first removal's obligation is beside it, with the
+-- record as its source. Two obligations, two generations, two sources, kept apart.
+select pg_temp.req('R', 'provenance', 'the second removal recorded ITS dependency although it wrote no record and no hold: its own review obligation on the payment, with the re-imported leg as a graph-observed source that names no decision; the first removal''s obligation, with the record as its source, is beside it',
+  (select count(*) = 2 and count(distinct o.removal_id) = 2 and bool_and(o.origin = 'captured' and o.user_id = pg_temp.aa())
+   from public.card_payment_review_obligations o where o.anchor_plaid_transaction_id = 'k-r')
+  and (select string_agg(r.plaid_item_id || ':' || s.evidence_kind || ':' || s.source_plaid_account_id || ':' || s.source_plaid_transaction_id
+                         || ':' || (s.decision_id is not null)::text, ' ; ' order by r.plaid_item_id collate "C")
+       from public.card_payment_review_obligations o
+       join public.card_payment_review_obligation_sources s on s.obligation_id = o.id
+       join public.plaid_item_removals r on r.id = o.removal_id
+       where o.anchor_plaid_transaction_id = 'k-r' and s.source_removal_id = o.removal_id)
+      = 'harness-item-a:removed_destination:a26-xa:xa-r:true ; harness-item-a7:graph_source:a26-xa-again:xr2:false');
 
 -- ---- INV. The whole ----------------------------------------------------------------------------------------
 select pg_temp.req('INV', 'provenance', 'every decision a removal wrote has exactly one provenance row, and no other decision has one',

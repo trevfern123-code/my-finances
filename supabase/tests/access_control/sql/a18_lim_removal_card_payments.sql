@@ -401,11 +401,24 @@ select pg_temp.cardleg('x2-auto', pg_temp.x2(), -98, '2026-09-02'),   -- matches
 create temporary table before_relink_eval as
   select (select count(*) from public.card_payment_decisions where kind = 'destination_removed_card' and superseded_by is null) as records;
 select public.evaluate_card_payments(pg_temp.aa());
-select th.assert(pg_temp.sre('k-excl') = 'tracked/auto_pair/0' and (pg_temp.leg('k-excl')->>'partnerTransactionId')::uuid = pg_temp.tid('x2-excl'),
-  'relinked: a re-imported matching leg re-tracks its payment through tier 1 (which outranks the record)');
-select th.assert(pg_temp.sre('k-return') = 'tracked/auto_pair/0' and pg_temp.sre('k-rev-posted') = 'tracked/auto_pair/0', 'relinked: the return and the posted leg re-track too');
-select th.assert(pg_temp.sre('k-auto') = 'tracked/auto_pair/0' and pg_temp.dstatus(pg_temp.record('k-auto')) = 'inactive/amount_changed',
-  'relinked: the leg whose record was invalidated pairs automatically with a clear tier 1 match');
+-- 20261009120000 (guarded manual recovery): each of these payments is one the first removal wrote a record
+-- about, and its review obligation knows no surviving edge. The re-imported leg is its clear tier 1 match — and
+-- the pair is WITHHELD, in both directions, until the user decides. The payment reads a range; the card leg is
+-- unresolved, 0; no decision is named on either; the record stays stored.
+select th.assert(pg_temp.sre('k-excl') = 'unresolved/relink_review_required/null' and pg_temp.leg('k-excl')->>'partnerTransactionId' is null
+                 and pg_temp.leg('k-excl')->>'decisionId' is null
+                 and (pg_temp.leg('k-excl')->>'lowCents')::bigint = -6000 and (pg_temp.leg('k-excl')->>'highCents')::bigint = 0
+                 and pg_temp.sre('x2-excl') = 'unresolved/relink_review_required/0' and pg_temp.leg('x2-excl')->>'partnerTransactionId' is null,
+  'relinked: a re-imported matching leg does NOT re-track its payment: the pair is withheld for review — no partner, the range {−60, 0}; the card leg unresolved, 0');
+select th.assert(pg_temp.sre('k-return') = 'unresolved/relink_review_required/null' and pg_temp.leg('k-return')->>'partnerTransactionId' is null
+                 and (pg_temp.leg('k-return')->>'lowCents')::bigint = 0 and (pg_temp.leg('k-return')->>'highCents')::bigint = 3500
+                 and pg_temp.sre('k-rev-posted') = 'unresolved/relink_review_required/null' and pg_temp.leg('k-rev-posted')->>'partnerTransactionId' is null
+                 and (pg_temp.leg('k-rev-posted')->>'lowCents')::bigint = -14000 and (pg_temp.leg('k-rev-posted')->>'highCents')::bigint = 0,
+  'relinked: the return and the posted leg are withheld too: the return reads the range {0, +35}, the posted payment {−140, 0}');
+select th.assert(pg_temp.sre('k-auto') = 'unresolved/relink_review_required/null' and pg_temp.leg('k-auto')->>'partnerTransactionId' is null
+                 and (pg_temp.leg('k-auto')->>'lowCents')::bigint = -9800 and (pg_temp.leg('k-auto')->>'highCents')::bigint = 0
+                 and pg_temp.dstatus(pg_temp.record('k-auto')) = 'inactive/amount_changed',
+  'relinked: the leg whose record was invalidated is still an affected payment: its clear tier 1 match is withheld — the range {−98, 0} at its corrected amount; the record stays invalidated');
 select th.assert(pg_temp.sre('k-user') = 'untracked/removed_card/-25000' and pg_temp.sre('k-diff') = 'untracked/removed_card/-8000',
   'relinked: legs with no tier 1 match (14 days apart; 2.00 different) keep the preserved destination — no automatic window is widened');
 select th.assert(pg_temp.sre('k-open') = 'unresolved/possible_match/null', 'relinked: the payment that was never resolved is unresolved again with its candidate');
@@ -431,9 +444,12 @@ select th.assert(pg_temp.sre('k-diff') = 'untracked/removed_card/-8000'
 select th.expect_error(format($q$ select public.undo_card_payment_decision(%L, %L, %s) $q$, pg_temp.aa(), pg_temp.record('k-excl'), pg_temp.iv()),
   '%system_decision%');
 
--- A second removal of the relinked card: converted again. Each removal records what IT removed (20261008120000):
--- a leg that was matched again to the relinked card gets a record of this removal's own, beside the one the first
--- removal wrote on the same key. Nothing a reader is shown changes: several live records on a leg read as one.
+-- A second removal of the relinked card. Each removal records what IT removed (20261008120000) — and a record is
+-- the known destination of an AUTOMATIC MATCH. Since 20261009120000 the re-imported legs were withheld, not
+-- matched: k-excl, k-return, k-rev-posted and k-auto had no automatic match when this removal ran, so it has no
+-- destination to record for them and writes NO second record. (What it knew of them — that each lost the
+-- re-imported candidate — is kept as a review obligation of its own; a26 and the packet 2-A harness assert that.)
+-- Each of those legs reads its ONE record again, as after the first removal.
 select th.assert(public.begin_plaid_item_removal(pg_temp.aa(), '00000000-0000-0000-0000-000000000004',
                  public.plaid_item_removal_digest(pg_temp.aa(), '00000000-0000-0000-0000-000000000004'))->>'outcome' = 'started', 'second removal begins');
 select public.record_plaid_item_removal_attempt(pg_temp.aa(), '00000000-0000-0000-0000-000000000004', 'already_removed', 'ITEM_NOT_FOUND');
@@ -444,18 +460,18 @@ select th.assert(
    from public.card_payment_decisions d where d.kind = 'destination_removed_card' and d.superseded_by is null)
   = jsonb_build_array(
       jsonb_build_array('f-excl', 4500),
-      jsonb_build_array('k-auto', 9800), jsonb_build_array('k-auto', 10000),
-      jsonb_build_array('k-excl', 6000), jsonb_build_array('k-excl', 6000),
+      jsonb_build_array('k-auto', 10000),
+      jsonb_build_array('k-excl', 6000),
       jsonb_build_array('k-pcard', 15000),
       jsonb_build_array('k-pend', 12000),
       jsonb_build_array('k-pend2', 13000),
-      jsonb_build_array('k-return', -3500), jsonb_build_array('k-return', -3500),
-      jsonb_build_array('k-rev-posted', 14000), jsonb_build_array('k-rev-posted', 14000)),
-  'second removal: a leg whose key is unchanged gets a second record, this removal''s own (k-excl, k-return, k-rev-posted); no other leg gets one, and none is retired');
-select th.assert(pg_temp.sources('k-excl') = 'record(k-excl 6000)<=harness-item-a4:a18-x2:x2-excl[partner] ; record(k-excl 6000)<=harness-item-a:a18-e:e-excl[partner]'
-                 and pg_temp.sources('k-return') = 'record(k-return -3500)<=harness-item-a4:a18-x2:x2-return[partner] ; record(k-return -3500)<=harness-item-a:a18-x:x-return[partner]'
-                 and pg_temp.sources('k-rev-posted') = 'record(k-rev-posted 14000)<=harness-item-a4:a18-x2:x2-rev[partner] ; record(k-rev-posted 14000)<=harness-item-a:a18-x:x-rev[partner]',
-  'second removal: of the two records on such a leg, each names the leg its own removal deleted, the payment''s automatic match both times: the first card''s (card E for k-excl), and the relinked card''s');
+      jsonb_build_array('k-return', -3500),
+      jsonb_build_array('k-rev-posted', 14000)),
+  'second removal: NO leg gets a second record — the re-imported legs were withheld, so no payment had an automatic match for this removal to record; the first removal''s records are all there, and none is retired');
+select th.assert(pg_temp.sources('k-excl') = 'record(k-excl 6000)<=harness-item-a:a18-e:e-excl[partner]'
+                 and pg_temp.sources('k-return') = 'record(k-return -3500)<=harness-item-a:a18-x:x-return[partner]'
+                 and pg_temp.sources('k-rev-posted') = 'record(k-rev-posted 14000)<=harness-item-a:a18-x:x-rev[partner]',
+  'second removal: the one record on such a leg still names the leg the FIRST removal deleted, the payment''s automatic match then (card E for k-excl)');
 select th.assert(pg_temp.sources('f-excl') = 'record(f-excl 4500)<=harness-item-a:a18-x:x-fexcl[partner]'
                  and pg_temp.sources('k-pcard') = 'record(k-pcard 15000)<=harness-item-a:a18-x:x-pcard[partner]'
                  and pg_temp.sources('k-pend') = 'record(k-pend 12000)<=harness-item-a:a18-x:x-pend[partner]'
@@ -464,20 +480,19 @@ select th.assert(pg_temp.sources('f-excl') = 'record(f-excl 4500)<=harness-item-
 select th.assert((select bool_and(pg_temp.sre(v.p) = 'untracked/removed_card/' || v.effect and pg_temp.leg(v.p)->>'partnerTransactionId' is null
                                   and (pg_temp.leg(v.p)->>'decisionId')::uuid = pg_temp.record(v.p))
                   from (values ('k-excl', '-6000'), ('k-return', '3500'), ('k-rev-posted', '-14000')) v(p, effect)),
-  'second removal: two live records on a leg read as one — removed_card, the same effect, no partner — and the leg names the one with the lesser id');
+  'second removal: the one live record on such a leg applies again — removed_card, the same effect, no partner — and the leg names it');
 select th.assert((select array_agg(a_cents order by a_cents) from public.card_payment_decisions
-                  where kind = 'destination_removed_card' and superseded_by is null and a_plaid_transaction_id = 'k-auto') = array[9800::bigint, 10000::bigint],
-  'second removal: the corrected leg gets a record at its current amount; the invalidated one stays as history');
-select th.assert(pg_temp.sources('k-auto') = 'record(k-auto 10000)<=harness-item-a:a18-x:x-auto[partner] ; record(k-auto 9800)<=harness-item-a4:a18-x2:x2-auto[partner]'
-                 and (select pg_temp.dstatus(d.id) = 'active' and d.id = (pg_temp.leg('k-auto')->>'decisionId')::uuid
-                      from public.card_payment_decisions d where d.kind = 'destination_removed_card' and d.a_plaid_transaction_id = 'k-auto' and d.a_cents = 9800)
+                  where kind = 'destination_removed_card' and superseded_by is null and a_plaid_transaction_id = 'k-auto') = array[10000::bigint],
+  'second removal: the corrected leg gets NO record at its current amount (its return was withheld, never matched); the invalidated one stays as history');
+select th.assert(pg_temp.sources('k-auto') = 'record(k-auto 10000)<=harness-item-a:a18-x:x-auto[partner]'
+                 and pg_temp.leg('k-auto')->>'decisionId' is null
                  and (select pg_temp.dstatus(d.id) = 'inactive/amount_changed'
                       from public.card_payment_decisions d where d.kind = 'destination_removed_card' and d.a_plaid_transaction_id = 'k-auto' and d.a_cents = 10000),
-  'second removal: the record at the current amount is this removal''s, from the relinked card''s leg, and it is the one that applies and that the leg names; the invalidated one is the first removal''s');
-select th.assert(pg_temp.sre('k-excl') = 'untracked/removed_card/-6000' and pg_temp.sre('k-auto') = 'untracked/removed_card/-9800'
+  'second removal: the only record on the corrected leg is the first removal''s, still invalidated; it is not proof and the leg names no decision');
+select th.assert(pg_temp.sre('k-excl') = 'untracked/removed_card/-6000' and pg_temp.sre('k-auto') = 'unresolved/no_candidate/null'
                  and pg_temp.sre('k-user') = 'untracked/removed_card/-25000' and pg_temp.sre('k-unlinked') = 'untracked/user_confirmed_unlinked/-3000'
                  and pg_temp.sre('k-open') = 'unresolved/no_candidate/null',
-  'second removal: preserved destinations again, the user pair preserved, the user''s unlinked confirmation and the unresolved leg as before');
+  'second removal: the preserved destination again (k-excl); the corrected leg unresolved with no candidate, as it was before the relink; the user pair preserved; the user''s unlinked confirmation and the unresolved leg as before');
 select th.assert((select count(*) filter (where superseded_by is null) = 1 and count(*) filter (where superseded_by is not null) = 1
                          and bool_and(b_plaid_transaction_id = case when superseded_by is null then 'x2-user' else 'x-user' end)
                   from public.card_payment_decisions where kind = 'pair_counterpart_removed' and a_plaid_transaction_id = 'k-user')

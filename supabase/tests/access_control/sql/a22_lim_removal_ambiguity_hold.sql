@@ -329,8 +329,16 @@ select pg_temp.observe('after later evidence', array['k-b', 'k-n', 'k-cn', 'k-cd
 
 select pg_temp.req('B', 'when one of the two kept candidates drops out, the other is not thereby proven: still unresolved', pg_temp.unresolved_range('k-b', 71000));
 select pg_temp.req('N', 'without a hold the same change resolves by the ordinary rule', pg_temp.srep('k-n') = 'tracked/auto_pair/0 partner=y-n');
-select pg_temp.req('C-new', 'a NEW, strictly closer transaction pairs by the ordinary rule: the hold is not a reservation of the payment',
-  pg_temp.srep('k-cn') = 'tracked/auto_pair/0 partner=z-cn' and pg_temp.srep('y-cn') like 'unresolved/%partner=-');
+-- 20261009120000 (guarded manual recovery). The hold is still not a reservation of the payment: the new leg IS
+-- selected by the ordinary rule. But k-cn is a payment the removal wrote a hold about, and its review obligation
+-- knows one surviving edge — y-cn. The new leg z-cn is not one: the selected pair is withheld, both ways, until the
+-- user decides. The payment reads the range {−720, 0}; the new leg unresolved, 0; the hold stays.
+select pg_temp.req('C-new', 'a NEW, strictly closer transaction is selected by the ordinary rule and WITHHELD for review: the range {−720, 0}, no partner, no decision; the new leg unresolved, 0; the hold remains',
+  pg_temp.srep('k-cn') = 'unresolved/relink_review_required/null partner=-'
+  and (pg_temp.leg('k-cn')->>'lowCents')::bigint = -72000 and (pg_temp.leg('k-cn')->>'highCents')::bigint = 0 and pg_temp.leg('k-cn')->>'decisionId' is null
+  and pg_temp.srep('z-cn') = 'unresolved/relink_review_required/0 partner=-'
+  and (pg_temp.leg('z-cn')->>'lowCents')::bigint = 0 and (pg_temp.leg('z-cn')->>'highCents')::bigint = 0
+  and pg_temp.srep('y-cn') like 'unresolved/%partner=-' and pg_temp.holds('k-cn') = 'removed_card:y-cn@2026-09-11');
 select pg_temp.req('C-date', 'a date change that leaves the kept leg no closer than the removed one was changes nothing', pg_temp.unresolved_range('k-cd', 73000));
 select pg_temp.req('C-amount', 'a corrected amount is new evidence: the hold no longer applies, and the two legs pair by the ordinary rule',
   pg_temp.srep('k-ca') = 'tracked/auto_pair/0 partner=y-ca' and pg_temp.dstatus(pg_temp.hold_id('k-ca')) = 'inactive/amount_changed');
@@ -379,8 +387,16 @@ select pg_temp.req('E', 'after a relink the re-imported leg and the kept card''s
   pg_temp.unresolved_range('k-e', 77000) and pg_temp.competitors('k-e') = 'x2-e,y-e');
 delete from public.transactions where plaid_transaction_id = 'y-e';
 select pg_temp.evaluate();
-select pg_temp.req('E', 'when the kept card''s leg is then withdrawn, the payment pairs with the re-imported leg: the hold does not stand in the way',
-  pg_temp.srep('k-e') = 'tracked/auto_pair/0 partner=x2-e');
+-- 20261009120000. The hold does not stand in the way: with y-e gone, k-e / x2-e is the selected pair. The
+-- re-imported leg did not survive the removal that wrote k-e's obligation, so it is not an edge that obligation
+-- knows: withheld. The payment reads the range {−770, 0}; the re-imported leg unresolved, 0. The obligation stays,
+-- although the only edge it knew (y-e) is gone.
+select pg_temp.req('E', 'when the kept card''s leg is then withdrawn, the payment''s pair with the re-imported leg is selected and WITHHELD for review: the range {−770, 0}, no partner, no decision; the re-imported leg unresolved, 0; the obligation remains',
+  pg_temp.srep('k-e') = 'unresolved/relink_review_required/null partner=-'
+  and (pg_temp.leg('k-e')->>'lowCents')::bigint = -77000 and (pg_temp.leg('k-e')->>'highCents')::bigint = 0 and pg_temp.leg('k-e')->>'decisionId' is null
+  and pg_temp.srep('x2-e') = 'unresolved/relink_review_required/0 partner=-'
+  and (pg_temp.leg('x2-e')->>'lowCents')::bigint = 0 and (pg_temp.leg('x2-e')->>'highCents')::bigint = 0
+  and (select count(*) = 1 from public.card_payment_review_obligations o where o.user_id = pg_temp.aa() and o.anchor_plaid_transaction_id = 'k-e'));
 select pg_temp.observe('after the relink', array['k-e', 'k-g']);
 
 -- ---- G. A second removal with the same ambiguity ----------------------------------------------------

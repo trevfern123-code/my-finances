@@ -121,6 +121,9 @@ export interface CardLegStateInput {
   /** `tracked` | `untracked` | `unresolved` (cash side); `paired` | `funded_from_excluded` |
    *  `unresolved` (credit side); `not_counted` (a leg on an excluded account — never aggregated). */
   state: string;
+  /** Why. For an unresolved leg this is the key of `cardPaymentsUnresolved.byReason`; since packet 2-A it can
+   *  be `relink_review_required` (the relink-review guard withheld the leg's automatic pair). The aggregation
+   *  does not interpret it: an unresolved cash leg is its range, whatever the reason. */
   reason: string;
   /** The resolved effect on cash flow in cents; null while a counted cash-side leg is unresolved. */
   effectCents: number | null;
@@ -132,8 +135,22 @@ export interface CardLegStateInput {
 
 /** The stored states the card-dependent aggregates need. They must describe exactly the version of
  *  the inputs the `transactions` were read at — that is the read protocol's job, not this module's. */
+/** The review state of one leg (packet 2-A; `get_card_payment_states` → `reviews`): it is an affected
+ *  payment of an institution removal, or the relink-review guard withheld its automatic pair. */
+export interface CardLegReviewInput {
+  transactionId: string;
+  guardWithheld: boolean;
+  withheldPartnerTransactionId: string | null;
+  obligationIds: string[];
+  coverageGap: boolean;
+}
+
 export interface CardPaymentStates {
   legs: CardLegStateInput[];
+  /** Present when the database carries the evaluator contract of 20261009120000. No aggregate reads it: a
+   *  withheld leg's uncertainty is already in its own state and bounds. It is carried so that one snapshot
+   *  holds everything a reader needs to say which figures are under review. */
+  reviews?: CardLegReviewInput[];
   /** Pending rows replaced by a posted row that is still present (pairing design §3.6): they have no
    *  state and are not counted. */
   supersededTransactionIds: string[];
