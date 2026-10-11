@@ -1,9 +1,20 @@
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from './supabaseClient';
+import { decodeSessionId } from './jwt';
 import type { ReportingRangeId } from './reportingRange';
 import type { OwnershipCheck } from './sessionOwnership';
 import { appUpdate, CLIENT_API_LEVEL, parseLevelHeader } from './appUpdate';
-import { readEffectsResponse, type EffectMeasure, type EffectsResponse } from './semanticModel';
+import {
+  readEffectsResponse,
+  readRecoveryAnswer,
+  readRecoveryLookup,
+  readRecoveryReviews,
+  type EffectMeasure,
+  type EffectsResponse,
+  type RecoveryAnswer,
+  type RecoveryLookup,
+  type RecoveryReviewsResponse,
+} from './semanticModel';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
@@ -128,6 +139,9 @@ async function authedFetch(
         { status: response.status },
         typeof body.code === 'string' ? { code: body.code } : {},
         typeof body.reason === 'string' ? { reason: body.reason } : {},
+        // A recovery refusal's fixed word (packet 2-A), and the operation id of a request whose outcome is unknown.
+        typeof body.detail === 'string' ? { detail: body.detail } : {},
+        typeof body.operation_id === 'string' ? { operation_id: body.operation_id } : {},
         body.superseded_by ? { superseded_by: body.superseded_by as TransactionItem } : {}
       );
     }
@@ -1053,4 +1067,77 @@ export function updateFinancialPreferences(
     false,
     verifyOwnership
   );
+}
+
+// ---- Payment review (I3A-R packet 2-A) -----------------------------------------------------------
+
+/** One action on a payment under review. Exactly the action's own fields: nothing here names an owner — the
+ *  server takes the owner from the session. */
+export type RecoveryActionInput =
+  | { type: 'pair_current'; transactionId: string; counterpartTransactionId: string; acceptedDifferenceCents: number }
+  | { type: 'confirm_unlinked'; transactionId: string }
+  | { type: 'dismiss_candidate'; transactionId: string; candidateTransactionId: string }
+  | { type: 'undo_decision'; decisionId: string }
+  | { type: 'reject_suggestion'; transactionId: string; candidateTransactionId: string }
+  | { type: 'defer'; transactionId: string };
+
+export interface RecoveryActionRequest {
+  /** Made once per user action and kept until its outcome is known: sending it again never acts twice. */
+  operationId: string;
+  /** The versions of what the user was looking at. */
+  expectedInputVersion: number;
+  expectedReviewRevision: number;
+  action: RecoveryActionInput;
+}
+
+/**
+ * The login that is current right now: the user and the Supabase login lifecycle (`session_id`). A screen that
+ * sends changes later remembers this when it opens and refuses to send under any other login (see
+ * lib/sessionOwnership.ts for the rule). Null when nobody is signed in.
+ */
+export async function getCurrentSessionOwner(): Promise<{ userId: string; sessionId: string | null } | null> {
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  return session ? { userId: session.user.id, sessionId: decodeSessionId(session.access_token) } : null;
+}
+
+/** A refused recovery request: the server's `code`, and — when the outcome is unknown — nothing else is known. */
+export const RECOVERY_OUTCOME_UNKNOWN = 'outcome_unknown';
+
+/** `GET /api/card-payment-recovery/reviews`: the payments under review, with their history. */
+export async function getRecoveryReviews(page: { cursor: string | null; limit?: number } = { cursor: null }, signal?: AbortSignal): Promise<RecoveryReviewsResponse> {
+  const params = new URLSearchParams({ limit: String(page.limit ?? 50) });
+  if (page.cursor !== null) params.set('cursor', page.cursor);
+  return readRecoveryReviews(await authedFetch(`/api/card-payment-recovery/reviews?${params.toString()}`, { signal }));
+}
+
+/**
+ * `POST /api/card-payment-recovery/actions`: ONE request for one action. The server saves the decision and its
+ * receipt together or not at all. A 504 `outcome_unknown` — or a request that never got an answer — means the
+ * outcome is NOT known: ask with `getRecoveryAction` and the same operation id before doing anything else.
+ */
+export async function applyRecoveryAction(request: RecoveryActionRequest, verifyOwnership: OwnershipCheck): Promise<RecoveryAnswer> {
+  return readRecoveryAnswer(await authedFetch('/api/card-payment-recovery/actions', { method: 'POST', body: JSON.stringify(request) }, false, verifyOwnership));
+}
+
+/**
+ * `GET /api/card-payment-recovery/actions/:operationId`: is a receipt of that operation visible?
+ * `found: false` means only that NO RECEIPT IS VISIBLE NOW. The request's transaction may still be open, or
+ * the request may not have arrived yet: it is not "not saved". With `verifyOwnership` the question is asked
+ * only under the login that sent the request (otherwise it throws SESSION_OWNER_MISMATCH and asks nothing).
+ */
+export async function getRecoveryAction(operationId: string, verifyOwnership?: OwnershipCheck, signal?: AbortSignal): Promise<RecoveryLookup> {
+  return readRecoveryLookup(
+    await authedFetch(`/api/card-payment-recovery/actions/${encodeURIComponent(operationId)}`, { signal }, false, verifyOwnership)
+  );
+}
+
+/**
+ * `POST /api/card-payment-recovery/refresh-retries`: QUEUES a refresh of the figures. An answer of `queued` says
+ * that work is waiting, not that anything is running it. It decides
+ * nothing about any payment, and it is available whether or not changes from review are switched on.
+ */
+export async function requestRecoveryRefresh(operationId: string, verifyOwnership: OwnershipCheck): Promise<RecoveryAnswer> {
+  return readRecoveryAnswer(await authedFetch('/api/card-payment-recovery/refresh-retries', { method: 'POST', body: JSON.stringify({ operationId }) }, false, verifyOwnership));
 }

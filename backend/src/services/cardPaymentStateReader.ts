@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '../config/supabase';
-import type { CardLegStateInput, CardPaymentStates } from './semanticAggregation';
+import type { CardLegReviewInput, CardLegStateInput, CardPaymentStates } from './semanticAggregation';
 
 /**
  * The stored card-payment matching state, as the application reads it (Financial Semantics Phase B,
@@ -26,7 +26,19 @@ import type { CardLegStateInput, CardPaymentStates } from './semanticAggregation
  *
  * The read never throws, retries, evaluates or writes. Failures are logged with an outcome and an
  * error code only — never a message, a payload or a user id.
+ *
+ * THE EVALUATOR CONTRACT (packet 2-A, migration 20261009120000). The database returns states only for a
+ * user whose states were published by the evaluator with the relink-review guard, and says so
+ * (`evaluatorContract`). This module accepts a fresh payload only when that value is one it supports. A
+ * payload naming another contract is not in the documented shape: `unexpected_response`, so every
+ * figure that depends on it is unavailable — never a figure computed under rules this backend does not
+ * know. A fresh payload WITHOUT the key comes from a database that does not have that migration (it has no
+ * review obligation and no guard either) and is read as before. The review states (`reviews`) say which
+ * legs are under review; a leg withheld by the guard already reads as a range in `legs`.
  */
+
+/** The evaluator contract this backend understands: the relink-review guard of 20261009120000. */
+export const SUPPORTED_EVALUATOR_CONTRACT = 2;
 
 /** How long one state read may take before the client stops waiting. Both reads are single,
  *  index-backed statements over a handful of rows per month; this bounds a hung connection, nothing
@@ -133,6 +145,18 @@ function parseLeg(value: unknown): CardLegStateInput | null {
   return { transactionId, accountId, amountCents, side, accountIncluded, state, reason, effectCents, lowCents, highCents, cashExcessCents, cardExcessCents };
 }
 
+/** One review state of the reader's payload, or null when it is not in the documented shape. */
+function parseReview(value: unknown): CardLegReviewInput | null {
+  if (!isRecord(value)) return null;
+  const { transactionId, guardWithheld, withheldPartnerTransactionId, obligationIds, coverageGap } = value;
+  if (typeof transactionId !== 'string' || typeof guardWithheld !== 'boolean' || typeof coverageGap !== 'boolean') return null;
+  if (withheldPartnerTransactionId !== null && typeof withheldPartnerTransactionId !== 'string') return null;
+  // A withheld leg names the leg it was withheld from, and only a withheld leg does.
+  if (guardWithheld !== (withheldPartnerTransactionId !== null)) return null;
+  if (!Array.isArray(obligationIds) || obligationIds.length === 0 || !obligationIds.every((id) => typeof id === 'string')) return null;
+  return { transactionId, guardWithheld, withheldPartnerTransactionId, obligationIds: obligationIds as string[], coverageGap };
+}
+
 /** The reader's `jsonb`, validated field by field. Anything outside the documented shape is
  *  `unexpected_response` — it is never coerced into a state. */
 export function parseCardPaymentStates(payload: unknown): Exclude<CardPaymentStateRead, { kind: 'unavailable' }> | null {
@@ -164,7 +188,25 @@ export function parseCardPaymentStates(payload: unknown): Exclude<CardPaymentSta
   // The reader builds the key with to_jsonb(uuid[]); a NULL array column would arrive as null.
   const superseded = payload.supersededTransactionIds ?? [];
   if (!Array.isArray(superseded) || !superseded.every((id) => typeof id === 'string')) return null;
-  return { kind: 'fresh', inputVersion, states: { legs, supersededTransactionIds: superseded as string[] } };
+  // The evaluator contract: absent (a database without 20261009120000), or exactly the supported one.
+  if (payload.evaluatorContract !== undefined && payload.evaluatorContract !== SUPPORTED_EVALUATOR_CONTRACT) return null;
+  // The review states: absent with the contract, an array with it. Each must name a leg of this payload at
+  // most once — a review of a leg that is not here would describe another version of the rows.
+  if (payload.evaluatorContract === undefined) {
+    if (payload.reviews !== undefined) return null;
+    return { kind: 'fresh', inputVersion, states: { legs, supersededTransactionIds: superseded as string[] } };
+  }
+  if (!Array.isArray(payload.reviews)) return null;
+  const legIds = new Set(legs.map((leg) => leg.transactionId));
+  const reviews: CardLegReviewInput[] = [];
+  const reviewed = new Set<string>();
+  for (const raw of payload.reviews) {
+    const review = parseReview(raw);
+    if (review === null || !legIds.has(review.transactionId) || reviewed.has(review.transactionId)) return null;
+    reviewed.add(review.transactionId);
+    reviews.push(review);
+  }
+  return { kind: 'fresh', inputVersion, states: { legs, supersededTransactionIds: superseded as string[], reviews } };
 }
 
 export interface CardPaymentStateReadOptions {

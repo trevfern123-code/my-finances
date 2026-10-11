@@ -20,6 +20,16 @@
 -- routinely: two holds on one pair with one date, written by two removals (Q16) or by one removal for two
 -- identical removed transactions (Q17); two records on one payment after a relink and a second removal (Q18);
 -- and a user pair whose removed leg was waiting to post (Q19).
+-- Since 20261009120000 (guarded manual recovery) a removal also records REVIEW OBLIGATIONS and the surviving
+-- edges each one knows. They are matching inputs: every I and CI line carries the owner's (reviewObligations), so
+-- the reference evaluator withholds what the SQL evaluator withholds; and the review metadata the reader returns
+-- (`reviews`) is compared too. An E line may state by hand, besides state and reason:
+--   figures             <plaid> -> "<effect>[<low>..<high>]><partner's Plaid id or ->"
+--   reviews             <plaid> -> "withheld=<partner's Plaid id or ->,obligations=<n>,gap=<t|f>"; EXACTLY these legs
+--                       of aa are under review
+--   checkpointLegs / checkpointFigures / checkpointReviews     the same, at a named checkpoint
+-- Q10, Q12, Q15 and Q18 state the guarded results; Q20 a return on an EXCLUDED card and the "no included card" rule,
+-- where the leg's own reason does not say that the guard withheld it and only the review metadata does.
 \set ON_ERROR_STOP 1
 set client_min_messages = warning;
 
@@ -110,7 +120,20 @@ create function pg_temp.inputs(p_user uuid) returns jsonb language sql as $$
                                         then jsonb_build_object('plaidTransactionId', d.b_plaid_transaction_id, 'cents', d.b_cents,
                                                                 'status', d.counterpart_status) end,
                     'counterpartDate', to_char(d.counterpart_date, 'YYYY-MM-DD')) order by d.id), '[]'::jsonb)
-                  from public.card_payment_decisions d))
+                  from public.card_payment_decisions d),
+    -- The OWNER's review obligations and the surviving edges each one knows (20261009120000). Owner-scoped: an
+    -- obligation of another user is never an input of this one.
+    'reviewObligations', (select coalesce(jsonb_agg(jsonb_build_object(
+                            'id', o.id, 'userId', o.user_id,
+                            'anchor', jsonb_build_object('accountId', o.anchor_account_id, 'plaidTransactionId', o.anchor_plaid_transaction_id,
+                                                         'cents', o.anchor_cents),
+                            'gap', o.origin = 'gap',
+                            'members', (select coalesce(jsonb_agg(jsonb_build_object('accountId', m.member_account_id,
+                                                                                    'plaidTransactionId', m.member_plaid_transaction_id,
+                                                                                    'cents', m.member_cents)
+                                                                  order by m.member_account_id, m.member_plaid_transaction_id), '[]'::jsonb)
+                                        from public.card_payment_review_memberships m where m.obligation_id = o.id)) order by o.id), '[]'::jsonb)
+                          from public.card_payment_review_obligations o where o.user_id = p_user))
 $$;
 create function pg_temp.dump(p_scenario text, p_expect jsonb) returns setof text language plpgsql as $$
 begin
@@ -325,7 +348,10 @@ select 'S|Q9|5-own|own-states:' || case when pg_temp.timeless((select s from pg_
                                              = pg_temp.timeless(public.get_card_payment_states(pg_temp.aa())) then 'same' else 'DIFFERENT' end;
 
 -- ==== Q10: after a removal, the bank corrects one preserved payment (its record is no longer proof) and the
---      card is linked again with new ids: a clear tier 1 match re-tracks, the records stay as history
+--      card is linked again with new ids. Each returned leg is the clear tier 1 match of its payment — and each
+--      payment is one the removal wrote a record about, whose obligation knows no surviving edge: the pair is
+--      WITHHELD (20261009120000). q10-a reads the range {−100, 0}, q10-b (corrected to 58) the range {−58, 0};
+--      the returned legs read unresolved, 0. q10-c has no return: its record reads −70. The records stay.
 select pg_temp.reset();
 select pg_temp.add_card_r();
 select pg_temp.tx('C', 'q10-a', 100, '2026-09-01'), pg_temp.txr('q10-r-a', -100, '2026-09-02'),
@@ -348,7 +374,13 @@ insert into public.transactions (account_id, plaid_transaction_id, amount, date,
   ('00000000-0000-4000-8000-0000000a0c0a', 'q10-r2-b', -58, '2026-09-06', 'credit_card_payment');
 select pg_temp.dump('Q10', jsonb_build_object(
   'steps', jsonb_build_array('removed:fresh', 'own-states:three-preserved'),
-  'legs', jsonb_build_object('q10-a', 'tracked/auto_pair', 'q10-b', 'tracked/auto_pair', 'q10-c', 'untracked/removed_card'),
+  'legs', jsonb_build_object('q10-a', 'unresolved/relink_review_required', 'q10-b', 'unresolved/relink_review_required', 'q10-c', 'untracked/removed_card',
+                             'q10-r2-a', 'unresolved/relink_review_required', 'q10-r2-b', 'unresolved/relink_review_required'),
+  'figures', jsonb_build_object('q10-a', 'null[-10000..0]>-', 'q10-b', 'null[-5800..0]>-', 'q10-c', '-7000[-7000..-7000]>-',
+                                'q10-r2-a', '0[0..0]>-', 'q10-r2-b', '0[0..0]>-'),
+  'reviews', jsonb_build_object('q10-a', 'withheld=q10-r2-a,obligations=1,gap=f', 'q10-r2-a', 'withheld=q10-a,obligations=1,gap=f',
+                                'q10-b', 'withheld=q10-r2-b,obligations=1,gap=f', 'q10-r2-b', 'withheld=q10-b,obligations=1,gap=f',
+                                'q10-c', 'withheld=-,obligations=1,gap=f'),
   'liveDecisions', 3));
 
 -- ==== Q11: user-confirmed pairs through a removal, with a competing card (Y) or cash leg (C2) for each: an
@@ -412,9 +444,13 @@ select pg_temp.dump('Q11', jsonb_build_object(
 --      is not evidence for the kept card: it writes a SYSTEM ambiguity hold — for a two-way tie, a three-way
 --      one, and the mirror case (a card leg that a removed cash leg and a kept cash leg both fitted). A payment
 --      whose kept card was strictly closer was paired before, and gets none. Then: the user cannot undo a hold;
---      the card is linked again (the tie is back by itself); the bank corrects the kept card's leg (the
---      re-imported leg pairs); a date change brings the mirror's kept cash leg strictly closer (it pairs); and
---      the user decides the three-way one.
+--      the card is linked again (the tie is back by itself); the bank corrects the kept card's leg — the
+--      re-imported leg is then the payment's only exact candidate, and that pair is WITHHELD (20261009120000:
+--      the payment's obligation knows only the kept card's leg): the range {−700, 0}; the kept card's corrected
+--      leg sees the unmatched payment a dollar away (amount_differs); a date change brings the mirror's kept
+--      cash leg strictly closer (a surviving edge the obligation knows: it pairs); and the user decides the
+--      three-way one. q12-far, whose kept card was strictly closer, lost a farther candidate: under review,
+--      and still matched to the edge its obligation knows.
 create function pg_temp.sr(p_plaids text[]) returns text language sql as $$
   select string_agg(t.plaid_transaction_id || '=' || (l->>'state') || '/' || (l->>'reason'), ',' order by t.plaid_transaction_id collate "C")
   from jsonb_array_elements(public.get_card_payment_states(pg_temp.aa())->'legs') l
@@ -476,10 +512,16 @@ select pg_temp.dump('Q12', jsonb_build_object(
     'q12-c2-mir=unresolved/ambiguous,q12-far=tracked/auto_pair,q12-three=unresolved/ambiguous,q12-tie=unresolved/ambiguous,q12-y-mir=unresolved/ambiguous',
     'refused:card_payment_invalid', 'q12-tie=unresolved/ambiguous', 'saved:fresh'),
   'legs', jsonb_build_object(
-    'q12-tie', 'tracked/auto_pair',     'q12-r2-tie', 'paired/auto_pair',     'q12-y-tie', 'unresolved/no_candidate',
+    'q12-tie', 'unresolved/relink_review_required', 'q12-r2-tie', 'unresolved/relink_review_required', 'q12-y-tie', 'unresolved/amount_differs',
     'q12-three', 'tracked/user_pair',   'q12-x-three', 'paired/user_pair',    'q12-y-three', 'unresolved/no_candidate', 'q12-r2-three', 'unresolved/no_candidate',
     'q12-far', 'tracked/auto_pair',
     'q12-y-mir', 'paired/auto_pair',    'q12-c2-mir', 'tracked/auto_pair'),
+  'figures', jsonb_build_object('q12-tie', 'null[-70000..0]>-', 'q12-r2-tie', '0[0..0]>-',
+                                'q12-three', '0[0..0]>q12-x-three', 'q12-far', '0[0..0]>q12-y-far',
+                                'q12-y-mir', '0[0..0]>q12-c2-mir', 'q12-c2-mir', '0[0..0]>q12-y-mir'),
+  'reviews', jsonb_build_object('q12-tie', 'withheld=q12-r2-tie,obligations=1,gap=f', 'q12-r2-tie', 'withheld=q12-tie,obligations=1,gap=f',
+                                'q12-three', 'withheld=-,obligations=1,gap=f', 'q12-far', 'withheld=-,obligations=1,gap=f',
+                                'q12-y-mir', 'withheld=-,obligations=1,gap=f'),
   'liveDecisions', 5));
 
 -- ---- Revision 5 (2026-10-07): Q13–Q15 ---------------------------------------------------------------------
@@ -647,9 +689,11 @@ select pg_temp.dump('Q14', jsonb_build_object(
 --      kept card's leg three days away also fitted. The removal keeps each payment's known destination (the
 --      SYSTEM record) and writes a hold on (the kept card's leg, the payment) with the removed leg's date: the
 --      card that was already there does not take the payment merely because the destination disappeared. Then,
---      for the first payment, a NEW and strictly closer leg arrives on another kept card: new evidence, paired
---      by the ordinary rule. For the second, the removed card is linked again (a new item, account and ids; the
---      same date and amount): the re-imported leg is the closest candidate again, and pairs.
+--      for the first payment, a NEW and strictly closer leg arrives on another kept card. It is the selected
+--      pair, and the payment's obligation does not know it: WITHHELD both ways (20261009120000) — the payment
+--      reads the range {−300, 0}, the new leg unresolved, 0. For the second, the removed card is linked again (a
+--      new item, account and ids; the same date and amount): the re-imported leg is the closest candidate again,
+--      and is withheld the same way: the range {−310, 0}. The records and the holds stay, active.
 select pg_temp.reset();
 select pg_temp.add_card_r();
 select pg_temp.tx('C', 'q15-k', 300, '2026-09-10'),  pg_temp.txr('q15-r-k', -300, '2026-09-11'),  pg_temp.tx('Y', 'q15-b', -300, '2026-09-13'),
@@ -696,14 +740,27 @@ select pg_temp.dump('Q15', jsonb_build_object(
       || 'q15-k2=untracked/removed_card/-31000[-31000..-31000]/->-@destination_removed_card;'
       || 'ambiguity_hold_removed_card:q15-b=active,ambiguity_hold_removed_card:q15-b2=active,'
       || 'destination_removed_card:q15-k=active,destination_removed_card:q15-k2=active',
-    'q15-b=unresolved/ambiguous/0[0..0]/->-@-,q15-k=tracked/auto_pair/0[0..0]/->q15-z@-,q15-z=paired/auto_pair/0[0..0]/->q15-k@-',
-    'q15-b2=unresolved/ambiguous/0[0..0]/->-@-,q15-k2=tracked/auto_pair/0[0..0]/->q15-r2-k2@-,q15-r2-k2=paired/auto_pair/0[0..0]/->q15-k2@-;'
+    'q15-b=unresolved/ambiguous/0[0..0]/->-@-,q15-k=unresolved/relink_review_required/null[-30000..0]/->-@-,q15-z=unresolved/relink_review_required/0[0..0]/->-@-',
+    'q15-b2=unresolved/ambiguous/0[0..0]/->-@-,q15-k2=unresolved/relink_review_required/null[-31000..0]/->-@-,q15-r2-k2=unresolved/relink_review_required/0[0..0]/->-@-;'
       || 'ambiguity_hold_removed_card:q15-b=active,ambiguity_hold_removed_card:q15-b2=active,'
       || 'destination_removed_card:q15-k=active,destination_removed_card:q15-k2=active'),
   'checkpoints', jsonb_build_array('after-removal', 'new-leg'),
   'legs', jsonb_build_object(
-    'q15-k', 'tracked/auto_pair',  'q15-z', 'paired/auto_pair',     'q15-b', 'unresolved/ambiguous',
-    'q15-k2', 'tracked/auto_pair', 'q15-r2-k2', 'paired/auto_pair', 'q15-b2', 'unresolved/ambiguous'),
+    'q15-k', 'unresolved/relink_review_required',  'q15-z', 'unresolved/relink_review_required',     'q15-b', 'unresolved/ambiguous',
+    'q15-k2', 'unresolved/relink_review_required', 'q15-r2-k2', 'unresolved/relink_review_required', 'q15-b2', 'unresolved/ambiguous'),
+  'figures', jsonb_build_object('q15-k', 'null[-30000..0]>-', 'q15-z', '0[0..0]>-', 'q15-k2', 'null[-31000..0]>-', 'q15-r2-k2', '0[0..0]>-'),
+  'reviews', jsonb_build_object('q15-k', 'withheld=q15-z,obligations=1,gap=f', 'q15-z', 'withheld=q15-k,obligations=1,gap=f',
+                                'q15-k2', 'withheld=q15-r2-k2,obligations=1,gap=f', 'q15-r2-k2', 'withheld=q15-k2,obligations=1,gap=f'),
+  'checkpointLegs', jsonb_build_object(
+    'after-removal', jsonb_build_object('q15-k', 'untracked/removed_card', 'q15-k2', 'untracked/removed_card'),
+    'new-leg', jsonb_build_object('q15-k', 'unresolved/relink_review_required', 'q15-z', 'unresolved/relink_review_required', 'q15-k2', 'untracked/removed_card')),
+  'checkpointFigures', jsonb_build_object(
+    'after-removal', jsonb_build_object('q15-k', '-30000[-30000..-30000]>-', 'q15-k2', '-31000[-31000..-31000]>-'),
+    'new-leg', jsonb_build_object('q15-k', 'null[-30000..0]>-', 'q15-z', '0[0..0]>-', 'q15-k2', '-31000[-31000..-31000]>-')),
+  'checkpointReviews', jsonb_build_object(
+    'after-removal', jsonb_build_object('q15-k', 'withheld=-,obligations=1,gap=f', 'q15-k2', 'withheld=-,obligations=1,gap=f'),
+    'new-leg', jsonb_build_object('q15-k', 'withheld=q15-z,obligations=1,gap=f', 'q15-z', 'withheld=q15-k,obligations=1,gap=f',
+                                  'q15-k2', 'withheld=-,obligations=1,gap=f')),
   'liveDecisions', 4));
 
 -- ---- One system row per source (20261008120000): Q16–Q19 ----------------------------------------------------
@@ -910,12 +967,15 @@ select pg_temp.dump('Q17', jsonb_build_object(
 -- ==== Q18: A SECOND REMOVAL AFTER A RELINK. A payment (C, 09-10) matched automatically to the removed card's leg
 --      (09-11), while the kept card's leg (Y, 09-13) also fitted. The first removal keeps the known destination
 --      (a record on the payment) and writes a hold on (Y's leg, the payment), both because of that leg. The card
---      is linked again with new ids and re-imports the leg: the payment matches it again, and the rows of the
---      first removal lie dormant. That institution is removed too: it writes its OWN record and its OWN hold,
---      because of the re-imported leg — although a live record with that key and a live hold with that pair and
---      date exist. Two records and two holds, each pair alike but for the id. They read as one: the payment is
---      untracked / removed_card, a figure, and names the record with the lesser id; the kept card does not take
---      it. Then the bank corrects the payment: all four rows are inactive alike, and none of them is proof.
+--      is linked again with new ids and re-imports the leg: it is the payment's closest candidate again, and
+--      the pair is WITHHELD (20261009120000: the first removal's obligation does not know it) — the range
+--      {−520, 0}. That institution is removed too. The payment had NO automatic match then, so the second
+--      removal has no destination to record: it writes NO second record. The re-imported leg was a removed
+--      candidate while the kept card's leg stays: it writes its OWN hold, because of that leg — although a live
+--      hold with that pair and date exists. ONE record and two holds, the holds alike but for the id and for
+--      the removal that wrote them. They read as one: the payment is untracked / removed_card, a figure, and
+--      names the one record; the kept card does not take it. The payment now has two review obligations, one of
+--      each removal. Then the bank corrects the payment: all three rows are inactive alike, and none is proof.
 select pg_temp.reset();
 select pg_temp.add_card_r();
 select pg_temp.tx('C', 'q18-k', 520, '2026-09-10'), pg_temp.txr('q18-r', -520, '2026-09-11'), pg_temp.tx('Y', 'q18-b', -520, '2026-09-13');
@@ -954,24 +1014,38 @@ select pg_temp.dump('Q18', jsonb_build_object(
     'own-states:same',
     'q18-b=unresolved/ambiguous/0[0..0]/->-@-,q18-k=untracked/removed_card/-52000[-52000..-52000]/->-@destination_removed_card;'
       || 'named=least-of-1;ambiguity_hold_removed_card:q18-b=active,destination_removed_card:q18-k=active',
-    'q18-b=unresolved/ambiguous/0[0..0]/->-@-,q18-k=tracked/auto_pair/0[0..0]/->q18-r2@-,q18-r2=paired/auto_pair/0[0..0]/->q18-k@-;'
+    'q18-b=unresolved/ambiguous/0[0..0]/->-@-,q18-k=unresolved/relink_review_required/null[-52000..0]/->-@-,q18-r2=unresolved/relink_review_required/0[0..0]/->-@-;'
       || 'ambiguity_hold_removed_card:q18-b=active,destination_removed_card:q18-k=active',
     'removed:fresh',
     'hold_removed_card:q18-b+q18-k@2026-09-11<=rpc-item-a2:rpc-r:q18-r[automatic_partner/row],'
-      || 'hold_removed_card:q18-b+q18-k@2026-09-11<=rpc-item-a3:rpc-r2:q18-r2[automatic_partner/row],'
-      || 'record:q18-k<=rpc-item-a2:rpc-r:q18-r[automatic_partner/row],'
-      || 'record:q18-k<=rpc-item-a3:rpc-r2:q18-r2[automatic_partner/row];removals=1:rpc-item-a2:recorded,2:rpc-item-a3:recorded',
+      || 'hold_removed_card:q18-b+q18-k@2026-09-11<=rpc-item-a3:rpc-r2:q18-r2[removed_candidate/row],'
+      || 'record:q18-k<=rpc-item-a2:rpc-r:q18-r[automatic_partner/row];removals=1:rpc-item-a2:recorded,2:rpc-item-a3:recorded',
     'own-states:same',
     'q18-b=unresolved/ambiguous/0[0..0]/->-@-,q18-k=untracked/removed_card/-52000[-52000..-52000]/->-@destination_removed_card;'
-      || 'named=least-of-2;ambiguity_hold_removed_card:q18-b=active,ambiguity_hold_removed_card:q18-b=active,'
-      || 'destination_removed_card:q18-k=active,destination_removed_card:q18-k=active',
+      || 'named=least-of-1;ambiguity_hold_removed_card:q18-b=active,ambiguity_hold_removed_card:q18-b=active,'
+      || 'destination_removed_card:q18-k=active',
     'q18-b=unresolved/amount_differs/0[0..0]/->-@-,q18-k=unresolved/amount_differs/null[-51800..0]/->-@-;'
       || 'ambiguity_hold_removed_card:q18-b=inactive/amount_changed,ambiguity_hold_removed_card:q18-b=inactive/amount_changed,'
-      || 'destination_removed_card:q18-k=inactive/amount_changed,destination_removed_card:q18-k=inactive/amount_changed'),
+      || 'destination_removed_card:q18-k=inactive/amount_changed'),
   'checkpoints', jsonb_build_array('after-first-removal', 'relinked', 'after-second-removal'),
   'legs', jsonb_build_object('q18-k', 'unresolved/amount_differs', 'q18-b', 'unresolved/amount_differs'),
-  'liveDecisions', 4,
-  'sameKeyRows', jsonb_build_object('destination_removed_card:q18-k', 2, 'ambiguity_hold_removed_card:q18-b+q18-k@2026-09-11', 2)));
+  'figures', jsonb_build_object('q18-k', 'null[-51800..0]>-', 'q18-b', '0[0..0]>-'),
+  -- Two obligations on the payment: one of each removal (two generations).
+  'reviews', jsonb_build_object('q18-k', 'withheld=-,obligations=2,gap=f'),
+  'checkpointLegs', jsonb_build_object(
+    'after-first-removal', jsonb_build_object('q18-k', 'untracked/removed_card'),
+    'relinked', jsonb_build_object('q18-k', 'unresolved/relink_review_required', 'q18-r2', 'unresolved/relink_review_required', 'q18-b', 'unresolved/ambiguous'),
+    'after-second-removal', jsonb_build_object('q18-k', 'untracked/removed_card', 'q18-b', 'unresolved/ambiguous')),
+  'checkpointFigures', jsonb_build_object(
+    'after-first-removal', jsonb_build_object('q18-k', '-52000[-52000..-52000]>-'),
+    'relinked', jsonb_build_object('q18-k', 'null[-52000..0]>-', 'q18-r2', '0[0..0]>-'),
+    'after-second-removal', jsonb_build_object('q18-k', '-52000[-52000..-52000]>-')),
+  'checkpointReviews', jsonb_build_object(
+    'after-first-removal', jsonb_build_object('q18-k', 'withheld=-,obligations=1,gap=f'),
+    'relinked', jsonb_build_object('q18-k', 'withheld=q18-r2,obligations=1,gap=f', 'q18-r2', 'withheld=q18-k,obligations=1,gap=f'),
+    'after-second-removal', jsonb_build_object('q18-k', 'withheld=-,obligations=2,gap=f')),
+  'liveDecisions', 3,
+  'sameKeyRows', jsonb_build_object('destination_removed_card:q18-k', 1, 'ambiguity_hold_removed_card:q18-b+q18-k@2026-09-11', 2)));
 
 -- ==== Q19: A USER PAIR WHOSE REMOVED LEG IS WAITING TO POST. The user confirms a payment (C, 09-10) with the removed
 --      card's PENDING leg (09-11); the kept card's leg (Y, 09-12) also fits. A sync withdraws the pending leg, and
@@ -1040,4 +1114,35 @@ select pg_temp.dump('Q19', jsonb_build_object(
       || 'pair_counterpart_removed:q19-k=active'),
   'checkpoints', jsonb_build_array('after-removal', 'relinked'),
   'legs', jsonb_build_object('q19-k', 'untracked/removed_card', 'q19-y', 'unresolved/no_candidate'),
+  'liveDecisions', 1));
+
+-- ==== Q20 (20261009120000): THE GUARD WHERE THE LEG'S OWN REASON DOES NOT SHOW IT. A payment (C, +440, 09-10)
+--      matched automatically to the removed card's leg (09-11); nothing else fits. The removal keeps the record,
+--      and the payment's obligation knows no surviving edge. Then a leg of the same amount arrives on the
+--      EXCLUDED card E (09-11). An excluded leg takes part in tier 1 like any other: the pair is selected, and
+--      WITHHELD. Included cards exist (X, Y), so the payment reads the range {−440, 0}; the excluded leg reads
+--      not_counted / excluded_account, 0 — the reason of ANY leg on that account. That the guard withheld it is
+--      said only by the review metadata (checkpoint 'excluded-return').
+--      Then X and Y are excluded as well: no included card is left, and the independent "no included card" rule
+--      gives the payment −440 — untracked / no_included_card, the reason of any such payment. It is still
+--      withheld from the excluded leg, and still under review: again only the review metadata says so.
+select pg_temp.reset();
+select pg_temp.add_card_r();
+select pg_temp.tx('C', 'q20-k', 440, '2026-09-10'), pg_temp.txr('q20-r', -440, '2026-09-11');
+select pg_temp.evaluate();
+set role service_role;
+select pg_temp.remove_r('Q20', '1-remove');
+reset role;
+select pg_temp.tx('E', 'q20-e', -440, '2026-09-11');
+select pg_temp.checkpoint('Q20', 'excluded-return');
+update public.accounts set exclude_from_cash_flow = true where id in (pg_temp.acct('X'), pg_temp.acct('Y'));
+select pg_temp.dump('Q20', jsonb_build_object(
+  'steps', jsonb_build_array('removed:fresh'),
+  'checkpoints', jsonb_build_array('excluded-return'),
+  'legs', jsonb_build_object('q20-k', 'untracked/no_included_card', 'q20-e', 'not_counted/excluded_account'),
+  'figures', jsonb_build_object('q20-k', '-44000[-44000..-44000]>-', 'q20-e', '0[0..0]>-'),
+  'reviews', jsonb_build_object('q20-k', 'withheld=q20-e,obligations=1,gap=f', 'q20-e', 'withheld=q20-k,obligations=1,gap=f'),
+  'checkpointLegs', jsonb_build_object('excluded-return', jsonb_build_object('q20-k', 'unresolved/relink_review_required', 'q20-e', 'not_counted/excluded_account')),
+  'checkpointFigures', jsonb_build_object('excluded-return', jsonb_build_object('q20-k', 'null[-44000..0]>-', 'q20-e', '0[0..0]>-')),
+  'checkpointReviews', jsonb_build_object('excluded-return', jsonb_build_object('q20-k', 'withheld=q20-e,obligations=1,gap=f', 'q20-e', 'withheld=q20-k,obligations=1,gap=f')),
   'liveDecisions', 1));

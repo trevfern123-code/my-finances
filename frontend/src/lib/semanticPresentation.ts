@@ -1,6 +1,7 @@
 import type { EffectsFailure } from './effectsDrilldown';
 import { formatCurrency } from './currency';
 import type { AmountRange, CashFlowFigures, EffectMeasure, EffectRow, SemanticNotShown } from './semanticModel';
+import type { RecoveryActionType, RecoveryCandidate, RecoveryObligation, RecoveryReview, RecoverySource } from './semanticModel';
 
 /**
  * Financial Semantics Phase B, integration slice I2 — how role-aware figures and their states are
@@ -282,4 +283,167 @@ export function cashFlowLineGroups(f: CashFlowFigures): CashFlowLineGroup[] {
     { title: 'Not counted in cash flow', lines: notCounted },
     { title: 'Not settled yet', lines: open },
   ].filter((group) => group.lines.length > 0);
+}
+
+// ---- Payment review (I3A-R packet 2-A) -----------------------------------------------------------
+// The words of the review. Everything shown comes from fixed text here plus dates, amounts and the removed
+// institution's name; no server message and no identifier is ever displayed.
+
+const formatReviewCents = (cents: number): string => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(Math.abs(cents) / 100);
+/** A cash-flow effect in cents, signed as the summary shows it: "−$370.00", "+$12.00", "$0.00". */
+const formatEffectCents = (cents: number): string => (cents === 0 ? formatReviewCents(0) : `${cents < 0 ? '−' : '+'}${formatReviewCents(cents)}`);
+
+export function formatReviewDate(date: string): string {
+  const [year, month, day] = date.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+}
+
+/** "Card payment of $370.00 on Sep 10, 2026" — what a review is about when the feed has no name for it. */
+export function reviewTitle(review: Pick<RecoveryReview, 'side' | 'direction' | 'amount_cents' | 'date'>): string {
+  const what =
+    review.side === 'cash' ? (review.direction === 'payment' ? 'Card payment' : 'Card payment returned') : review.direction === 'payment' ? 'Payment received on a card' : 'Card payment reversed';
+  return `${what} of ${formatReviewCents(review.amount_cents)} on ${formatReviewDate(review.date)}`;
+}
+
+/** How many of the unresolved card payments are waiting for a review after a removal. */
+export function relinkReviewCount(byReason: Record<string, number>): number {
+  return byReason.relink_review_required ?? 0;
+}
+
+export function paymentsUnderReviewNote(count: number): string {
+  return count === 1 ? '1 payment to review' : `${count} payments to review`;
+}
+
+/** What the payment counts as now — one headline and one sentence. Figures only as given: a range stays a range. */
+export function reviewReadingText(review: RecoveryReview): { headline: string; detail: string } {
+  const range = `between ${formatEffectCents(review.low_cents)} and ${formatEffectCents(review.high_cents)}`;
+  const effect = review.effect_cents === null ? null : formatEffectCents(review.effect_cents);
+  const reading = `${review.state}/${review.reason}`;
+  if (reading === 'unresolved/relink_review_required') {
+    return review.side === 'cash'
+      ? {
+          headline: 'Needs your review',
+          detail: `A transaction that arrived after a bank connection was removed looks like the other side of this payment, but nothing confirms it. Until you decide, cash flow counts this payment as a range: ${range}.`,
+        }
+      : {
+          headline: 'Needs your review',
+          detail: 'This card payment looks like the other side of a payment that a removed bank connection was involved in. It is not matched to anything until you decide. It does not change cash flow.',
+        };
+  }
+  if (reading === 'untracked/removed_card') {
+    return { headline: 'Counted as paid to a removed card', detail: `It counts as money that went to a card whose bank connection was removed: ${effect}.` };
+  }
+  if (reading === 'untracked/no_included_card') {
+    return {
+      headline: 'Counted as money that left your accounts',
+      detail: `None of your cards is included in cash flow, so this payment counts in full: ${effect}.${review.guard_withheld ? ' A possible match is waiting for your review.' : ''}`,
+    };
+  }
+  if (reading === 'untracked/user_confirmed_unlinked') return { headline: 'Your decision: a card you have not linked', detail: `It counts as money that left your accounts: ${effect}.` };
+  if (reading === 'untracked/partner_excluded') return { headline: 'Paid to a card that is excluded from cash flow', detail: `It counts in full: ${effect}.` };
+  if (reading === 'tracked/user_pair') return { headline: 'Your decision: matched', detail: `It counts as a transfer between your accounts: ${effect}.` };
+  if (reading === 'tracked/auto_pair') return { headline: 'Matched automatically', detail: `It is matched to a card payment that was already there before the connection was removed: ${effect}.` };
+  if (review.state === 'paired' || review.state === 'funded_from_excluded') return { headline: 'Matched', detail: 'This card payment is matched. It does not change cash flow.' };
+  if (reading === 'not_counted/excluded_account') return { headline: 'Not counted', detail: 'Its account is excluded from cash flow, so this payment is not counted.' };
+  if (reading === 'unresolved/decision_invalidated' || reading === 'unresolved/matched_leg_not_posted') {
+    return {
+      headline: 'Your earlier decision needs another look',
+      detail:
+        review.side === 'cash'
+          ? `The bank's data no longer fits a decision you made about this payment, so it is kept as it is and not matched to anything else. Cash flow counts it as a range: ${range}.`
+          : "The bank's data no longer fits a decision you made about this payment, so it is kept as it is and not matched to anything else.",
+    };
+  }
+  return review.side === 'cash'
+    ? { headline: 'Not matched yet', detail: `Cash flow counts this payment as a range: ${range}.` }
+    : { headline: 'Not matched yet', detail: 'This card payment is not matched to anything. It does not change cash flow.' };
+}
+
+export function reviewSourceText(source: RecoverySource): string {
+  if (!source.source_known || source.source_date === null || source.source_cents === null) {
+    return source.evidence_kind === 'preserved_confirmation'
+      ? 'You had confirmed its match with a transaction at the removed bank. That transaction was not recorded.'
+      : 'What this depended on at the removed bank was not recorded.';
+  }
+  const what = `${formatReviewCents(source.source_cents)} on ${formatReviewDate(source.source_date)}`;
+  if (source.evidence_kind === 'removed_destination') return `It had been matched automatically to a transaction of ${what} at the removed bank.`;
+  if (source.evidence_kind === 'preserved_confirmation') return `You had confirmed its match with a transaction of ${what} at the removed bank.`;
+  if (source.evidence_kind === 'graph_source') {
+    return source.source_relation === 'automatic_partner'
+      ? `Its automatic match, ${what}, was at the removed bank.`
+      : `A transaction of ${what} at the removed bank could have been its other side.`;
+  }
+  return source.source_relation === 'automatic_partner'
+    ? `Its automatic match, ${what}, was at the removed bank — and another of your transactions fitted it too.`
+    : `A transaction of ${what} at the removed bank could also have been its other side.`;
+}
+
+/** One paragraph per obligation: which removal, or which gap. */
+export function reviewObligationText(obligation: RecoveryObligation): string {
+  const bank = obligation.institution_name ?? 'A bank connection';
+  if (obligation.gap_reason === 'unattributed_decision') {
+    return 'Part of this payment\'s history was recorded before the app kept track of what a removal depended on. Which removed transaction it was is not known, so nothing new is matched to this payment automatically.';
+  }
+  if (obligation.gap_reason === 'unrecorded_removal') {
+    return `${bank} was removed without a record of what that removal depended on. It may concern this payment, so nothing new is matched to it automatically.`;
+  }
+  return `${bank} was removed${obligation.removed_on ? ` on ${formatReviewDate(obligation.removed_on)}` : ''}.`;
+}
+
+/** "Sep 11, 2026 · $370.00 · 1 day apart", with what the user must know before choosing it. */
+export function reviewCandidateText(candidate: RecoveryCandidate): string {
+  const parts = [formatReviewDate(candidate.date), formatReviewCents(candidate.amount_cents), candidate.distance_days === 0 ? 'same day' : candidate.distance_days === 1 ? '1 day apart' : `${candidate.distance_days} days apart`];
+  if (candidate.difference_cents !== 0) parts.push(`differs by ${formatReviewCents(candidate.difference_cents)}`);
+  if (candidate.pending) parts.push('pending');
+  if (!candidate.account_included) parts.push('on an account excluded from cash flow');
+  return parts.join(' · ');
+}
+
+/** What matching would accept when the amounts differ — shown before the user confirms. */
+export function acceptedDifferenceText(differenceCents: number): string {
+  return differenceCents > 0
+    ? `The payment is ${formatReviewCents(differenceCents)} more than this transaction. Matching them accepts that difference: it stays counted as money that left your accounts.`
+    : `This transaction is ${formatReviewCents(differenceCents)} more than the payment. Matching them accepts that difference.`;
+}
+
+/** What each action does — and what it does not. Shown beside the action. */
+export const REVIEW_ACTION_HELP: Record<RecoveryActionType, string> = {
+  pair_current: 'Matches this payment with that transaction, so it counts as a transfer between your accounts. This decides this payment only: what is on record about the removed connection stays as it is.',
+  confirm_unlinked: 'Counts this payment as money that went to a card you have not linked.',
+  dismiss_candidate: 'Says this transaction is not the other side of this payment. This can change the figure: the payment is then read without it.',
+  undo_decision: 'Takes that decision back. The payment goes back to what the bank data and the record of the removal say. A decision it had replaced does not come back.',
+  reject_suggestion: 'Hides this suggestion. Nothing else changes: the figure stays as it is.',
+  defer: 'Leaves it for later. Nothing changes.',
+};
+
+const DECISION_KIND_TEXT: Record<string, string> = {
+  pair: 'You matched this payment',
+  destination_unlinked: 'You said it went to a card you have not linked',
+  pair_counterpart_removed: 'You had confirmed a match with a transaction at a bank that was removed',
+};
+export function reviewDecisionText(decision: NonNullable<RecoveryReview['controlling_decision']>): string {
+  const what = DECISION_KIND_TEXT[decision.kind] ?? 'A decision is recorded for this payment';
+  return decision.status === 'active' ? `${what}.` : `${what}, and the bank's data no longer fits it.`;
+}
+
+const RECOVERY_FAILURE_TEXT: Record<string, string> = {
+  stale_version: 'Something changed since this was loaded, so nothing was saved. The review has been reloaded — check it and try again.',
+  stale_review: 'This review changed since it was loaded, so nothing was saved. It has been reloaded — check it and try again.',
+  operation_conflict: 'That request could not be sent again in a different form. Nothing was saved.',
+  not_reviewable: 'This payment is no longer under review. Nothing was saved.',
+  not_found: 'That transaction is no longer there. Nothing was saved.',
+  invalid_action: 'That cannot be done with these transactions. Nothing was saved.',
+  counterpart_reserved: 'That transaction already belongs to another match you confirmed. Undo that one first. Nothing was saved.',
+  pair_confirmed: 'These two are a match you saved. Undo the match first. Nothing was saved.',
+  decision_replaced: 'That decision was already replaced by a later one. Nothing was saved.',
+  retry: 'That could not be completed just now. Nothing was saved — try again.',
+  recovery_actions_disabled: 'Changes from this screen are switched off right now. Nothing was saved.',
+  recovery_unavailable: "Payment review isn't available right now.",
+  session_owner_mismatch: 'You signed in again since this was opened. Nothing was sent — reload the review.',
+  session_owner_required: 'You need to be signed in to do that. Nothing was sent.',
+  client_update_required: 'This version of the app is out of date. Reload to update, then try again. Nothing was saved.',
+};
+/** The fixed sentence for a refused or failed recovery request. Never the server's own message. */
+export function recoveryFailureText(code: string | null): string {
+  return (code !== null && RECOVERY_FAILURE_TEXT[code]) || "That didn't work, and nothing is known to have been saved.";
 }

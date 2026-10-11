@@ -526,10 +526,20 @@ select th.assert((select string_agg(c.conname || ':' || c.contype::text, ', ' or
 select th.assert((select string_agg(n.nspname || '.' || p.proname, ', ' order by p.proname)
                   from pg_proc p join pg_namespace n on n.oid = p.pronamespace
                   where n.nspname not in ('pg_catalog', 'information_schema') and n.nspname !~ '^pg_temp' and p.prosrc ~ 'card_payment_removal_(generations|sources)')
-                 = 'public.card_payment_removal_generations_guard, public.card_payment_removal_sources_guard, public.remove_plaid_item_local'
-                 and not exists (select 1 from unnest(array['public', 'anon', 'authenticated']) r
-                                 where has_function_privilege(r, 'public.remove_plaid_item_local(uuid, uuid)'::regprocedure, 'execute')),
-  'catalog: the only functions whose source names a provenance table are the removal and the two guards, and no client role can execute any of them');
+                 = 'public.card_payment_removal_generations_guard, public.card_payment_removal_sources_guard, public.card_payment_review_capture, '
+                   || 'public.card_payment_review_record_gaps, public.card_payment_review_seed_retained, public.remove_plaid_item_local'
+                 -- No client role can execute ANY function of that inventory (not only the removal).
+                 and not exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                                 cross join unnest(array['public', 'anon', 'authenticated']) r
+                                 where n.nspname not in ('pg_catalog', 'information_schema') and n.nspname !~ '^pg_temp'
+                                   and p.prosrc ~ 'card_payment_removal_(generations|sources)' and has_function_privilege(r, p.oid, 'execute'))
+                 -- The three functions 20261009120000 adds to the inventory only READ the provenance: none of them
+                 -- inserts into, updates or deletes from either table.
+                 and not exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                                 where n.nspname = 'public'
+                                   and p.proname in ('card_payment_review_capture', 'card_payment_review_record_gaps', 'card_payment_review_seed_retained')
+                                   and p.prosrc ~* '(insert[[:space:]]+into|update|delete[[:space:]]+from)[[:space:]]+public[.]card_payment_removal_(generations|sources)'),
+  'catalog: the only functions whose source names a provenance table are the removal, the two guards, and the three functions of 20261009120000 that READ it (the review capture, the gap recorder, the seeding of retained history); none of those three writes to it, and no client role can execute any of the six');
 select th.assert(not exists (select 1 from pg_depend d
                              where d.refclassid = 'pg_class'::regclass
                                and d.refobjid in ('public.card_payment_removal_generations'::regclass, 'public.card_payment_removal_sources'::regclass)
@@ -538,10 +548,11 @@ select th.assert(not exists (select 1 from pg_depend d
 select th.assert(not exists (select 1 from pg_publication_tables t where t.schemaname = 'public' and t.tablename like 'card\_payment\_removal\_%')
                  and not exists (select 1 from pg_publication p where p.puballtables),
   'catalog: no publication carries either table to a subscriber');
--- (The literal is the one the postcondition of 20261008120000 names; it must follow that file.)
+-- (The literal is the one the postcondition of 20261009120000 names: that file replaces 20261008120000's body,
+-- cc12b7a12c6510924781b93c658ee854, with the same text plus the review capture. It must follow that file.)
 select th.assert((select md5(replace(p.prosrc, E'\r', '')) from pg_proc p where p.oid = 'public.remove_plaid_item_local(uuid, uuid)'::regprocedure)
-                 = 'cc12b7a12c6510924781b93c658ee854',
-  'catalog: the installed remove_plaid_item_local is the body 20261008120000 installs');
+                 = '5b3cb3fdc0ab9570a345cf1ace387481',
+  'catalog: the installed remove_plaid_item_local is the body 20261009120000 installs');
 
 -- ==== 2. Runtime, as each role ==========================================================================================
 -- Both tables hold rows now (R1's generation and the marker; R1's four provenance rows): a refusal below is a
@@ -1011,8 +1022,8 @@ insert into pg_temp.rpc values ('harness-item-a6', 'preview', public.preview_pla
 insert into pg_temp.rpc values ('aa', 'states', public.get_card_payment_states(pg_temp.aa()));
 insert into pg_temp.rpc values ('aa', 'snapshot', public.get_financial_read_snapshot(pg_temp.aa(), '2026-09-01', null, false, false, true));
 select th.assert((select pg_temp.keys(result) from rpc where plaid_item = 'aa' and step = 'states')
-                 = 'asOf, decisions, evaluatedVersion, fresh, inputVersion, legs, supersededTransactionIds',
-  'exposure: get_card_payment_states returns the keys it returned before');
+                 = 'asOf, decisions, evaluatedVersion, evaluatorContract, fresh, inputVersion, legs, reviews, supersededTransactionIds',
+  'exposure: get_card_payment_states returns the keys it returned before, and the two that 20261009120000 adds: evaluatorContract (which evaluator published the states) and reviews (the legs under review)');
 select th.assert((select pg_temp.element_keys(result->'legs') from rpc where plaid_item = 'aa' and step = 'states')
                  = 'accountId, accountIncluded, amountCents, candidates, cardExcessCents, cashExcessCents, date, decisionId, detail, direction, effectCents, '
                    || 'highCents, lowCents, partnerTransactionId, pending, reason, recent, side, state, transactionId',

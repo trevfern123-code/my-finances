@@ -3,6 +3,7 @@ import type { BudgetCategory, TransactionItem } from '../lib/api';
 import { budgetCategoryLabel, selectableCategories } from '../lib/categoryLabels';
 import { accountDisplayName } from '../lib/accountDisplay';
 import { SplitEditor } from './SplitEditor';
+import { CardPaymentRecoveryReview, reviewEntryLabel, reviewIndex, usePendingRecoveryEntry, useRecoveryReviews } from './CardPaymentRecoveryReview';
 
 function formatAmount(amount: number, currency: string | null) {
   const formatted = new Intl.NumberFormat('en-US', {
@@ -49,6 +50,22 @@ export function TransactionsFeed({
   const [needsReviewOnly, setNeedsReviewOnly] = useState(false);
   const [splitEditingId, setSplitEditingId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
+  // Payments under review after a bank connection was removed (I3A-R packet 2-A). The entry is here whether
+  // or not such a payment is among the rows below, and whether or not its figures are current: 'all' opens the
+  // whole review, a transaction id opens it at that payment.
+  const recoveryReviews = useRecoveryReviews();
+  // A change sent from the review whose outcome is not known yet is always reachable from here — also after the
+  // review was closed, after this screen was left, and when the list of reviews cannot be read.
+  const pendingEntry = usePendingRecoveryEntry();
+  const reviewEntry = reviewEntryLabel(recoveryReviews.state, pendingEntry);
+  const { ids: reviewIds } = reviewIndex(recoveryReviews.state);
+  const [reviewOpen, setReviewOpen] = useState<string | null>(null);
+  const describeTransaction = (transactionId: string): string | null => {
+    const found = transactions.find((t) => t.id === transactionId);
+    if (!found) return null;
+    const label = found.merchant_name ?? found.name;
+    return found.accounts ? `${label} (${accountDisplayName(found.accounts)})` : label;
+  };
 
   const categoryById = useMemo(() => {
     const map = new Map<string, BudgetCategory>();
@@ -103,6 +120,16 @@ export function TransactionsFeed({
       <div className="section-header">
         <h2>Recent transactions</h2>
         <div className="transactions-header-actions">
+          {reviewEntry !== null && (
+            <button
+              type="button"
+              className={reviewOpen === 'all' ? 'needs-review-toggle active' : 'needs-review-toggle'}
+              onClick={() => setReviewOpen((prev) => (prev === 'all' ? null : 'all'))}
+              aria-expanded={reviewOpen === 'all'}
+            >
+              {reviewEntry}
+            </button>
+          )}
           {needsReviewCount > 0 && (
             <button
               type="button"
@@ -126,6 +153,8 @@ export function TransactionsFeed({
           </button>
         </div>
       </div>
+
+      {reviewOpen === 'all' && <CardPaymentRecoveryReview describeTransaction={describeTransaction} onChanged={recoveryReviews.reload} />}
 
       {collapsed ? null : transactions.length === 0 ? (
         <p className="hint">No transactions yet — link an account or sync to fetch history.</p>
@@ -240,7 +269,20 @@ export function TransactionsFeed({
                       >
                         {hasSplits ? 'Edit split' : 'Split'}
                       </button>
+                      {reviewIds.has(t.id) && (
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => setReviewOpen((prev) => (prev === t.id ? null : t.id))}
+                          aria-expanded={reviewOpen === t.id}
+                        >
+                          Review payment
+                        </button>
+                      )}
                     </div>
+                    {reviewOpen === t.id && (
+                      <CardPaymentRecoveryReview focusTransactionId={t.id} describeTransaction={describeTransaction} onChanged={recoveryReviews.reload} />
+                    )}
                     {isEditingSplit && (
                       <SplitEditor
                         totalAmount={t.amount}

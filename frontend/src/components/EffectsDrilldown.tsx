@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import type { EffectsQuery } from '../lib/api';
+import { CardPaymentRecoveryReview, reviewEntryLabel, reviewIndex, usePendingRecoveryEntry, useRecoveryReviews } from './CardPaymentRecoveryReview';
 import { useEffectsDrilldown } from '../hooks/useEffectsDrilldown';
 import { toCents } from '../lib/semanticModel';
 import { effectRowLabel, effectsFailureText, formatSigned, itemCount } from '../lib/semanticPresentation';
@@ -34,6 +36,41 @@ export function EffectsDrilldown({
   emptyText?: string;
 }) {
   const { state, loadMore, retry } = useEffectsDrilldown(query);
+  // Payments under review after a bank connection was removed (I3A-R packet 2-A): reachable from every list of
+  // card payments — also while that list cannot be shown because the figures are not current.
+  const reviewable = query.measure.startsWith('card_payments_') || query.measure.startsWith('credit_card_payments_');
+  const recoveryReviews = useRecoveryReviews(reviewable);
+  // A change sent from the review whose outcome is not known yet is reachable from every card-payment list too.
+  const pendingEntry = usePendingRecoveryEntry(reviewable);
+  const reviewEntry = reviewable ? reviewEntryLabel(recoveryReviews.state, pendingEntry) : null;
+  const { ids: reviewIds } = reviewIndex(recoveryReviews.state);
+  const [reviewOpen, setReviewOpen] = useState<string | null>(null);
+  const rowNames = state.phase === 'ready' ? state.rows : [];
+  const review =
+    reviewEntry === null ? null : (
+      <>
+        <p className="hint" role="status">
+          {reviewEntry}.{' '}
+          <button type="button" className="link-button" onClick={() => setReviewOpen((prev) => (prev === 'all' ? null : 'all'))} aria-expanded={reviewOpen !== null}>
+            {reviewOpen === null ? 'Open the review' : 'Close the review'}
+          </button>
+        </p>
+        {reviewOpen !== null && (
+          <CardPaymentRecoveryReview
+            focusTransactionId={reviewOpen === 'all' ? null : reviewOpen}
+            describeTransaction={(id) => {
+              const found = rowNames.find((row) => row.transaction.id === id);
+              return found ? effectRowLabel(found) : null;
+            }}
+            onChanged={() => {
+              recoveryReviews.reload();
+              retry();
+              onRefreshParent?.();
+            }}
+          />
+        )}
+      </>
+    );
 
   if (state.phase === 'loading') {
     return (
@@ -56,6 +93,7 @@ export function EffectsDrilldown({
             Try again
           </button>
         </p>
+        {review}
       </div>
     );
   }
@@ -89,6 +127,14 @@ export function EffectsDrilldown({
               {effectRowLabel(row)}
               {row.allocation === 'split' && <span className="split-badge">split</span>}
               {row.transaction.pending && <span className="split-badge">pending</span>}
+              {reviewIds.has(row.transaction.id) && (
+                <>
+                  {' '}
+                  <button type="button" className="link-button" onClick={() => setReviewOpen(row.transaction.id)}>
+                    Review
+                  </button>
+                </>
+              )}
             </span>
             <span className="drilldown-amount">{formatSigned(row.effect_amount)}</span>
           </div>
@@ -104,6 +150,7 @@ export function EffectsDrilldown({
           {state.loadingMore ? 'Loading…' : 'Load more'}
         </button>
       )}
+      {review}
       {parentChanged && (
         <p className="hint drilldown-mismatch" role="status">
           This list totals {formatSigned(total)} and the figure above is {formatSigned(parentAmount)}: they were loaded at

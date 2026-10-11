@@ -2,6 +2,7 @@ import { env } from './config/env';
 import { createApp } from './app';
 import { validateKeyRingOrExit } from './services/tokenEncryption';
 import { summarizeErrorSafely } from './services/errorSanitizer';
+import { createRecoveryWorker } from './workers/cardPaymentRecoveryWorker';
 
 // Last-resort logging so a future unhandled rejection is visible in deploy logs before
 // the process exits, rather than the container just going silently unresponsive. Never log the
@@ -30,3 +31,12 @@ const app = createApp({ frontendUrl: env.frontendUrl });
 app.listen(env.port, '0.0.0.0', () => {
   console.log(`Backend listening on 0.0.0.0:${env.port}`);
 });
+
+// The durable card-payment refresh worker (packet 2-A). Default off; see config/env.ts. Its first poll runs at
+// once, so whatever refresh work was outstanding when this process started is found without waiting for a sync.
+// It holds no state of its own and installs no signal handler: when the process is stopped, a refresh in
+// flight either finishes on the server or its lease expires, and the next process's first poll finds the rest.
+if (env.cardPaymentRecoveryWorkerEnabled) {
+  createRecoveryWorker().start();
+  console.log('Card-payment refresh worker started');
+}

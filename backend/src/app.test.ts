@@ -594,6 +594,7 @@ describe('Every covered prefix is gated (a future omission from CLIENT_API_ROUTE
     '/api/category-mappings',
     '/api/manual-loans',
     '/api/user-preferences',
+    '/api/card-payment-recovery',
   ];
   let strictServer: Server;
   let strictBase: string;
@@ -612,7 +613,7 @@ describe('Every covered prefix is gated (a future omission from CLIENT_API_ROUTE
     await new Promise<void>((resolve) => strictServer.close(() => resolve()));
   });
 
-  it('CLIENT_API_ROUTES is exactly the five protected prefixes (adding or dropping one must be a deliberate change here)', () => {
+  it('CLIENT_API_ROUTES is exactly the six protected prefixes (adding or dropping one must be a deliberate change here)', () => {
     expect([...CLIENT_API_ROUTES].sort()).toEqual([...PROTECTED_PREFIXES].sort());
   });
 

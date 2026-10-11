@@ -221,9 +221,22 @@ create temporary table kept as
   select s, (pg_temp.preserved('k-' || s)).id as id from unnest(array['v1', 'v2', 'v3', 'pr']) s;
 -- Undo releases the leg.
 select th.assert(public.undo_card_payment_decision(pg_temp.aa(), (select id from kept where s = 'v1'), pg_temp.iv())->>'status' = 'undone', 'V1: the user undoes the preserved decision');
+-- 20261009120000 (guarded manual recovery). k-v1 (+470) was held by the user's confirmation when its institution
+-- was removed, so it was outside the automatic-matching pool: the removal recorded an obligation for it and NO
+-- surviving edge — that y-v1 (−470) was there, with the same amount, is not an edge it knew. After the undo the
+-- pair k-v1 / y-v1 is selected by the ordinary rule, and withheld: the payment reads the range {−470, 0}, the
+-- kept card's leg unresolved, 0; neither has a partner. The undone decision does not come back; the obligation stays.
 select th.assert((select superseded_by = id from public.card_payment_decisions where id = (select id from kept where s = 'v1'))
-                 and pg_temp.srep('k-v1') = 'tracked/auto_pair/0 partner=y-v1' and pg_temp.holder_kind('k-v1') = 'none',
-  'V1: undone (kept as history, superseded by itself); the leg is released and now matches automatically');
+                 and pg_temp.srep('k-v1') = 'unresolved/relink_review_required/null partner=-' and pg_temp.holder_kind('k-v1') = 'none'
+                 and (pg_temp.leg('k-v1')->>'lowCents')::bigint = -47000 and (pg_temp.leg('k-v1')->>'highCents')::bigint = 0
+                 and pg_temp.srep('y-v1') = 'unresolved/relink_review_required/0 partner=-' and pg_temp.holder_kind('y-v1') = 'none'
+                 and (pg_temp.leg('y-v1')->>'lowCents')::bigint = 0 and (pg_temp.leg('y-v1')->>'highCents')::bigint = 0,
+  'V1: undone (kept as history, superseded by itself); no user decision holds the leg; its pair with the kept card is WITHHELD for review — the range {−470, 0}, the card leg unresolved 0, no partner on either');
+select th.assert((select count(*) = 1 and bool_and(o.origin = 'captured') from public.card_payment_review_obligations o
+                  where o.user_id = pg_temp.aa() and o.anchor_plaid_transaction_id = 'k-v1')
+                 and (select count(*) = 0 from public.card_payment_review_memberships m join public.card_payment_review_obligations o on o.id = m.obligation_id
+                      where o.anchor_plaid_transaction_id = 'k-v1'),
+  'V1: the payment''s review obligation remains after the undo, and knows no surviving edge');
 -- A new match supersedes it.
 select th.assert(public.link_card_payment(pg_temp.aa(), pg_temp.tid('k-v2'), pg_temp.tid('y-v2'), 0, pg_temp.iv())->>'status' = 'saved', 'V2: the user matches the payment with the other card');
 select th.assert((select superseded_by = pg_temp.pair_of('k-v2') from public.card_payment_decisions where id = (select id from kept where s = 'v2'))
