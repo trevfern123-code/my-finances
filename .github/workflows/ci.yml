@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, feature/phase-b-i3a-r-provenance]
 
 jobs:
   build-and-test:
