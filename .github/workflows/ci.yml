@@ -79,6 +79,11 @@ jobs:
     # and access_control. Throwaway local containers only. Each suite runs even if an earlier one
     # failed, so one run reports all three.
     runs-on: ubuntu-latest
+    env:
+      # Supabase's official Docker Hub mirror avoids ECR Public's anonymous-download quota.
+      # Version 17.6.1.155: this index digest matches ECR exactly (verified 2026-09-30).
+      # Only the history/access-control steps opt in; scaffold keeps its postgres:17 image.
+      SUPABASE_TEST_PG_IMAGE: docker.io/supabase/postgres@sha256:3866d94d8426927e8db3f1c5d790752292bfbe27b5f1f46e199ae1b7d3c1710b
     steps:
       - uses: actions/checkout@v5
 
@@ -98,7 +103,10 @@ jobs:
         run: bash supabase/tests/phase_a/run.sh
         env:
           PHASE_A_BASE: history
+          PG_IMAGE: ${{ env.SUPABASE_TEST_PG_IMAGE }}
 
       - name: access_control
         if: ${{ !cancelled() }}
         run: bash supabase/tests/access_control/run.sh
+        env:
+          PG_IMAGE: ${{ env.SUPABASE_TEST_PG_IMAGE }}
