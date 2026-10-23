@@ -642,6 +642,35 @@ describe('rotate — final recheck', () => {
     expect(logs.entries.find((e) => e.stage === 'final_check')?.counts).toMatchObject({ link_tokens_v2: 0, link_tokens_v3: 1 });
   });
 
+  // Changes that leave every count, the row-id set and the V2/V3 split intact: only the per-row
+  // fingerprint of the verified state catches these.
+  it.each([
+    ['a V2 ciphertext replaced by another valid V2 encryption', (items: FakeItem[]) => Object.assign(items[0], { ...item(ID_A, V2_RING), status: items[0].status, transactions_cursor: items[0].transactions_cursor })],
+    ['a plaintext copy changed to another value', (items: FakeItem[]) => Object.assign(items[1], { access_token: 'a-different-token' })],
+    ['a nonce swapped for a fresh one', (items: FakeItem[]) => Object.assign(items[2], { access_token_nonce: Buffer.alloc(12, 9).toString('base64') })],
+  ])('fails a dry run when, after a row was verified, %s', async (_name, mutate) => {
+    setupFakeSupabase(productionCohort(), [], {
+      beforeReread: (items, n) => {
+        if (n === 4) mutate(items); // row D is being read; rows A-C were verified already
+      },
+    });
+    const logs = captureLogs();
+    expect(await main(rotateArgv())).toBe(1);
+    expect(logs.outcomes()).toEqual(['started:rotate:read_only', 'read', 'passed', 'dry_run_verified', 'dry_run_verified', 'dry_run_verified', 'dry_run_verified', 'failed:row_changed_after_verification', 'failed']);
+  });
+
+  it('fails an apply run when a rotated row is changed after its post-write verification', async () => {
+    setupFakeSupabase(productionCohort(), [], {
+      afterUpdate: (items, n) => {
+        if (n === 4) Object.assign(items[0], { ...item(ID_A, MIXED_RING), status: items[0].status, transactions_cursor: items[0].transactions_cursor });
+      },
+    });
+    const logs = captureLogs();
+    expect(await main(rotateArgv({ extra: APPLY }))).toBe(1);
+    expect(logs.outcomes()).toContain('failed:row_changed_after_verification');
+    expect(logs.outcomes()).not.toContain('rotation_complete');
+  });
+
   it('fails a dry run when a plaintext copy is cleared while it runs', async () => {
     setupFakeSupabase(productionCohort(), [], {
       beforeReread: (items, n) => {
@@ -903,6 +932,18 @@ describe('verify-retirement (read-only V2 retirement gate)', () => {
     const logs = captureLogs();
     expect(await main(verifyArgv())).toBe(1);
     expect(logs.outcomes()).toContain('halted:plaintext_copy_changed');
+  });
+
+  it('fails when a row is re-encrypted (still valid V3) after it was verified', async () => {
+    setupFakeSupabase(rotatedCohort(), [], {
+      beforeReread: (items, n) => {
+        if (n === 4) Object.assign(items[0], { ...item(ID_A, MIXED_RING), status: items[0].status, transactions_cursor: items[0].transactions_cursor });
+      },
+    });
+    const logs = captureLogs();
+    expect(await main(verifyArgv())).toBe(1);
+    expect(logs.outcomes()).toContain('failed:row_changed_after_verification');
+    expect(logs.outcomes()).not.toContain('v2_retirement_gate_passed');
   });
 
   it('fails when a row labelled V3 actually needs the V2 key', async () => {

@@ -34,6 +34,7 @@
  * and it does nothing unless it is the process's own entrypoint (`require.main === module`).
  */
 
+import { createHash } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase';
 import { env } from '../config/env';
 import {
@@ -150,6 +151,26 @@ export type RowClass =
   | 'missing_both'
   | 'unexpected_key'
   | 'unexpected_version';
+
+/** In-memory digest of a row's id, plaintext copy and five encrypted columns, so the final recount
+ *  can prove each row is still byte-for-byte the state that was verified — any later change to a
+ *  ciphertext, nonce, tag, key id, version or plaintext value is caught, not only changes to counts.
+ *  Never logged, printed or stored. */
+export function rowFingerprint(row: TokenRow): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        row.id,
+        row.access_token,
+        row.access_token_ciphertext,
+        row.access_token_nonce,
+        row.access_token_auth_tag,
+        row.access_token_key_id,
+        row.access_token_enc_version,
+      ])
+    )
+    .digest('hex');
+}
 
 export function classifyRow(row: TokenRow): RowClass {
   const state = classifyStorageState(row);
@@ -685,7 +706,13 @@ function verifyStoredV3(
 
 export type RowOutcome = 'already_v3_verified' | 'dry_run_verified' | 'rotated' | 'concurrent_rotation_verified';
 
-export async function rotateRow(id: string, apply: boolean, fullRing: KeyRing): Promise<RowOutcome> {
+/** `fingerprint` is rowFingerprint() of exactly the stored state this call verified. */
+export interface RowResult {
+  outcome: RowOutcome;
+  fingerprint: string;
+}
+
+export async function rotateRow(id: string, apply: boolean, fullRing: KeyRing): Promise<RowResult> {
   const v3Ring = v3OnlyKeyRing(fullRing);
   if (!v3Ring) throw new HaltError(id, 'v3_key_missing');
 
@@ -704,7 +731,7 @@ export async function rotateRow(id: string, apply: boolean, fullRing: KeyRing): 
     // or write; reverify what is stored.
     verifyStoredV3(id, initial, v3Ring, plaintextBefore, null);
     logEntry({ id, stage: 'done', outcome: 'already_v3_verified' });
-    return 'already_v3_verified';
+    return { outcome: 'already_v3_verified', fingerprint: rowFingerprint(initial) };
   }
   if (cls !== 'v2') {
     logEntry({ id, stage: 'reread_initial', outcome: `failed:${cls}` });
@@ -740,7 +767,7 @@ export async function rotateRow(id: string, apply: boolean, fullRing: KeyRing): 
   if (!apply) {
     throwIfInterrupted(id);
     logEntry({ id, stage: 'done', outcome: 'dry_run_verified' });
-    return 'dry_run_verified';
+    return { outcome: 'dry_run_verified', fingerprint: rowFingerprint(initial) };
   }
 
   throwIfInterrupted(id);
@@ -773,15 +800,16 @@ export async function rotateRow(id: string, apply: boolean, fullRing: KeyRing): 
   verifyStoredV3(id, after, v3Ring, plaintextBefore, token);
   const outcome: RowOutcome = affected === 1 ? 'rotated' : 'concurrent_rotation_verified';
   logEntry({ id, stage: 'done', outcome });
-  return outcome;
+  return { outcome, fingerprint: rowFingerprint(after) };
 }
 
 // ---- verify-retirement: every row decrypts with the V3-only ring, zero writes -------------------------------
 
-export async function verifyAllWithV3Only(rows: TokenRow[], fullRing: KeyRing): Promise<number> {
+/** Returns rowFingerprint() of each row as verified, keyed by id. */
+export async function verifyAllWithV3Only(rows: TokenRow[], fullRing: KeyRing): Promise<Map<string, string>> {
   const v3Ring = v3OnlyKeyRing(fullRing);
   if (!v3Ring) throw new HaltError(undefined, 'v3_key_missing');
-  let verified = 0;
+  const verified = new Map<string, string>();
   for (const listed of rows) {
     throwIfInterrupted(listed.id);
     // Fresh reread per row, so the gate reflects the database now, not the inventory snapshot.
@@ -793,7 +821,7 @@ export async function verifyAllWithV3Only(rows: TokenRow[], fullRing: KeyRing): 
     }
     verifyStoredV3(listed.id, row, v3Ring, listed.access_token, null);
     logEntry({ id: listed.id, stage: 'done', outcome: 'v3_only_verified' });
-    verified++;
+    verified.set(listed.id, rowFingerprint(row));
   }
   return verified;
 }
@@ -834,6 +862,7 @@ function inventoryCounts(p: PreflightResult): Record<string, number> {
 
 export type FinalCheckFailure =
   | 'row_set_changed'
+  | 'row_changed_after_verification'
   | 'total_changed'
   | 'plaintext_copy_count_changed'
   | 'anomalous_rows_present'
@@ -856,11 +885,16 @@ export type FinalCheckFailure =
  * total but is still a different table). A V2 link token count that GREW means some writer still
  * encrypts under V2 — the "missed writer" case — and fails every mode; retirement additionally
  * requires zero V2 link tokens.
+ *
+ * `verified` maps each row id to rowFingerprint() of the state the per-row pass verified; every row
+ * must still match it exactly, so a change to any ciphertext, nonce, tag, key id, version or plaintext
+ * value made after that row's verification is caught too. Fingerprints are compared in memory only.
  */
 export async function finalRecheck(
   args: ParsedArgs,
   before: { inventory: Inventory; linkTokens: LinkTokenInventory },
-  expect: 'unchanged' | 'all_v3'
+  expect: 'unchanged' | 'all_v3',
+  verified: ReadonlyMap<string, string>
 ): Promise<{ failures: FinalCheckFailure[]; inventory: Inventory; linkTokens: LinkTokenInventory }> {
   const inventory = await readInventory();
   const linkTokens = await readLinkTokenInventory();
@@ -871,6 +905,7 @@ export async function finalRecheck(
   const idsBefore = before.inventory.rows.map((r) => r.id).join(',');
   const idsNow = inventory.rows.map((r) => r.id).join(','); // both ordered by id
   if (idsNow !== idsBefore) failures.push('row_set_changed');
+  if (inventory.rows.some((r) => verified.get(r.id) !== rowFingerprint(r))) failures.push('row_changed_after_verification');
   if (c.total !== args.expectedTotal) failures.push('total_changed');
   if (c.plaintextCopies !== args.expectedPlaintextCopies) failures.push('plaintext_copy_count_changed');
   if (c.plaintext_only + c.partial + c.missing_both + c.unexpected_key + c.unexpected_version > 0) {
@@ -894,10 +929,11 @@ async function finishWithRecheck(
   args: ParsedArgs,
   preflight: PreflightResult & { inventory: Inventory; linkTokens: LinkTokenInventory },
   expect: 'unchanged' | 'all_v3',
+  verified: ReadonlyMap<string, string>,
   successOutcome: string,
   tally?: Record<string, number>
 ): Promise<number> {
-  const recheck = await finalRecheck(args, preflight, expect);
+  const recheck = await finalRecheck(args, preflight, expect, verified);
   throwIfInterrupted();
   const counts = inventoryCounts({ ...preflight, inventory: recheck.inventory, linkTokens: recheck.linkTokens });
   for (const f of recheck.failures) logEntry({ stage: 'final_check', outcome: `failed:${f}` });
@@ -936,11 +972,11 @@ export async function main(argv: string[]): Promise<number> {
     const checked = { ...preflight, inventory: preflight.inventory, linkTokens: preflight.linkTokens };
 
     if (args.mode === 'verify-retirement') {
-      await verifyAllWithV3Only(preflight.inventory.rows, preflight.keyRing);
+      const verified = await verifyAllWithV3Only(preflight.inventory.rows, preflight.keyRing);
       throwIfInterrupted();
       // Recount after the per-row pass, so a row inserted under V2 (or a V2 link token created)
       // while the pass ran is caught here rather than missed.
-      return await finishWithRecheck(args, checked, 'all_v3', 'v2_retirement_gate_passed');
+      return await finishWithRecheck(args, checked, 'all_v3', verified, 'v2_retirement_gate_passed');
     }
 
     const tally: Record<RowOutcome, number> = {
@@ -949,18 +985,21 @@ export async function main(argv: string[]): Promise<number> {
       rotated: 0,
       concurrent_rotation_verified: 0,
     };
+    const verified = new Map<string, string>();
     // Id order, halting on the first failure — rows after a failed one are left exactly as they are.
     for (const row of preflight.inventory.rows) {
       throwIfInterrupted(row.id);
-      tally[await rotateRow(row.id, args.apply, preflight.keyRing)]++;
+      const result = await rotateRow(row.id, args.apply, preflight.keyRing);
+      tally[result.outcome]++;
+      verified.set(row.id, result.fingerprint);
     }
     throwIfInterrupted();
 
     // Same recount for the dry run as for apply: a dry run that "passed" while an item was added,
     // removed or changed, or while a writer created V2 link tokens, would be a false green light.
     return args.apply
-      ? await finishWithRecheck(args, checked, 'all_v3', 'rotation_complete', tally)
-      : await finishWithRecheck(args, checked, 'unchanged', 'dry_run_complete', tally);
+      ? await finishWithRecheck(args, checked, 'all_v3', verified, 'rotation_complete', tally)
+      : await finishWithRecheck(args, checked, 'unchanged', verified, 'dry_run_complete', tally);
   } catch (err) {
     if (err instanceof InterruptedError) {
       logEntry({ id: err.targetId, stage: 'run', outcome: 'interrupted' });
