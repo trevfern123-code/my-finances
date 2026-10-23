@@ -581,7 +581,7 @@ time.
 of the fake secret values appeared in its output.
 
 **Local PostgREST rehearsal** (`supabase/tests/key_rotation_v3/rehearse.sh`, review 2's "staging rehearsal"):
-**30/30 checks passed** on commit `531725a`.
+**30/30 checks passed** on commit `531725a`, and again on `7b90d35` (revision 4).
 
 - **Stack:** a scratch local Supabase stack from CLI 2.117.0 (Postgres 17.6.1.155, PostgREST v16.2, Kong 2.8.1,
   GoTrue v2.196.0) with all 17 checkout migrations applied.
