@@ -25,6 +25,10 @@
  *     (and id) — and the database Item set is unchanged — is `webhooks_on_target` logged. An earlier
  *     Item that changed again while a later one was being updated is caught here.
  *
+ * "No webhook" as Plaid reports it: `/item/get` returns `item.webhook` as a nullable string, documented as
+ * "Empty string if no webhook is set" (plaid-openapi 2020-09-14.yml). Both `""` and `null` mean none here;
+ * a missing field or any non-string value halts (`malformed_webhook_field`) instead (canonicalReadWebhook).
+ *
  * Items with NO webhook: the forward move updates them to OWN only when their number equals
  * `--expected-no-webhook` (0 refuses any). The dry run logs `source:none` with their internal row ids,
  * so the operator can record them; a rollback restores exactly those to "no webhook" (Plaid documents
@@ -364,7 +368,26 @@ async function readBoundItem(row: ItemRow, accessToken: string, stage: string): 
     logEntry({ id: row.id, stage, outcome: 'failed:item_id_mismatch' });
     throw new HaltError(row.id, 'item_id_mismatch');
   }
-  return typeof item.webhook === 'string' ? item.webhook : null;
+  const webhook = canonicalReadWebhook(item.webhook);
+  if (webhook === undefined) {
+    logEntry({ id: row.id, stage, outcome: 'failed:malformed_webhook_field' });
+    throw new HaltError(row.id, 'malformed_webhook_field');
+  }
+  return webhook;
+}
+
+/**
+ * Plaid's `/item/get` `item.webhook` is a nullable string, documented as "Empty string if no webhook
+ * is set" (plaid-openapi 2020-09-14.yml, Item.webhook). Both documented representations of "no
+ * webhook" — `""` and `null` — become internal `null`, so classification, the post-update check after
+ * a `webhook: null` removal, and the postflight all agree. Any other string is returned as-is (and is
+ * then either one of the two approved URLs or refused as an unexpected source). A missing field or any
+ * non-string value is NOT taken to mean "no webhook": it returns undefined and the caller halts.
+ */
+export function canonicalReadWebhook(value: unknown): string | null | undefined {
+  if (value === null || value === '') return null;
+  if (typeof value === 'string') return value;
+  return undefined;
 }
 
 // ---- Phase 1: classify every Item (read-only) ---------------------------------------------------------------------

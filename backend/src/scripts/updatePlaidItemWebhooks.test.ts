@@ -23,6 +23,11 @@ const plaid = vi.hoisted(() => ({
   ignoreUpdateFor: null as string | null,
   onUpdate: null as ((accessToken: string, n: number) => void) | null,
   updates: 0,
+  /** How /item/get reports an Item with no webhook. Plaid documents "Empty string if no webhook is
+   *  set" (plaid-openapi Item.webhook, nullable), so "" is the default; null is covered too. */
+  noWebhookAs: '' as string | null,
+  /** Raw `webhook` values to return instead of the stored one (malformed-response cases). */
+  rawWebhook: new Map<string, unknown>(),
 }));
 vi.mock('../config/plaid', () => ({
   plaidClient: {
@@ -30,7 +35,10 @@ vi.mock('../config/plaid', () => ({
       plaid.calls.push({ method: 'itemGet', accessToken: access_token });
       const it = plaid.items.get(access_token);
       if (!it) throw Object.assign(new Error('x'), { response: { status: 400, data: { error_code: 'INVALID_ACCESS_TOKEN' } } });
-      return { data: { item: { item_id: it.itemId, webhook: it.webhook } } };
+      const webhook = plaid.rawWebhook.has(access_token) ? plaid.rawWebhook.get(access_token) : it.webhook === null ? plaid.noWebhookAs : it.webhook;
+      const item: Record<string, unknown> = { item_id: it.itemId, webhook };
+      if (webhook === undefined) delete item.webhook;
+      return { data: { item } };
     }),
     itemWebhookUpdate: vi.fn(async ({ access_token, webhook }: { access_token: string; webhook: string | null }) => {
       plaid.calls.push({ method: 'itemWebhookUpdate', accessToken: access_token, webhook });
@@ -50,7 +58,7 @@ vi.mock('../services/tokenEncryption', async (importOriginal) => {
   return { ...actual, getKeyRing: vi.fn(() => keyRingHolder.current) };
 });
 
-import { CONFIRM_TOKEN, canonicalWebhookUrl, main, parseArgs, __setInterruptedForTests } from './updatePlaidItemWebhooks';
+import { CONFIRM_TOKEN, canonicalReadWebhook, canonicalWebhookUrl, main, parseArgs, __setInterruptedForTests } from './updatePlaidItemWebhooks';
 import { encryptAccessToken, loadKeyRing } from '../services/tokenEncryption';
 
 const RING = loadKeyRing({ PLAID_TOKEN_KEY_RAILWAY_PROD_V2: Buffer.alloc(32, 21).toString('base64'), PLAID_TOKEN_CURRENT_KEY_ID: 'RAILWAY_PROD_V2' });
@@ -151,6 +159,8 @@ beforeEach(() => {
   plaid.ignoreUpdateFor = null;
   plaid.onUpdate = null;
   plaid.updates = 0;
+  plaid.noWebhookAs = '';
+  plaid.rawWebhook = new Map();
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -469,5 +479,140 @@ describe('apply', () => {
     ]) {
       expect(out).not.toContain(s as string);
     }
+  });
+});
+
+// ---- Plaid's representations of "no webhook" (review 4) --------------------------------------------------
+// plaid-openapi 2020-09-14.yml: Item.webhook is a nullable string, "Empty string if no webhook is set";
+// ItemWebhookUpdateRequest.webhook: "To remove a webhook from an Item, set to `null`."
+
+describe('canonicalReadWebhook', () => {
+  it('maps both documented no-webhook representations to null and keeps URLs as they are', () => {
+    expect(canonicalReadWebhook('')).toBeNull();
+    expect(canonicalReadWebhook(null)).toBeNull();
+    expect(canonicalReadWebhook(RENDER_HOOK)).toBe(RENDER_HOOK);
+  });
+
+  it.each([[undefined], [0], [123], [false], [{}], [[]], [{ url: RENDER_HOOK }]])('does not treat a malformed value %j as "no webhook"', (value) => {
+    expect(canonicalReadWebhook(value)).toBeUndefined();
+  });
+});
+
+describe.each([
+  ['"" (as documented)', ''],
+  ['null', null],
+])('Items with no webhook reported by /item/get as %s', (_name, representation) => {
+  beforeEach(() => {
+    plaid.noWebhookAs = representation;
+    plaid.items.get(tokenOf(IDS[1]))!.webhook = null; // B has no webhook
+  });
+
+  it('classifies it as none (not an unexpected source) and refuses it unless attested', async () => {
+    setupDb(cohort());
+    const logs = captureLogs();
+    expect(await main(forward(APPLY))).toBe(1);
+    expect(logs.outcomes()).toContain('halted:unexpected_no_webhook_count');
+    expect(logs.outcomes()).not.toContain('halted:unexpected_webhook_source');
+    expect(logs.lines.map((l) => JSON.parse(l))).toContainEqual(expect.objectContaining({ id: IDS[1], stage: 'classify', outcome: 'source:none' }));
+    expect(updateCalls()).toHaveLength(0);
+  });
+
+  it('dry run reports it in the none count when attested', async () => {
+    setupDb(cohort());
+    const logs = captureLogs();
+    expect(await main(forward([], { none: 1 }))).toBe(0);
+    expect(logs.last()).toMatchObject({ outcome: 'dry_run_complete', counts: { total: 4, on_source: 3, none: 1, to_update: 4 } });
+    expect(updateCalls()).toHaveLength(0);
+  });
+
+  it('forward migration with --expected-no-webhook 1 moves it to OWN, verifies and passes the Plaid postflight', async () => {
+    setupDb(cohort());
+    const logs = captureLogs();
+    expect(await main(forward(APPLY, { none: 1 }))).toBe(0);
+    expect(webhooks()).toEqual([RENDER_HOOK, RENDER_HOOK, RENDER_HOOK, RENDER_HOOK]);
+    expect(logs.outcomes()).toEqual(expect.arrayContaining(['passed', 'webhooks_on_target']));
+  });
+
+  it('rollback restores it with webhook: null; the re-read and the postflight accept Plaid reporting it back as no webhook', async () => {
+    setupDb(cohort());
+    captureLogs();
+    expect(await main(forward(APPLY, { none: 1 }))).toBe(0);
+
+    setupDb(cohort());
+    plaid.calls = [];
+    const logs = captureLogs();
+    expect(await main(rollback([...APPLY, '--restore-no-webhook-ids', IDS[1]]))).toBe(0);
+    expect(updateCalls().find((c) => c.accessToken === tokenOf(IDS[1]))).toMatchObject({ webhook: null });
+    expect(webhooks()).toEqual([RAILWAY_HOOK, null, RAILWAY_HOOK, RAILWAY_HOOK]);
+    expect(logs.outcomes()).not.toContain('halted:webhook_not_applied');
+    expect(logs.outcomes()).toContain('webhooks_on_target');
+  });
+
+  it('a rerun of the completed rollback is idempotent: B is "none", nothing is updated', async () => {
+    setupDb(cohort());
+    captureLogs();
+    await main(forward(APPLY, { none: 1 }));
+    setupDb(cohort());
+    captureLogs();
+    await main(rollback([...APPLY, '--restore-no-webhook-ids', IDS[1]]));
+
+    setupDb(cohort());
+    plaid.calls = [];
+    const logs = captureLogs();
+    expect(await main(rollback([...APPLY, '--restore-no-webhook-ids', IDS[1]], { none: 1 }))).toBe(0);
+    expect(updateCalls()).toHaveLength(0);
+    expect(logs.last()).toMatchObject({ outcome: 'webhooks_on_target', counts: { none: 1, to_update: 0 } });
+  });
+
+  it('the postflight fails when a restored Item gets a webhook again during a later update', async () => {
+    setupDb(cohort());
+    captureLogs();
+    await main(forward(APPLY, { none: 1 }));
+
+    plaid.onUpdate = (_token, n) => {
+      if (n === 3) plaid.items.get(tokenOf(IDS[1]))!.webhook = THIRD_PARTY_HOOK; // during C's update; B was restored and verified
+    };
+    plaid.updates = 0;
+    setupDb(cohort());
+    const logs = captureLogs();
+    expect(await main(rollback([...APPLY, '--restore-no-webhook-ids', IDS[1]]))).toBe(1);
+    expect(logs.lines.map((l) => JSON.parse(l))).toContainEqual(expect.objectContaining({ id: IDS[1], outcome: 'failed:webhook_changed_after_update' }));
+    expect(logs.outcomes()).not.toContain('webhooks_on_target');
+  });
+});
+
+describe('malformed /item/get webhook fields fail closed', () => {
+  it.each([
+    ['missing', undefined],
+    ['a number', 42],
+    ['an object', { url: RENDER_HOOK }],
+  ])('halts with zero updates when one Item\'s webhook field is %s', async (_name, value) => {
+    plaid.rawWebhook.set(tokenOf(IDS[2]), value);
+    setupDb(cohort());
+    const logs = captureLogs();
+    expect(await main(forward(APPLY))).toBe(1);
+    expect(logs.lines.map((l) => JSON.parse(l))).toContainEqual(expect.objectContaining({ id: IDS[2], outcome: 'failed:malformed_webhook_field' }));
+    expect(logs.outcomes()).toContain('halted:malformed_webhook_field');
+    expect(updateCalls()).toHaveLength(0);
+  });
+
+  it('halts in the postflight when a field turns malformed after the updates', async () => {
+    plaid.onUpdate = (_token, n) => {
+      if (n === 4) plaid.rawWebhook.set(tokenOf(IDS[0]), 7);
+    };
+    setupDb(cohort());
+    const logs = captureLogs();
+    expect(await main(forward(APPLY))).toBe(1);
+    expect(logs.outcomes()).toContain('halted:malformed_webhook_field');
+    expect(logs.outcomes()).not.toContain('webhooks_on_target');
+  });
+
+  it('a whitespace-only webhook is not "no webhook": it is refused as an unexpected source', async () => {
+    plaid.rawWebhook.set(tokenOf(IDS[0]), ' ');
+    setupDb(cohort());
+    const logs = captureLogs();
+    expect(await main(forward(APPLY))).toBe(1);
+    expect(logs.outcomes()).toContain('halted:unexpected_webhook_source');
+    expect(updateCalls()).toHaveLength(0);
   });
 });

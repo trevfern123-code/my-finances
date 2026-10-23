@@ -39,6 +39,11 @@ record).
   - **Webhook tool, postflight:** every Item is re-read at Plaid before the success line.
   - **Runbook:** counts are re-attested before every command, because the G2 test Item changes them (§4.0
     step 3), and the CORS check now sends the frontend's real headers (G1).
+- **Revision 5 (2026-10-23)** answers review 4. Plaid's `/item/get` reports an Item with no webhook as an
+  **empty string** (plaid-openapi `2020-09-14.yml`, `Item.webhook`: "Empty string if no webhook is set", nullable).
+  The webhook tool now treats `""` and `null` alike as "no webhook", everywhere it reads one: classification, the
+  per-update verify after a `webhook: null` removal, and the postflight. A missing field or any non-string value
+  halts with `malformed_webhook_field` instead of being taken as "none".
 
 ## 1. Starting state
 
@@ -435,7 +440,9 @@ fragment or trailing slash):
 - The tool decrypts each token, with no plaintext fallback, and calls `/item/get`.
 - **Identity binding.** The returned `item_id` must equal the row's stored `plaid_item_id`. A stale or
   misassociated credential can therefore never move some other Item's webhook.
-- **Source classification.** Each current webhook must be the target, the other approved URL, or none.
+- **Source classification.** Each current webhook must be the target, the other approved URL, or none. Plaid
+  reports "none" as `""` (documented) or `null`, and both are accepted. A whitespace-only string is an unexpected
+  source. A missing or non-string field halts with `malformed_webhook_field`.
 - **Any third-party URL, any id mismatch, or a no-webhook count different from `--expected-no-webhook` halts the run
   with no update made.**
 - Neither id, and no URL, is ever logged. The dry run logs each Item's class by internal row id (`source:none`,
@@ -557,7 +564,8 @@ only.
 | File | Tests | Covers |
 |---|---|---|
 | `rotatePlaidTokenKeyV2ToV3.test.ts` | 75 | Everything in §3, including the final recount. Revision 3 adds 5 fingerprint cases: a V2 ciphertext replaced by another valid V2 encryption, a changed plaintext value and a swapped nonce in a dry run, a rotated row changed after its post-write verification, and a row re-encrypted after `verify-retirement` checked it |
-| `updatePlaidItemWebhooks.test.ts` | 31 | URL canonicalisation and every argument refusal. Preflight: own URL missing or non-canonical refuses both directions; a rollback-host typo; a forward target that is not this backend; previous = own; host guard (no read, no Plaid); count and `removing` refusals. *(Revision 4)* Classification runs before any change: a credential answering for a different Item halts with **zero updates**, as does an unexpected third-party source (both directions) or an unattested no-webhook Item. The postflight catches an earlier Item changed during a later update, and an Item id changed after the updates. Exact restore-to-none rollback, and its idempotent rerun; a rollback without the list; restore ids on PREVIOUS or unknown refused. Interruption; halt on a Plaid refusal (error code only); unapplied update; no plaintext fallback; Item linked mid-run; no token, item id, URL or host in any log |
+| `updatePlaidItemWebhooks.test.ts` | 56 | *(Revision 5)* The fake Plaid reports "no webhook" as `""`, as documented, and every no-webhook scenario also runs with `null`: classification as none, never as an unexpected source; the attested none count (refused, then dry run); forward migration and postflight; rollback restore with `webhook: null` re-read as none; an idempotent rerun; and a postflight failure when a restored Item gets a webhook again. Malformed fields (missing, number, object) halt with zero updates, or in the postflight. Whitespace is refused as an unexpected source. |
+| *(revision 4 coverage, still included)* | | URL canonicalisation and every argument refusal. Preflight: own URL missing or non-canonical refuses both directions; a rollback-host typo; a forward target that is not this backend; previous = own; host guard (no read, no Plaid); count and `removing` refusals. *(Revision 4)* Classification runs before any change: a credential answering for a different Item halts with **zero updates**, as does an unexpected third-party source (both directions) or an unattested no-webhook Item. The postflight catches an earlier Item changed during a later update, and an Item id changed after the updates. Exact restore-to-none rollback, and its idempotent rerun; a rollback without the list; restore ids on PREVIOUS or unknown refused. Interruption; halt on a Plaid refusal (error code only); unapplied update; no plaintext fallback; Item linked mid-run; no token, item id, URL or host in any log |
 | `tokenKeyRotationV3.compat.test.ts` | 12 | The real `dataService` under the transition key rings |
 
 **Mutation check.** Safety-relevant lines were removed or inverted one at a time, and the tool's tests re-run each
@@ -565,7 +573,8 @@ time.
 
 - **Rotation CLI:** 23 of 24 caught, including dropping the fingerprint check and leaving the plaintext copy out of
   the fingerprint. The survivor is equivalent: the V3-only ring vs. the full ring when verifying.
-- **Webhook CLI** *(revision 4)*: 24 of 24 caught. These included:
+- **Webhook CLI** *(revision 5)*: 26 of 26 caught, including re-introducing review 4's bug (`""` treated as a URL) and
+  treating a malformed value as "no webhook". The revision 4 set, 24 of 24, is also included; it covered:
   - dropping the item-id binding, the exact-target check, the own-URL requirement or its canonicalisation, the
     previous = own check, the unexpected-source halt, the no-webhook count, the restore-state or restore-id checks,
     the postflight (removed, or made to ignore changes) or the per-update verify;
@@ -615,6 +624,7 @@ The webhook CLI is not part of the rehearsal, because it needs Plaid. It is cove
 | `40002500366` | `a4705ca` | pass | fail | fail |
 | `40004715483` | `f83ff04` | pass | **pass** | fail (Docker Hub `toomanyrequests` before any migration ran) |
 | `40008522706` | `5488c2b` | pass | fail (Docker Hub `toomanyrequests` during image pull) | **pass** |
+| `40020156224` | `7938e4b` | pass | fail (Docker Hub `toomanyrequests: Rate exceeded` during image pull) | **pass** |
 
 No run has had all three green yet. The red job each time was an image pull refused by Docker Hub, not a test failure. A run with all three green on the commit to be merged is still required (§4.1).
 
