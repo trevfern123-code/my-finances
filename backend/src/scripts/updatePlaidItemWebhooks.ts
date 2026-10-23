@@ -4,20 +4,37 @@
  * PLAID_KEY_ROTATION_V2_TO_V3.md §5.3. New Items get their webhook from BACKEND_PUBLIC_URL at Link
  * time; Items linked earlier keep the URL they were created with until this runs.
  *
- * Read-only by default: without `--apply --confirm UPDATE_PLAID_ITEM_WEBHOOKS` it only reads each
- * Item's current webhook with `/item/get` and reports how many already point at the target. With
- * apply it calls `/item/webhook/update` for each Item not yet on the target, then re-reads the Item
- * with `/item/get` and requires the stored webhook to equal the target exactly.
+ * Exactly two webhook URLs are ever involved, both canonical `https://<host>/api/webhooks/plaid`:
+ *   OWN       derived from this process's BACKEND_PUBLIC_URL (what plaidService registers on new
+ *             Link tokens) — required and canonical, for both directions;
+ *   PREVIOUS  `--approved-previous-webhook-url`, the old backend's URL as recorded in the runbook's
+ *             parity matrix — required, and must differ from OWN.
+ * `--target-role this-backend` moves Items PREVIOUS → OWN; `--target-role other-backend` is the
+ * rollback, OWN → PREVIOUS. `--target-webhook-url` must repeat the role's target exactly (a second,
+ * independent statement of intent, so a typo in either is refused rather than obeyed).
  *
- * The same command with the previous URL and `--target-role other-backend` is the rollback.
- * Updating a webhook is idempotent and reversible; it does not change, rotate or invalidate the
- * access token, does not sync transactions, and does not touch the database (no Supabase write of any
- * kind — the token rows are only read, to decrypt each access token in-process).
+ * Three phases, all fail-closed:
+ *  1. Read-only classification of EVERY Item before anything changes: the stored external
+ *     `plaid_item_id` must equal the `item_id` Plaid returns for the decrypted token (a stale or
+ *     misassociated credential must never move some other Item's webhook), and each current webhook
+ *     must be the target, the other approved URL, or none. Any third-party URL, any id mismatch, or a
+ *     no-webhook count different from `--expected-no-webhook` halts here — no update is made.
+ *  2. Apply only (`--apply --confirm UPDATE_PLAID_ITEM_WEBHOOKS`): `/item/webhook/update` for each
+ *     Item still needing it, each followed by `/item/get` (item id and webhook both re-checked).
+ *  3. Postflight at Plaid: every Item is re-read again; only if each still has its expected webhook
+ *     (and id) — and the database Item set is unchanged — is `webhooks_on_target` logged. An earlier
+ *     Item that changed again while a later one was being updated is caught here.
  *
- * Never logs or prints an access token, ciphertext, the external Plaid item_id, the webhook URL or
- * any host name, or a raw error: every line is `{ts, id?, stage, outcome, counts?}` with fixed codes.
- * Like the rotation script it is fixed-purpose, never imported by the server, and does nothing unless
- * it is the process's own entrypoint.
+ * Items with NO webhook: the forward move updates them to OWN only when their number equals
+ * `--expected-no-webhook` (0 refuses any). The dry run logs `source:none` with their internal row ids,
+ * so the operator can record them; a rollback restores exactly those to "no webhook" (Plaid documents
+ * `webhook: null` as removal) when they are listed in `--restore-no-webhook-ids`, and otherwise moves
+ * them to PREVIOUS like any other Item on OWN.
+ *
+ * Never writes the database (token rows are only read, to decrypt each access token in-process with
+ * no plaintext fallback). Never logs an access token, ciphertext, Plaid's external item_id, a webhook
+ * URL, a host name or a raw error: lines are `{ts, id?, stage, outcome, counts?}` with fixed codes and
+ * internal row ids only. Never imported by the server; does nothing unless run as the entrypoint.
  */
 
 import { supabaseAdmin } from '../config/supabase';
@@ -30,10 +47,12 @@ export const WEBHOOK_PATH = '/api/webhooks/plaid';
 const REQUIRED_EXPECTED_PLAID_ENV = 'sandbox';
 const MAX_COUNT_FLAG = 1000;
 const ITEM_COLUMNS =
-  'id, status, access_token, access_token_ciphertext, access_token_nonce, access_token_auth_tag, access_token_key_id, access_token_enc_version';
+  'id, plaid_item_id, status, access_token, access_token_ciphertext, access_token_nonce, access_token_auth_tag, access_token_key_id, access_token_enc_version';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 interface ItemRow {
   id: string;
+  plaid_item_id: string;
   status: string;
   access_token: string | null;
   access_token_ciphertext: string | null;
@@ -56,7 +75,10 @@ export type TargetRole = 'this-backend' | 'other-backend';
 export interface ParsedArgs {
   targetWebhookUrl: string;
   targetRole: TargetRole;
+  approvedPreviousWebhookUrl: string;
   expectedTotal: number;
+  expectedNoWebhook: number;
+  restoreNoWebhookIds: string[];
   expectedPlaidEnv: string;
   expectedSupabaseHost: string;
   apply: boolean;
@@ -70,7 +92,18 @@ export class ArgError extends Error {
   }
 }
 
-const KNOWN_FLAGS = ['target-webhook-url', 'target-role', 'expected-total', 'expected-plaid-env', 'expected-supabase-host', 'confirm', 'apply'];
+const KNOWN_FLAGS = [
+  'target-webhook-url',
+  'target-role',
+  'approved-previous-webhook-url',
+  'expected-total',
+  'expected-no-webhook',
+  'restore-no-webhook-ids',
+  'expected-plaid-env',
+  'expected-supabase-host',
+  'confirm',
+  'apply',
+];
 const HOST_RE = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?$/;
 
 /** The only accepted shape: `https://<lowercase host>[:port]/api/webhooks/plaid` — no credentials,
@@ -89,9 +122,19 @@ export function canonicalWebhookUrl(raw: string): string | null {
   return canonical === raw ? canonical : null;
 }
 
-/** The webhook URL this process itself registers on new Link tokens (plaidService.ts). */
+/** The webhook URL this process itself registers on new Link tokens (plaidService.ts builds it the
+ *  same way), or null when BACKEND_PUBLIC_URL is unset or would not produce a canonical URL (e.g. a
+ *  trailing slash, which would make plaidService register `//api/...`). */
 export function ownWebhookUrl(): string | null {
-  return env.backendPublicUrl ? `${env.backendPublicUrl}${WEBHOOK_PATH}` : null;
+  return env.backendPublicUrl ? canonicalWebhookUrl(`${env.backendPublicUrl}${WEBHOOK_PATH}`) : null;
+}
+
+function parseCount(raw: string | true | undefined, flag: string, min: number): number {
+  if (typeof raw !== 'string') throw new ArgError(`${flag.replace(/-/g, '_')}_required`, `--${flag} is required.`);
+  if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) < min || Number(raw) > MAX_COUNT_FLAG) {
+    throw new ArgError(`${flag.replace(/-/g, '_')}_invalid`, `--${flag} must be a canonical integer >= ${min}.`);
+  }
+  return Number(raw);
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -116,6 +159,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
     opts[key] = value;
   }
 
+  const role = opts['target-role'];
+  if (role !== 'this-backend' && role !== 'other-backend') {
+    throw new ArgError('target_role_invalid', '--target-role must be exactly "this-backend" or "other-backend".');
+  }
+
   const urlRaw = opts['target-webhook-url'];
   if (typeof urlRaw !== 'string') throw new ArgError('target_webhook_url_required', '--target-webhook-url is required.');
   const targetWebhookUrl = canonicalWebhookUrl(urlRaw);
@@ -123,15 +171,29 @@ export function parseArgs(argv: string[]): ParsedArgs {
     throw new ArgError('target_webhook_url_invalid', `--target-webhook-url must be exactly https://<lowercase host>${WEBHOOK_PATH}.`);
   }
 
-  const role = opts['target-role'];
-  if (role !== 'this-backend' && role !== 'other-backend') {
-    throw new ArgError('target_role_invalid', '--target-role must be exactly "this-backend" or "other-backend".');
+  const prevRaw = opts['approved-previous-webhook-url'];
+  if (typeof prevRaw !== 'string') {
+    throw new ArgError('approved_previous_webhook_url_required', '--approved-previous-webhook-url is required (the parity matrix value).');
+  }
+  const approvedPreviousWebhookUrl = canonicalWebhookUrl(prevRaw);
+  if (!approvedPreviousWebhookUrl) {
+    throw new ArgError('approved_previous_webhook_url_invalid', `--approved-previous-webhook-url must be exactly https://<lowercase host>${WEBHOOK_PATH}.`);
   }
 
-  const totalRaw = opts['expected-total'];
-  if (typeof totalRaw !== 'string') throw new ArgError('expected_total_required', '--expected-total is required.');
-  if (!/^[1-9][0-9]*$/.test(totalRaw) || Number(totalRaw) > MAX_COUNT_FLAG) {
-    throw new ArgError('expected_total_invalid', '--expected-total must be a positive integer.');
+  const expectedTotal = parseCount(opts['expected-total'], 'expected-total', 1);
+  const expectedNoWebhook = parseCount(opts['expected-no-webhook'], 'expected-no-webhook', 0);
+  if (expectedNoWebhook > expectedTotal) throw new ArgError('expected_no_webhook_invalid', '--expected-no-webhook cannot exceed --expected-total.');
+
+  let restoreNoWebhookIds: string[] = [];
+  const restoreRaw = opts['restore-no-webhook-ids'];
+  if (restoreRaw !== undefined) {
+    if (role !== 'other-backend') {
+      throw new ArgError('restore_only_on_rollback', '--restore-no-webhook-ids is only accepted with --target-role other-backend.');
+    }
+    restoreNoWebhookIds = String(restoreRaw).split(',');
+    if (restoreNoWebhookIds.some((id) => !UUID_RE.test(id)) || new Set(restoreNoWebhookIds).size !== restoreNoWebhookIds.length) {
+      throw new ArgError('restore_no_webhook_ids_invalid', '--restore-no-webhook-ids must be distinct lowercase plaid_items ids, comma-separated.');
+    }
   }
 
   const plaidEnvRaw = opts['expected-plaid-env'];
@@ -148,7 +210,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
   if (!apply && opts.confirm !== undefined) throw new ArgError('confirm_without_apply', '--confirm is only accepted together with --apply.');
   if (apply && opts.confirm !== CONFIRM_TOKEN) throw new ArgError('apply_requires_confirm', `--apply requires --confirm ${CONFIRM_TOKEN}.`);
 
-  return { targetWebhookUrl, targetRole: role, expectedTotal: Number(totalRaw), expectedPlaidEnv: plaidEnvRaw, expectedSupabaseHost: hostRaw, apply };
+  return {
+    targetWebhookUrl,
+    targetRole: role,
+    approvedPreviousWebhookUrl,
+    expectedTotal,
+    expectedNoWebhook,
+    restoreNoWebhookIds,
+    expectedPlaidEnv: plaidEnvRaw,
+    expectedSupabaseHost: hostRaw,
+    apply,
+  };
 }
 
 // ---- Errors / interruption ------------------------------------------------------------------------------
@@ -217,7 +289,16 @@ async function readItems(): Promise<ItemRow[]> {
   return rows;
 }
 
-export async function runPreflight(args: ParsedArgs): Promise<{ failures: string[]; rows: ItemRow[] | null; keyRing: KeyRing | null }> {
+export interface Plan {
+  own: string;
+  /** The URL each role moves Items TO, and the other approved URL it moves them FROM. */
+  target: string;
+  source: string;
+}
+
+export async function runPreflight(
+  args: ParsedArgs
+): Promise<{ failures: string[]; rows: ItemRow[] | null; keyRing: KeyRing | null; plan: Plan | null }> {
   const failures: string[] = [];
   if (env.plaidEnv !== args.expectedPlaidEnv) failures.push('unexpected_plaid_environment');
 
@@ -229,11 +310,24 @@ export async function runPreflight(args: ParsedArgs): Promise<{ failures: string
   }
   if (host !== null && host !== args.expectedSupabaseHost) failures.push('unexpected_supabase_host');
 
-  // The declared role is checked both ways, so neither the normal move nor the rollback can be run
-  // with the other's URL by mistake.
+  // Both directions need this process's own URL: it is the target of the move and the only
+  // acceptable source of the rollback.
   const own = ownWebhookUrl();
-  if (args.targetRole === 'this-backend' && own !== args.targetWebhookUrl) failures.push('target_is_not_this_backend');
-  if (args.targetRole === 'other-backend' && own === args.targetWebhookUrl) failures.push('target_is_this_backend');
+  let plan: Plan | null = null;
+  if (own === null) {
+    failures.push('own_webhook_url_unconfigured');
+  } else if (args.approvedPreviousWebhookUrl === own) {
+    failures.push('previous_equals_own');
+  } else {
+    plan =
+      args.targetRole === 'this-backend'
+        ? { own, target: own, source: args.approvedPreviousWebhookUrl }
+        : { own, target: args.approvedPreviousWebhookUrl, source: own };
+    // The explicit target must be exactly the role's target: a typo'd or arbitrary host is refused.
+    if (args.targetWebhookUrl !== plan.target) {
+      failures.push(args.targetRole === 'this-backend' ? 'target_is_not_this_backend' : 'target_is_not_approved_previous');
+    }
+  }
 
   let keyRing: KeyRing | null = null;
   try {
@@ -243,60 +337,115 @@ export async function runPreflight(args: ParsedArgs): Promise<{ failures: string
   }
 
   if (failures.includes('unexpected_supabase_host') || failures.includes('supabase_host_unparseable')) {
-    return { failures, rows: null, keyRing };
+    return { failures, rows: null, keyRing, plan };
   }
   const rows = await readItems();
   if (rows.length !== args.expectedTotal) failures.push('unexpected_total_count');
   // An Item being removed is frozen by the app (itemStatus.ts); it is not this tool's to touch.
   if (rows.some((r) => r.status === 'removing')) failures.push('item_being_removed');
-  return { failures, rows, keyRing };
+  if (args.restoreNoWebhookIds.some((id) => !rows.some((r) => r.id === id))) failures.push('restore_id_not_found');
+  return { failures, rows, keyRing, plan };
 }
 
-// ---- Per-item flow --------------------------------------------------------------------------------------------
+// ---- Plaid reads, bound to the stored external Item id -----------------------------------------------------------
 
-export type ItemOutcome = 'already_target' | 'would_update' | 'updated';
-
-async function currentWebhook(id: string, accessToken: string): Promise<string | null> {
+/** `/item/get` for this row's token, refusing the answer unless it is about the Item this row says it
+ *  is. Neither id is ever logged. */
+async function readBoundItem(row: ItemRow, accessToken: string, stage: string): Promise<string | null> {
+  let item: { item_id?: unknown; webhook?: unknown };
   try {
-    const response = await plaidClient.itemGet({ access_token: accessToken });
-    return response.data.item.webhook ?? null;
-  } catch (err) {
-    throw new HaltError(id, plaidFailureReason(err));
-  }
-}
-
-export async function processItem(row: ItemRow, keyRing: KeyRing, target: string, apply: boolean): Promise<ItemOutcome> {
-  throwIfInterrupted(row.id);
-  const accessToken = resolveToken(row, keyRing);
-  const before = await currentWebhook(row.id, accessToken);
-  throwIfInterrupted(row.id);
-  if (before === target) {
-    logEntry({ id: row.id, stage: 'done', outcome: 'already_target' });
-    return 'already_target';
-  }
-  if (!apply) {
-    logEntry({ id: row.id, stage: 'done', outcome: before === null ? 'would_update:no_webhook' : 'would_update' });
-    return 'would_update';
-  }
-
-  logEntry({ id: row.id, stage: 'webhook_update', outcome: 'started' });
-  try {
-    await plaidClient.itemWebhookUpdate({ access_token: accessToken, webhook: target });
+    item = (await plaidClient.itemGet({ access_token: accessToken })).data.item;
   } catch (err) {
     const reason = plaidFailureReason(err);
-    logEntry({ id: row.id, stage: 'webhook_update', outcome: `failed:${reason}` });
+    logEntry({ id: row.id, stage, outcome: `failed:${reason}` });
     throw new HaltError(row.id, reason);
   }
-  throwIfInterrupted(row.id);
-
-  // Verified from a fresh /item/get, never from the update call's own response.
-  const after = await currentWebhook(row.id, accessToken);
-  if (after !== target) {
-    logEntry({ id: row.id, stage: 'verify', outcome: 'failed:webhook_not_applied' });
-    throw new HaltError(row.id, 'webhook_not_applied');
+  if (typeof item?.item_id !== 'string' || item.item_id !== row.plaid_item_id) {
+    logEntry({ id: row.id, stage, outcome: 'failed:item_id_mismatch' });
+    throw new HaltError(row.id, 'item_id_mismatch');
   }
-  logEntry({ id: row.id, stage: 'done', outcome: 'updated' });
-  return 'updated';
+  return typeof item.webhook === 'string' ? item.webhook : null;
+}
+
+// ---- Phase 1: classify every Item (read-only) ---------------------------------------------------------------------
+
+export type SourceClass = 'on_target' | 'on_source' | 'none';
+
+interface Classified {
+  row: ItemRow;
+  accessToken: string;
+  source: SourceClass;
+  /** What this Item's webhook must be when the run finishes: the target, or null (no webhook). */
+  finalWebhook: string | null;
+}
+
+export async function classifyAll(rows: ItemRow[], keyRing: KeyRing, plan: Plan, args: ParsedArgs): Promise<Classified[]> {
+  const classified: Classified[] = [];
+  for (const row of rows) {
+    throwIfInterrupted(row.id);
+    const accessToken = resolveToken(row, keyRing);
+    const webhook = await readBoundItem(row, accessToken, 'classify');
+    throwIfInterrupted(row.id);
+    let source: SourceClass;
+    if (webhook === plan.target) source = 'on_target';
+    else if (webhook === plan.source) source = 'on_source';
+    else if (webhook === null) source = 'none';
+    else {
+      // A destination that is neither approved URL: never moved, in either direction.
+      logEntry({ id: row.id, stage: 'classify', outcome: 'failed:unexpected_webhook_source' });
+      throw new HaltError(row.id, 'unexpected_webhook_source');
+    }
+    const restoreToNone = args.restoreNoWebhookIds.includes(row.id);
+    if (restoreToNone && source === 'on_target') {
+      // A listed Item must be on OWN (to be restored) or already have no webhook (restored by an
+      // earlier run of this rollback); one on PREVIOUS contradicts the operator's record.
+      logEntry({ id: row.id, stage: 'classify', outcome: 'failed:restore_id_unexpected_state' });
+      throw new HaltError(row.id, 'restore_id_unexpected_state');
+    }
+    // Rollback leaves a no-webhook Item as it is; the forward move gives it the target.
+    const finalWebhook = restoreToNone || (source === 'none' && args.targetRole === 'other-backend') ? null : plan.target;
+    logEntry({ id: row.id, stage: 'classify', outcome: `source:${source}${restoreToNone ? ':restore_to_none' : ''}` });
+    classified.push({ row, accessToken, source, finalWebhook });
+  }
+  const none = classified.filter((c) => c.source === 'none').length;
+  if (none !== args.expectedNoWebhook) {
+    logEntry({ stage: 'classify', outcome: 'failed:unexpected_no_webhook_count', counts: { none } });
+    throw new HaltError(undefined, 'unexpected_no_webhook_count');
+  }
+  return classified;
+}
+
+// ---- Phase 2: updates (apply only) --------------------------------------------------------------------------------
+
+async function updateItem(c: Classified): Promise<void> {
+  throwIfInterrupted(c.row.id);
+  logEntry({ id: c.row.id, stage: 'webhook_update', outcome: c.finalWebhook === null ? 'started:remove' : 'started' });
+  try {
+    await plaidClient.itemWebhookUpdate({ access_token: c.accessToken, webhook: c.finalWebhook });
+  } catch (err) {
+    const reason = plaidFailureReason(err);
+    logEntry({ id: c.row.id, stage: 'webhook_update', outcome: `failed:${reason}` });
+    throw new HaltError(c.row.id, reason);
+  }
+  throwIfInterrupted(c.row.id);
+  // Verified from a fresh /item/get (bound to the stored item id), never from the update's response.
+  if ((await readBoundItem(c.row, c.accessToken, 'verify')) !== c.finalWebhook) {
+    logEntry({ id: c.row.id, stage: 'verify', outcome: 'failed:webhook_not_applied' });
+    throw new HaltError(c.row.id, 'webhook_not_applied');
+  }
+  logEntry({ id: c.row.id, stage: 'done', outcome: 'updated' });
+}
+
+// ---- Phase 3: postflight at Plaid ------------------------------------------------------------------------------------
+
+async function postflight(classified: Classified[]): Promise<void> {
+  for (const c of classified) {
+    throwIfInterrupted(c.row.id);
+    if ((await readBoundItem(c.row, c.accessToken, 'postflight')) !== c.finalWebhook) {
+      logEntry({ id: c.row.id, stage: 'postflight', outcome: 'failed:webhook_changed_after_update' });
+      throw new HaltError(c.row.id, 'webhook_changed_after_update');
+    }
+  }
 }
 
 // ---- Orchestration ----------------------------------------------------------------------------------------------
@@ -327,26 +476,40 @@ export async function main(argv: string[]): Promise<number> {
     logEntry({ stage: 'preflight', outcome: `started:${args.targetRole}${args.apply ? ':apply' : ':read_only'}` });
     const preflight = await runPreflight(args);
     for (const f of preflight.failures) logEntry({ stage: 'preflight', outcome: `failed:${f}` });
-    if (preflight.failures.length > 0 || !preflight.rows || !preflight.keyRing) {
+    if (preflight.failures.length > 0 || !preflight.rows || !preflight.keyRing || !preflight.plan) {
       logEntry({ stage: 'preflight', outcome: 'failed' });
       return 1;
     }
     logEntry({ stage: 'preflight', outcome: 'passed', counts: { total: preflight.rows.length } });
 
-    const tally: Record<ItemOutcome, number> = { already_target: 0, would_update: 0, updated: 0 };
-    for (const row of preflight.rows) {
-      tally[await processItem(row, preflight.keyRing, args.targetWebhookUrl, args.apply)]++;
+    // Phase 1 completes for every Item before anything is changed.
+    const classified = await classifyAll(preflight.rows, preflight.keyRing, preflight.plan, args);
+    const pending = classified.filter((c) => (c.finalWebhook === null ? c.source !== 'none' : c.source !== 'on_target'));
+    const counts = {
+      total: classified.length,
+      on_target: classified.filter((c) => c.source === 'on_target').length,
+      on_source: classified.filter((c) => c.source === 'on_source').length,
+      none: classified.filter((c) => c.source === 'none').length,
+      to_update: pending.length,
+    };
+    logEntry({ stage: 'classify', outcome: 'passed', counts });
+
+    if (args.apply) {
+      for (const c of pending) await updateItem(c);
+      // Phase 3: every Item re-read at Plaid after the last update — not just the database.
+      await postflight(classified);
+      logEntry({ stage: 'postflight', outcome: 'passed', counts: { total: classified.length } });
     }
 
-    // The item set must not have changed while the pass ran: a new Item linked meanwhile was never
-    // looked at (and, before the cutover is complete, may carry the old webhook).
+    // The Item set must not have changed while the run went on: a new Item linked meanwhile was
+    // never looked at (and may carry the old webhook).
     const finalRows = await readItems();
     if (finalRows.map((r) => r.id).join(',') !== preflight.rows.map((r) => r.id).join(',')) {
       logEntry({ stage: 'final_check', outcome: 'failed:item_set_changed', counts: { total: finalRows.length } });
       return 1;
     }
     logEntry({ stage: 'final_check', outcome: 'passed', counts: { total: finalRows.length } });
-    logEntry({ stage: 'done', outcome: args.apply ? 'webhooks_on_target' : 'dry_run_complete', counts: tally });
+    logEntry({ stage: 'done', outcome: args.apply ? 'webhooks_on_target' : 'dry_run_complete', counts });
     return 0;
   } catch (err) {
     if (err instanceof HaltError) {

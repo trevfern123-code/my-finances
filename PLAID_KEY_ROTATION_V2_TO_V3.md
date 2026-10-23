@@ -28,6 +28,17 @@ record).
   - an explicit STOP/GO cutover gate (§4.2);
   - precise `finalRecheck` wording, plus a per-row fingerprint check (§3.2);
   - a local PostgREST rehearsal, now actually run (§8).
+- **Revision 4 (2026-10-23)** answers review 3:
+  - **Webhook tool, binding:** each decrypted credential is bound to its stored Plaid `item_id` before and after
+    every change.
+  - **Webhook tool, URLs:** rollback goes only to an exact, approved previous URL; this backend's own URL is
+    required in both directions.
+  - **Webhook tool, sources:** every Item's current webhook is classified before any change. Unexpected
+    destinations stop the run, the number of Items without a webhook must be attested exactly, and those Items
+    can be restored exactly on rollback.
+  - **Webhook tool, postflight:** every Item is re-read at Plaid before the success line.
+  - **Runbook:** counts are re-attested before every command, because the G2 test Item changes them (§4.0
+    step 3), and the CORS check now sends the frontend's real headers (G1).
 
 ## 1. Starting state
 
@@ -190,21 +201,35 @@ file by its full path. Never run a tool locally with production keys.
    Expect exit 1, with `failed:unexpected_supabase_host` and no `inventory` line. Before V3 exists, expect
    `failed:v3_key_missing` and `failed:v3_not_current` as well. This proves the compiled file runs, the
    environment and key ring load, and the host guard stops before any read.
-3. Define the arguments the later steps share (`<project-ref>` comes from `SUPABASE_URL`):
+3. **Attest the counts afresh before every rotation command (review 3).** Never reuse numbers from an earlier step.
+   1. Run the §7 query immediately before the command.
+   2. Take `N_TOTAL` = `total_items`, `N_V2` = `v2_items` and `N_PLAIN` = `plaintext_copies` from its output.
+   3. Compare them with the only states this runbook allows. **If the query shows anything else, stop**: something
+      outside the plan happened.
+
+   | Situation | `N_TOTAL` | `N_V2` before the apply | `N_PLAIN` |
+   |---|---|---|---|
+   | No test Item linked (G2 criterion (c) satisfied by removing it first, see §5.3) | 4 | 4 | 3 |
+   | One Sandbox test Item linked on Render during G2 and kept. It is created while Render is still on V2, so it is a V2 row with no plaintext copy | 5 | 5 | 3 |
+
+   Then define:
 
    ```sh
-   COMMON="--expected-total 4 --expected-plaintext-copies 3 --expected-plaid-env sandbox \
+   COMMON="--expected-total $N_TOTAL --expected-plaintext-copies $N_PLAIN --expected-plaid-env sandbox \
      --expected-supabase-host <project-ref>.supabase.co --constraints-confirmed PLAID_PHASE1_CONSTRAINTS_VERIFIED"
    ```
 
-   The equivalent npm form is
-   `npm run rotate:plaid-key-v2-to-v3 --workspace backend -- <args>`. npm runs it from `backend/`, and the script
-   path in `package.json` is relative to that directory.
+   `<project-ref>` comes from `SUPABASE_URL`. Use `--expected-remaining-v2 $N_V2` for `rotate`. The webhook tool's
+   `--expected-total` and `--expected-no-webhook` come from the same fresh attestation and from its own dry run
+   (§5.3).
+
+   The equivalent npm form is `npm run rotate:plaid-key-v2-to-v3 --workspace backend -- <args>`. npm runs it from
+   `backend/`, and the script path in `package.json` is relative to that directory.
 
 ### 4.1 Before anything else
 
 1. **Record the option B approval** and its rollback scope (§5.1, §5.4) in this document.
-2. **CI green:** re-run `migration-replay` once Docker Hub's limit clears (§8).
+2. **CI green:** every job must be green on the commit to be merged. Each of the three jobs has now passed at least once on this branch, but never all on the same commit: `database-harness` failed last on Docker Hub's limit (§8).
 3. **Rehearsal:** re-run `supabase/tests/key_rotation_v3/rehearse.sh` (§8) on the exact commit to be merged.
 4. **The merge is a deploy event and needs its own release approval.**
    - Railway auto-deploys `backend/**` (reported by review 1; set in Railway's dashboard, not `railway.json`).
@@ -233,8 +258,27 @@ fully reversible.
   - **GO** when every "must match" row matches and every "differs by design" row is as expected.
 - **G1 API switch readiness.** These checks are read-only and use no Vercel preview (finding 7 in §2):
   - `curl -s -o /dev/null -w '%{http_code}\n' https://<render-origin>/health` → `200`.
-  - `curl -si -X OPTIONS https://<render-origin>/api/plaid/items -H 'Origin: <FRONTEND_URL>' -H 'Access-Control-Request-Method: GET'`
-    → the response's `access-control-allow-origin` header equals `FRONTEND_URL`.
+  - A CORS preflight with **the headers the real frontend sends** (`frontend/src/lib/api.ts`: `Authorization`,
+    `X-Client-Api-Level`, `Content-Type`; manual-loan creates also send `Idempotency-Key`):
+
+    ```sh
+    curl -si -X OPTIONS https://<render-origin>/api/plaid/items -H 'Origin: <FRONTEND_URL>' \
+      -H 'Access-Control-Request-Method: GET' \
+      -H 'Access-Control-Request-Headers: authorization,x-client-api-level,content-type,idempotency-key'
+    ```
+
+    Expect a 2xx response. `access-control-allow-origin` must equal `FRONTEND_URL`, and
+    `access-control-allow-headers` must list all four requested headers (`app.ts` allows `Content-Type`,
+    `Authorization`, `Idempotency-Key` and `X-Client-Api-Level`).
+  - An unauthenticated GET with the same `Origin` and an `X-Client-Api-Level` header:
+
+    ```sh
+    curl -si https://<render-origin>/api/plaid/items -H 'Origin: <FRONTEND_URL>' -H 'X-Client-Api-Level: <current level>'
+    ```
+
+    Expect it to be refused (no session), and the response to still carry `access-control-allow-origin` equal to
+    `FRONTEND_URL` and `access-control-expose-headers` including `X-Api-Level` and `X-Min-Client-Api-Level`.
+    Without those, the browser could not read the refusal. These checks are read-only and send no credential.
   - **GO**, then switch: set Vercel Production `VITE_API_BASE_URL` to Render's origin and redeploy. Note the
     previous production deployment's id; it is the rollback.
   - Signed-in smoke test: the dashboard loads and items list. **Railway keeps running** for a grace period, so
@@ -246,7 +290,7 @@ fully reversible.
   - Proof that Railway is no longer writing:
     1. its `/health` no longer returns 200;
     2. Railway shows no running deployment and no log lines after the stop time;
-    3. the webhook tool's dry run still reports `already_target` = total;
+    3. the webhook tool's dry run still reports `on_target` = total and `to_update` = 0;
     4. two `--mode rotate` dry runs (with V3 still absent, both are refused at preflight by the key-ring checks,
        but each logs its `inventory` counts) taken some minutes apart show unchanged counts. Alternatively, run
        the §7 query twice.
@@ -254,14 +298,17 @@ fully reversible.
     secret key), confirm that the legacy key has no requests after the stop. This is optional: revoking the legacy
     key would be a separate credential change.
 - **G4 Rollback drill. Required before any V3 step.**
-  1. Exercise the G1 and G2 rollbacks once: Vercel Instant Rollback to the Railway build, and the webhook tool with
-     `--target-role other-backend`, both with Railway restarted.
-  2. Confirm the app works on Railway again.
+  1. Exercise the G1 and G2 rollbacks once, with Railway restarted:
+     - Vercel Instant Rollback to the Railway build;
+     - the webhook rollback exactly as in §5.4, including `--restore-no-webhook-ids` when G2 moved Items that had
+       no webhook.
+  2. Confirm the app works on Railway again, and that a webhook-tool dry run shows every Item back on its
+     pre-G2 state.
   3. Roll forward again, through G1–G3.
 
   The drill is what proves Railway rollback actually works while it is still possible.
-- **STOP/GO for V3:** Trevor's explicit go-ahead, recorded here. **From step 2 of §4.3 onward, Railway rollback
-  is no longer possible** (§5.4, the point of no return).
+- **STOP/GO for V3:** Trevor's explicit go-ahead, recorded here. **From step 3 of §4.3 onward (V3 current),
+  Railway rollback is no longer possible** (§5.4, the point of no return).
 
 ### 4.3 V3 on Render only
 
@@ -271,17 +318,23 @@ fully reversible.
    parity report must list key ids `RAILWAY_PROD_V2` and `RENDER_PROD_V3`.
 3. Set `PLAID_TOKEN_CURRENT_KEY_ID=RENDER_PROD_V3` on Render and redeploy. New Items and link tokens are now V3.
    **Point of no return for Railway rollback.**
-4. Dry run:
-   `node backend/dist/scripts/rotatePlaidTokenKeyV2ToV3.js --mode rotate --expected-remaining-v2 4 $COMMON`.
-   Expect 4 × `dry_run_verified`, `final_check: passed`, `dry_run_complete`.
-5. Apply: the same command plus `--apply --confirm ROTATE_PLAID_KEY_V2_TO_V3`. Expect 4 × `rotated`,
-   `final_check: passed`, `rotation_complete`.
-6. Run the §7 queries: `v2_items = 0`, `v3_items = 4`, `plaintext_copies = 3`, `distinct_encrypted_nonces = 4`,
-   and every anomaly count 0.
+4. **Attest the counts afresh** (§4.0 step 3) and define `COMMON`. Then dry run:
+   `node backend/dist/scripts/rotatePlaidTokenKeyV2ToV3.js --mode rotate --expected-remaining-v2 $N_V2 $COMMON`.
+   Expect `$N_V2` × `dry_run_verified`, `final_check: passed`, `dry_run_complete`.
+5. Apply: the same command, with the **same** attested numbers, plus
+   `--apply --confirm ROTATE_PLAID_KEY_V2_TO_V3`. Expect `$N_V2` × `rotated`, `final_check: passed`,
+   `rotation_complete`.
+
+   If anything was linked or removed since step 4, preflight refuses the stale numbers. Re-attest from a fresh §7
+   query and dry-run again; never edit the numbers to make a refusal go away.
+6. Run the §7 queries. Expect `v2_items = 0`, `v3_items = $N_TOTAL`, `plaintext_copies = $N_PLAIN`,
+   `distinct_encrypted_nonces = $N_TOTAL`, and every anomaly count 0. That is 4/3/4, or 5/3/5 with the kept test
+   Item.
 7. Soak with both keys on Render. Watch for `UnknownKeyIdError` / `PlaidCredentialError` outcomes and new
    `credential_error` statuses.
 
-**Avoid linking a test Item between steps 4 and 5.** If one is linked, re-attest `--expected-total`.
+**No test Item may be linked between steps 4 and 6.** Every later `verify-retirement` uses the same fresh
+attestation (`$N_TOTAL`, `$N_PLAIN`).
 
 ### 4.4 Hosted Link cleanup (separately approved, exact count, bounded)
 
@@ -351,6 +404,7 @@ Run it in both shells. **Railway values are to be read from that report, not cop
 | health check | platform | — | `/health` (`railway.json`) | | Render's health check path must be `/health` |
 | build command | platform | — | `npm install && npm run build --workspace backend` | | must build `backend` (the report's `present:` lines) |
 | Vercel `VITE_API_BASE_URL` | frontend | no | → Railway origin | | switched at G1. `VITE_SUPABASE_*` unchanged |
+| **Approved webhook URLs** (review 3) | webhook tool | no | **PREVIOUS** = the Railway report's `webhook registered on NEW Link tokens=` value, exactly | **OWN** = the Render report's same line, after G0 | Both must be canonical `https://<host>/api/webhooks/plaid` and must differ. Record both here, exactly. PREVIOUS becomes the tool's `--approved-previous-webhook-url`, and is the **only** destination a rollback may use |
 
 ### 5.3 Webhook migration plan
 
@@ -359,43 +413,92 @@ Run it in both shells. **Railway values are to be read from that report, not cop
 is why step 2 below runs only after G1.
 
 **Existing Items** are moved with `backend/dist/scripts/updatePlaidItemWebhooks.js` (Plaid `/item/webhook/update`),
-run in the Render shell:
+run in the Render shell. Revision 4 tightened it as follows (review 3).
 
-- **The target is explicit.** It must be exactly `https://<host>/api/webhooks/plaid`, with no credentials, query,
-  fragment or trailing slash.
-- **The role is declared and checked both ways.** `--target-role this-backend` requires the target to equal this
-  process's own `BACKEND_PUBLIC_URL` webhook, so it fails on Render until G0 has set that variable.
-  `--target-role other-backend` (the rollback) requires the target to differ from it.
-- **Same guards as the rotation CLI:** `--expected-total`, `--expected-plaid-env sandbox`, and
-  `--expected-supabase-host` (checked before any read).
-- **Read-only by default.** A dry run makes one `/item/get` per Item: a Plaid read with no sync and no token
-  change.
-- **Apply** needs `--apply --confirm UPDATE_PLAID_ITEM_WEBHOOKS`. For each Item not yet on the target it calls
-  `/item/webhook/update`, then **verifies with a fresh `/item/get`**.
-- **Halts on the first refusal**, logging only Plaid's documented error code (for example
-  `plaid_error:ITEM_LOGIN_REQUIRED`). Webhook updates are idempotent, so a rerun completes.
-- **Never writes the database.** Tokens are only decrypted in-process, with no plaintext fallback.
-- **Final check:** the Item set must not have changed during the pass.
+**Exactly two approved URLs exist**, both canonical `https://<host>/api/webhooks/plaid` (no credentials, query,
+fragment or trailing slash):
 
-Procedure (G2):
+- **OWN** is derived from this process's `BACKEND_PUBLIC_URL`. It is **required in both directions**: an unset value,
+  or one that would not be canonical (for example a trailing slash), refuses the run.
+- **PREVIOUS** is `--approved-previous-webhook-url`, the exact Railway value recorded in the §5.2 matrix. It must
+  differ from OWN.
 
-1. Dry run, for example
-   `node backend/dist/scripts/updatePlaidItemWebhooks.js --target-webhook-url https://<render-origin>/api/webhooks/plaid --target-role this-backend --expected-total 4 --expected-plaid-env sandbox --expected-supabase-host <project-ref>.supabase.co`.
-   Expect `would_update` = 4.
-2. Apply: the same command plus `--apply --confirm UPDATE_PLAID_ITEM_WEBHOOKS`. Expect `updated` = 4 and
-   `webhooks_on_target`.
-3. Dry run again: `already_target` = 4.
+**Roles:**
+
+- `--target-role this-backend` moves Items PREVIOUS → OWN.
+- `--target-role other-backend` is the rollback, OWN → PREVIOUS.
+- `--target-webhook-url` must restate the role's target exactly, so a typo'd or arbitrary host is refused in either
+  direction.
+
+**Phase 1: classify every Item, read-only, before anything changes.**
+
+- The tool decrypts each token, with no plaintext fallback, and calls `/item/get`.
+- **Identity binding.** The returned `item_id` must equal the row's stored `plaid_item_id`. A stale or
+  misassociated credential can therefore never move some other Item's webhook.
+- **Source classification.** Each current webhook must be the target, the other approved URL, or none.
+- **Any third-party URL, any id mismatch, or a no-webhook count different from `--expected-no-webhook` halts the run
+  with no update made.**
+- Neither id, and no URL, is ever logged. The dry run logs each Item's class by internal row id (`source:none`,
+  …).
+
+**Phase 2: apply** (`--apply --confirm UPDATE_PLAID_ITEM_WEBHOOKS`).
+
+- For each Item that still needs it, the tool calls `/item/webhook/update`.
+- Each update is followed by a fresh `/item/get` that re-checks both the `item_id` and the webhook.
+- The run halts on the first refusal, logging only Plaid's documented error code. Interrupt checkpoints sit
+  between every call.
+
+**Phase 3: postflight at Plaid.**
+
+- Every Item is re-read again, with the id re-checked, after the last update.
+- Each must still have its expected final webhook, and the database Item set must be unchanged.
+- Only then is `webhooks_on_target` logged. An earlier Item that changed while a later one was updated fails here
+  (`webhook_changed_after_update`).
+
+**It never writes the database.**
+
+**Items with no webhook.**
+
+- **Forward move:** they are updated to OWN only when their number equals `--expected-no-webhook`, which is 0 unless
+  the dry run showed otherwise. **Record their internal row ids** from the dry run's `source:none` lines in this
+  document.
+- **Rollback:** passing those ids as `--restore-no-webhook-ids` restores exactly those Items to "no webhook" (Plaid
+  documents `webhook: null` as removal). Without the list they move to PREVIOUS like every other Item on OWN. A
+  listed id that is on PREVIOUS, or that is unknown, is refused. Re-running a completed rollback is a no-op.
+
+**Procedure (G2).** Use counts from a fresh attestation (§4.0 step 3), so `N_TOTAL` is 4 at this point.
+
+1. **Dry run:**
+   `node backend/dist/scripts/updatePlaidItemWebhooks.js --target-role this-backend --target-webhook-url <OWN> --approved-previous-webhook-url <PREVIOUS> --expected-total 4 --expected-no-webhook 0 --expected-plaid-env sandbox --expected-supabase-host <project-ref>.supabase.co`.
+   Expect `classify: passed` with `on_source` = 4 and `to_update` = 4.
+
+   If the dry run halts with `unexpected_no_webhook_count`:
+   - Read `counts.none` and the `source:none` ids.
+   - Record them.
+   - Re-run with `--expected-no-webhook <that number>`, but only after Trevor approves moving those Items as well.
+2. **Apply:** the same command plus `--apply --confirm UPDATE_PLAID_ITEM_WEBHOOKS`. Expect `updated` = 4,
+   `postflight: passed`, then `webhooks_on_target`.
+3. **Standalone check, immediately after** (still the same arguments, without `--apply`). Expect `on_target` = 4,
+   `to_update` = 0.
 
 **Completion criteria. Do not call the webhook migration complete until all three hold:**
 
-- **(a)** Step 3 of the procedure reports `already_target` = total.
+- **(a)** Step 2 reached `webhooks_on_target`, and step 3, run immediately afterwards, reports `on_target` = total.
 - **(b)** Render's logs show a verified Plaid webhook delivery for the moved Items. Plaid sends
   `WEBHOOK_UPDATE_ACKNOWLEDGED` to the new URL, which the handler accepts and ignores. If none arrives, use a
-  separately approved Sandbox test webhook (the app's existing `sandbox-fire-webhook` route). It can start a
-  Sandbox transaction sync, which is why it needs its own approval.
-- **(c)** A **new** Item, linked on Render (a separately approved Sandbox test link), shows as `already_target` in
-  a further dry run with `--expected-total 5`. This raises the item count, so re-attest every later
-  `--expected-total`.
+  separately approved Sandbox test webhook (the app's `sandbox-fire-webhook` route). It can start a Sandbox
+  transaction sync, so it needs its own approval.
+- **(c)** A **new** Item linked on Render (a separately approved Sandbox test link) is `on_target` in a further dry
+  run, re-attested with `--expected-total 5`. **Then choose one, and record it:**
+  - **Keep the test Item.** Every later count is then the 5/5/3 row of §4.0 step 3. The test Item is a V2 row with
+    no plaintext copy, because Render is still on V2 at G2.
+  - **Remove it** through the app's normal institution-removal flow, which calls Plaid `/item/remove` and deletes
+    its data. This is separately approved. Every later count is then 4/4/3.
+
+  Either way, the next command re-attests from a fresh §7 query. Nothing proceeds on stale numbers.
+
+  A Hosted Link attempt for the test link that was abandoned before completion leaves a V2 link token. §4.4 counts
+  and cleans it up like any other.
 
 This is a Plaid-side change. Like everything here it was not executed.
 
@@ -406,7 +509,7 @@ This is a Plaid-side change. Like everything here it was not executed.
 | G0 Render variables | Revert the variables and redeploy (Render serves no traffic yet) | yes |
 | Merge / deploy (inert CLIs) | Revert the merge commit, or redeploy the previous deployment on each platform | yes |
 | G1 Vercel switched | Vercel **Instant Rollback** to the noted previous production deployment (built with Railway's URL); no rebuild | yes |
-| G2 webhooks moved | `updatePlaidItemWebhooks.js --target-webhook-url https://<railway-origin>/api/webhooks/plaid --target-role other-backend --expected-total N … --apply --confirm UPDATE_PLAID_ITEM_WEBHOOKS`, then a dry run showing `already_target` = N | yes |
+| G2 webhooks moved | On Render: `node backend/dist/scripts/updatePlaidItemWebhooks.js --target-role other-backend --target-webhook-url <PREVIOUS> --approved-previous-webhook-url <PREVIOUS> --expected-total $N_TOTAL --expected-no-webhook <freshly attested> [--restore-no-webhook-ids <ids recorded at G2>] … --apply --confirm UPDATE_PLAID_ITEM_WEBHOOKS`. `<PREVIOUS>` is exactly the §5.2 value, and no other destination is accepted. Then run a dry run, which should show every Item `on_target` (PREVIOUS), or none for the restored ids | yes |
 | G3 Railway stopped | Redeploy Railway's last deployment (variables untouched), check `/health`, then roll back G2 and G1 | yes |
 | §4.3 step 2: V3 key on Render, still not current | Remove the variable and redeploy; nothing has used V3 | yes |
 | **§4.3 step 3: V3 current on Render** | Set `PLAID_TOKEN_CURRENT_KEY_ID` back to `RAILWAY_PROD_V2` **on Render**, keeping both keys. V3 rows keep reading | **no.** Any V3 row (a new Item, a new link token, a rotated row) is unreadable on Railway, which has only V2 |
@@ -454,7 +557,7 @@ only.
 | File | Tests | Covers |
 |---|---|---|
 | `rotatePlaidTokenKeyV2ToV3.test.ts` | 75 | Everything in §3, including the final recount. Revision 3 adds 5 fingerprint cases: a V2 ciphertext replaced by another valid V2 encryption, a changed plaintext value and a swapped nonce in a dry run, a rotated row changed after its post-write verification, and a row re-encrypted after `verify-retirement` checked it |
-| `updatePlaidItemWebhooks.test.ts` | 21 | Target URL canonicalisation; role checks both ways, including Render's missing `BACKEND_PUBLIC_URL`; host guard (no read, no Plaid); count and `removing` refusals; dry run is read-only; apply verifies with a fresh `/item/get`; idempotent rerun; rollback; halt on a Plaid refusal with only its error code logged; unapplied update; undecryptable token with no plaintext fallback; Item linked mid-run; no token, item id, URL or host in any log |
+| `updatePlaidItemWebhooks.test.ts` | 31 | URL canonicalisation and every argument refusal. Preflight: own URL missing or non-canonical refuses both directions; a rollback-host typo; a forward target that is not this backend; previous = own; host guard (no read, no Plaid); count and `removing` refusals. *(Revision 4)* Classification runs before any change: a credential answering for a different Item halts with **zero updates**, as does an unexpected third-party source (both directions) or an unattested no-webhook Item. The postflight catches an earlier Item changed during a later update, and an Item id changed after the updates. Exact restore-to-none rollback, and its idempotent rerun; a rollback without the list; restore ids on PREVIOUS or unknown refused. Interruption; halt on a Plaid refusal (error code only); unapplied update; no plaintext fallback; Item linked mid-run; no token, item id, URL or host in any log |
 | `tokenKeyRotationV3.compat.test.ts` | 12 | The real `dataService` under the transition key rings |
 
 **Mutation check.** Safety-relevant lines were removed or inverted one at a time, and the tool's tests re-run each
@@ -462,12 +565,15 @@ time.
 
 - **Rotation CLI:** 23 of 24 caught, including dropping the fingerprint check and leaving the plaintext copy out of
   the fingerprint. The survivor is equivalent: the V3-only ring vs. the full ring when verifying.
-- **Webhook CLI:** 13 of 13 caught. These included:
-  - dropping either role check or the host guard;
+- **Webhook CLI** *(revision 4)*: 24 of 24 caught. These included:
+  - dropping the item-id binding, the exact-target check, the own-URL requirement or its canonicalisation, the
+    previous = own check, the unexpected-source halt, the no-webhook count, the restore-state or restore-id checks,
+    the postflight (removed, or made to ignore changes) or the per-update verify;
+  - interleaving updates into the classification phase;
   - letting a dry run write;
-  - skipping the post-update `/item/get`;
   - accepting a non-canonical URL;
   - falling back to plaintext;
+  - dropping the post-update interrupt checkpoint;
   - logging Plaid's raw message.
 
 **Parity report:** run with a Render-like fake environment (the review's gaps). It reported
@@ -508,8 +614,9 @@ The webhook CLI is not part of the rehearsal, because it needs Plaid. It is cove
 |---|---|---|---|---|
 | `40002500366` | `a4705ca` | pass | fail | fail |
 | `40004715483` | `f83ff04` | pass | **pass** | fail (Docker Hub `toomanyrequests` before any migration ran) |
+| `40008522706` | `5488c2b` | pass | fail (Docker Hub `toomanyrequests` during image pull) | **pass** |
 
-`migration-replay` still needs a green re-run (§4.1).
+No run has had all three green yet. The red job each time was an image pull refused by Docker Hub, not a test failure. A run with all three green on the commit to be merged is still required (§4.1).
 
 ## 9. Risks and open questions
 
@@ -520,7 +627,7 @@ The webhook CLI is not part of the rehearsal, because it needs Plaid. It is cove
   `credential_error` Items. If Plaid refuses, the tool halts with the error code, and those Items need a decision.
 - **Old access tokens stay valid, and plaintext copies remain (§6).**
 - **`credential_error` item:** its cause is not yet established.
-- **CI `migration-replay`** has not passed on this branch yet (registry limit).
+- **CI:** there is no single all-green run yet (registry limit; §8).
 - **Supabase API logs** record the rotation's update filters (`id`, key id, version, plaintext presence), but no
   token material.
 - **The key id** `RENDER_PROD_V3` is a proposal.
