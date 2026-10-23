@@ -159,7 +159,7 @@ interface FakeHooks {
   /** Runs right after an update has been applied. */
   afterUpdate?: (items: FakeItem[], callNumber: number) => void;
   /** Runs before each single-row reread resolves (1-based call count). */
-  beforeReread?: (items: FakeItem[], callNumber: number) => void;
+  beforeReread?: (items: FakeItem[], callNumber: number, links: FakeLink[]) => void;
   updateError?: boolean;
   /** Reports a different exact count than the rows returned (a truncated page). */
   itemsCountOverride?: number;
@@ -215,7 +215,7 @@ function setupFakeSupabase(initialItems: FakeItem[], initialLinks: FakeLink[] = 
       },
       maybeSingle: async () => {
         rereadCalls++;
-        hooks.beforeReread?.(items, rereadCalls);
+        hooks.beforeReread?.(items, rereadCalls, links);
         const found = matches();
         return { data: found[0] ? { ...found[0] } : null, error: null };
       },
@@ -578,6 +578,82 @@ describe('rotate — dry run (default)', () => {
   });
 });
 
+// ---- Final whole-table recheck (every mode recounts before reporting success) -----------------------
+
+describe('rotate — final recheck', () => {
+  const NEW_LINK_ID = '33333333-3333-4333-8333-333333333333';
+
+  it('logs a passing final check (with counts) before dry_run_complete', async () => {
+    setupFakeSupabase(productionCohort());
+    const logs = captureLogs();
+    expect(await main(rotateArgv())).toBe(0);
+    const tail = logs.entries.slice(-2);
+    expect(tail[0]).toMatchObject({ stage: 'final_check', outcome: 'passed', counts: { total: 4, v2: 4, v3: 0, plaintext_copies: 3 } });
+    expect(tail[1]).toMatchObject({ stage: 'done', outcome: 'dry_run_complete' });
+  });
+
+  it('fails a dry run when a V2 item is inserted while it runs', async () => {
+    const fake = setupFakeSupabase(productionCohort(), [], {
+      beforeReread: (items, n) => {
+        if (n === 4) items.push(item(ID_E, V2_RING, { plaintext: false, status: 'active' }));
+      },
+    });
+    const logs = captureLogs();
+    expect(await main(rotateArgv())).toBe(1);
+    expect(logs.outcomes()).toEqual(expect.arrayContaining(['failed:row_set_changed', 'failed:total_changed', 'failed:row_shape_changed']));
+    expect(logs.outcomes()).not.toContain('dry_run_complete');
+    expect(fake.updates).toHaveLength(0);
+  });
+
+  it('fails a dry run when an item is replaced (same total, different row set)', async () => {
+    setupFakeSupabase(productionCohort(), [], {
+      beforeReread: (items, n) => {
+        if (n === 4) items.splice(0, 1, item(ID_E, V2_RING));
+      },
+    });
+    const logs = captureLogs();
+    expect(await main(rotateArgv())).toBe(1);
+    expect(logs.outcomes()).toContain('failed:row_set_changed');
+    expect(logs.outcomes()).not.toContain('failed:total_changed');
+  });
+
+  it.each([
+    ['a dry run', [] as string[]],
+    ['an apply run', APPLY],
+  ])('fails %s when a writer creates a V2 Hosted Link token while it runs (a backend still on V2)', async (_name, extra) => {
+    setupFakeSupabase(productionCohort(), [], {
+      beforeReread: (_items, n, links) => {
+        if (n === 2) links.push(linkAttempt(NEW_LINK_ID, V2_RING, FUTURE));
+      },
+    });
+    const logs = captureLogs();
+    expect(await main(rotateArgv({ extra }))).toBe(1);
+    expect(logs.outcomes()).toContain('failed:new_v2_link_tokens_created');
+  });
+
+  it('accepts a V3 Hosted Link token created while a dry run runs (the expected post-switch state)', async () => {
+    setupFakeSupabase(productionCohort(), [], {
+      beforeReread: (_items, n, links) => {
+        if (n === 2) links.push(linkAttempt(NEW_LINK_ID, MIXED_RING, FUTURE));
+      },
+    });
+    const logs = captureLogs();
+    expect(await main(rotateArgv())).toBe(0);
+    expect(logs.entries.find((e) => e.stage === 'final_check')?.counts).toMatchObject({ link_tokens_v2: 0, link_tokens_v3: 1 });
+  });
+
+  it('fails a dry run when a plaintext copy is cleared while it runs', async () => {
+    setupFakeSupabase(productionCohort(), [], {
+      beforeReread: (items, n) => {
+        if (n === 4) items[0].access_token = null;
+      },
+    });
+    const logs = captureLogs();
+    expect(await main(rotateArgv())).toBe(1);
+    expect(logs.outcomes()).toContain('failed:plaintext_copy_count_changed');
+  });
+});
+
 // ---- Rotation: apply ------------------------------------------------------------------------------------
 
 describe('rotate — apply', () => {
@@ -804,7 +880,9 @@ describe('verify-retirement (read-only V2 retirement gate)', () => {
     setupFakeSupabase(rotatedCohort(), [linkAttempt('11111111-1111-4111-8111-111111111111', V2_RING, PAST)]);
     const logs = captureLogs();
     expect(await main(verifyArgv())).toBe(1);
-    expect(logs.outcomes()).toContain('failed:v2_link_tokens_remaining');
+    // Refused at preflight — before any per-row work — not only by the final recheck.
+    expect(logs.entries).toContainEqual(expect.objectContaining({ stage: 'preflight', outcome: 'failed:v2_link_tokens_remaining' }));
+    expect(logs.outcomes()).not.toContain('v3_only_verified');
   });
 
   it('fails when a V3 row disagrees with its plaintext copy', async () => {
@@ -844,7 +922,7 @@ describe('verify-retirement (read-only V2 retirement gate)', () => {
     });
     const logs = captureLogs();
     expect(await main(verifyArgv())).toBe(1);
-    expect(logs.outcomes()).toContain('failed:state_changed_during_verification');
+    expect(logs.outcomes()).toEqual(expect.arrayContaining(['failed:row_set_changed', 'failed:total_changed', 'failed:v2_rows_remaining']));
     expect(fake.updates).toHaveLength(0);
   });
 });

@@ -2,55 +2,69 @@
 
 **Status: preparation only. Nothing here has been executed, deployed, or configured.** No production data, schema,
 key, or platform setting was read or changed while preparing this branch. Running any of it in production needs a
-separate review and approval (see §9).
+separate review and approval (§10).
 
-Builds on `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` (the encryption design, §22's rotation addendum and §23's V1 → V2
-record). Code: `backend/src/scripts/rotatePlaidTokenKeyV2ToV3.ts`, with regression tests in
+Builds on `PLAID_TOKEN_ENCRYPTION_DESIGN_REVIEW.md` (the encryption design, §22's rotation addendum, §23's V1 → V2
+record). Code: `backend/src/scripts/rotatePlaidTokenKeyV2ToV3.ts`; tests:
 `rotatePlaidTokenKeyV2ToV3.test.ts` and `backend/src/services/tokenKeyRotationV3.compat.test.ts`.
+
+**Revision 2 (2026-10-23)** answers the first independent review of PR #20. Changes: the Hosted Link cleanup step
+(§4.3, finding 1); a platform-sequencing decision (§5, finding 2); what this rotation does not remediate (§6,
+finding 3); CI evidence (§8, finding 4); merge-as-deploy gating (§4.1, finding 5); and a final recount in every mode
+(§3.2, finding 6).
 
 ## 1. Starting state
 
-Reported by Trevor; **not re-verified on this branch**, because checking it would mean reading production:
+Reported by Trevor and **not re-verified on this branch**, because verifying it would mean reading production:
 
-- Render backend deployed and healthy; reaches Supabase with a new secret API key; decrypts all 4 existing Plaid
-  Sandbox access tokens; Plaid accepted all 4 under the new Sandbox secret.
-- All 4 `plaid_items` rows reference `RAILWAY_PROD_V2`. 3 keep a plaintext `access_token` copy, 1 is encrypted-only.
+- Render backend deployed and healthy, reaching Supabase with a new secret API key.
+- Render decrypts all 4 existing Plaid Sandbox access tokens, and Plaid accepted all 4 under the new Sandbox secret.
+- All 4 `plaid_items` rows reference `RAILWAY_PROD_V2`. 3 keep a plaintext `access_token` copy; 1 is
+  encrypted-only.
 - Item statuses: 3 `login_required`, 1 `credential_error`.
-- Railway is still the active backend. Render must not get production traffic yet.
+- Railway is the active backend. Render must not get production traffic yet.
 
 The script's preflight re-checks every one of these data facts (§3.3) before it writes anything.
 
 ## 2. Audit findings (what the code actually does)
 
-1. **"V3" is a key id, not a new format.** The key ring (`tokenEncryption.ts`) is built only from the environment:
-   every `PLAID_TOKEN_KEY_<ID>` variable becomes key `<ID>`, and `PLAID_TOKEN_CURRENT_KEY_ID` picks which key new
-   encryptions use. `ENC_VERSION` stays `1`, and the AAD (`…:v1:<row id>`) does not include the key id. Rotating
-   means re-encrypting under a different key id at the same version. **No application code or schema change is
-   needed.** V2 stays readable for exactly as long as `PLAID_TOKEN_KEY_RAILWAY_PROD_V2` is configured.
+1. **"V3" is a key id, not a new format.**
+   - The key ring (`tokenEncryption.ts`) is built only from the environment. Each `PLAID_TOKEN_KEY_<ID>` becomes
+     key `<ID>`, and `PLAID_TOKEN_CURRENT_KEY_ID` picks which key new encryptions use.
+   - `ENC_VERSION` stays `1`, and the AAD (`…:v1:<row id>`) does not include the key id.
+   - So no application code or schema change is needed. V2 stays readable for as long as
+     `PLAID_TOKEN_KEY_RAILWAY_PROD_V2` is configured.
 2. **Plaintext copies are never a fallback.** `dataService.resolveAccessToken` decrypts whenever all five encrypted
-   columns are present, and it never falls back to `access_token` when decryption fails. So if V2 were removed too
-   early, the 3 rows with plaintext copies would fail (`UnknownKeyIdError` → `credential_error`) just like the
-   encrypted-only one. A compat test pins this behaviour.
-3. **No application path rewrites a stored access token.** `insertPlaidItem` and `store_plaid_link_item` only
-   insert, with a fresh random row id. `transitionItemStatus`, the cursor updates and removal never touch the token
-   columns. The only thing that can move a row off V2 is this script, which is what makes the concurrency argument
-   in §3.4 work.
-4. **Hosted Link tokens** (`plaid_link_attempts.link_token_*`) use the same key ring under their own AAD context.
-   They exist only while an attempt is `pending`/`claimed` (a table check enforces this), attempts expire 30 minutes
-   after creation, the app's own state machine erases them on exchange or failure, and
-   `purge_expired_plaid_link_attempts` deletes rows that expired more than an hour ago. However,
-   `readPlaidLinkAttempt` still decrypts the token of an *expired* pending row that has not been purged yet. That
-   gives an unreadable error, not a security problem, but it means expired V2 rows also block V2 retirement.
+   columns are present, and never falls back to `access_token`. If V2 were removed too early, the 3 rows with
+   plaintext copies would fail (`UnknownKeyIdError`, then `credential_error`) just like the encrypted-only one. A
+   compat test pins this.
+3. **No application path rewrites a stored access token.**
+   - `insertPlaidItem` and `store_plaid_link_item` only insert, with a fresh random row id.
+   - Status, cursor and removal updates never touch the token columns.
+   - Only this script moves a row off V2, which is what the concurrency argument in §3.4 rests on.
+4. **Hosted Link tokens** (`plaid_link_attempts.link_token_*`) share the key ring under their own AAD context.
+   - A token exists only while an attempt is `pending`/`claimed` (a table check enforces this). Attempts expire 30
+     minutes after creation, and the app's state machine erases the token on exchange or failure.
+   - **Expired rows are not removed on a timer.** `purge_expired_plaid_link_attempts(100)` runs only inside
+     `create_plaid_link_attempt` and inside a *successful* `claim_plaid_link_attempt` (migration
+     `20260922130000`, lines ~208 and ~275). It deletes only rows that expired more than an hour ago. With no Link
+     traffic, expired V2 rows stay forever.
+   - `readPlaidLinkAttempt` still decrypts the token of an expired pending row that has not been purged. So expired
+     V2 rows block V2 retirement, and they need the explicit cleanup step in §4.3.
+   - *(Revision 1 wrongly said these rows age out by themselves. Finding 1.)*
 5. **`plaid_item_removals` stores no token.** A migration-time check refuses any `%token%` column. No other table
    holds key-ring ciphertext.
-6. **Existing scripts are left as they are and will refuse to run after the switch.** `backfillTokenEncryption.ts`
-   requires current = `RAILWAY_PROD_V2` and has nothing to do anyway (no plaintext-only rows remain).
-   `rotateTartanTokenKey.ts` requires current = `RAILWAY_PROD_V2` and is finished. Once `PLAID_TOKEN_CURRENT_KEY_ID`
-   becomes `RENDER_PROD_V3`, both refuse at preflight, which is the safe outcome.
-7. **Schema constraints the script relies on:** `plaid_items_encrypted_token_complete` and
-   `plaid_items_token_present` (Phase 1 migration), and the `plaid_link_attempts` check tying token presence to
-   status. The script cannot inspect `pg_constraint` through PostgREST, so an operator attests to them
-   (`--constraints-confirmed`) after running the query in §6.
+6. **Plaid webhooks are addressed by URL, chosen at link time.** `plaidService` registers
+   `${BACKEND_PUBLIC_URL}/api/webhooks/plaid` when a link token is created, so existing items still point at the
+   Railway domain. Any cutover that stops Railway must deal with this (§5).
+7. **Existing scripts are left untouched and will refuse after the switch.** `backfillTokenEncryption.ts` requires
+   current = `RAILWAY_PROD_V2` and has nothing left to do. `rotateTartanTokenKey.ts` also requires current =
+   `RAILWAY_PROD_V2` and is finished. Both refuse once V3 is current.
+8. **Constraints relied on.**
+   - `plaid_items_encrypted_token_complete` and `plaid_items_token_present` (Phase 1).
+   - The `plaid_link_attempts` check that ties token presence to status.
+   - The script cannot inspect `pg_constraint` through PostgREST, so the operator attests to them
+     (`--constraints-confirmed`) after running the query in §7.
 
 ## 3. Design
 
@@ -58,163 +72,315 @@ The script's preflight re-checks every one of these data facts (§3.3) before it
 
 | Mode | Writes | Purpose |
 |---|---|---|
-| `--mode rotate` (dry run) | never | Full per-row verification, including a local V3 round trip |
+| `--mode rotate` (dry run) | never | Full per-row verification including a local V3 round trip, then a whole-table recount |
 | `--mode rotate --apply --confirm ROTATE_PLAID_KEY_V2_TO_V3` | only the five `access_token_*` encryption columns of V2 rows | The migration |
-| `--mode verify-retirement` | never (`--apply` is refused) | The gate before V2 can be removed anywhere |
+| `--mode verify-retirement` | never (`--apply` refused) | The gate before V2 can be removed anywhere |
 
-The key ids are fixed constants (`OLD_KEY_ID`, `NEW_KEY_ID`). **`RENDER_PROD_V3` is a proposed name.** If a
-different id is chosen, change the constant and the test fixtures before review. The id becomes the env-var
-suffix, `PLAID_TOKEN_KEY_RENDER_PROD_V3`.
+The key ids are fixed constants. **`RENDER_PROD_V3` is a proposed name.** To change it, edit one constant and the
+test fixtures before review.
 
-### 3.2 Per-row flow (`rotate`, rows in id order, halting on the first anomaly)
+### 3.2 Per-row flow (`rotate`: id order, halts on the first anomaly)
 
-1. Fresh reread. A missing row, or any state other than complete-V2 or complete-V3 at version 1, halts with its
+1. **Fresh reread.** A missing row, or any state other than complete V2 or complete V3 at version 1, halts with its
    own reason code.
-2. **Already V3** (resume path): no re-encryption and no write. The stored value is decrypted with a **V3-only key
-   ring** and compared with the plaintext copy when there is one.
-3. **V2:** decrypt with the full ring. When a plaintext copy exists, it must equal the decrypted token, and a
-   disagreement halts the run (neither side is picked as authoritative). The encrypted-only row has no second copy,
-   so its V2 decryption is the source, checked by every round trip after it.
-4. Encrypt under the current key, then require `keyId = RENDER_PROD_V3` and version 1, and decrypt locally with the
-   V3-only ring to get the same token back.
-5. Dry run stops here.
-6. Guarded update (§3.4) of the five encrypted columns only.
-7. Reread. Classify the stored row again; require the plaintext copy to be unchanged (present or absent, same
-   value); decrypt the **stored** value with the V3-only ring and compare it to the token and to the plaintext
-   copy. The local ciphertext object is never what gets verified.
+2. **Already V3 (resume path).** No write. The stored value is decrypted with a **V3-only key ring** and compared
+   with the plaintext copy, if there is one.
+3. **V2.** Decrypt with the full ring.
+   - If there is a plaintext copy, it must equal the decrypted token. A mismatch halts the run, and neither value
+     is treated as authoritative.
+   - The encrypted-only row has no second copy, so its V2 decryption is the source, checked by every round trip
+     after it.
+4. **Encrypt** under the current key. Require `keyId = RENDER_PROD_V3` and version 1, then decrypt locally with the
+   V3-only ring and get the same token back.
+5. **Dry run** stops here for this row.
+6. **Guarded update** (§3.4) of the five encrypted columns only.
+7. **Reread and verify the stored value.**
+   - Classify the row again.
+   - Require the plaintext copy to be unchanged: same presence, same value.
+   - Decrypt the **stored** value with the V3-only ring. The local copy of the ciphertext is never what gets
+     verified.
 
-After an apply run, a whole-table check requires: total equal to the attested count, plaintext-copy count
-unchanged, zero V2 rows, every row on V3, and distinct nonces.
+**Final recount (every mode, before any success line; finding 6).** `finalRecheck` reads the whole table again and
+requires:
+
+- the same row-id set as at preflight (a delete plus an insert keeps the total but is still caught);
+- the attested total and plaintext-copy count;
+- no anomalous rows, and distinct nonces;
+- the V2/V3 split unchanged (dry run), or zero V2 rows and every row on V3 (apply, retirement);
+- **no growth in V2 link tokens** (any growth means some writer still encrypts under V2);
+- no link token on an unknown key or version;
+- for retirement, zero V2 link tokens.
+
+`dry_run_complete`, `rotation_complete` and `v2_retirement_gate_passed` are logged only after `final_check: passed`.
 
 ### 3.3 Strict record counts (operator attestations, compared exactly)
 
-The operator must supply each of these, and preflight compares them exactly against the database:
+| Flag | Value today |
+|---|---|
+| `--expected-total` | 4 |
+| `--expected-plaintext-copies` | 3 |
+| `--expected-remaining-v2` (`rotate` only) | 4 on the first run; the current count after an interruption |
+| `--expected-plaid-env` | `sandbox` |
+| `--expected-supabase-host` | `<project-ref>.supabase.co` |
+| `--constraints-confirmed` | `PLAID_PHASE1_CONSTRAINTS_VERIFIED` |
 
-- `--expected-total` (4 today)
-- `--expected-plaintext-copies` (3 today)
-- `rotate` only: `--expected-remaining-v2` (4 on the first run; whatever is left after an interruption)
-- `--expected-plaid-env sandbox`
-- `--expected-supabase-host <project-ref>.supabase.co`. This is compared with `SUPABASE_URL` **before any read**,
-  so a process pointed at the wrong project reads nothing. The host is never logged.
-- `--constraints-confirmed PLAID_PHASE1_CONSTRAINTS_VERIFIED`
+The host is compared with `SUPABASE_URL` **before any read** and is never logged.
 
 Preflight refuses the whole run on any of these:
 
-- plaintext-only, partial, missing, unknown-key or unexpected-version rows;
-- reused nonces;
+- a plaintext-only, partial, missing, unknown-key or unexpected-version row;
+- nonce reuse;
 - a truncated read (exact `count` ≠ rows returned);
-- link tokens on an unknown key or version;
-- a key-ring problem: V2 missing (rotate only), V3 missing, V3 not current, or V2 and V3 with identical bytes.
+- a link token on an unknown key or version;
+- V2 missing (rotate only), V3 missing, V3 not current, or V2 and V3 with identical key bytes.
 
-Count flags must be canonical integers (no `04`, `1e1`, signs or whitespace). A stray `--confirm` without `--apply`
-is refused.
+Count flags must be canonical integers, and a stray `--confirm` without `--apply` is refused.
 
 ### 3.4 Concurrency and the update guard
 
-The update matches the exact `id`, `access_token_key_id = RAILWAY_PROD_V2`, `access_token_enc_version = 1`, and
-the plaintext-copy **presence** that was read (`is null` / `not is null`).
+The update matches:
 
-It deliberately does **not** compare a ciphertext, nonce, tag or plaintext **value**. PostgREST filters travel in
-the request URL, and the design forbids logging nonces and token material (§11 of the design review). Leaving the
-value out is safe because of finding 3: nothing but this script moves a row off V2, and every run of this script
-encrypts the same decrypted token. If two runs race, the loser matches zero rows, rereads, and verifies the
-winner's stored V3 value (`concurrent_rotation_verified`). If a row's plaintext presence changes in between, the
-guard matches nothing and the run halts with `update_not_applied`. If the plaintext value changes, the post-write
-check halts with `plaintext_copy_changed`.
+- the exact `id`;
+- `access_token_key_id = RAILWAY_PROD_V2` and `access_token_enc_version = 1`;
+- the plaintext copy's **presence** as read.
 
-### 3.5 What the script never does
+It deliberately compares no ciphertext, nonce, tag or plaintext **value**: PostgREST filters travel in the URL, and
+the design forbids logging nonces and token material. That is safe because of finding 3 in §2: only this script
+moves a row off V2, and every run of it encrypts the same decrypted token.
 
-These hold by construction, and tests assert them:
+| Race | Outcome |
+|---|---|
+| Two runs of this script on the same row | The loser matches zero rows, rereads, and verifies the winner's stored value (`concurrent_rotation_verified`) |
+| Plaintext presence changes in between | The guard matches nothing: `update_not_applied` |
+| Plaintext value changes in between | `plaintext_copy_changed` |
 
-- It never writes or clears `access_token`, and never writes `status`, `transactions_cursor`, any other column, or
-  any `plaid_link_attempts` row. The 3 `login_required` items and the 1 `credential_error` item keep their status.
-- It never calls Plaid: `plaidService` is not imported. The V1 → V2 tool checked tokens with a live Plaid call
-  because V1 had been exposed. Here the round trips prove the same bytes went back in, so no network check is
-  needed, and no sync, token exchange or invalidation is triggered.
-- It never logs or prints a token, ciphertext, nonce, tag, key bytes, the Supabase URL/host, or a raw error. Each
-  log line is `{ts, id?, stage, outcome, counts?}`, built from fixed codes and aggregate numbers only.
-- It never runs on import (`require.main === module`), and nothing the server's module graph imports reaches it.
+### 3.5 What the script never does (tests assert each)
 
-### 3.6 Hosted Link tokens: drained, not rewritten
+- It never writes or clears `access_token`.
+- It never writes `status`, `transactions_cursor` or any other column, and never writes any `plaid_link_attempts`
+  row. It **deletes nothing**: Hosted Link cleanup is a separate, human-run step (§4.3).
+- It never calls Plaid. `plaidService` is not imported, so there is no sync, exchange or invalidation.
+- It never logs or prints a token, ciphertext, nonce, tag, key bytes, the Supabase URL or host, or a raw error.
+  Every log line is `{ts, id?, stage, outcome, counts?}`.
+- It never runs on import (`require.main === module`), and nothing in the server's module graph reaches it.
+
+### 3.6 Hosted Link tokens: not rewritten, explicitly cleaned up
 
 Re-encrypting `pending`/`claimed` link tokens would race the claim/exchange state machine to save at most 30
-minutes. Once the active backend's current key is V3, every new link token is V3 and the V2 ones age out on their
-own. The script therefore only counts them, by key and by expiry. `rotate` allows V2 link tokens.
-`verify-retirement` fails while **any** link token, expired or not, still references V2 (see finding 4). Expired
-leftovers clear through the app's existing purge, or simply by waiting until nothing V2 remains.
+minutes, so the script only counts them.
+
+- Once the writers' current key is V3, every new link token is V3.
+- `rotate` allows existing V2 link tokens, but fails if their number **grows** during a run.
+- `verify-retirement` fails while **any** V2 link token exists, expired or not.
+- Expired V2 rows do not disappear without Link traffic (finding 4 in §2). They are removed by the separately
+  approved, exact-count step in §4.3, never by the CLI.
 
 ### 3.7 `verify-retirement`
 
 This mode does not need V2 in its key ring, and is meant to be run both before and after V2 is removed. It checks:
 
-- every row is on V3;
-- every row decrypts with a **V3-only ring** (so a row labelled V3 but encrypted with V2 bytes fails);
-- plaintext copies agree, and the plaintext-copy count matches;
-- zero V2 link tokens remain;
-- the whole-table check is re-run after the per-row pass, so a V2 row inserted during the pass is caught.
+- every row is on V3 and decrypts with a **V3-only ring**, so a row labelled V3 but holding V2 bytes fails;
+- plaintext copies agree;
+- zero V2 link tokens exist, both at preflight and at the final recount;
+- the row-id set is unchanged across the pass.
 
 ## 4. Operator runbook
 
-Each step needs Trevor's explicit authorization when it happens.
+**Every step needs Trevor's explicit authorization when it is taken.**
 
-Run the script **inside** the deployment whose environment holds both keys (for example a Render shell or one-off
-job, or `railway ssh` into the Railway container). Never run it locally with production keys (precedent: §22,
-"Execution environment"). A one-off job or shell does not route HTTP traffic to Render.
+The steps below follow **option B** from §5, which is recommended but **not yet approved**. Where option A differs,
+that is noted in §5.
 
-Arguments common to every command below:
+Run the script **inside** the deployment that holds the keys (a Render shell or one-off job). Never run it locally
+with production keys (precedent: design review §22, "Execution environment"). Arguments common to every command:
 
 ```
 COMMON="--expected-total 4 --expected-plaintext-copies 3 --expected-plaid-env sandbox \
   --expected-supabase-host <project-ref>.supabase.co --constraints-confirmed PLAID_PHASE1_CONSTRAINTS_VERIFIED"
 ```
 
-0. **Before anything else:**
-   - Review and merge this PR (a separate approval).
-   - Run the §6 read-only queries and confirm the counts match §1 and both constraints exist.
-   - Confirm Supabase backups / point-in-time recovery cover the window.
-   - Find out *why* one item is `credential_error` while Render decrypts all four. If it predates this work it is
-     unrelated, but write it down, so a new decryption failure after the switch is not mistaken for that old one.
-1. **Generate the V3 key** offline (`randomBytes(32).toString('base64')`, the same as for V1/V2) and store a secure
-   backup outside every platform **before** configuring it. Sealed or secret variables cannot be read back.
-2. **Add `PLAID_TOKEN_KEY_RENDER_PROD_V3`** to Railway (active) and Render, leaving `PLAID_TOKEN_CURRENT_KEY_ID`
-   unchanged (`RAILWAY_PROD_V2`). Redeploy both. Startup validation must pass. Nothing changes functionally yet.
-3. **Flip `PLAID_TOKEN_CURRENT_KEY_ID=RENDER_PROD_V3`** on **every** backend that can write (Railway and Render) and
-   redeploy. From now on new items and link tokens are written under V3, and V2 rows still read. If any writer is
-   missed, it keeps creating V2 rows. The script's final check and `verify-retirement` both catch this
-   (`total_changed`, `v2_rows_remaining`).
-4. **Dry run:** `node dist/scripts/rotatePlaidTokenKeyV2ToV3.js --mode rotate --expected-remaining-v2 4 $COMMON`
-   Expect 4 × `dry_run_verified` and `dry_run_complete`.
-5. **Apply:** the same command plus `--apply --confirm ROTATE_PLAID_KEY_V2_TO_V3`. Expect 4 × `rotated` and
-   `rotation_complete`.
-6. **Re-run the §6 queries:** `v2_items = 0`, `v3_items = 4`, `plaintext_copies = 3`,
-   `distinct_encrypted_nonces = 4`, every anomaly count 0.
-7. **Soak** with both keys still configured. Watch the logs for `UnknownKeyIdError` or other `PlaidCredentialError`
-   outcomes, and watch for status changes to `credential_error`. Any refresh or sync during the soak is Trevor's
-   decision; this tooling triggers none.
-8. **Wait at least 90 minutes after step 3** (30-minute link expiry plus the 1-hour purge threshold), then run
-   `--mode verify-retirement $COMMON` and expect `v2_retirement_gate_passed`.
-9. **Traffic cutover to Render:** a separate plan, outside this PR. Rotation does not depend on it, but every
-   backend that is live at any point must have both keys until step 10.
-10. **Retire V2** after the soak. Confirm the offline V2 backup exists, run `verify-retirement` again, then remove
-    `PLAID_TOKEN_KEY_RAILWAY_PROD_V2` from Render (and from Railway when it is decommissioned). Redeploy, then run
-    `verify-retirement` once more inside the environment that no longer has V2.
+### 4.1 Before anything else
 
-## 5. Recovery
+1. **Decide §5 (platform sequencing)** and record the decision and its rollback scope in this document.
+2. **Merging this PR is a deploy event (finding 5).**
+   - The PR changes `backend/**`. The reviewer reports Railway's watch path is `/backend/**`. That is set in the
+     Railway dashboard, not in this repo's `railway.json`, so I could not check it.
+   - Merging into `main` should therefore be expected to redeploy the Railway backend and start Vercel's `main`
+     pipeline. The CLI is inert (nothing imports it), but the redeploy still restarts the live service.
+   - So the merge needs its own **release approval**, scheduled for when a backend restart is acceptable, after
+     the staging rehearsal below.
+   - Under option B the script must also reach the Render deployment that will run it, and how Render deploys
+     from `main` is not recorded in this repo.
+3. **Staging rehearsal, before the merge.** Run both modes against a non-production database: a scratch local
+   Supabase stack seeded with fixture rows encrypted under throwaway keys, or a non-production Supabase project
+   with its own keys. The local tests use a filter-faithful fake, not real PostgREST.
+4. **Re-run the CI database jobs** once the Docker registry limit clears (§8).
+5. **Read-only checks:**
+   - Run the §7 queries and confirm the counts match §1 and both constraints exist.
+   - Confirm Supabase backups or point-in-time recovery cover the window.
+   - Find out *why* one item is `credential_error` while Render decrypts all four, so a new failure is not
+     mistaken for that old one.
 
-| Situation | What to do |
-|---|---|
-| Interrupted run (Ctrl+C, SIGTERM, lost shell) | The table is a valid mix of V2 and V3 rows, and both keys read it. Run the §6 query, dry-run again with `--expected-remaining-v2` set to the current V2 count, then apply. Rows already on V3 are reverified with zero writes. |
-| `halted:db_error:write` (write outcome unknown) | Rerun the same way. The initial reread finds the real state: V3 → verified, V2 → rotated again. |
-| `halted:<reason>` on a row | Rows before it are V3 and the rest are untouched V2, which is fully functional. **Never hand-edit token columns.** Diagnose the reason code (`v2_plaintext_mismatch`, `crypto_mismatch`, `partial`, …) and treat it as a separate, reviewed problem. |
-| Preflight count mismatch | Stop. Something changed (a new link, a removal, a different database). Re-establish the facts read-only before attesting new counts. |
-| Need to undo the key switch | While both keys are configured, flipping `PLAID_TOKEN_CURRENT_KEY_ID` back to `RAILWAY_PROD_V2` is safe: V3 rows keep reading. **Never remove the V3 key once any row or link token uses it.** |
-| V2 removed too early (`UnknownKeyIdError`) | Re-add `PLAID_TOKEN_KEY_RAILWAY_PROD_V2` from the offline backup and redeploy. No data changes are needed. Items marked `credential_error` meanwhile recover through the normal `synced` transition after a successful Plaid call. |
-| V3 key lost after rotation | V3 rows become unreadable. The 3 rows with plaintext copies could be recovered only by a new, separately reviewed procedure. The encrypted-only item would need re-linking. This is why step 1's backup comes first. |
-| Reverse data rotation (V3 → V2) | Not implemented, deliberately. No foreseen scenario needs it, because a mixed table is valid. It would need its own reviewed script. |
+### 4.2 Rotation (option B)
 
-## 6. Read-only verification queries
+1. **Cut production traffic over to Render, with Render on V2 only** (current = `RAILWAY_PROD_V2`). This is a
+   separate, separately approved cutover plan. It must cover:
+   - Plaid webhooks of existing items, which point at the Railway domain (finding 6 in §2);
+   - the frontend's API base URL;
+   - Railway being **stopped from serving and writing**. The code has no "freeze Link" switch, so freezing means
+     Railway serves no traffic at all.
 
-These return counts only, never token values. Run them in the Supabase SQL editor.
+   Confirm from Railway's logs that it has made no writes since the cutover.
+2. **Generate the V3 key** offline (`randomBytes(32).toString('base64')`) and store a secure backup outside every
+   platform, **before** configuring it.
+3. **Add `PLAID_TOKEN_KEY_RENDER_PROD_V3` to Render only.** Keep current = V2 and redeploy. Startup validation
+   must pass.
+4. **Set `PLAID_TOKEN_CURRENT_KEY_ID=RENDER_PROD_V3` on Render** and redeploy. New items and link tokens are now
+   V3; V2 rows still read.
+5. **Dry run:**
+   `node dist/scripts/rotatePlaidTokenKeyV2ToV3.js --mode rotate --expected-remaining-v2 4 $COMMON`
+   Expect 4 × `dry_run_verified`, `final_check: passed`, then `dry_run_complete`.
+6. **Apply:** the same command plus `--apply --confirm ROTATE_PLAID_KEY_V2_TO_V3`. Expect 4 × `rotated`,
+   `final_check: passed`, then `rotation_complete`.
+7. **Re-run the §7 queries:**
+   - `v2_items = 0`, `v3_items = 4`, `plaintext_copies = 3`, `distinct_encrypted_nonces = 4`;
+   - every anomaly count 0;
+   - only V2 link tokens that predate step 4 remain.
+8. **Soak** with both keys still configured on Render. Watch for `UnknownKeyIdError` or `PlaidCredentialError`
+   outcomes, and for new `credential_error` statuses. Any refresh or sync during the soak is Trevor's call; this
+   tooling triggers none.
+
+### 4.3 Hosted Link cleanup (separately approved, exact count, bounded; finding 1)
+
+Wait at least 90 minutes after step 4 of §4.2. That is 30 minutes of link expiry plus the 1-hour purge threshold,
+after which no V2 token can still be usable. Then:
+
+1. **Read-only count**, using the database's clock:
+
+   ```sql
+   select count(*)                                                          as v2_link_tokens,
+          count(*) filter (where expires_at <= now() - interval '1 hour')   as purgeable,
+          count(*) filter (where expires_at >  now() - interval '1 hour')   as not_yet_purgeable
+     from public.plaid_link_attempts
+    where link_token_key_id = 'RAILWAY_PROD_V2';
+   ```
+
+   If `v2_link_tokens = 0`, skip to step 3. If `not_yet_purgeable > 0`, wait and count again.
+2. **Delete exactly `purgeable` rows.** This is the one write in §4.3, and it needs its own approval with the
+   number stated.
+
+   ```sql
+   do $$
+   declare
+     v_expected constant integer := <purgeable from step 1>;
+     v_deleted integer;
+   begin
+     if v_expected < 1 or v_expected > 100 then
+       raise exception 'expected count out of bounds';
+     end if;
+     if exists (select 1 from public.plaid_link_attempts
+                 where link_token_key_id = 'RAILWAY_PROD_V2'
+                   and expires_at > now() - interval '1 hour') then
+       raise exception 'V2 link tokens newer than the purge threshold exist; wait and recount';
+     end if;
+     delete from public.plaid_link_attempts
+      where link_token_key_id = 'RAILWAY_PROD_V2'
+        and status in ('pending', 'claimed')
+        and expires_at <= now() - interval '1 hour';
+     get diagnostics v_deleted = row_count;
+     if v_deleted <> v_expected then
+       raise exception 'deleted % rows, expected %: rolled back', v_deleted, v_expected;
+     end if;
+   end $$;
+   ```
+
+   Any exception aborts the statement, so the delete rolls back. A concurrent app purge that removes some of the
+   same rows first makes `v_deleted` smaller, which rolls back too: count again and retry.
+
+   **Why this instead of `purge_expired_plaid_link_attempts(n)`.**
+   - It deletes a strict subset of what the app's own purge would delete: the same 1-hour threshold, restricted to
+     V2-keyed rows.
+   - The app's purge also deletes every old `completed`/`failed`/`exchange_unknown` attempt. Those rows hold no
+     token, but they are the record of possibly orphaned Plaid items, and they should not be lost as a side effect
+     of key retirement.
+   - The rows deleted here are dead: a claim requires an unexpired attempt, and the 1-hour margin leaves no live
+     exchange.
+   - If the reviewer prefers the existing function: `select public.purge_expired_plaid_link_attempts(n)` with `n`
+     taken from a count of *all* attempts that expired over an hour ago. Check that the return value equals `n`.
+     It returns 0 when another sweep holds its lock.
+3. **Count again read-only:** expect `v2_link_tokens = 0`.
+4. **Run the retirement gate:** `--mode verify-retirement $COMMON`. Expect `v2_retirement_gate_passed`.
+
+### 4.4 Retire V2
+
+After the soak:
+
+1. Confirm the offline V2 backup exists.
+2. Run `verify-retirement` again.
+3. Remove `PLAID_TOKEN_KEY_RAILWAY_PROD_V2` from Render and redeploy.
+4. Run `verify-retirement` once more, inside the environment that no longer has V2.
+5. Railway's own V2 variable goes with Railway's decommissioning, a separate step.
+
+## 5. Platform sequencing (decision required before any V3 key exists; finding 2)
+
+The review notes that Railway is the platform involved in the reported secret exposure. This repo does not record
+that; the V1 exposure on record was a screenshot during setup. Either way, the fresh key should not be assumed safe
+to place on Railway.
+
+| | **A: dual writer, V3 on Railway and Render** | **B: Render becomes sole writer first, V3 only on Render** (recommended) |
+|---|---|---|
+| Where V3 exists | Railway and Render, for as long as V3 is the key | Render only. V3 never touches Railway |
+| Writers during rotation | Two. A missed writer keeps creating V2 rows (detected by the final recount, not prevented) | One. The missed-writer case cannot occur once Railway is stopped |
+| Prerequisite | None beyond adding the key | The production cutover to Render (currently "not yet") must come first, with webhooks and the frontend URL handled |
+| Downtime | None | Whatever the cutover itself needs. The rotation adds none |
+| Webhooks of existing items | Keep reaching Railway | Point at the Railway domain: must be moved (domain or Plaid `/item/webhook/update`, a separately approved Plaid change) or accepted as lost until refresh |
+| Rollback scope | Back to Railway at any time; both platforms hold both keys | **Back to Railway only before step 4 of §4.2** (Railway has V2 only). After V3 is current, any V3 row is unreadable on Railway, so rollback means "flip Render's current back to V2", not "return to Railway". Returning to Railway after that would require putting V3 on Railway, which this option exists to avoid |
+| Script changes | None | None. The CLI is identical; only the runbook order differs |
+
+**Recommendation: B.** The goal is to leave Railway, and B keeps the new key off it at the cost of making the
+cutover a prerequisite. **This needs Trevor's recorded approval.**
+
+If A is chosen anyway, §4.2 becomes:
+
+1. Add V3 to Railway and Render.
+2. Flip current to V3 on **both**, then redeploy both.
+3. Rotate.
+4. Cut over later.
+
+## 6. What this rotation does NOT remediate (finding 3)
+
+Re-encrypting under V3 changes **only which key protects the stored ciphertext**.
+
+- **The four Plaid access tokens are unchanged and stay valid at Plaid.** Anyone who already obtained a token
+  value, or the V2 key together with a copy of the ciphertext, can still use it.
+- **The three plaintext `access_token` copies are not touched.** This rotation does not remediate exposed token
+  bytes or database plaintext.
+
+That needs two **separate, separately designed and approved packets**, not this script.
+
+**1. Access-token rotation via Plaid `/item/access_token/invalidate`.** Plaid documents that this returns a new
+access token and invalidates the old one immediately. The irreversible failure to design against: Plaid succeeds
+but the new token is lost before it is durably stored, which leaves the item unusable until the user re-links. The
+packet must at least:
+
+- run one item at a time, recording a durable intent before the call;
+- store the new token, encrypted under the current key, in the same flow, with bounded retries and an operator stop
+  on an unknown outcome;
+- never retry `invalidate` for an item whose previous outcome is unknown;
+- make its storage step handle the plaintext copy explicitly. After invalidation that copy is a dead token, and
+  this tool's plaintext/ciphertext equality checks would rightly fail on it;
+- plan for `login_required` and `credential_error` items, whose behaviour under invalidate must be verified
+  against Plaid's documentation first.
+
+**2. Plaintext retirement:** clearing `access_token` for the three legacy rows (design review §7, Phase 6). This is
+best done after packet 1, or together with it, under its own approval. After it, run this tool's
+`verify-retirement` with `--expected-plaintext-copies 0`.
+
+Neither packet is started on this branch.
+
+## 7. Read-only verification queries
+
+These return counts only and never token values. Run them in the Supabase SQL editor.
 
 ```sql
 select count(*)                                                                    as total_items,
@@ -243,69 +409,69 @@ select conname from pg_constraint
    and conname in ('plaid_items_token_present', 'plaid_items_encrypted_token_complete');
 ```
 
-## 7. Tests
+## 8. Tests and CI evidence
 
-**Script tests** (`rotatePlaidTokenKeyV2ToV3.test.ts`) use a fake Supabase that evaluates filters the way PostgREST
-does. They cover:
+**Script tests** (`rotatePlaidTokenKeyV2ToV3.test.ts`) run against a fake Supabase that evaluates filters the way
+PostgREST does. They cover:
 
-- argument parsing: every refusal, canonical counts, the confirm token, and mode-specific flags;
+- argument parsing;
 - classification of every storage state;
-- preflight: each count mismatch, the host guard (no read at all), Plaid env, each key-ring failure, each table
-  anomaly, nonce reuse, truncated reads, and link-token keys;
-- dry run: zero writes, and the table byte-for-byte unchanged;
-- apply: exactly five columns written; guard filters as specified; plaintext, status, cursor and user unchanged;
-  stored values decrypt with a V3-only ring; Plaid never called;
-- idempotent rerun with zero writes;
-- interruption right after a write (no write outcome logged), then resume with re-attested counts;
-- a concurrent run having already rotated a row;
-- plaintext vanished or changed between the read and the write;
-- a corrupted stored value after the write, and a row labelled V3 that holds V2 bytes;
-- a row deleted mid-run, a new V2 row inserted mid-run, and a failed write;
+- each preflight refusal, including the host guard (which reads nothing);
+- a dry run with zero writes;
+- apply: only five columns written, the exact guard filters, other columns unchanged, stored values verified with a
+  V3-only ring, Plaid never called;
+- idempotent reruns;
+- interrupt and resume;
+- every concurrency race in §3.4;
+- corrupted stored values;
+- rows deleted, inserted or replaced mid-run;
+- a failed write;
 - no secrets in any log line;
-- `verify-retirement`: passes with V2 absent from the ring; fails on a V2 row, on a V2 link token (expired too), on
-  a plaintext mismatch, and on rows added or changed during the pass.
+- the retirement gate;
+- *(revision 2)* the final recount: a passing recount logged before `dry_run_complete`, plus a dry run that fails on
+  an inserted item, a replaced item (same total), a cleared plaintext copy, or a V2 link token created mid-run
+  (dry run and apply). V3 link tokens created mid-run are accepted, and the V2-link-token gate refuses at
+  preflight, before any per-row work.
 
-**Compat tests** (`tokenKeyRotationV3.compat.test.ts`) exercise the real `dataService` under the transition key
-rings. They show that:
+**Compat tests** (`tokenKeyRotationV3.compat.test.ts`) run the real `dataService` under the transition key rings.
 
-- V2 rows (with and without a plaintext copy) and V2 link tokens still read with both keys configured, whichever
-  key is current;
-- new inserts and Hosted Link stores are written under V3;
-- a V3-only ring fails closed on V2 rows (even with a plaintext copy) and on expired, unpurged V2 link tokens.
+**Mutation check.** Each of 22 safety-relevant lines was removed or inverted one at a time and the script tests
+re-run. 21 were caught. The survivor is equivalent: post-write decryption with the full ring instead of the V3-only
+ring, where the stored key-id label already selects V3.
 
-**Mutation check:** each of 18 safety-relevant lines was removed or inverted one at a time and the script test file
-re-run. 17 were caught. The one survivor is equivalent: post-write decryption with the full ring instead of the
-V3-only ring makes no difference, because the stored key-id label already selects the V3 key and classification
-requires that label to be V3. The V3-only ring is kept as defense in depth.
+**CI (finding 4).** Run `40002500366` on head `a4705ca`:
 
-Results from the local run are recorded in the PR description.
+- `build-and-test` passed;
+- `migration-replay` and `database-harness` failed while pulling Docker images (`toomanyrequests: Data limit
+  exceeded`), before any migration ran.
 
-## 8. Risks and open questions
+This PR adds no migration or SQL file. Those jobs must still be re-run green once the registry limit clears (§4.1),
+and each push's run is recorded in the PR description. An earlier statement that the PR had no CI checks was wrong:
+the app's status cache was read before Actions had started.
 
-- **Missed writer at step 3.** A backend still on current = V2 keeps creating V2 rows. This is detected (final
-  check, `verify-retirement`), not prevented: the script cannot see the servers' configuration.
-- **The key id name** `RENDER_PROD_V3` is a proposal (§3.1).
-- **`credential_error` item.** Its cause is not established on this branch (§4 step 0). The rotation leaves its
-  status alone. After the switch, only a successful Plaid call clears it.
-- **Supabase API logs** record the update's filters (`id`, key id, version, plaintext presence), but no token
+## 9. Risks and open questions
+
+- **Platform sequencing (§5)** is undecided. B makes the cutover, including webhook handling, a prerequisite.
+- **Missed writer (option A only):** detected by the final recount and by `verify-retirement`, not prevented.
+- **Old access tokens stay valid, and plaintext copies remain (§6).** These are out of scope here and need their
+  own packets.
+- **The key id** `RENDER_PROD_V3` is a proposal.
+- **`credential_error` item:** its cause is not established. The rotation leaves its status alone.
+- **Supabase API logs** record the update filters (`id`, key id, version, plaintext presence), but no token
   material.
-- **Not yet exercised against a real PostgREST/Postgres.** The tests use a faithful fake. A rehearsal against a
-  scratch local Supabase stack (as for earlier packets) would add confidence before production.
-- **Attested constraints.** The script trusts `--constraints-confirmed`. The operator must actually run the §6
-  query first.
-- **Item row deleted during a run** (a user removing an institution) halts the run with `row_missing`. Re-attest
-  the counts and rerun.
+- **No rehearsal against real PostgREST/Postgres yet** (§4.1 step 3), and the CI database jobs are not yet green
+  (§8).
+- **Attested constraints:** `--constraints-confirmed` is trusted. The operator must run the §7 query first.
 
-## 9. Steps that require human authorization
+## 10. Steps that require human authorization (none performed)
 
-Everything in §4 from step 0 onward. Specifically:
-
-- merging this PR;
-- generating and backing up the V3 key;
-- adding it to Railway/Render;
-- flipping `PLAID_TOKEN_CURRENT_KEY_ID` and redeploying;
-- running the dry run and the apply in production;
-- the traffic cutover;
-- removing V2.
-
-None of these were performed while preparing this branch.
+1. The §5 decision.
+2. The release approval to merge (a deploy event), after the staging rehearsal and green CI.
+3. The production cutover plan (option B), including webhooks and the frontend URL.
+4. Generating and backing up the V3 key.
+5. Adding it to Render (and to Railway only under option A).
+6. Flipping `PLAID_TOKEN_CURRENT_KEY_ID` and redeploying.
+7. The dry run and the apply.
+8. The §4.3 Hosted Link cleanup delete, approved with its exact count.
+9. Removing V2.
+10. The separate packets in §6.

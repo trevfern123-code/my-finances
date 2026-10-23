@@ -832,6 +832,84 @@ function inventoryCounts(p: PreflightResult): Record<string, number> {
   };
 }
 
+export type FinalCheckFailure =
+  | 'row_set_changed'
+  | 'total_changed'
+  | 'plaintext_copy_count_changed'
+  | 'anomalous_rows_present'
+  | 'nonce_reuse_detected'
+  | 'row_shape_changed'
+  | 'v2_rows_remaining'
+  | 'non_v3_rows_present'
+  | 'new_v2_link_tokens_created'
+  | 'v2_link_tokens_remaining'
+  | 'link_tokens_unexpected_key'
+  | 'link_tokens_unexpected_version';
+
+/**
+ * The whole-table recount every mode runs before it may report success, so a success line can never
+ * overlook an item inserted, deleted or changed — or a link token written under V2 — while the
+ * per-row pass ran. `expect` is what the table must look like now:
+ *   'unchanged'  (dry run)          the same V2/V3 split as at preflight;
+ *   'all_v3'     (apply, retirement) nothing left on V2, every row on V3.
+ * The row-id set must be identical to the preflight inventory (a delete plus an insert keeps the
+ * total but is still a different table). A V2 link token count that GREW means some writer still
+ * encrypts under V2 — the "missed writer" case — and fails every mode; retirement additionally
+ * requires zero V2 link tokens.
+ */
+export async function finalRecheck(
+  args: ParsedArgs,
+  before: { inventory: Inventory; linkTokens: LinkTokenInventory },
+  expect: 'unchanged' | 'all_v3'
+): Promise<{ failures: FinalCheckFailure[]; inventory: Inventory; linkTokens: LinkTokenInventory }> {
+  const inventory = await readInventory();
+  const linkTokens = await readLinkTokenInventory();
+  const c = inventory.counts;
+  const b = before.inventory.counts;
+  const failures: FinalCheckFailure[] = [];
+
+  const idsBefore = before.inventory.rows.map((r) => r.id).join(',');
+  const idsNow = inventory.rows.map((r) => r.id).join(','); // both ordered by id
+  if (idsNow !== idsBefore) failures.push('row_set_changed');
+  if (c.total !== args.expectedTotal) failures.push('total_changed');
+  if (c.plaintextCopies !== args.expectedPlaintextCopies) failures.push('plaintext_copy_count_changed');
+  if (c.plaintext_only + c.partial + c.missing_both + c.unexpected_key + c.unexpected_version > 0) {
+    failures.push('anomalous_rows_present');
+  }
+  if (c.distinctNonces !== c.total) failures.push('nonce_reuse_detected');
+  if (expect === 'unchanged') {
+    if (c.v2 !== b.v2 || c.v3 !== b.v3) failures.push('row_shape_changed');
+  } else {
+    if (c.v2 !== 0) failures.push('v2_rows_remaining');
+    if (c.v3 !== c.total) failures.push('non_v3_rows_present');
+  }
+  if (linkTokens.v2 > before.linkTokens.v2) failures.push('new_v2_link_tokens_created');
+  if (args.mode === 'verify-retirement' && linkTokens.v2 > 0) failures.push('v2_link_tokens_remaining');
+  if (linkTokens.unexpectedKey > 0) failures.push('link_tokens_unexpected_key');
+  if (linkTokens.unexpectedVersion > 0) failures.push('link_tokens_unexpected_version');
+  return { failures, inventory, linkTokens };
+}
+
+async function finishWithRecheck(
+  args: ParsedArgs,
+  preflight: PreflightResult & { inventory: Inventory; linkTokens: LinkTokenInventory },
+  expect: 'unchanged' | 'all_v3',
+  successOutcome: string,
+  tally?: Record<string, number>
+): Promise<number> {
+  const recheck = await finalRecheck(args, preflight, expect);
+  throwIfInterrupted();
+  const counts = inventoryCounts({ ...preflight, inventory: recheck.inventory, linkTokens: recheck.linkTokens });
+  for (const f of recheck.failures) logEntry({ stage: 'final_check', outcome: `failed:${f}` });
+  if (recheck.failures.length > 0) {
+    logEntry({ stage: 'final_check', outcome: 'failed', counts });
+    return 1;
+  }
+  logEntry({ stage: 'final_check', outcome: 'passed', counts });
+  logEntry({ stage: 'done', outcome: successOutcome, counts: tally });
+  return 0;
+}
+
 export async function main(argv: string[]): Promise<number> {
   let args: ParsedArgs;
   try {
@@ -850,26 +928,19 @@ export async function main(argv: string[]): Promise<number> {
     throwIfInterrupted();
     if (preflight.inventory) logEntry({ stage: 'inventory', outcome: 'read', counts: inventoryCounts(preflight) });
     for (const failure of preflight.failures) logEntry({ stage: 'preflight', outcome: `failed:${failure}` });
-    if (!preflight.ok || !preflight.keyRing || !preflight.inventory) {
+    if (!preflight.ok || !preflight.keyRing || !preflight.inventory || !preflight.linkTokens) {
       logEntry({ stage: 'preflight', outcome: 'failed' });
       return 1;
     }
     logEntry({ stage: 'preflight', outcome: 'passed' });
+    const checked = { ...preflight, inventory: preflight.inventory, linkTokens: preflight.linkTokens };
 
     if (args.mode === 'verify-retirement') {
-      const verified = await verifyAllWithV3Only(preflight.inventory.rows, preflight.keyRing);
+      await verifyAllWithV3Only(preflight.inventory.rows, preflight.keyRing);
       throwIfInterrupted();
-      // Re-run the whole-table checks once more after the per-row pass, so a row inserted under V2
-      // (or a V2 link token created) while the pass ran is caught here rather than missed.
-      const recheck = await runPreflight(args);
-      throwIfInterrupted();
-      if (!recheck.ok || recheck.inventory?.counts.total !== verified) {
-        for (const failure of recheck.failures) logEntry({ stage: 'final_check', outcome: `failed:${failure}` });
-        logEntry({ stage: 'final_check', outcome: 'failed:state_changed_during_verification' });
-        return 1;
-      }
-      logEntry({ stage: 'done', outcome: 'v2_retirement_gate_passed', counts: inventoryCounts(recheck) });
-      return 0;
+      // Recount after the per-row pass, so a row inserted under V2 (or a V2 link token created)
+      // while the pass ran is caught here rather than missed.
+      return await finishWithRecheck(args, checked, 'all_v3', 'v2_retirement_gate_passed');
     }
 
     const tally: Record<RowOutcome, number> = {
@@ -885,25 +956,11 @@ export async function main(argv: string[]): Promise<number> {
     }
     throwIfInterrupted();
 
-    if (!args.apply) {
-      logEntry({ stage: 'done', outcome: 'dry_run_complete', counts: tally });
-      return 0;
-    }
-
-    // Final whole-table check: same total and plaintext-copy count as attested, nothing left on V2.
-    const finalInventory = await readInventory();
-    throwIfInterrupted();
-    const c = finalInventory.counts;
-    const finalFailures: string[] = [];
-    if (c.total !== args.expectedTotal) finalFailures.push('total_changed');
-    if (c.plaintextCopies !== args.expectedPlaintextCopies) finalFailures.push('plaintext_copy_count_changed');
-    if (c.v2 !== 0) finalFailures.push('v2_rows_remaining');
-    if (c.v3 !== c.total) finalFailures.push('non_v3_rows_present');
-    if (c.distinctNonces !== c.total) finalFailures.push('nonce_reuse_detected');
-    for (const f of finalFailures) logEntry({ stage: 'final_check', outcome: `failed:${f}` });
-    if (finalFailures.length > 0) return 1;
-    logEntry({ stage: 'done', outcome: 'rotation_complete', counts: tally });
-    return 0;
+    // Same recount for the dry run as for apply: a dry run that "passed" while an item was added,
+    // removed or changed, or while a writer created V2 link tokens, would be a false green light.
+    return args.apply
+      ? await finishWithRecheck(args, checked, 'all_v3', 'rotation_complete', tally)
+      : await finishWithRecheck(args, checked, 'unchanged', 'dry_run_complete', tally);
   } catch (err) {
     if (err instanceof InterruptedError) {
       logEntry({ id: err.targetId, stage: 'run', outcome: 'interrupted' });
