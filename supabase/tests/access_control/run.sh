@@ -14,13 +14,18 @@
 # background, contender.sql one second later, then verify.sql). Queries run under `set role authenticated` + `request.jwt.claims`,
 # which is exactly how PostgREST executes a request made with the anon key and a user's JWT.
 #
-# Requires: docker, bash.
+# Requires: docker, bash, GNU timeout (coreutils).
 #   PG_IMAGE=<image>   override the image (default public.ecr.aws/supabase/postgres:17.6.1.155)
-#   EXCLUDE=<file>     skip one migration by basename — e.g. the one under test, to watch its tests
-#                      fail against the schema it was written to fix
+#   EXCLUDE=<file>...  skip migrations by basename (several: separated by spaces or commas) — e.g. the one
+#                      under test, to watch its tests fail against the schema it was written to fix. A
+#                      migration that builds on an excluded one must be excluded too: its guard refuses.
 #   KEEP=1             leave the container running afterwards
 #   VERBOSE=1          print every test's transcript, not just failing ones
+#   STARTUP_TIMEOUT=s  fail if the database does not accept connections within s seconds (default 180)
+#   PSQL_TIMEOUT=s     fail any single psql run (migration, seed, test, holder, contender, verify)
+#                      that exceeds s seconds (default 600); the transcript says TIMEOUT
 set -uo pipefail
+command -v timeout >/dev/null 2>&1 || { echo "FAILED: GNU timeout (coreutils) is required to bound database waits"; exit 1; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -33,12 +38,34 @@ cleanup_container() {
 }
 trap cleanup_container EXIT
 
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-180}"
+PSQL_TIMEOUT="${PSQL_TIMEOUT:-600}"
+# Runs a command under PSQL_TIMEOUT; a timeout is reported on stderr (so it lands in the test's log).
+bounded() {
+  timeout "$PSQL_TIMEOUT" "$@"
+  local rc=$?
+  [ "$rc" -eq 124 ] && echo "TIMEOUT: exceeded ${PSQL_TIMEOUT}s (PSQL_TIMEOUT)" >&2
+  return "$rc"
+}
 psql_db() {
-  docker exec -i "$CONTAINER" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"
+  bounded docker exec -i "$CONTAINER" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"
 }
 # supabase_admin owns auth.users.
 psql_admin() {
-  docker exec -i "$CONTAINER" psql -X -q -v ON_ERROR_STOP=1 -U supabase_admin -d postgres "$@"
+  bounded docker exec -i "$CONTAINER" psql -X -q -v ON_ERROR_STOP=1 -U supabase_admin -d postgres "$@"
+}
+# Waits for the database, bounded; exits with the container's recent logs if it stops or times out.
+wait_for_database() {
+  local deadline=$((SECONDS + STARTUP_TIMEOUT))
+  until timeout 10 docker exec "$CONTAINER" psql -U supabase_admin -d postgres -Atc "select 1" >/dev/null 2>&1; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != true ]; then
+      echo "FAILED: the database container stopped during startup. Last log lines:"; docker logs --tail 40 "$CONTAINER" 2>&1; exit 1
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "FAILED: the database did not accept connections within ${STARTUP_TIMEOUT}s. Last log lines:"; docker logs --tail 40 "$CONTAINER" 2>&1; exit 1
+    fi
+    sleep 1
+  done
 }
 
 FILTERS=("$@")
@@ -52,8 +79,8 @@ wanted() {
 }
 
 echo "image: $IMAGE   container: $CONTAINER"
-docker run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=harness "$IMAGE" >/dev/null || exit 1
-until docker exec "$CONTAINER" psql -U supabase_admin -d postgres -Atc "select 1" >/dev/null 2>&1; do sleep 1; done
+docker run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=harness "$IMAGE" >/dev/null || { echo "FAILED: could not start the database container"; exit 1; }
+wait_for_database
 # Supabase's image finishes its own role/extension setup shortly after it first accepts connections.
 for _ in $(seq 1 60); do
   [ "$(docker logs "$CONTAINER" 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break
@@ -62,9 +89,19 @@ done
 sleep 3
 echo "server: $(psql_db -At -c 'show server_version' </dev/null)"
 
+EXCLUDED="${EXCLUDE:-}"
+EXCLUDED="${EXCLUDED//,/ }"
+excluded() {
+  local name="$1" e
+  for e in $EXCLUDED; do [ "$name" = "$e" ] && return 0; done
+  return 1
+}
+for e in $EXCLUDED; do
+  [ -f "$ROOT/supabase/migrations/$e" ] || { echo "FAILED: EXCLUDE names no migration: $e"; exit 1; }
+done
 for f in "$ROOT"/supabase/migrations/*.sql; do  # glob order is sorted, and safe with spaces in paths
-  if [ -n "${EXCLUDE:-}" ] && [ "$(basename "$f")" = "$EXCLUDE" ]; then echo "skipping $EXCLUDE (EXCLUDE)"; continue; fi
-  if ! docker exec -i "$CONTAINER" psql -X -q -1 -v ON_ERROR_STOP=1 -U postgres -d postgres < "$f" >>"$LOGS/history.log" 2>&1; then
+  if excluded "$(basename "$f")"; then echo "skipping $(basename "$f") (EXCLUDE)"; continue; fi
+  if ! bounded docker exec -i "$CONTAINER" psql -X -q -1 -v ON_ERROR_STOP=1 -U postgres -d postgres < "$f" >>"$LOGS/history.log" 2>&1; then
     echo "FAILED to apply migration $(basename "$f"):"; tail -20 "$LOGS/history.log"; exit 1
   fi
 done

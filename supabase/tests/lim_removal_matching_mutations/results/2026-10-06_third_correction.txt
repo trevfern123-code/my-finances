@@ -1,0 +1,249 @@
+# supabase/tests/lim_removal_matching_mutations/run.sh   (2026-10-06, third correction: removal body f19b079c87a102ef1f5541f7394fcb82, evaluator 8322bf880414b1ba2ea18adaec0ab395; 44 mutants, each in its own throwaway local database; run in four parallel shards and listed here in manifest order)
+MUTANT                                   RESULT     DETAIL
+no_preservation                          ok         DELETION WITHOUT PRESERVATION: both preservation statements are removed; the removal only evaluates and deletes
+                                                    expected: a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record
+                                                    tests: a18:FAIL a19:FAIL a20:FAIL a21:FAIL a22:FAIL c26:FAIL c27:FAIL c33:FAIL c34:FAIL c35:FAIL
+                                                    first failure in a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record, keyed by account, own Plaid id and cents
+                                                    first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, A-cash, L-card, L-cash, M-active, M-amount, U-tie, W-card, W-cash (39 of 40 requirements)
+                                                    first failure in a21: aa: preserved — the two passively invalidated confirmations (each with the removed side's reason) and the three valid ones; NOT the undone, the replaced, or the two the user re-classified a leg of
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (24 of 42 requirements)
+                                                    first failure in c26: the removal preserved the one known destination; the unconfirmed payment got none
+                                                    first failure in c27: the removal saw the confirmation that committed just before it and preserved it as the user's own decision (not as a system record)
+                                                    first failure in c33: and committed fresh, with the destination preserved
+                                                    first failure in c34: and it preserved the known destination from the rows as the writer left them
+                                                    first failure in c35: and it preserved the known destination from the rows as the writer left them
+preservation_after_delete                ok         PRESERVATION AFTER THE DELETE: the same statements, moved after the item is deleted (the rows and the pair decisions are gone)
+                                                    expected: a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record
+                                                    tests: a18:FAIL a19:FAIL a20:FAIL a21:FAIL a22:FAIL c26:FAIL c27:FAIL c33:FAIL c34:FAIL c35:FAIL
+                                                    first failure in a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record, keyed by account, own Plaid id and cents
+                                                    first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, A-cash, L-card, L-cash, M-active, M-amount, U-tie, W-card, W-cash (39 of 40 requirements)
+                                                    first failure in a21: aa: preserved — the two passively invalidated confirmations (each with the removed side's reason) and the three valid ones; NOT the undone, the replaced, or the two the user re-classified a leg of
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (24 of 42 requirements)
+                                                    first failure in c26: the removal preserved the one known destination; the unconfirmed payment got none
+                                                    first failure in c27: the removal saw the confirmation that committed just before it and preserved it as the user's own decision (not as a system record)
+                                                    first failure in c33: and committed fresh, with the destination preserved
+                                                    first failure in c34: and it preserved the known destination from the rows as the writer left them
+                                                    first failure in c35: and it preserved the known destination from the rows as the writer left them
+no_first_evaluation                      ok         no in-transaction evaluation before the preservation: it reads the STORED states at their stored version
+                                                    expected: a19: records: k-a, and k-late (a pair no stored state knew)
+                                                    tests: a18:pass a19:FAIL a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+first_evaluation_best_effort             ok         PRE-EVALUATION BEST-EFFORT: the first evaluation in a subtransaction whose failure is swallowed (try_evaluate): the preservation then runs on stale states
+                                                    expected: a19: expected an error like remove_plaid_item_local: card-payment matching could not be evaluated before the removal
+                                                    tests: a18:pass a19:FAIL a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: expected an error like remove_plaid_item_local: card-payment matching could not be evaluated before the removal (SQLSTATE 25001); nothing was removed but the statement succeeded:  select public.remove_plaid_item_local('000000
+no_final_evaluation                      ok         no evaluation after the delete: the removal commits with the version ahead of the published states
+                                                    expected: a18: the removal published fresh states at exactly the final input version
+                                                    tests: a18:FAIL a19:FAIL a20:pass a21:FAIL a22:FAIL c26:FAIL c27:FAIL c33:FAIL c34:FAIL c35:FAIL
+                                                    first failure in a18: the removal published fresh states at exactly the final input version
+                                                    first failure in a19: A: fresh at the final version, which advanced
+                                                    first failure in a21: states are not fresh when reading leg k-eu
+                                                    first failure in a22: states are not fresh when reading leg k-a
+                                                    first failure in c26: fresh: the refused confirmation changed no input after the removal's evaluation
+                                                    first failure in c27: fresh after the removal, the last writer
+                                                    first failure in c33: and committed fresh, with the destination preserved
+                                                    first failure in c34: fresh: the removal ran after the writer committed and was the last writer
+                                                    first failure in c35: fresh: the removal ran after the writer committed and was the last writer
+final_evaluation_strict                  ok         FINAL EVALUATION STRICT AGAIN: a failure of the final evaluation raises, and undoes a removal whose evidence was already preserved
+                                                    expected: a19: B3: a failed final evaluation must not fail the removal
+                                                    tests: a18:pass a19:FAIL a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: B3: a failed final evaluation must not fail the removal (it raised: remove_plaid_item_local: card-payment matching could not be evaluated after the removal (SQLSTATE P0001); nothing was removed)
+failed_final_evaluation_marked_fresh     ok         STALE STATE EXPOSED AS FRESH AFTER A FAILED FINAL EVALUATION: the normal path is untouched; when the final evaluation fails, the version is declared evaluated anyway
+                                                    expected: a19: B3: the versions say stale
+                                                    tests: a18:pass a19:FAIL a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: B3: the versions say stale: the input version moved past the last evaluated one
+stale_marked_fresh                       ok         STALE FINAL STATE PUBLISHED AS FRESH: instead of evaluating again, the version is simply declared evaluated
+                                                    expected: a18: no state row of an earlier version, and none for a deleted transaction
+                                                    tests: a18:FAIL a19:FAIL a20:pass a21:FAIL a22:FAIL c26:FAIL c27:FAIL c33:pass c34:FAIL c35:FAIL
+                                                    first failure in a18: no state row of an earlier version, and none for a deleted transaction
+                                                    first failure in a19: A: both preserved destinations count
+                                                    first failure in a21: E-undo: the undone confirmation is not resurrected; the payment is matched like any unconfirmed one (here: automatically, with the remaining card)
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (14 of 42 requirements)
+                                                    first failure in c26: the converted payment counts as leaving the tracked accounts
+                                                    first failure in c27: the confirmed payment counts as leaving the tracked accounts — not unresolved
+                                                    first failure in c34: the payment counts as leaving the tracked accounts
+                                                    first failure in c35: the payment counts as leaving the tracked accounts
+version_not_advanced                     ok         MISSING VERSION BUMP: correct states, but the input version ends where it was before the removal (needs UPDATE on the derived tables: applied as postgres-owned SECURITY DEFINER in the mutant only)
+                                                    expected: a18: the matching input version advanced
+                                                    tests: a18:FAIL a19:FAIL a20:pass a21:pass a22:pass c26:FAIL c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a18: the matching input version advanced
+                                                    first failure in a19: A: fresh at the final version, which advanced
+                                                    first failure in c26: the confirmation was refused: the matching state it was made on no longer exists
+converts_unresolved                      ok         REMOVAL TREATED AS EVIDENCE: any surviving cash leg with an opposite-amount leg on the removed item gets a system record, paired or not
+                                                    expected: a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record
+                                                    tests: a18:FAIL a19:pass a20:pass a21:FAIL a22:FAIL c26:FAIL c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record, keyed by account, own Plaid id and cents
+                                                    first failure in a21: bb: the never-confirmed payment got NO record; it counts by current evidence alone — the user has no included card
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, P (20 of 42 requirements)
+                                                    first failure in c26: the removal preserved the one known destination; the unconfirmed payment got none
+converts_kept_pairs                      ok         no restriction to the removed item: automatic pairs with a card that stays get a system record too
+                                                    expected: a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record
+                                                    tests: a18:FAIL a19:FAIL a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record, keyed by account, own Plaid id and cents
+                                                    first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+wrong_lineage_key                        ok         the system record is keyed by the removed card leg's Plaid id instead of the surviving cash leg's own
+                                                    expected: a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record
+                                                    tests: a18:FAIL a19:FAIL a20:pass a21:pass a22:pass c26:FAIL c27:pass c33:FAIL c34:FAIL c35:FAIL
+                                                    first failure in a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record, keyed by account, own Plaid id and cents
+                                                    first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+                                                    first failure in c26: the removal preserved the one known destination; the unconfirmed payment got none
+                                                    first failure in c33: and committed fresh, with the destination preserved
+                                                    first failure in c34: and it preserved the known destination from the rows as the writer left them
+                                                    first failure in c35: and it preserved the known destination from the rows as the writer left them
+no_dedupe                                ok         no check for an existing live system record with the same key
+                                                    expected: a18: second removal: a leg whose key is unchanged keeps its one record
+                                                    tests: a18:FAIL a19:pass a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a18: second removal: a leg whose key is unchanged keeps its one record
+raw_errors                               ok         the preservation error is not replaced by the fixed message: whatever the failing statement says reaches the caller
+                                                    expected: a19: expected an error like remove_plaid_item_local: known card-payment destinations could not be preserved
+                                                    tests: a18:pass a19:FAIL a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: expected an error like remove_plaid_item_local: known card-payment destinations could not be preserved (SQLSTATE P0001); nothing was removed but got: injected failure with a secret id 00000000-0000-0000-0000-00000000dead
+version_row_before_advisory_lock         ok         LOCK ORDER: the version row (L2) is locked before the per-user advisory lock (L1)
+                                                    expected: c33: while waiting on L1, the removal held no lock on the version row
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:pass c26:pass c27:pass c33:FAIL c34:FAIL c35:FAIL
+                                                    first failure in c33: while waiting on L1, the removal held no lock on the version row (L1 strictly before L2)
+                                                    first failure in c34: deadlock detected
+                                                    first failure in c35: deadlock detected
+no_user_filter                           ok         the automatic-pair statement does not re-check the owner of either account (the evaluator already wrote only this user's states, and the insert trigger re-checks the account)
+                                                    expected: SURVIVES (defense in depth: redundant with the per-user states and card_payment_decisions_same_user)
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+no_survivor_filter                       ok         cash legs on the removed item itself get a system record too (deleted with their account by the cascade)
+                                                    expected: SURVIVES (redundant with the account cascade: a record on a removed account goes with it)
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+user_pairs_not_preserved                 ok         USER-STRENGTH PRESERVATION DROPPED: no pair_counterpart_removed decision is written; a user-confirmed pair is simply deleted with the account
+                                                    expected: a18: exactly the two USER-confirmed pairs became user decisions on their surviving legs
+                                                    tests: a18:FAIL a19:FAIL a20:FAIL a21:FAIL a22:pass c26:pass c27:FAIL c33:pass c34:pass c35:pass
+                                                    first failure in a18: exactly the two USER-confirmed pairs became user decisions on their surviving legs: the removed leg's reference, the accepted difference, a valid counterpart, no account reference to the removed card, live
+                                                    first failure in a19: C: both inactive user pairs were preserved, each with the removed side's status as the removal itself evaluated it
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, A-cash, L-card, L-cash, M-active, M-amount, U-tie, W-card, W-cash (39 of 40 requirements)
+                                                    first failure in a21: aa: preserved — the two passively invalidated confirmations (each with the removed side's reason) and the three valid ones; NOT the undone, the replaced, or the two the user re-classified a leg of
+                                                    first failure in c27: the removal saw the confirmation that committed just before it and preserved it as the user's own decision (not as a system record)
+user_pairs_downgraded_to_system_record   ok         DOWNGRADE TO THE SYSTEM RECORD: an active user-confirmed pair gets the ordinary non-reserving destination_removed_card instead (the behaviour of the candidate before this decision)
+                                                    expected: a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record
+                                                    tests: a18:FAIL a19:FAIL a20:FAIL a21:FAIL a22:pass c26:pass c27:FAIL c33:pass c34:pass c35:pass
+                                                    first failure in a18: exactly the eight surviving cash legs that were paired AUTOMATICALLY with a removed card leg have a system record, keyed by account, own Plaid id and cents
+                                                    first failure in a19: C: both inactive user pairs were preserved, each with the removed side's status as the removal itself evaluated it
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, A-cash, L-card, L-cash, M-active, M-amount, U-tie, W-card, W-cash (39 of 40 requirements)
+                                                    first failure in a21: aa: preserved — the two passively invalidated confirmations (each with the removed side's reason) and the three valid ones; NOT the undone, the replaced, or the two the user re-classified a leg of
+                                                    first failure in c27: the removal saw the confirmation that committed just before it and preserved it as the user's own decision (not as a system record)
+waiting_confirmation_released            ok         WAITING CONFIRMATION RELEASED: a user pair that is waiting to post when the account is removed is not preserved
+                                                    expected: a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: W-card, W-cash
+                                                    tests: a18:pass a19:FAIL a20:FAIL a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: C: both inactive user pairs were preserved, each with the removed side's status as the removal itself evaluated it
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: W-card, W-cash (9 of 40 requirements)
+amount_changed_reservation_released      ok         AMOUNT-CHANGED RESERVATION RELEASED: a user pair invalidated by an amount change is not preserved
+                                                    expected: a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, A-cash, M-amount
+                                                    tests: a18:pass a19:FAIL a20:FAIL a21:FAIL a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: C: both inactive user pairs were preserved, each with the removed side's status as the removal itself evaluated it
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, A-cash, M-amount (13 of 40 requirements)
+                                                    first failure in a21: bb: both confirmations preserved
+ambiguous_confirmation_released          ok         AMBIGUOUS-LINEAGE RESERVATION RELEASED: a user pair with conflicting replacements is not preserved
+                                                    expected: a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: L-card, L-cash
+                                                    tests: a18:pass a19:pass a20:FAIL a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: L-card, L-cash (8 of 40 requirements)
+mirror_case_not_preserved                ok         MIRROR CASE DROPPED: only a surviving CASH leg is preserved; a card leg whose confirmed cash account was removed is released
+                                                    expected: a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: M-active, M-amount
+                                                    tests: a18:pass a19:pass a20:FAIL a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: M-active, M-amount (9 of 40 requirements)
+active_pair_frozen_as_invalid            ok         WRONG FROZEN STATUS: an active confirmation is preserved, but recorded as invalid — it would hold its leg and never count
+                                                    expected: a18: exactly the two USER-confirmed pairs became user decisions on their surviving legs
+                                                    tests: a18:FAIL a19:pass a20:FAIL a21:FAIL a22:pass c26:pass c27:FAIL c33:pass c34:pass c35:pass
+                                                    first failure in a18: exactly the two USER-confirmed pairs became user decisions on their surviving legs: the removed leg's reference, the accepted difference, a valid counterpart, no account reference to the removed card, live
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: M-active, U-tie (2 of 40 requirements)
+                                                    first failure in a21: aa: preserved — the two passively invalidated confirmations (each with the removed side's reason) and the three valid ones; NOT the undone, the replaced, or the two the user re-classified a leg of
+                                                    first failure in c27: the confirmed payment counts as leaving the tracked accounts — not unresolved
+superseded_pairs_preserved               ok         AN UNDONE OR REPLACED CONFIRMATION RESURRECTED: superseded pairs are preserved too
+                                                    expected: a21: aa: preserved
+                                                    tests: a18:pass a19:pass a20:pass a21:FAIL a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a21: aa: preserved — the two passively invalidated confirmations (each with the removed side's reason) and the three valid ones; NOT the undone, the replaced, or the two the user re-classified a leg of
+reclassified_pairs_preserved             ok         A NEWER EXPLICIT USER ACTION IGNORED: a pair one of whose legs the user re-classified away from card payment is preserved, and keeps holding the other leg
+                                                    expected: a21: aa: preserved
+                                                    tests: a18:pass a19:pass a20:pass a21:FAIL a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a21: aa: preserved — the two passively invalidated confirmations (each with the removed side's reason) and the three valid ones; NOT the undone, the replaced, or the two the user re-classified a leg of
+no_account_locks                         ok         ACCOUNT LOCKS OMITTED: the version row is taken (first evaluation) before any account row of the item — the new deadlock of the earlier candidate
+                                                    expected: c34: deadlock detected
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:FAIL c35:FAIL
+                                                    first failure in c34: deadlock detected
+                                                    first failure in c35: deadlock detected
+account_locks_after_first_evaluation     ok         ACCOUNT LOCKS TOO LATE: the same locks, taken after the first evaluation has taken the version row
+                                                    expected: c34: deadlock detected
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:FAIL c35:FAIL
+                                                    first failure in c34: deadlock detected
+                                                    first failure in c35: deadlock detected
+account_locks_for_share                  ok         ACCOUNT LOCKS TOO WEAK: FOR SHARE instead of the delete's own FOR UPDATE — it stops an account update but lets an insert that references the account through
+                                                    expected: c35: deadlock detected
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:pass c26:pass c27:pass c33:pass c34:pass c35:FAIL
+                                                    first failure in c35: deadlock detected
+eval_preserved_pair_not_reserving        ok         EVALUATOR: the preserved user pair is read like the system record — below tier 1 and holding nothing (user strength lost at evaluation)
+                                                    expected: a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in:
+                                                    tests: a18:pass a19:FAIL a20:FAIL a21:FAIL a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: C: a confirmation whose card amount had changed stays reserved and unresolved: the removal does not make it valid
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, A-cash, L-card, L-cash, M-active, M-amount, U-tie, W-card, W-cash (30 of 40 requirements)
+                                                    first failure in a21: P-role: a confirmation the classifier invalidated is preserved; its cash leg is reserved and unresolved, and the competitor is not paired
+eval_preserved_leg_left_in_tier1_pool    ok         EVALUATOR: COMPETITOR AUTO-MATCH ALLOWED — a leg held by a preserved pair stays in the automatic-matching pool, so another card can pair with it
+                                                    expected: a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in:
+                                                    tests: a18:pass a19:pass a20:FAIL a21:FAIL a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, A-cash, L-card, L-cash, M-active, M-amount, U-tie, W-card, W-cash (11 of 40 requirements)
+                                                    first failure in a21: P-role: a confirmation the classifier invalidated is preserved; its cash leg is reserved and unresolved, and the competitor is not paired
+eval_frozen_status_ignored               ok         EVALUATOR: the frozen status of the removed side is ignored — a confirmation that was invalid on that side becomes valid through the removal
+                                                    expected: a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, L-card, M-amount
+                                                    tests: a18:pass a19:FAIL a20:FAIL a21:FAIL a22:pass c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a19: C: a confirmation whose card amount had changed stays reserved and unresolved: the removal does not make it valid
+                                                    first failure in a20: institution removal keeps explicit user confirmations and their reservations (Decision 2); violated in: A-card, L-card, M-amount (5 of 40 requirements)
+                                                    first failure in a21: P-role: a confirmation the classifier invalidated is preserved; its cash leg is reserved and unresolved, and the competitor is not paired
+ambiguity_hold_omitted                   ok         AMBIGUITY HOLD OMITTED: the removal writes no hold; a tie between a removed card and a kept one resolves to the kept card when the other is deleted (the behaviour before this decision)
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (
+                                                    tests: a18:pass a19:pass a20:pass a21:FAIL a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a21: T: the tie the removal must not resolve is still a tie — the payment is unresolved, not matched to the card that is left, and no decision is attached to it
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (24 of 42 requirements)
+hold_without_a_removed_candidate         ok         EVERY UNRESOLVED PAYMENT FROZEN: a hold is written whether or not one of the candidates is on the removed institution
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, N, P (
+                                                    tests: a18:pass a19:pass a20:pass a21:FAIL a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a21: E-undo: the undone confirmation is not resurrected; the payment is matched like any unconfirmed one (here: automatically, with the remaining card)
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, N, P (17 of 42 requirements)
+hold_records_the_wrong_date              ok         WRONG DATE KEPT: the hold records the KEPT candidate's date instead of the removed one's — a kept card that was strictly closer all along is then withheld like a tie
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: P (
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: P (2 of 42 requirements)
+hold_kind_swapped                        ok         WRONG LEG: the hold says the removed candidate competed for the other leg of the pair
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (
+                                                    tests: a18:pass a19:pass a20:pass a21:FAIL a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a21: T: the removal wrote no destination for the unresolved payment, and one system hold on the pair of the two legs that are left
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (15 of 42 requirements)
+hold_not_deduplicated                    ok         no check for an existing live hold with the same legs and date: a second removal with the same ambiguity writes it again
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: G (
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: G (1 of 42 requirements)
+eval_hold_does_not_withhold              ok         EVALUATOR: THE HOLD FAILS TO BLOCK THE SURVIVING COMPETITOR — it is recorded and read, but the automatic pair of its two legs is formed anyway
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M (
+                                                    tests: a18:pass a19:pass a20:pass a21:FAIL a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a21: T: the tie the removal must not resolve is still a tie — the payment is unresolved, not matched to the card that is left, and no decision is attached to it
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M (17 of 42 requirements)
+eval_hold_publishes_an_effect            ok         EVALUATOR: THE HOLD PUBLISHES A FINANCIAL EFFECT — a held payment is read like a known removed-card destination (untracked, −amount)
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (
+                                                    tests: a18:pass a19:pass a20:pass a21:FAIL a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a21: T: the tie the removal must not resolve is still a tie — the payment is unresolved, not matched to the card that is left, and no decision is attached to it
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (22 of 42 requirements)
+eval_hold_user_strength                  ok         EVALUATOR: THE HOLD HAS USER-STRENGTH PRECEDENCE — its legs are taken out of automatic matching altogether, like legs a user decision holds
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (
+                                                    tests: a18:pass a19:pass a20:pass a21:FAIL a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a21: T: the tie the removal must not resolve is still a tie — the payment is unresolved, not matched to the card that is left, and no decision is attached to it
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: A, B, C-amount, C-date, C-new, C-posted, D, E, F, G, M, P (25 of 42 requirements)
+eval_hold_ignores_date_changes           ok         EVALUATOR: THE HOLD NEVER EXPIRES ON A DATE CHANGE — the pair is withheld whatever the dates are now, even when the partner is strictly closer than the removed candidate was
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: C-date, M, P (
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: C-date, M, P (3 of 42 requirements)
+eval_hold_ignores_amount_changes         ok         EVALUATOR: THE HOLD NEVER EXPIRES ON AN AMOUNT CHANGE — it still applies after the bank corrected the legs it was recorded for
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: C-amount (
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: C-amount (1 of 42 requirements)
+eval_hold_blocks_any_pair_of_its_legs    ok         EVALUATOR: THE HOLD BLOCKS BEYOND ITS SCOPE — it withholds any automatic pair of a held leg, also one with a new transaction or a relinked leg
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: C-new (
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: C-new (1 of 42 requirements)
+eval_hold_overrides_user_decision        ok         EVALUATOR: THE HOLD BLOCKS A LATER EXPLICIT USER DECISION — a user's confirmation or "unlinked" on a held leg is read as conflicting with the hold
+                                                    expected: a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: D (
+                                                    tests: a18:pass a19:pass a20:pass a21:pass a22:FAIL c26:pass c27:pass c33:pass c34:pass c35:pass
+                                                    first failure in a22: institution removal is not evidence: an unresolved tie stays unresolved until new evidence or the user decides; violated in: D (3 of 42 requirements)

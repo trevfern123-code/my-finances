@@ -1,0 +1,91 @@
+# supabase/tests/lim_removal_lock_comparison/run.sh   (2026-10-06, third correction: candidate body f19b079c87a102ef1f5541f7394fcb82 — the removal now also writes ambiguity holds; the harness and its expectations are unchanged; one throwaway local database; 11 cases)
+
+image: public.ecr.aws/supabase/postgres:17.6.1.155   container: lim-lock-comparison-3845
+server: 17.6
+remove_plaid_item_local body: a8f567d397b9dae5b777497317985ab7 (previous: 20260926120000)
+
+CASE  body=previous  scenario=S1  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 539 waits for ShareLock on transaction 1023; blocked by process 546. | Process 546 waits for ShareLock on transaction 1025; blocked by process 539.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=stale-unreadable loan=1000
+  -> as-documented
+
+CASE  body=previous  scenario=S2  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 596 waits for ShareLock on transaction 1075; blocked by process 603. | Process 603 waits for ShareLock on transaction 1077; blocked by process 596.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=stale-unreadable loan=1000
+  -> as-documented
+
+CASE  body=previous  scenario=S3  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 659 waits for ShareLock on transaction 1116; blocked by process 652. | Process 652 waits for ShareLock on transaction 1118; blocked by process 659.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=stale-unreadable loan=1000
+  -> as-documented
+
+CASE  body=previous  scenario=S4  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=stale-unreadable loan=1000
+  -> as-documented
+
+CASE  body=previous  scenario=S5  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid at the barrier)
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=stale-unreadable loan=1000
+  -> as-documented
+
+remove_plaid_item_local body: f19b079c87a102ef1f5541f7394fcb82 (candidate: 20261006120000_lim_removal_card_payment_matching.sql)
+
+CASE  body=candidate  scenario=S1  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 849 waits for ShareLock on transaction 1230; blocked by process 856. | Process 856 waits for ShareLock on transaction 1231; blocked by process 849.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=candidate  scenario=S2  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 905 waits for ShareLock on transaction 1275; blocked by process 912. | Process 912 waits for ShareLock on transaction 1276; blocked by process 905.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=candidate  scenario=S3  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL removal saw: Process 976 waits for ShareLock on transaction 1336; blocked by process 969. | Process 969 waits for ShareLock on transaction 1337; blocked by process 976.
+  RESULT removal=error(40P01) writer=updated deadlock=yes victim=removal removal_retried=yes final=fresh loan=1000
+  -> as-documented
+
+CASE  body=candidate  scenario=S4  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+CASE  body=candidate  scenario=S5  deadlock_timeout: removal=1s writer=1s
+  WAIT removal waited for writer (Lock/transactionid at the barrier)
+  RESULT removal=removed writer=updated deadlock=no victim=none removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+CASE  body=candidate  scenario=S1  deadlock_timeout: removal=60s writer=1s
+  WAIT removal waited for writer (Lock/transactionid, Lock/transactionid at the barrier)
+  WAIT writer waited for removal (Lock/transactionid)
+  DETAIL writer saw: Process 1138 waits for ShareLock on transaction 1461; blocked by process 1145. | Process 1145 waits for ShareLock on transaction 1460; blocked by process 1138.
+  RESULT removal=removed writer=error(40P01) deadlock=yes victim=writer removal_retried=no final=fresh loan=1000
+  -> as-documented
+
+BODY       SCENARIO  TIMEOUT rem/wr     DEADLOCK  VICTIM   FINAL             VERDICT
+previous   S1        1s/1s              yes       removal  stale-unreadable  as-documented
+previous   S2        1s/1s              yes       removal  stale-unreadable  as-documented
+previous   S3        1s/1s              yes       removal  stale-unreadable  as-documented
+previous   S4        1s/1s              no        none     stale-unreadable  as-documented
+previous   S5        1s/1s              no        none     stale-unreadable  as-documented
+candidate  S1        1s/1s              yes       removal  fresh             as-documented
+candidate  S2        1s/1s              yes       removal  fresh             as-documented
+candidate  S3        1s/1s              yes       removal  fresh             as-documented
+candidate  S4        1s/1s              no        none     fresh             as-documented
+candidate  S5        1s/1s              no        none     fresh             as-documented
+candidate  S1        60s/1s             yes       writer   fresh             as-documented
+
+all 11 cases as documented

@@ -24,8 +24,14 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
  * older client depends on; raise MIN_CLIENT_API_LEVEL only in a release that must refuse older
  * clients (for example, when retiring the legacy routes kept for pre-contract bundles). Both are
  * deliberately code constants, not configuration: changing them is a reviewed release decision.
+ *
+ * Level 2 (Financial Semantics Phase B, integration slice I2): the role-aware fields on the three
+ * aggregate endpoints and the effects endpoint, served to a client that declares level 2
+ * (controllers/semanticResponse.ts). Raising API_LEVEL tells a level-1 bundle that a newer build
+ * exists; it changes nothing that bundle receives. Every response field a level-1 or level-0 client
+ * reads keeps its sign-based meaning, so MIN_CLIENT_API_LEVEL stays 0 (design §6.4, §12 D11).
  */
-export const API_LEVEL = 1;
+export const API_LEVEL = 2;
 export const MIN_CLIENT_API_LEVEL = 0;
 
 export const CLIENT_API_LEVEL_HEADER = 'X-Client-Api-Level';

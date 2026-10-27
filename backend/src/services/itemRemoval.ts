@@ -21,10 +21,31 @@ import type { ItemRemovalRecord, LoanAdjustment } from './dataService';
  *   plaid_removed  -> remove_plaid_item_local: one transaction restores every manual-loan balance by
  *                     exactly the recorded applied amounts of the item's linked transactions and deletes
  *                     the item (cascading to accounts, transactions, splits, streams, liabilities).
+ *                     Since 20261006120000 the same transaction also keeps what card-payment matching
+ *                     knew (CARD_PAYMENT_PAIRING_DESIGN.md §4.7): before the delete it evaluates
+ *                     matching and records, on every payment from a surviving account that was matched
+ *                     to a card of this item, that its destination was the removed card — as a system
+ *                     record for an automatic match, as the user's own decision (which keeps holding the
+ *                     surviving leg) for a match the user had confirmed. A system hold on one possible
+ *                     pair covers two more cases. A payment that had no automatic match because a card of
+ *                     this item and a card that stays both fitted it — whatever it is shown as — gets
+ *                     the hold instead of a destination, so that deleting one candidate does not match it
+ *                     to the other. And a payment that was matched automatically to a card of this item
+ *                     keeps its recorded destination: where a card that was already there also fitted it,
+ *                     less well, the hold keeps the removal from switching it to that card. After the
+ *                     delete it evaluates again, so it normally commits fresh matching states. The first
+ *                     evaluation is strict: if matching cannot be evaluated, or the destinations cannot
+ *                     be recorded, the call fails and nothing is removed — the operation stays
+ *                     plaid_removed and a retry runs the cleanup again. The last one is best-effort: if
+ *                     it fails the removal still commits and the call still succeeds, with matching left
+ *                     stale (readers get "updating") until a later evaluation succeeds. The result has
+ *                     the same shape as before, and does not say which of the two happened.
  *   cleaned        -> follow-ups that cannot run inside that transaction (the classifier is TypeScript):
  *                     re-validate relational roles of the surviving rows (their transfer/refund partner
  *                     may have been deleted), forward-reconcile the rows that sweep reset, and recompute
- *                     today's net-worth snapshot. Then reconciled.
+ *                     today's net-worth snapshot. Then reconciled. (A role these follow-ups change makes
+ *                     the matching states stale again — safely: readers get "updating" — until the next
+ *                     evaluation. Nothing here evaluates after them yet.)
  *
  * Local data is never deleted before Plaid has confirmed the Item is gone, and an operation is never
  * cancelled or restarted — only resumed.

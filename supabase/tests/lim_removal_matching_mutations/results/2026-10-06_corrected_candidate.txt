@@ -1,0 +1,91 @@
+# supabase/tests/lim_removal_matching_mutations/run.sh   (2026-10-06, corrected candidate: body 26f4c420dee834396b67be2599e66691; 17 mutants, each in its own throwaway local database)
+MUTANT                             RESULT     DETAIL
+no_conversion                      ok         DELETION WITHOUT CONVERSION: the conversion statement is removed; the removal only evaluates and deletes
+                                              expected: a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record
+                                              tests: a18:FAIL a19:FAIL c26:FAIL c27:FAIL c33:FAIL
+                                              first failure in a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record, keyed by account, own Plaid id and cents
+                                              first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+                                              first failure in c26: the removal preserved the one known destination; the unconfirmed payment got none
+                                              first failure in c27: the removal saw the confirmation that committed just before it and preserved its destination
+                                              first failure in c33: and committed fresh, with the destination preserved
+conversion_after_delete            ok         CONVERSION AFTER THE DELETE: the same statement, moved after the item is deleted (its partner rows are gone)
+                                              expected: a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record
+                                              tests: a18:FAIL a19:FAIL c26:FAIL c27:FAIL c33:FAIL
+                                              first failure in a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record, keyed by account, own Plaid id and cents
+                                              first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+                                              first failure in c26: the removal preserved the one known destination; the unconfirmed payment got none
+                                              first failure in c27: the removal saw the confirmation that committed just before it and preserved its destination
+                                              first failure in c33: and committed fresh, with the destination preserved
+no_first_evaluation                ok         no in-transaction evaluation before the conversion: it reads the STORED states at their stored version
+                                              expected: a19: records: k-a, and k-late (a pair no stored state knew)
+                                              tests: a18:pass a19:FAIL c26:pass c27:pass c33:pass
+                                              first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+first_evaluation_best_effort       ok         PRE-EVALUATION BEST-EFFORT: the first evaluation in a subtransaction whose failure is swallowed (try_evaluate): the conversion then runs on stale states
+                                              expected: a19: expected an error like remove_plaid_item_local: card-payment matching could not be evaluated before the removal
+                                              tests: a18:pass a19:FAIL c26:pass c27:pass c33:pass
+                                              first failure in a19: expected an error like remove_plaid_item_local: card-payment matching could not be evaluated before the removal (SQLSTATE 25001); nothing was removed but the statement succeeded:  select public.remove_plaid_item_local('000000
+no_final_evaluation                ok         no evaluation after the delete: the removal commits with the version ahead of the published states
+                                              expected: a18: the removal published fresh states at exactly the final input version
+                                              tests: a18:FAIL a19:FAIL c26:FAIL c27:FAIL c33:FAIL
+                                              first failure in a18: the removal published fresh states at exactly the final input version
+                                              first failure in a19: A: fresh at the final version, which advanced
+                                              first failure in c26: fresh: the refused confirmation changed no input after the removal's evaluation
+                                              first failure in c27: fresh after the removal, the last writer
+                                              first failure in c33: and committed fresh, with the destination preserved
+final_evaluation_strict            ok         FINAL EVALUATION STRICT AGAIN: a failure of the final evaluation raises, and undoes a removal whose evidence was already preserved
+                                              expected: a19: B3: a failed final evaluation must not fail the removal
+                                              tests: a18:pass a19:FAIL c26:pass c27:pass c33:pass
+                                              first failure in a19: B3: a failed final evaluation must not fail the removal (it raised: remove_plaid_item_local: card-payment matching could not be evaluated after the removal (SQLSTATE P0001); nothing was removed)
+failed_final_evaluation_marked_fresh ok         STALE STATE EXPOSED AS FRESH AFTER A FAILED FINAL EVALUATION: the normal path is untouched; when the final evaluation fails, the version is declared evaluated anyway
+                                              expected: a19: B3: the versions say stale
+                                              tests: a18:pass a19:FAIL c26:pass c27:pass c33:pass
+                                              first failure in a19: B3: the versions say stale: the input version moved past the last evaluated one
+stale_marked_fresh                 ok         STALE FINAL STATE PUBLISHED AS FRESH: instead of evaluating again, the version is simply declared evaluated
+                                              expected: a18: no state row of an earlier version, and none for a deleted transaction
+                                              tests: a18:FAIL a19:FAIL c26:FAIL c27:FAIL c33:pass
+                                              first failure in a18: no state row of an earlier version, and none for a deleted transaction
+                                              first failure in a19: A: both preserved destinations count
+                                              first failure in c26: the converted payment counts as leaving the tracked accounts
+                                              first failure in c27: the confirmed payment counts as leaving the tracked accounts — not unresolved
+version_not_advanced               ok         MISSING VERSION BUMP: correct states, but the input version ends where it was before the removal (needs UPDATE on the derived tables: applied as postgres-owned SECURITY DEFINER in the mutant only)
+                                              expected: a18: the matching input version advanced
+                                              tests: a18:FAIL a19:FAIL c26:FAIL c27:pass c33:pass
+                                              first failure in a18: the matching input version advanced
+                                              first failure in a19: A: fresh at the final version, which advanced
+                                              first failure in c26: the confirmation was refused: the matching state it was made on no longer exists
+converts_unresolved                ok         removal treated as evidence: any surviving cash leg with an opposite-amount leg on the removed item is converted, paired or not
+                                              expected: a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record
+                                              tests: a18:FAIL a19:pass c26:FAIL c27:pass c33:pass
+                                              first failure in a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record, keyed by account, own Plaid id and cents
+                                              first failure in c26: the removal preserved the one known destination; the unconfirmed payment got none
+converts_kept_pairs                ok         no restriction to the removed item: pairs with a card that stays are converted too
+                                              expected: a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record
+                                              tests: a18:FAIL a19:FAIL c26:pass c27:pass c33:pass
+                                              first failure in a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record, keyed by account, own Plaid id and cents
+                                              first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+wrong_lineage_key                  ok         the record is keyed by the removed card leg's Plaid id instead of the surviving cash leg's own
+                                              expected: a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record
+                                              tests: a18:FAIL a19:FAIL c26:FAIL c27:FAIL c33:FAIL
+                                              first failure in a18: exactly the ten surviving cash legs that were paired with a removed card leg have a record, keyed by account, own Plaid id and cents
+                                              first failure in a19: records: k-a, and k-late (a pair no stored state knew). NOT k-gone or k-inval (stored pairs that no longer held), nor k-wait
+                                              first failure in c26: the removal preserved the one known destination; the unconfirmed payment got none
+                                              first failure in c27: the removal saw the confirmation that committed just before it and preserved its destination
+                                              first failure in c33: and committed fresh, with the destination preserved
+no_dedupe                          ok         no check for an existing live record with the same key
+                                              expected: a18: second removal: a leg whose key is unchanged keeps its one record
+                                              tests: a18:FAIL a19:pass c26:pass c27:pass c33:pass
+                                              first failure in a18: second removal: a leg whose key is unchanged keeps its one record
+raw_errors                         ok         the conversion error is not replaced by the fixed message: whatever the failing statement says reaches the caller
+                                              expected: a19: expected an error like remove_plaid_item_local: known card-payment destinations could not be preserved
+                                              tests: a18:pass a19:FAIL c26:pass c27:pass c33:pass
+                                              first failure in a19: expected an error like remove_plaid_item_local: known card-payment destinations could not be preserved (SQLSTATE P0001); nothing was removed but got: injected failure with a secret id 00000000-0000-0000-0000-00000000dead
+version_row_before_advisory_lock   ok         LOCK ORDER: the version row (L2) is locked before the per-user advisory lock (L1)
+                                              expected: c33: while waiting on L1, the removal held no lock on the version row
+                                              tests: a18:pass a19:pass c26:pass c27:pass c33:FAIL
+                                              first failure in c33: while waiting on L1, the removal held no lock on the version row (L1 strictly before L2)
+no_user_filter                     ok         the conversion does not re-check the owner of either account (the evaluator already wrote only this user's states, and the insert trigger re-checks the account)
+                                              expected: SURVIVES (defense in depth: redundant with the per-user states and card_payment_decisions_same_user)
+                                              tests: a18:pass a19:pass c26:pass c27:pass c33:pass
+no_survivor_filter                 ok         cash legs on the removed item itself are converted too (their records are then deleted with their account by the cascade)
+                                              expected: SURVIVES (redundant with the account cascade: a record on a removed account goes with it)
+                                              tests: a18:pass a19:pass c26:pass c27:pass c33:pass
