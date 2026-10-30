@@ -1,3 +1,4 @@
+import { useId } from 'react';
 import type { AssetGroup, BudgetCategory, Loan, ManualLoan, RecurringStream } from '../lib/api';
 import { computeLiquidCash } from '../lib/assets';
 import { collectUpcomingItems } from '../lib/upcomingItems';
@@ -65,52 +66,65 @@ export function SafeToSpend({
           includeRemainingBudget,
         });
   const withheld = withheldText(budgetSemantics.kind === 'ok' ? { kind: 'invalid' } : budgetSemantics);
+  const stepsId = useId();
 
+  // Presentation: the result first, then the steps that produce it, each a line of the breakdown
+  // in the order the formula applies them. A line switched off in Financial preferences stays
+  // listed and says so in words.
   return (
     <div className="card safe-to-spend-card">
       <h2>Safe to spend</h2>
-      {safeToSpend === null ? (
-        <>
-          <div className="safe-to-spend-value safe-to-spend-withheld">—</div>
-          <p className={withheld.tone === 'alert' ? 'error' : 'hint'} role={withheld.tone === 'alert' ? 'alert' : 'status'}>
-            {withheld.short} Remaining budget isn't available, so this can't be worked out yet.
-          </p>
-        </>
-      ) : (
-        <div className={safeToSpend < 0 ? 'safe-to-spend-value negative' : 'safe-to-spend-value'}>
-          {formatCurrency(safeToSpend)}
+      <div className="safe-to-spend-body">
+        <div className="safe-to-spend-result">
+          {safeToSpend === null ? (
+            <>
+              <div className="safe-to-spend-value safe-to-spend-withheld">—</div>
+              <p className={withheld.tone === 'alert' ? 'error' : 'hint'} role={withheld.tone === 'alert' ? 'alert' : 'status'}>
+                {withheld.short} Remaining budget isn't available, so this can't be worked out yet.
+              </p>
+            </>
+          ) : (
+            <div className={safeToSpend < 0 ? 'safe-to-spend-value negative' : 'safe-to-spend-value'}>
+              {formatCurrency(safeToSpend)}
+            </div>
+          )}
+          <p className="hint">What's left after upcoming bills and unspent budget are set aside.</p>
         </div>
-      )}
-      <p className="hint">What's left after upcoming bills and unspent budget are set aside.</p>
-      <div className="safe-to-spend-breakdown">
-        <div className="safe-to-spend-line">
-          <span>Liquid cash</span>
-          <span>{formatCurrency(liquidCash)}</span>
-        </div>
-        <div className={includeUpcomingBills ? 'safe-to-spend-line' : 'safe-to-spend-line excluded'}>
-          <span>
-            Upcoming bills (next {upcomingBillsDays} days)
-            {!includeUpcomingBills && <span className="safe-to-spend-excluded-tag"> — Not included</span>}
-          </span>
-          <span>−{formatCurrency(includeUpcomingBills ? billsTotal : 0)}</span>
-        </div>
-        <div className={includeUpcomingBills ? 'safe-to-spend-line' : 'safe-to-spend-line excluded'}>
-          <span>
-            Credit card minimum payments
-            {!includeUpcomingBills && <span className="safe-to-spend-excluded-tag"> — Not included</span>}
-          </span>
-          <span>−{formatCurrency(includeUpcomingBills ? creditCardMinimumsTotal : 0)}</span>
-        </div>
-        <div className={includeRemainingBudget ? 'safe-to-spend-line' : 'safe-to-spend-line excluded'}>
-          <span>
-            Remaining budget
-            {!includeRemainingBudget && <span className="safe-to-spend-excluded-tag"> — Not included</span>}
-          </span>
-          <span>{remainingBudget === null && includeRemainingBudget ? '—' : `−${formatCurrency(includeRemainingBudget ? (remainingBudget ?? 0) : 0)}`}</span>
-        </div>
-        <div className="safe-to-spend-line">
-          <span>Minimum cash buffer</span>
-          <span>−{formatCurrency(minimumCashBuffer)}</span>
+        <div className="safe-to-spend-steps">
+          <h3 className="safe-to-spend-steps-title" id={stepsId}>
+            How it's worked out
+          </h3>
+          <div className="safe-to-spend-breakdown" role="list" aria-labelledby={stepsId}>
+            <div className="safe-to-spend-line safe-to-spend-line-start" role="listitem">
+              <span>Liquid cash</span>
+              <span>{formatCurrency(liquidCash)}</span>
+            </div>
+            <div className={includeUpcomingBills ? 'safe-to-spend-line' : 'safe-to-spend-line excluded'} role="listitem">
+              <span>
+                Upcoming bills (next {upcomingBillsDays} days)
+                {!includeUpcomingBills && <span className="safe-to-spend-excluded-tag"> — Not included</span>}
+              </span>
+              <span>−{formatCurrency(includeUpcomingBills ? billsTotal : 0)}</span>
+            </div>
+            <div className={includeUpcomingBills ? 'safe-to-spend-line' : 'safe-to-spend-line excluded'} role="listitem">
+              <span>
+                Credit card minimum payments
+                {!includeUpcomingBills && <span className="safe-to-spend-excluded-tag"> — Not included</span>}
+              </span>
+              <span>−{formatCurrency(includeUpcomingBills ? creditCardMinimumsTotal : 0)}</span>
+            </div>
+            <div className={includeRemainingBudget ? 'safe-to-spend-line' : 'safe-to-spend-line excluded'} role="listitem">
+              <span>
+                Remaining budget
+                {!includeRemainingBudget && <span className="safe-to-spend-excluded-tag"> — Not included</span>}
+              </span>
+              <span>{remainingBudget === null && includeRemainingBudget ? '—' : `−${formatCurrency(includeRemainingBudget ? (remainingBudget ?? 0) : 0)}`}</span>
+            </div>
+            <div className="safe-to-spend-line" role="listitem">
+              <span>Minimum cash buffer</span>
+              <span>−{formatCurrency(minimumCashBuffer)}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>

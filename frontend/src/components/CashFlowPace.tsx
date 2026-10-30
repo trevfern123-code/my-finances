@@ -84,45 +84,53 @@ export function CashFlowPace({
 
   const pctMonthElapsed = monthProgress(new Date());
 
+  // Presentation: this month's cash flow and the budget pace are two groups of the card (side by
+  // side on wide screens, see CommandCenterOverview.css). Each keeps its own figures and state.
   return (
-    <div className="card">
+    <div className="card cash-flow-pace-card">
       <h2>Cash flow &amp; budget pace</h2>
 
-      {semantics.kind !== 'ok' ? (
-        <SemanticNotice state={semantics} onRetry={onRetry} />
-      ) : (
-        <>
-          <CashFlowBars figures={semantics.currentMonth} />
-          <p className="cash-flow-result">
-            Cash flow this month:{' '}
-            {semantics.currentMonth.cash_flow !== null ? (
-              <strong>{formatSigned(semantics.currentMonth.cash_flow)}</strong>
-            ) : (
-              <>
-                <strong>{formatAmountRange(semantics.currentMonth.cash_flow_range)}</strong> ·{' '}
-                {unresolvedCardPaymentsNote(semantics.currentMonth.card_payments_unresolved.count)}
-              </>
-            )}
-          </p>
-          <CashFlowDetails figures={semantics.currentMonth} period={currentMonthRange()} onRefresh={onRetry} />
-        </>
-      )}
-
-      {totalBudget <= 0 ? (
-        <p className="hint budget-pace-hint">
-          Set up budget categories (on the Budget tab) to track your spending pace against them.
-        </p>
-      ) : totalBudgetSpent === null ? (
-        <div className="budget-pace">
-          <div className="section-header">
-            <span className="stat-label">Budget pace</span>
-            <span className="budget-category-summary">— of {formatCurrency(totalBudget)} budgeted</span>
-          </div>
-          <SemanticNotice state={budgetSemantics.kind === 'ok' ? { kind: 'invalid' } : budgetSemantics} onRetry={onRetryBudget} />
+      <div className="cash-flow-pace-body">
+        <div className="cash-flow-pace-month">
+          {semantics.kind !== 'ok' ? (
+            <SemanticNotice state={semantics} onRetry={onRetry} />
+          ) : (
+            <>
+              <CashFlowBars figures={semantics.currentMonth} />
+              <p className="cash-flow-result">
+                Cash flow this month:{' '}
+                {semantics.currentMonth.cash_flow !== null ? (
+                  <strong>{formatSigned(semantics.currentMonth.cash_flow)}</strong>
+                ) : (
+                  <>
+                    <strong>{formatAmountRange(semantics.currentMonth.cash_flow_range)}</strong> ·{' '}
+                    {unresolvedCardPaymentsNote(semantics.currentMonth.card_payments_unresolved.count)}
+                  </>
+                )}
+              </p>
+              <CashFlowDetails figures={semantics.currentMonth} period={currentMonthRange()} onRefresh={onRetry} />
+            </>
+          )}
         </div>
-      ) : (
-        <BudgetPace totalBudget={totalBudget} totalBudgetSpent={totalBudgetSpent} pctMonthElapsed={pctMonthElapsed} />
-      )}
+
+        <div className="cash-flow-pace-budget">
+          {totalBudget <= 0 ? (
+            <p className="hint budget-pace-hint">
+              Set up budget categories (on the Budget tab) to track your spending pace against them.
+            </p>
+          ) : totalBudgetSpent === null ? (
+            <div className="budget-pace">
+              <div className="section-header">
+                <h3 className="stat-label budget-pace-title">Budget pace</h3>
+                <span className="budget-category-summary">— of {formatCurrency(totalBudget)} budgeted</span>
+              </div>
+              <SemanticNotice state={budgetSemantics.kind === 'ok' ? { kind: 'invalid' } : budgetSemantics} onRetry={onRetryBudget} />
+            </div>
+          ) : (
+            <BudgetPace totalBudget={totalBudget} totalBudgetSpent={totalBudgetSpent} pctMonthElapsed={pctMonthElapsed} />
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -135,7 +143,7 @@ function BudgetPace({ totalBudget, totalBudgetSpent, pctMonthElapsed }: { totalB
   return (
     <div className="budget-pace">
       <div className="section-header">
-        <span className="stat-label">Budget pace</span>
+        <h3 className="stat-label budget-pace-title">Budget pace</h3>
         <span className={`budget-category-summary budget-category-summary-${tier}`}>
           {formatSpending(totalBudgetSpent)} of {formatCurrency(totalBudget)} budgeted
         </span>

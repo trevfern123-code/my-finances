@@ -131,6 +131,156 @@
   color: var(--text-muted);
 }
 
+/* ---- At a glance (UI Packet 02) ---- */
+
+/* OverviewStats puts the three headline figures under one "At a glance" heading, styled as a
+   small section label. Each tile: a sentence-case label, the figure, then its note (the change,
+   the range's reason or the withheld state's word) below a divider aligned across the tiles. */
+.mf-cc-overview .overview-at-a-glance {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mf-cc-overview .overview-section-title,
+.mf-cc-overview .safe-to-spend-steps-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.mf-cc-overview .stat-card .stat-label {
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.mf-cc-overview .stat-card .stat-delta {
+  margin-top: auto;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+
+/* A dash standing in place of a headline figure (OverviewStats adds `stat-value-withheld`): a
+   placeholder in the regular UI face and the muted color, never styled as an amount. */
+.mf-cc-overview .stat-value.stat-value-withheld {
+  font-family: inherit;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+/* ---- Safe to spend: the result, then how it's worked out ---- */
+
+.mf-cc-overview .safe-to-spend-steps {
+  margin-top: 1rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--border);
+}
+
+.mf-cc-overview .safe-to-spend-steps-title {
+  margin-bottom: 0.35rem;
+}
+
+/* The steps carry their own divider above, so the breakdown's own top rule is dropped. */
+.mf-cc-overview .safe-to-spend-breakdown {
+  gap: 0;
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.mf-cc-overview .safe-to-spend-line {
+  gap: 1rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.mf-cc-overview .safe-to-spend-line:last-child {
+  border-bottom: 0;
+}
+
+.mf-cc-overview .safe-to-spend-line > span:last-child {
+  flex-shrink: 0;
+  text-align: right;
+}
+
+/* The starting amount the deductions come off. */
+.mf-cc-overview .safe-to-spend-line-start {
+  font-weight: 500;
+  color: var(--text);
+}
+
+/* ---- Cash flow & budget pace ---- */
+
+.mf-cc-overview .cash-flow-pace-card > h2 {
+  margin-bottom: 0.9rem;
+}
+
+.mf-cc-overview .cash-flow-row .stat-label {
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.mf-cc-overview .cash-flow-result {
+  margin: 0.9rem 0 0.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.mf-cc-overview .cash-flow-result strong {
+  font-family: var(--mf-cc-serif);
+  font-size: 1.2rem;
+  font-weight: 500;
+  font-variant-numeric: lining-nums tabular-nums;
+  color: var(--text);
+}
+
+/* Safe to spend and Cash flow & budget pace are never paired (dashboardLayout), so they always
+   span the panel: on wide screens each splits into two columns divided by a rule. Narrower
+   screens keep the stacked order. */
+@media (min-width: 900px) {
+  .mf-cc-overview .safe-to-spend-body {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+    column-gap: 28px;
+    align-items: start;
+  }
+
+  .mf-cc-overview .safe-to-spend-steps {
+    margin-top: 0;
+    padding-top: 0;
+    padding-left: 28px;
+    border-top: 0;
+    border-left: 1px solid var(--border);
+  }
+
+  .mf-cc-overview .cash-flow-pace-body {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    column-gap: 28px;
+  }
+
+  .mf-cc-overview .cash-flow-pace-budget {
+    padding-left: 28px;
+    border-left: 1px solid var(--border);
+  }
+
+  .mf-cc-overview .cash-flow-pace-budget .budget-pace {
+    padding-top: 0;
+    border-top: 0;
+  }
+
+  .mf-cc-overview .cash-flow-pace-budget > .budget-pace-hint:first-child {
+    margin-top: 0;
+  }
+}
+
 /* Three headline cards side by side are narrowest between the stacked phone layout (App.css,
    560px) and wider screens; a slightly smaller figure keeps a typical cash-flow range on one line.
    Longer figures still wrap at their spaces rather than being clipped. */
