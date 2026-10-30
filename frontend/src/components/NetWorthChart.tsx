@@ -10,6 +10,17 @@ function formatDate(date: string) {
   });
 }
 
+/** With the year, for the written description: a chart's history can span more than one. */
+function formatFullDate(date: string) {
+  const [year, month, day] = date.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC',
+  });
+}
+
 const WIDTH = 700;
 const HEIGHT = 220;
 const PAD_LEFT = 64;
@@ -25,7 +36,7 @@ export function NetWorthChart({ history }: { history: NetWorthPoint[] }) {
       <div className="card">
         <h2>Net worth over time</h2>
         <p className="hint">
-          No history yet — snapshots are recorded whenever balances are refreshed. Check back
+          No recorded snapshots yet. This chart starts once a net worth snapshot is saved, such as
           after your next "Refresh balances."
         </p>
       </div>
@@ -52,16 +63,29 @@ export function NetWorthChart({ history }: { history: NetWorthPoint[] }) {
   const areaPath = `${linePath} L${xFor(history.length - 1).toFixed(1)},${zeroY.toFixed(1)} L${xFor(0).toFixed(1)},${zeroY.toFixed(1)} Z`;
 
   const latest = history[history.length - 1];
+  const isSingle = history.length === 1;
+  const period = isSingle
+    ? `One recorded snapshot so far, from ${formatFullDate(latest.date)}.`
+    : `Recorded snapshots from ${formatFullDate(history[0].date)} to ${formatFullDate(latest.date)}.`;
 
   return (
     <div className="card">
       <div className="section-header">
         <h2>Net worth over time</h2>
-        <span className={latest.net_worth >= 0 ? 'stat-value-inline' : 'stat-value-inline negative'}>
-          {formatCurrency(latest.net_worth)}
+        <span className="net-worth-latest">
+          <span className="hint">Latest snapshot</span>
+          <span className={latest.net_worth >= 0 ? 'stat-value-inline' : 'stat-value-inline negative'}>
+            {formatCurrency(latest.net_worth)}
+          </span>
         </span>
       </div>
-      <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="networth-svg" preserveAspectRatio="none">
+      <svg
+        viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+        className="networth-svg"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`${period} Latest snapshot: ${formatCurrency(latest.net_worth)}.`}
+      >
         <defs>
           <linearGradient id="networth-area-fill" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="var(--info)" stopOpacity="0.35" />
@@ -104,13 +128,25 @@ export function NetWorthChart({ history }: { history: NetWorthPoint[] }) {
           />
         ))}
 
-        <text x={PAD_LEFT} y={HEIGHT - 6} className="networth-axis-label" textAnchor="start">
-          {formatDate(history[0].date)}
-        </text>
-        <text x={WIDTH - PAD_RIGHT} y={HEIGHT - 6} className="networth-axis-label" textAnchor="end">
-          {formatDate(latest.date)}
-        </text>
+        {isSingle ? (
+          <text x={xFor(0)} y={HEIGHT - 6} className="networth-axis-label" textAnchor="middle">
+            {formatDate(latest.date)}
+          </text>
+        ) : (
+          <>
+            <text x={PAD_LEFT} y={HEIGHT - 6} className="networth-axis-label" textAnchor="start">
+              {formatDate(history[0].date)}
+            </text>
+            <text x={WIDTH - PAD_RIGHT} y={HEIGHT - 6} className="networth-axis-label" textAnchor="end">
+              {formatDate(latest.date)}
+            </text>
+          </>
+        )}
       </svg>
+      <p className="hint card-source-note">
+        {period} Each point is the total saved on that date, not confirmation that every balance was
+        up to date.
+      </p>
     </div>
   );
 }

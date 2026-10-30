@@ -317,3 +317,83 @@
     font-size: 2rem;
   }
 }
+
+/* ---- Support cards: accounts, bills, activity, net worth trend (UI Packet 03) ---- */
+
+/* A short line saying what a card's list is based on. It only explains the source; it never
+   claims the list is complete or its figures current. */
+.mf-cc-overview .card-source-note {
+  margin-top: 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.mf-cc-overview .account-quick-card > h2 {
+  margin-bottom: 0.85rem;
+}
+
+/* Account name over its institution and flags; the balance keeps its own column and never wraps.
+   Long names wrap inside theirs. */
+.mf-cc-overview .quick-view-list > .account-quick-row {
+  gap: 1rem;
+  padding: 0.55rem 0;
+}
+
+.mf-cc-overview .account-quick-main,
+.mf-cc-overview .upcoming-bill-name {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.mf-cc-overview .account-quick-name,
+.mf-cc-overview .upcoming-bill-title {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.mf-cc-overview .account-quick-row > .balance,
+.mf-cc-overview .upcoming-bill-row > .balance,
+.mf-cc-overview .recent-activity-row > .amount-debit,
+.mf-cc-overview .recent-activity-row > .amount-credit {
+  flex-shrink: 0;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.mf-cc-overview .upcoming-bills-card .section-header {
+  flex-wrap: wrap;
+}
+
+/* When the name can't share a line with the due date and amount, those two drop below it and
+   spread to the card's edges. */
+.mf-cc-overview .quick-view-list > .upcoming-bill-row {
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  padding: 0.55rem 0;
+}
+
+.mf-cc-overview .upcoming-bill-row > .upcoming-bill-name {
+  flex: 1 1 11rem;
+}
+
+.mf-cc-overview .quick-view-list > .recent-activity-row {
+  padding: 0.55rem 0;
+  font-size: 0.9rem;
+}
+
+.mf-cc-overview .recent-activity-row .transaction-name {
+  overflow-wrap: anywhere;
+}
+
+.mf-cc-overview .net-worth-latest {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  flex-shrink: 0;
+}
+
+.mf-cc-overview .net-worth-latest .hint {
+  font-size: 0.75rem;
+}

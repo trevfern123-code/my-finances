@@ -31,7 +31,7 @@ export function RecentActivity({
   const categoryById = new Map(budgetCategories.map((c) => [c.id, c]));
 
   return (
-    <div className="card">
+    <div className="card recent-activity-card">
       <div className="section-header">
         <h2>Recent activity</h2>
         <button className="link-button" onClick={onViewAll}>
@@ -39,27 +39,33 @@ export function RecentActivity({
         </button>
       </div>
       {recent.length === 0 ? (
-        <p className="hint">No transactions yet.</p>
+        <p className="hint">No transactions to show.</p>
       ) : (
-        <div className="quick-view-list">
-          {recent.map((t) => {
-            const emoji = t.budget_category_id ? categoryById.get(t.budget_category_id)?.emoji : null;
-            return (
-              <div key={t.id} className="recent-activity-row">
-                <div className="transaction-card-main">
-                  <span className="transaction-name">
-                    {emoji && <span className="transaction-emoji">{emoji}</span>}
-                    {t.merchant_name ?? t.name}
+        <>
+          <ul className="quick-view-list">
+            {recent.map((t) => {
+              const emoji = t.budget_category_id ? categoryById.get(t.budget_category_id)?.emoji : null;
+              return (
+                <li key={t.id} className="recent-activity-row">
+                  <div className="transaction-card-main">
+                    <span className="transaction-name">
+                      {emoji && <span className="transaction-emoji">{emoji}</span>}
+                      {t.merchant_name ?? t.name}
+                    </span>
+                    <span className="hint">{formatDate(t.date)}</span>
+                  </div>
+                  <span className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
+                    {formatAmount(t.amount, t.iso_currency_code)}
                   </span>
-                  <span className="hint">{formatDate(t.date)}</span>
-                </div>
-                <span className={t.amount >= 0 ? 'amount-debit' : 'amount-credit'}>
-                  {formatAmount(t.amount, t.iso_currency_code)}
-                </span>
-              </div>
-            );
-          })}
-        </div>
+                </li>
+              );
+            })}
+          </ul>
+          <p className="hint card-source-note">
+            Showing {recent.length} of {transactions.length} loaded{' '}
+            {transactions.length === 1 ? 'transaction' : 'transactions'}, not a complete history.
+          </p>
+        </>
       )}
     </div>
   );
