@@ -1,0 +1,169 @@
+/*
+ * Command Center V2.1 — Overview visual foundation (UI Packet 01).
+ *
+ * Every rule is scoped under `.mf-cc-overview`, the class App.tsx puts on the Overview tab panel
+ * only, so other tabs, the app header, tab navigation and the global theme/accent tokens are left
+ * exactly as App.css defines them. Colors come from App.css's existing tokens (--surface, --border,
+ * --text, --accent, ...), so system/light/dark and the chosen accent apply here unchanged; only the
+ * shadow differs by theme, using the same three-selector pattern App.css uses.
+ *
+ * Presentation only: nothing here hides, truncates, clips or reorders content. Amounts and ranges
+ * wrap rather than overflow, and warning/notice text keeps its existing color and size.
+ */
+
+.mf-cc-overview {
+  --mf-cc-radius: 12px;
+  --mf-cc-gap: 16px;
+  --mf-cc-pad: 22px;
+  --mf-cc-pad-compact: 16px;
+  /* Local fonts only (nothing is fetched). Fallbacks chosen for lining figures, which suit amounts
+     better than the old-style figures some common serifs default to. */
+  --mf-cc-serif: 'Source Serif 4', 'Source Serif Pro', Charter, 'Bitstream Charter', Cambria, 'Times New Roman',
+    serif;
+  --mf-cc-shadow: 0 1px 2px rgba(14, 22, 38, 0.04), 0 2px 8px rgba(14, 22, 38, 0.03);
+  gap: var(--mf-cc-gap);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .mf-cc-overview {
+    --mf-cc-shadow: none;
+  }
+}
+
+:root[data-theme='dark'] .mf-cc-overview {
+  --mf-cc-shadow: none;
+}
+
+/* ---- Page heading ---- */
+
+.mf-cc-overview > .overview-header {
+  flex-wrap: wrap;
+  align-items: flex-end;
+  margin-bottom: 0;
+  padding: 0.25rem 0 0;
+}
+
+.mf-cc-overview > .overview-header > .hint {
+  font-family: var(--mf-cc-serif);
+  font-size: 1.85rem;
+  font-weight: 400;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+/* ---- Card rows ---- */
+
+/* Paired cards keep their own height (App.css aligns them to the top of the row), so a short card,
+   such as one showing only an unavailable message, never stretches into a mostly empty panel. */
+.mf-cc-overview .dashboard-grid {
+  gap: var(--mf-cc-gap);
+}
+
+/* ---- Panels ---- */
+
+.mf-cc-overview .card {
+  border-radius: var(--mf-cc-radius);
+  padding: var(--mf-cc-pad);
+  box-shadow: var(--mf-cc-shadow);
+}
+
+.mf-cc-overview .card h2 {
+  font-size: 1rem;
+  letter-spacing: -0.005em;
+}
+
+.mf-cc-overview .card .section-header {
+  margin-bottom: 0.85rem;
+}
+
+/* ---- Headline figures (net worth, liquid cash, cash flow) ---- */
+
+.mf-cc-overview .overview-stats {
+  gap: var(--mf-cc-gap);
+  margin-bottom: 0;
+}
+
+.mf-cc-overview .stat-card {
+  background: var(--surface);
+  border-radius: var(--mf-cc-radius);
+  padding: 20px var(--mf-cc-pad);
+  box-shadow: var(--mf-cc-shadow);
+  gap: 0.4rem;
+}
+
+.mf-cc-overview .stat-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+.mf-cc-overview .stat-value,
+.mf-cc-overview .safe-to-spend-value,
+.mf-cc-overview .stat-value-inline {
+  font-family: var(--mf-cc-serif);
+  font-weight: 500;
+  font-variant-numeric: lining-nums tabular-nums;
+  letter-spacing: -0.01em;
+  overflow-wrap: break-word;
+}
+
+.mf-cc-overview .stat-value {
+  font-size: 1.85rem;
+  line-height: 1.15;
+}
+
+.mf-cc-overview .safe-to-spend-value {
+  font-size: 2.35rem;
+  line-height: 1.1;
+}
+
+.mf-cc-overview .stat-value-inline {
+  font-size: 1.25rem;
+}
+
+/* Withheld Safe to Spend: SafeToSpend.tsx marks the "—" it shows in place of an amount with
+   `safe-to-spend-withheld`. Neutral and in the regular UI face, so it can't read as a positive figure.
+   Real amounts, including zero and negative ones, never carry the class and keep their existing colors. */
+.mf-cc-overview .safe-to-spend-value.safe-to-spend-withheld {
+  font-family: inherit;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+/* Three headline cards side by side are narrowest between the stacked phone layout (App.css,
+   560px) and wider screens; a slightly smaller figure keeps a typical cash-flow range on one line.
+   Longer figures still wrap at their spaces rather than being clipped. */
+@media (min-width: 561px) and (max-width: 900px) {
+  .mf-cc-overview .stat-card {
+    padding: 18px;
+  }
+
+  .mf-cc-overview .stat-value {
+    font-size: 1.5rem;
+  }
+}
+
+/* ---- Narrow screens ---- */
+
+@media (max-width: 560px) {
+  .mf-cc-overview .card {
+    padding: var(--mf-cc-pad-compact);
+  }
+
+  .mf-cc-overview .stat-card {
+    padding: var(--mf-cc-pad-compact);
+  }
+
+  .mf-cc-overview > .overview-header > .hint {
+    font-size: 1.6rem;
+  }
+
+  .mf-cc-overview .stat-value {
+    font-size: 1.6rem;
+  }
+
+  .mf-cc-overview .safe-to-spend-value {
+    font-size: 2rem;
+  }
+}

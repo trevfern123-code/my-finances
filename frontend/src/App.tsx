@@ -116,6 +116,7 @@ import {
   type SummaryView,
 } from './lib/semanticModel';
 import './App.css';
+import './CommandCenterOverview.css';
 
 // The backend caps /api/plaid/transactions at 200 regardless of what's requested — fetching the
 // max gives the transactions feed as much history as the API allows, rather than the default 50.
@@ -2273,7 +2274,8 @@ export default function App() {
                   )}
 
                   {activeTab === 'overview' && (
-                    <div className="tab-panel">
+                    // mf-cc-overview scopes CommandCenterOverview.css to this panel only.
+                    <div className="tab-panel mf-cc-overview">
                       <div className="section-header overview-header">
                         <span className="hint">Overview</span>
                         <button

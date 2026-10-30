@@ -71,7 +71,7 @@ export function SafeToSpend({
       <h2>Safe to spend</h2>
       {safeToSpend === null ? (
         <>
-          <div className="safe-to-spend-value">—</div>
+          <div className="safe-to-spend-value safe-to-spend-withheld">—</div>
           <p className={withheld.tone === 'alert' ? 'error' : 'hint'} role={withheld.tone === 'alert' ? 'alert' : 'status'}>
             {withheld.short} Remaining budget isn't available, so this can't be worked out yet.
           </p>
