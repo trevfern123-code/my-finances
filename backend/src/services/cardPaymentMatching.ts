@@ -49,6 +49,16 @@
  * automatically nor offered as other legs' candidates. Nothing is deleted, merged or selected; a later
  * snapshot with a single replacement evaluates normally.
  *
+ * The relink-review guard (APPROVED by Trevor, 2026-10-09; packet 2-A): an institution removal leaves REVIEW
+ * OBLIGATIONS on the payments that survive it. Each names an affected payment (a lineage reference) and the
+ * surviving edges it positively knows; a coverage gap is an obligation that knows none. Tier 1 and the holds
+ * are computed as always. Then an automatic pair whose leg is an affected payment stays only if EVERY
+ * obligation on either leg lists that pair; otherwise it is withheld in both directions, nothing is selected
+ * in its place, and both legs stay in the pool. A withheld leg reads — before any removed-card record, which
+ * is not named on it — `unresolved` / `relink_review_required` (a cash leg: its range; a card leg: 0), or
+ * `untracked` / `no_included_card` when the user has no included card. A user decision still comes first.
+ * An obligation is never ended here: nothing in this module, or anywhere in packet 2-A, retires one.
+ *
  * Amounts are integer cents (Plaid sign: + out, − in). Dates are YYYY-MM-DD.
  */
 
@@ -165,6 +175,21 @@ export interface MatchingDecision {
   counterpartDate?: string | null;
 }
 
+/** A review obligation left by an institution removal (packet 2-A): the affected payment and the surviving
+ *  edges this obligation positively knows. References are lineage keys, like a decision's: they resolve to a
+ *  current row by the same rule, and to nothing when the account is gone or the lineage is ambiguous. The
+ *  cents are what was recorded; they do not take part in the resolution. */
+export interface MatchingReviewObligation {
+  id: string;
+  userId: string;
+  /** The affected payment. */
+  anchor: DecisionLegRef;
+  /** A coverage gap (unknown attribution, or a removal that recorded no sources): it lists no edge. */
+  gap: boolean;
+  /** The other leg of each surviving edge this obligation lists. Positive facts only. */
+  members: DecisionLegRef[];
+}
+
 export interface CardPaymentMatchingInput {
   userId: string;
   /** ISO timestamp — the evaluation's notion of "now" (carry-over expiry, recency label). */
@@ -173,6 +198,8 @@ export interface CardPaymentMatchingInput {
   transactions: MatchingTransaction[];
   carryovers: MatchingCarryover[];
   decisions: MatchingDecision[];
+  /** Absent or empty: no payment is under review and the guard withholds nothing. */
+  reviewObligations?: MatchingReviewObligation[];
 }
 
 // ---- Output ---------------------------------------------------------------------------------------
@@ -204,6 +231,9 @@ export type CardLegReason =
   | 'ambiguous'
   | 'matched_leg_not_posted'
   | 'decision_invalidated'
+  /** The relink-review guard withheld this leg's automatic pair: no obligation on either leg lists it
+   *  (approved rule, 2026-10-09). A range on an included cash leg; 0 on a card leg. */
+  | 'relink_review_required'
   /** More than one posted row on this account names the same pending id (approved rule, 2026-09-30). */
   | 'ambiguous_replacement'
   | 'excluded_account';
@@ -276,10 +306,26 @@ export interface DecisionResult {
   detail: InactiveDetail | 'foreign_user' | 'foreign_account' | null;
 }
 
+/** The review state of one leg (packet 2-A): it is an affected payment, or the guard withheld its pair. */
+export interface LegReviewResult {
+  transactionId: string;
+  /** The guard withheld this leg's automatic pair. */
+  guardWithheld: boolean;
+  /** The leg it was withheld from; null when nothing was withheld. */
+  withheldPartnerTransactionId: string | null;
+  /** The obligations concerned: this leg's own and, when withheld, its partner's. Sorted. */
+  obligationIds: string[];
+  /** One of them is a coverage gap. */
+  coverageGap: boolean;
+}
+
 export interface CardPaymentEvaluation {
   userId: string;
   /** One entry per card leg of the user, sorted by transactionId. */
   legs: CardLegResult[];
+  /** One entry per leg that is under review, sorted by transactionId. Separate from `legs`, whose entries
+   *  are exactly what they were before the guard existed. */
+  reviews: LegReviewResult[];
   /** One entry per decision owned by the user or touching the user's accounts, sorted by id. */
   decisions: DecisionResult[];
   /** Pending rows replaced by a posted row still present (§3.6 step 1): no state, not evidence. */
@@ -445,6 +491,13 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
     }
     if (counterpartDate !== null) dayNumber(counterpartDate, `decision '${d.id}' counterpartDate`);
     if (!Number.isSafeInteger(d.decidedSeq)) throw new CardPaymentMatchingIntegrityError(`decision '${d.id}' decidedSeq`);
+  }
+  const obligationIds = new Set<string>();
+  for (const o of input.reviewObligations ?? []) {
+    if (obligationIds.has(o.id)) throw new CardPaymentMatchingIntegrityError(`duplicate review obligation id '${o.id}'`);
+    obligationIds.add(o.id);
+    for (const ref of [o.anchor, ...o.members]) assertCents(ref.cents, `review obligation '${o.id}' cents`);
+    if (o.gap && o.members.length > 0) throw new CardPaymentMatchingIntegrityError(`review obligation '${o.id}' is a gap and lists an edge`);
   }
 
   // -- The user's view: only their accounts and the rows, carry-overs and decisions on them.
@@ -682,6 +735,36 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
     }
   }
 
+  // The relink-review guard (packet 2-A). An affected payment is a row a review obligation's reference
+  // resolves to, by the lineage rule; the amount does not take part. An obligation of another user, or one
+  // whose account is not this user's, resolves to nothing.
+  const reviewAnchors: Array<{ obligationId: string; rowId: string; gap: boolean }> = [];
+  const listedEdges = new Set<string>();
+  for (const o of input.reviewObligations ?? []) {
+    if (o.userId !== userId || !owns(o.anchor.accountId)) continue;
+    const anchor = resolveLineage(o.anchor);
+    if (anchor.kind !== 'row') continue;
+    reviewAnchors.push({ obligationId: o.id, rowId: anchor.txn.id, gap: o.gap });
+    for (const ref of o.members) {
+      if (!owns(ref.accountId)) continue;
+      const member = resolveLineage(ref);
+      if (member.kind === 'row') listedEdges.add(`${o.id}\u0000${member.txn.id}`);
+    }
+  }
+  // Of the automatic pairs left after the holds: one whose leg is an affected payment stays only if EVERY
+  // obligation on either leg lists that pair. Withheld in both directions; nothing is selected in its place;
+  // both legs stay in the pool.
+  const guardWithheld = new Map<string, string>();
+  for (const [legId, partner] of tier1) {
+    const unlisted = reviewAnchors.some(
+      (a) =>
+        (a.rowId === legId || a.rowId === partner.txn.id) &&
+        !listedEdges.has(`${a.obligationId}\u0000${a.rowId === legId ? partner.txn.id : legId}`)
+    );
+    if (unlisted) guardWithheld.set(legId, partner.txn.id);
+  }
+  for (const legId of guardWithheld.keys()) tier1.delete(legId);
+
   const includedCreditExists = userAccounts.some((a) => a.type === 'credit' && !a.excludeFromCashFlow);
 
   // Tracked pairs (for the return-of-pair suggestion label): cash leg id → credit leg id.
@@ -828,6 +911,12 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
       // 2. Tier 1.
       draft.partner = tier1Partner;
       applyPair(draft, tier1Partner, 'auto_pair');
+    } else if (guardWithheld.has(leg.txn.id)) {
+      // 2a. The guard withheld this leg's automatic pair: it needs review. Published BEFORE a removed-card
+      // record (3), which stays stored and is not named on this leg. A cash leg is a range, unless no
+      // included card exists: that is established independently, and counts in full.
+      if (leg.side === 'cash' && !includedCreditExists) setResolved(draft, 'untracked', 'no_included_card', -leg.txn.amountCents);
+      else draft.reason = 'relink_review_required';
     } else if (leg.side === 'cash' && removedCard.has(leg.txn.id)) {
       // 3. A known destination preserved through institution removal (§4.7, T9).
       draft.decisionId = removedCard.get(leg.txn.id)!.id;
@@ -943,9 +1032,35 @@ export function evaluateCardPayments(input: CardPaymentMatchingInput): CardPayme
     });
   }
 
+  // Review states: every leg that is an affected payment, and every leg whose pair the guard withheld — with
+  // the obligations concerned (its own, and those of the leg it was withheld from).
+  const reviewOf = new Map<string, { obligationIds: Set<string>; gap: boolean }>();
+  const noteReview = (legId: string, obligationId: string, gap: boolean) => {
+    if (!legs.has(legId)) return;
+    const entry = reviewOf.get(legId) ?? { obligationIds: new Set<string>(), gap: false };
+    entry.obligationIds.add(obligationId);
+    entry.gap = entry.gap || gap;
+    reviewOf.set(legId, entry);
+  };
+  for (const a of reviewAnchors) {
+    noteReview(a.rowId, a.obligationId, a.gap);
+    const withheldFrom = guardWithheld.get(a.rowId);
+    if (withheldFrom !== undefined) noteReview(withheldFrom, a.obligationId, a.gap);
+  }
+  const reviews: LegReviewResult[] = [...reviewOf.entries()]
+    .map(([transactionId, entry]) => ({
+      transactionId,
+      guardWithheld: guardWithheld.has(transactionId),
+      withheldPartnerTransactionId: guardWithheld.get(transactionId) ?? null,
+      obligationIds: [...entry.obligationIds].sort(cmp),
+      coverageGap: entry.gap,
+    }))
+    .sort((x, y) => cmp(x.transactionId, y.transactionId));
+
   return {
     userId,
     legs: results,
+    reviews,
     decisions: [...decisionResults.values()].sort((x, y) => cmp(x.decisionId, y.decisionId)),
     supersededTransactionIds: [...superseded].sort(cmp),
   };

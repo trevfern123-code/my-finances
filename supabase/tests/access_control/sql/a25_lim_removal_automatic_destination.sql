@@ -434,8 +434,17 @@ select pg_temp.observe('after later evidence', array['k-d', 'z-d', 'k-e', 'y-e',
 
 select pg_temp.req('D', 'when one of the two competitors drops out, the other is not thereby proven: the payment keeps its removed destination',
   pg_temp.removed_destination('k-d', 13000) and pg_temp.unmatched('z-d'));
-select pg_temp.req('E', 'a NEW, strictly closer transaction pairs by the ordinary rule — the protection is not a reservation of the payment; the record is dormant behind it',
-  pg_temp.srep('k-e') = 'tracked/auto_pair/0 partner=z-e' and pg_temp.leg('k-e')->>'decisionId' is null and pg_temp.records('k-e') = 1 and pg_temp.unmatched('y-e'));
+-- 20261009120000 (guarded manual recovery), cases E and O. The protection is still not a reservation: the new leg
+-- IS selected by the ordinary rule. But the payment is one the removal wrote a record and a hold about; its review
+-- obligation knows one surviving edge (the old competitor), and the new leg is not one. The selected pair is
+-- withheld both ways and published BEFORE the record: the payment reads a range, names no decision, has no
+-- partner; the new leg is unresolved, 0. The record and the hold stay as they are.
+select pg_temp.req('E', 'a NEW, strictly closer transaction is selected by the ordinary rule and WITHHELD for review: the range {−140, 0}, no partner, no decision; the new leg unresolved, 0; the record and the hold remain',
+  pg_temp.srep('k-e') = 'unresolved/relink_review_required/null partner=-'
+  and (pg_temp.leg('k-e')->>'lowCents')::bigint = -14000 and (pg_temp.leg('k-e')->>'highCents')::bigint = 0 and pg_temp.leg('k-e')->>'decisionId' is null
+  and pg_temp.srep('z-e') = 'unresolved/relink_review_required/0 partner=-'
+  and (pg_temp.leg('z-e')->>'lowCents')::bigint = 0 and (pg_temp.leg('z-e')->>'highCents')::bigint = 0
+  and pg_temp.records('k-e') = 1 and pg_temp.dstatus(pg_temp.record_id('k-e')) = 'active' and pg_temp.dstatus(pg_temp.hold_id('k-e')) = 'active' and pg_temp.unmatched('y-e'));
 select pg_temp.req('E2', 'a NEW transaction no closer than the old competitor is a tie of its own: nothing pairs, and the payment keeps its removed destination',
   pg_temp.removed_destination('k-e2', 15000) and pg_temp.unmatched('y-e2') and pg_temp.unmatched('z-e2'));
 select pg_temp.req('F-date', 'a date change that leaves the competitor no closer than the removed destination was changes nothing', pg_temp.removed_destination('k-fd', 16000) and pg_temp.unmatched('y-fd'));
@@ -454,8 +463,12 @@ select pg_temp.req('G-date', 'posted on the competitor''s own day: a date change
   pg_temp.srep('k-gd-posted') = 'tracked/auto_pair/0 partner=y-gd');
 select pg_temp.req('K-ce', 'when the payment''s account is later INCLUDED, it counts as a removed-card payment (−280) — it is NOT a tracked payment to the card that was already there',
   pg_temp.removed_destination('kc-kc', 28000) and pg_temp.unmatched('y-kc'));
-select pg_temp.req('O', 'precedence: current automatic evidence that is genuinely NEW outranks the system record (tracked with the new leg); the old competitor is still unmatched',
-  pg_temp.srep('k-o') = 'tracked/auto_pair/0 partner=z-o' and pg_temp.unmatched('y-o') and pg_temp.dstatus(pg_temp.record_id('k-o')) = 'active');
+select pg_temp.req('O', 'precedence: the guard result is published before the system record — genuinely NEW automatic evidence is withheld for review (the range {−310, 0}), not tracked and not read as the removed destination; the old competitor is still unmatched; the record stays active',
+  pg_temp.srep('k-o') = 'unresolved/relink_review_required/null partner=-'
+  and (pg_temp.leg('k-o')->>'lowCents')::bigint = -31000 and (pg_temp.leg('k-o')->>'highCents')::bigint = 0 and pg_temp.leg('k-o')->>'decisionId' is null
+  and pg_temp.srep('z-o') = 'unresolved/relink_review_required/0 partner=-'
+  and (pg_temp.leg('z-o')->>'lowCents')::bigint = 0 and (pg_temp.leg('z-o')->>'highCents')::bigint = 0
+  and pg_temp.unmatched('y-o') and pg_temp.dstatus(pg_temp.record_id('k-o')) = 'active');
 
 -- F-date, step 2: re-dated to the 11th — one day from the payment, strictly closer than the removed leg was (two).
 update public.transactions set date = '2026-09-11' where plaid_transaction_id = 'y-fd';
@@ -494,40 +507,60 @@ select pg_temp.cardleg('x2-q7', '00000000-0000-0000-0000-0000000025d1', -370, '2
 select pg_temp.evaluate();
 select pg_temp.oq7('OQ7: relinked, the leg re-imported FARTHER away than the kept card''s leg — today the hold still withholds the kept pair by the stored date: the payment reads untracked / removed_card, -370, although both cards are linked; the kept leg and the re-imported leg are unmatched',
   pg_temp.removed_destination('k-q7', 37000) and pg_temp.dstatus(pg_temp.hold_id('k-q7')) = 'active' and pg_temp.unmatched('y-q7') and pg_temp.unmatched('x2-q7'));
-select pg_temp.oq7('OQ7-dis: relinked, the leg re-imported on its original date — it pairs again, as in H',
-  pg_temp.srep('k-q7d') = 'tracked/auto_pair/0 partner=x2-q7d' and pg_temp.unmatched('y-q7d'));
+-- Decided for this reading by the owner (packet 2-A product approval, 2026-10-09; 20261009120000): a return on
+-- its original date is the closest candidate again, as in H, and is WITHHELD for review — the range {−380, 0}.
+select pg_temp.oq7('OQ7-dis: relinked, the leg re-imported on its original date — it is the closest candidate again, as in H, and is withheld for review: the range {−380, 0}; the re-imported leg unresolved, 0; the kept leg unmatched',
+  pg_temp.srep('k-q7d') = 'unresolved/relink_review_required/null partner=-'
+  and (pg_temp.leg('k-q7d')->>'lowCents')::bigint = -38000 and (pg_temp.leg('k-q7d')->>'highCents')::bigint = 0 and pg_temp.leg('k-q7d')->>'decisionId' is null
+  and pg_temp.srep('x2-q7d') = 'unresolved/relink_review_required/0 partner=-'
+  and (pg_temp.leg('x2-q7d')->>'lowCents')::bigint = 0 and (pg_temp.leg('x2-q7d')->>'highCents')::bigint = 0
+  and pg_temp.unmatched('y-q7d'));
 select pg_temp.call('dismiss-q7', format('select public.dismiss_card_payment_candidate(%L, %L, %L, %s)', pg_temp.aa(), pg_temp.tid('k-q7d'), pg_temp.tid('x2-q7d'), pg_temp.iv()));
 select pg_temp.oq7('OQ7-dis: the user then dismisses the re-imported leg — today that does not release the hold''s own pair: the payment reads untracked / removed_card, -380, again; the kept leg is unmatched',
   pg_temp.called('dismiss-q7') = 'saved' and pg_temp.removed_destination('k-q7d', 38000) and pg_temp.unmatched('y-q7d'));
 select pg_temp.observe('open question 7, after the relink', array['k-q7', 'y-q7', 'x2-q7', 'k-q7d', 'y-q7d', 'x2-q7d']);
 select pg_temp.req('O3', 'after the relink two cards tie for the payment: nothing pairs, and it is still PUBLISHED untracked / removed_card through the earlier record — no reader sees it as unresolved',
   pg_temp.removed_destination('k-o3', 35000) and pg_temp.holds('k-o3') = 'none' and pg_temp.unmatched('x2-o3') and pg_temp.unmatched('y-o3'));
-select pg_temp.req('H', 'after a relink the re-imported leg — closer than the competitor, as the removed one was — matches again by the ordinary rule: the hold is on the other pair and does not stand in the way; the record is dormant',
-  pg_temp.srep('k-h') = 'tracked/auto_pair/0 partner=x2-h' and pg_temp.unmatched('y-h') and pg_temp.records('k-h') = 1);
-select pg_temp.req('O2', 'after a relink the payment matches the re-imported leg (one day; the competitor is three)', pg_temp.srep('k-o2') = 'tracked/auto_pair/0 partner=x2-o2');
+-- 20261009120000. The re-imported leg did not survive the removal that wrote the payment's obligation: it is not
+-- an edge that obligation knows. It is selected by the ordinary rule (the hold is on the other pair and does not
+-- stand in the way) and WITHHELD: a range, before the record, which stays.
+select pg_temp.req('H', 'after a relink the re-imported leg — closer than the competitor, as the removed one was — is selected again by the ordinary rule and WITHHELD for review: the range {−220, 0}, no partner; the hold is on the other pair; the one record stays',
+  pg_temp.srep('k-h') = 'unresolved/relink_review_required/null partner=-'
+  and (pg_temp.leg('k-h')->>'lowCents')::bigint = -22000 and (pg_temp.leg('k-h')->>'highCents')::bigint = 0 and pg_temp.leg('k-h')->>'decisionId' is null
+  and pg_temp.srep('x2-h') = 'unresolved/relink_review_required/0 partner=-'
+  and (pg_temp.leg('x2-h')->>'lowCents')::bigint = 0 and (pg_temp.leg('x2-h')->>'highCents')::bigint = 0
+  and pg_temp.unmatched('y-h') and pg_temp.records('k-h') = 1);
+select pg_temp.req('O2', 'after a relink the re-imported leg (one day; the competitor is three) is selected and WITHHELD for review: the range {−320, 0}, no partner',
+  pg_temp.srep('k-o2') = 'unresolved/relink_review_required/null partner=-'
+  and (pg_temp.leg('k-o2')->>'lowCents')::bigint = -32000 and (pg_temp.leg('k-o2')->>'highCents')::bigint = 0 and pg_temp.leg('k-o2')->>'decisionId' is null
+  and pg_temp.srep('x2-o2') = 'unresolved/relink_review_required/0 partner=-'
+  and (pg_temp.leg('x2-o2')->>'lowCents')::bigint = 0 and (pg_temp.leg('x2-o2')->>'highCents')::bigint = 0);
 select pg_temp.remove(pg_temp.aa(), '00000000-0000-0000-0000-000000000007');
 select pg_temp.observe('after the relink and the second removal', array['k-h', 'y-h', 'k-o2', 'y-o2']);
 -- Each removal records what IT removed (20261008120000): a record for the automatic match it deletes, a hold for
--- each candidate it deletes, and neither merged into a row an earlier removal wrote. Rows that differ only in
--- their source read as one: nothing a reader is shown changes.
-select pg_temp.req('H', 'a second removal with the same evidence writes its OWN record and its OWN hold: two live records on the payment, and two live holds on the one pair with the one date',
-  pg_temp.records('k-h') = 2 and pg_temp.holds('k-h') = 'removed_card:y-h/k-h@2026-09-11,removed_card:y-h/k-h@2026-09-11');
-select pg_temp.req('H', 'each of the four names the leg its own removal deleted, the payment''s automatic match both times: Card Bank''s, and the relinked card''s',
-  pg_temp.deps('k-h') = 'hold_removed_card(y-h/k-h@2026-09-11)<=harness-item-a7:a25-x2:x2-h[partner] ; hold_removed_card(y-h/k-h@2026-09-11)<=harness-item-a:a25-x:x-h[partner] ; '
-                        || 'record(k-h)<=harness-item-a7:a25-x2:x2-h[partner] ; record(k-h)<=harness-item-a:a25-x:x-h[partner]');
-select pg_temp.req('H', 'the payment reads its removed destination again, as with one record and one hold; the competitor is unmatched',
+-- each candidate it deletes, and neither merged into a row an earlier removal wrote.
+-- Since 20261009120000 the re-imported leg was WITHHELD, not matched: when the second removal runs, the payment has
+-- no automatic match, so there is no destination for it to record — NO second record (as O3 always was). The
+-- re-imported leg was a removed CANDIDATE while the kept card's leg stays: the second removal writes its own hold,
+-- whose source is that candidate. One record, two holds. The payment reads its ONE record again.
+select pg_temp.req('H', 'a second removal writes its OWN hold and NO second record (the payment had no automatic match for it to record): one live record on the payment, and two live holds on the one pair with the one date',
+  pg_temp.records('k-h') = 1 and pg_temp.holds('k-h') = 'removed_card:y-h/k-h@2026-09-11,removed_card:y-h/k-h@2026-09-11');
+select pg_temp.req('H', 'each of the three names the leg its own removal deleted: the first removal''s record and hold the payment''s automatic match on Card Bank; the second removal''s hold the relinked card''s leg, a candidate that was no match',
+  pg_temp.deps('k-h') = 'hold_removed_card(y-h/k-h@2026-09-11)<=harness-item-a7:a25-x2:x2-h[candidate] ; hold_removed_card(y-h/k-h@2026-09-11)<=harness-item-a:a25-x:x-h[partner] ; '
+                        || 'record(k-h)<=harness-item-a:a25-x:x-h[partner]');
+select pg_temp.req('H', 'the payment reads its removed destination again (−220, equal bounds, no partner), as with one record and one hold; the competitor is unmatched',
   pg_temp.removed_destination('k-h', 22000) and pg_temp.unmatched('y-h'));
-select pg_temp.req('H', 'the record the payment NAMES is the one of its two with the lesser id — a name, not an attribution: both are its dependencies',
-  pg_temp.records('k-h') = 2 and (pg_temp.leg('k-h')->>'decisionId')::uuid = pg_temp.record_id('k-h'));
-select pg_temp.req('O2', 'competing system history: the second removal writes its own record — two live records on the payment — and its own hold on the same pair, with the second removed leg''s date',
-  pg_temp.records('k-o2') = 2 and pg_temp.holds('k-o2') = 'removed_card:y-o2/k-o2@2026-09-10,removed_card:y-o2/k-o2@2026-09-11');
-select pg_temp.req('O2', 'each record and each hold names the leg its own removal deleted, the payment''s automatic match both times: Card Bank''s on the 10th, and the relinked card''s on the 11th',
-  pg_temp.deps('k-o2') = 'hold_removed_card(y-o2/k-o2@2026-09-10)<=harness-item-a:a25-x:x-o2[partner] ; hold_removed_card(y-o2/k-o2@2026-09-11)<=harness-item-a7:a25-x2:x2-o2[partner] ; '
-                         || 'record(k-o2)<=harness-item-a7:a25-x2:x2-o2[partner] ; record(k-o2)<=harness-item-a:a25-x:x-o2[partner]');
-select pg_temp.req('O2', 'the payment is not switched: it reads its removed destination, as with one record; the competitor is unmatched',
+select pg_temp.req('H', 'the record the payment NAMES is its one record, the first removal''s',
+  pg_temp.records('k-h') = 1 and (pg_temp.leg('k-h')->>'decisionId')::uuid = pg_temp.record_id('k-h'));
+select pg_temp.req('O2', 'competing system history: the second removal writes NO second record — one live record on the payment — and its own hold on the same pair, with the second removed leg''s date',
+  pg_temp.records('k-o2') = 1 and pg_temp.holds('k-o2') = 'removed_card:y-o2/k-o2@2026-09-10,removed_card:y-o2/k-o2@2026-09-11');
+select pg_temp.req('O2', 'the record and each hold name the leg their own removal deleted: Card Bank''s on the 10th, the payment''s automatic match then; and the relinked card''s on the 11th, a candidate that was no match',
+  pg_temp.deps('k-o2') = 'hold_removed_card(y-o2/k-o2@2026-09-10)<=harness-item-a:a25-x:x-o2[partner] ; hold_removed_card(y-o2/k-o2@2026-09-11)<=harness-item-a7:a25-x2:x2-o2[candidate] ; '
+                         || 'record(k-o2)<=harness-item-a:a25-x:x-o2[partner]');
+select pg_temp.req('O2', 'the payment is not switched: it reads its removed destination (−320, equal bounds, no partner), as with one record; the competitor is unmatched',
   pg_temp.removed_destination('k-o2', 32000) and pg_temp.unmatched('y-o2'));
-select pg_temp.req('O2', 'the record the payment NAMES is the one of its two with the lesser id',
-  pg_temp.records('k-o2') = 2 and (pg_temp.leg('k-o2')->>'decisionId')::uuid = pg_temp.record_id('k-o2'));
+select pg_temp.req('O2', 'the record the payment NAMES is its one record',
+  pg_temp.records('k-o2') = 1 and (pg_temp.leg('k-o2')->>'decisionId')::uuid = pg_temp.record_id('k-o2'));
 select pg_temp.req('O3', 'the second removal deletes one of the two tied candidates; the tie is held although the payment was never published unresolved: one hold on the kept leg, still ONE record (the payment had no automatic match for this removal to record), and the payment is not switched to the card that is left',
   pg_temp.holds('k-o3') = 'removed_card:y-o3/k-o3@2026-09-12' and pg_temp.records('k-o3') = 1 and pg_temp.removed_destination('k-o3', 35000) and pg_temp.unmatched('y-o3'));
 select pg_temp.req('O3', 'the record is the first removal''s, from the automatic match it deleted; the hold is the second removal''s, from the tied candidate it deleted, which was no match',

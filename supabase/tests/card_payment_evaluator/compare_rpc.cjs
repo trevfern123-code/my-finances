@@ -14,6 +14,14 @@
 // b's>][@<removed candidate's date>]" → how many live decisions of user aa have that key at the end of the
 // sequence): every one of them must have reached the reference evaluator under its own id, the same in
 // every other field it reads, and come out of it with one status.
+// Since 20261009120000 the inputs carry the owner's review obligations (reviewObligations), and the reader
+// returns review metadata (`reviews`: which legs are under review, which partner the guard withheld, under
+// which obligations, whether a coverage gap). The metadata is compared ON ITS OWN, after the legs: a reader
+// that returns none, or a reference result that differs, is a failure named "review metadata". An E line may
+// state by hand — at the end (`figures`, `reviews`) and at named checkpoints (`checkpointLegs`,
+// `checkpointFigures`, `checkpointReviews`) — each leg's effect, bounds and partner, and EXACTLY which of
+// aa's legs are under review and how. Those are checked against the reference result, which the SQL states
+// were just required to equal.
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert');
@@ -64,7 +72,48 @@ const sameAsReference = (label, got, want) => {
   } catch (err) {
     fail(`${label}: SQL states differ from the reference evaluator on the RPC-written decisions\n${err.message.split('\n').slice(0, 20).join('\n')}`);
   }
+  // The review metadata, on its own. A reader that returns none has not said which legs the guard withheld.
+  if (!Array.isArray(got.reviews)) {
+    fail(`${label}: review metadata: the reader returned no \`reviews\``);
+  } else {
+    try {
+      assert.deepStrictEqual(got.reviews, want.reviews);
+    } catch (err) {
+      fail(`${label}: review metadata: SQL \`reviews\` differ from the reference evaluator\n${err.message.split('\n').slice(0, 20).join('\n')}`);
+    }
+  }
   return true;
+};
+// Hand-written expectations of one evaluation of user aa (the end of a sequence, or a checkpoint), checked
+// against the reference result: state/reason, figures, and the review metadata.
+const plaidOf = (input) => new Map(input.transactions.map((t) => [t.id, t.plaidTransactionId]));
+const idOf = (input) => new Map(input.transactions.map((t) => [t.plaidTransactionId, t.id]));
+const checkExpected = (label, input, want, expected) => {
+  const ids = idOf(input);
+  const plaids = plaidOf(input);
+  const legs = new Map(want.legs.map((l) => [l.transactionId, l]));
+  const name = (id) => (id === null || id === undefined ? '-' : plaids.get(id) ?? `(unknown ${id})`);
+  for (const [plaid, expectedLeg] of Object.entries(expected.legs ?? {})) {
+    const leg = legs.get(ids.get(plaid));
+    const got = leg ? `${leg.state}/${leg.reason}` : '(no leg)';
+    if (got !== expectedLeg) fail(`${label}: leg ${plaid} is ${got} under the reference evaluator, expected ${expectedLeg}`);
+  }
+  for (const [plaid, expectedFigure] of Object.entries(expected.figures ?? {})) {
+    const leg = legs.get(ids.get(plaid));
+    const got = leg ? `${leg.effectCents === null ? 'null' : leg.effectCents}[${leg.lowCents}..${leg.highCents}]>${name(leg.partnerTransactionId)}` : '(no leg)';
+    if (got !== expectedFigure) fail(`${label}: figures: leg ${plaid} is ${got} under the reference evaluator, expected ${expectedFigure}`);
+  }
+  if (expected.reviews !== undefined) {
+    const got = Object.fromEntries(
+      (want.reviews ?? []).map((r) => [name(r.transactionId), `withheld=${name(r.withheldPartnerTransactionId)},obligations=${r.obligationIds.length},gap=${r.coverageGap ? 't' : 'f'}`])
+    );
+    const sorted = (o) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+    try {
+      assert.deepStrictEqual(sorted(got), sorted(expected.reviews));
+    } catch {
+      fail(`${label}: review metadata: the legs under review are ${JSON.stringify(sorted(got))} under the reference evaluator, expected EXACTLY ${JSON.stringify(sorted(expected.reviews))}`);
+    }
+  }
 };
 for (const [name, sc] of scenarios) {
   if (!sc.expect) {
@@ -82,6 +131,7 @@ for (const [name, sc] of scenarios) {
     for (const t of input.transactions) byPlaid.set(t.plaidTransactionId, t.id);
     for (const l of want.legs) oracleLegs.set(l.transactionId, l);
     if (user !== AA) continue;
+    checkExpected(name, input, want, { figures: sc.expect.figures, reviews: sc.expect.reviews });
     // Only user aa calls the RPCs; count aa's live (non-superseded) decisions.
     const liveDecisions = input.decisions.filter((d) => d.userId === AA && d.supersededBy === null);
     live = liveDecisions.length;
@@ -104,9 +154,20 @@ for (const [name, sc] of scenarios) {
   for (const [stage, cp] of sc.checkpoints) {
     for (const [user, input] of Object.entries(cp.inputs)) {
       atCheckpoints += 1;
-      sameAsReference(`${name} at checkpoint '${stage}' user ${user}`, cp.states[user], evaluateCardPayments(input));
+      const want = evaluateCardPayments(input);
+      if (!sameAsReference(`${name} at checkpoint '${stage}' user ${user}`, cp.states[user], want) || user !== AA) continue;
+      checkExpected(`${name} at checkpoint '${stage}'`, input, want, {
+        legs: sc.expect.checkpointLegs?.[stage],
+        figures: sc.expect.checkpointFigures?.[stage],
+        reviews: sc.expect.checkpointReviews?.[stage],
+      });
     }
     if (Object.keys(cp.inputs).length !== 2) fail(`${name} at checkpoint '${stage}': the inputs of ${Object.keys(cp.inputs).length} users, expected 2`);
+  }
+  for (const key of ['checkpointLegs', 'checkpointFigures', 'checkpointReviews']) {
+    for (const stage of Object.keys(sc.expect[key] ?? {})) {
+      if (!sc.checkpoints.has(stage)) fail(`${name}: ${key} names the checkpoint '${stage}', which the sequence did not print`);
+    }
   }
   try {
     assert.deepStrictEqual([...sc.checkpoints.keys()], sc.expect.checkpoints ?? []);

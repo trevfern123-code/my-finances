@@ -45,4 +45,20 @@ export const env = {
   // read, never written, by the role-aware read path (services/semanticReadPath.ts), which runs only
   // for a client at API level 2 or above and is independent of this flag.
   cardPaymentSyncEvaluationEnabled: parseOptInFlag(process.env.CARD_PAYMENT_SYNC_EVALUATION_ENABLED),
+
+  // Optional, default OFF (Financial Semantics Phase B, I3A-R packet 2-A). When "true", a user may change a
+  // payment from its review: pair it with a current transaction, say it went to a card that is not linked,
+  // dismiss a candidate, undo one of those, reject a suggestion, defer (POST /api/card-payment-recovery/actions).
+  // OFF refuses that one endpoint and nothing else. It does NOT switch the protection off — the relink-review
+  // guard is in the database evaluator and has no switch — and the review, the receipts and the refresh-only
+  // retry stay available. Requires migration 20261009120000.
+  cardPaymentRecoveryActionsEnabled: parseOptInFlag(process.env.CARD_PAYMENT_RECOVERY_ACTIONS_ENABLED),
+
+  // Optional, default OFF (packet 2-A). When "true", this process runs the durable refresh worker
+  // (workers/cardPaymentRecoveryWorker.ts): it brings an owner's card-payment figures up to date whenever the
+  // database has registered that they are not, with no bank sync needed. Independent of
+  // CARD_PAYMENT_SYNC_EVALUATION_ENABLED. It must be ON wherever migration 20261009120000 is applied and users
+  // are served: that migration makes every user unreadable until evaluated again, and without a worker only a
+  // sync evaluation or a user action does that. (A release gate, recorded in the packet note.)
+  cardPaymentRecoveryWorkerEnabled: parseOptInFlag(process.env.CARD_PAYMENT_RECOVERY_WORKER_ENABLED),
 };

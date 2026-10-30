@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, feature/phase-b-i3a-r-provenance]
 
 jobs:
   build-and-test:
@@ -76,9 +76,9 @@ jobs:
   database-harness:
     # The adversarial PostgreSQL suites behind the manual-loan and Plaid-link database code: Phase A
     # (scaffold and history modes, which include the post-audit t07/t08, c07/c08 and g06/g07 tests),
-    # access_control, and the card-payment SQL-evaluator equivalence check (SQL vs the TypeScript
-    # reference evaluator). Throwaway local containers only. Each suite runs even if an earlier one
-    # failed, so one run reports all four.
+    # access_control, the card-payment SQL-evaluator equivalence check (SQL vs the TypeScript
+    # reference evaluator), and the three card-payment recovery checks. Throwaway local containers
+    # only. Each suite runs even if an earlier one failed, so one run reports all of them.
     runs-on: ubuntu-latest
     env:
       # Supabase's PostgreSQL 17.6.1.155 from ECR Public, after Docker Hub rejected CI pulls (pull limit).
@@ -126,3 +126,34 @@ jobs:
         run: bash supabase/tests/card_payment_evaluator/run.sh
         env:
           PG_IMAGE: ${{ env.SUPABASE_TEST_PG_IMAGE }}
+
+      - name: Recovery SQL, concurrency, and reference
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: bash
+        working-directory: .
+        run: bash supabase/tests/card_payment_recovery_review/run.sh
+        env:
+          PG_IMAGE: ${{ env.SUPABASE_TEST_PG_IMAGE }}
+          LOGDIR: ${{ runner.temp }}/packet-2a/recovery
+          REFERENCE: "1"
+
+      - name: Recovery rollback and reapply
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: bash
+        working-directory: .
+        run: bash supabase/tests/card_payment_recovery_review/rehearsal.sh
+        env:
+          PG_IMAGE: ${{ env.SUPABASE_TEST_PG_IMAGE }}
+          LOGDIR: ${{ runner.temp }}/packet-2a/rehearsal
+
+      - name: Recovery RPC metadata controls
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: bash
+        working-directory: .
+        run: bash supabase/tests/card_payment_recovery_review/rpc_metadata_controls.sh
+        env:
+          PG_IMAGE: ${{ env.SUPABASE_TEST_PG_IMAGE }}
+          LOGDIR: ${{ runner.temp }}/packet-2a/rpc-metadata
